@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+token.json
+credentials.json
+artemis.db
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
