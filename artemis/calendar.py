@@ -132,6 +132,6 @@ class CalendarClient:
                 for a in e.get("external_attendees", e["attendees"])
                 if not a.get("self")
             ]
-            attendee_str = ", ".join(attendee_names) if attendee_names else "no external attendees"
+            attendee_str = ", ".join(attendee_names) if attendee_names else "(solo)"
             lines.append(f"- **{e['summary']}** at {e['start']} — {attendee_str}")
         return "\n".join(lines)
