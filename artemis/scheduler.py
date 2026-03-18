@@ -17,7 +17,7 @@ from artemis.commitments import (
     get_commitments_for_client,
     list_commitments,
 )
-from artemis.crm import upsert_contact
+from artemis.crm import get_contact, upsert_contact
 from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.inbox import (
@@ -234,6 +234,10 @@ class ArtemisScheduler:
                         msg["thread_id"], msg["subject"], msg["from_email"],
                         state=NEEDS_ACTION,
                     )
+                    # Fetch full body for priority contacts
+                    body = self.gmail.get_full_message(msg["id"])
+                    if body:
+                        msg["full_body"] = body
                     post = self.mm.post_message(
                         config.CHANNEL_OPS,
                         f"**Priority email** from {msg['from']}\n"
@@ -261,6 +265,9 @@ class ArtemisScheduler:
                 triaged = triage_emails(email_text, playbook_text=get_playbook_text())
 
                 # Zip triage results back with original messages for thread tracking
+                full_body_fetches = 0
+                _MAX_FULL_FETCHES = 5
+
                 for i, item in enumerate(triaged):
                     urgency = item.get("urgency", "low")
                     sender_type = item.get("sender_type", "")
@@ -290,6 +297,22 @@ class ArtemisScheduler:
                         )
                     else:
                         self._pending_triage.append(item)
+
+                    # Fetch full body for playbook matches or known CRM contacts
+                    # (limited to _MAX_FULL_FETCHES per cycle to control API costs)
+                    if orig and full_body_fetches < _MAX_FULL_FETCHES:
+                        needs_full = bool(playbook_match)
+                        if not needs_full:
+                            needs_full = bool(get_contact(orig.get("from_email", "")))
+                        if needs_full:
+                            body = self.gmail.get_full_message(orig["id"])
+                            if body:
+                                orig["full_body"] = body
+                                full_body_fetches += 1
+                                logger.info(
+                                    "Fetched full body for [%s] (%d chars)",
+                                    orig.get("subject", ""), len(body),
+                                )
 
                     # Execute playbook if matched
                     if playbook_match and orig:
