@@ -709,26 +709,10 @@ def _handle_availability_command(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "No valid slots selected.", root_id=root_id)
         return True
 
-    # Generate draft reply via Claude
-    from artemis.briefs import _call_claude
-    from artemis.prompts import AVAILABILITY_REPLY_SYSTEM, AVAILABILITY_REPLY_USER
-
+    # Generate draft directly from real calendar slots — no Claude rewrite.
+    # format_slots_email produces the exact template with specific dates/times.
     sender_first = pending.get("sender_name", "").split()[0] if pending.get("sender_name", "").strip() else ""
-    slots_text = format_slots_email(selected, sender_first_name=sender_first)
-    user_prompt = AVAILABILITY_REPLY_USER.format(
-        sender_name=pending.get("sender_name", ""),
-        sender_email=pending.get("sender_email", ""),
-        subject=pending.get("subject", ""),
-        snippet=pending.get("snippet", ""),
-        slots_text=slots_text,
-        booking_link=config.BOOKING_LINK or "none",
-    )
-
-    try:
-        draft_body = _call_claude(AVAILABILITY_REPLY_SYSTEM, user_prompt)
-    except Exception:
-        logger.exception("Failed to generate availability reply draft")
-        draft_body = slots_text  # Fallback to raw slot text
+    draft_body = format_slots_email(selected, sender_first_name=sender_first)
 
     # Move to Phase 2: draft review
     pending["phase"] = "draft_review"
@@ -854,6 +838,84 @@ def _handle_timezone_command(post: dict, question: str) -> bool:
             return True
 
     return False
+
+
+def _handle_scheduling_mention(post: dict, question: str) -> bool:
+    """Detect scheduling/availability questions and respond with real calendar slots.
+
+    Catches questions like "when can we meet", "schedule a call", "find time",
+    "what's your availability", etc. that would otherwise fall through to
+    Claude's freeform handler which might produce vague language.
+
+    Returns True if handled.
+    """
+    q_lower = question.lower().strip()
+
+    # Skip if already handled by the explicit "availability" command
+    if q_lower.startswith("availability") or "when am i free" in q_lower:
+        return False
+
+    # Scheduling intent patterns
+    _SCHEDULING_PATTERNS = [
+        r"\b(schedule|set up|arrange|book)\s+(a\s+)?(call|meeting|chat|time|session)",
+        r"\bwhen\s+(can|could|should)\s+(we|i|you)\s+(meet|talk|chat|connect|call)",
+        r"\bfind\s+(a\s+)?time\s+(to|for)",
+        r"\bwhat.?s?\s+(your|my)\s+(availability|schedule|calendar)",
+        r"\b(free|available|open)\s+(time|slot|hour)",
+        r"\blet.?s?\s+(meet|connect|chat|talk|hop on)",
+        r"\bgrab\s+time",
+        r"\bset\s+up\s+time",
+        r"\bpick\s+(a\s+)?time",
+    ]
+
+    is_scheduling = False
+    for pattern in _SCHEDULING_PATTERNS:
+        if re.search(pattern, q_lower):
+            is_scheduling = True
+            break
+
+    if not is_scheduling:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Extract timeframe from the question, then look up real slots
+    start_date, end_date = parse_timeframe(question)
+    slots = get_availability(_calendar, start_date, end_date)
+
+    if not slots:
+        reply = (
+            "I checked your calendar but didn't find open slots in that timeframe.\n\n"
+            f"Booking link: {config.BOOKING_LINK}" if config.BOOKING_LINK else
+            "I checked your calendar but didn't find open slots in that timeframe."
+        )
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # Format with real, specific times
+    from artemis.quiet_hours import get_tz_abbrev
+    tz_abbrev = get_tz_abbrev()
+
+    lines = [":calendar: **Here are your next available slots:**", ""]
+    for i, slot in enumerate(slots, 1):
+        date_str = slot["date"].strftime("%A, %B %d")
+        start_str = slot["start"].strftime("%I:%M %p").lstrip("0")
+        lines.append(f"{i}. {date_str} — {start_str} {tz_abbrev}")
+
+    if config.BOOKING_LINK:
+        lines.append(f"\nBooking link: {config.BOOKING_LINK}")
+
+    reply = "\n".join(lines)
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
 
 
 def _handle_quiet_command(post: dict, question: str) -> bool:
@@ -1045,6 +1107,10 @@ def _handle_mention(post: dict, thread: list[dict]):
 
     # Timezone override: "I'm in [city]" / "timezone [tz]"
     if _handle_timezone_command(post, question):
+        return
+
+    # Scheduling intent detection (real slots, never vague language)
+    if _handle_scheduling_mention(post, question):
         return
 
     # Availability check command
