@@ -101,9 +101,17 @@ response with this exact format (the system will parse it and create the event):
 {{"summary": "Meeting title", "date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM", "description": "optional notes", "attendees": ["email@example.com"]}}
 ```
 
+CALENDAR SAFETY RULES:
+- NEVER add external attendees without explicit user approval. If the event has
+  attendees, the system will draft the event and ask the user to confirm before
+  sending invites. Only include attendees if the user specifically requested them.
+- Internal events (no attendees) are created directly.
+- The system checks for conflicting events within ±2 hours automatically.
+- Never claim an event was created — the system will confirm with the actual event ID.
+- For deletions, use: `delete event <event_id or name>` — the system will confirm.
+
 Only include the calendar_event block when you are confident about the details.
-If details are ambiguous, ask for clarification instead. Never claim an event
-was created — the system will confirm creation with the actual event ID."""
+If details are ambiguous, ask for clarification instead."""
 
 PLAYBOOK_EXTRACT_SYSTEM = f"""You are Artemis, an AI chief of staff.
 Extract structured data from an email to execute a playbook action.

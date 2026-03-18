@@ -141,6 +141,101 @@ class CalendarClient:
 
         return result
 
+    def get_events_around(self, target_datetime: datetime, window_hours: int = 2) -> list[dict]:
+        """Get events within ±window_hours of target_datetime for conflict detection."""
+        if not self.service:
+            return []
+
+        local_tz = ZoneInfo(config.TIMEZONE)
+        if target_datetime.tzinfo is None:
+            target_datetime = target_datetime.replace(tzinfo=local_tz)
+
+        time_min = target_datetime - timedelta(hours=window_hours)
+        time_max = target_datetime + timedelta(hours=window_hours)
+
+        try:
+            result = (
+                self.service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min.isoformat(),
+                    timeMax=time_max.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+        except Exception:
+            logger.exception("Failed to fetch events for conflict check")
+            return []
+
+        events = []
+        for event in result.get("items", []):
+            attendees = event.get("attendees", [])
+            start = event.get("start", {})
+            start_time = start.get("dateTime", start.get("date", ""))
+            events.append({
+                "id": event["id"],
+                "summary": event.get("summary", "(no title)"),
+                "start": start_time,
+                "attendees": [
+                    {
+                        "email": a.get("email", ""),
+                        "name": a.get("displayName", ""),
+                        "self": a.get("self", False),
+                    }
+                    for a in attendees
+                ],
+            })
+
+        return events
+
+    def delete_event(self, event_id: str) -> bool:
+        """Delete a calendar event by ID. Returns True on success."""
+        if not self.service:
+            logger.error("Calendar not authenticated — cannot delete event")
+            return False
+        try:
+            self.service.events().delete(calendarId="primary", eventId=event_id).execute()
+            logger.info("Deleted calendar event %s", event_id)
+            return True
+        except Exception:
+            logger.exception("Failed to delete calendar event %s", event_id)
+            return False
+
+    def get_event(self, event_id: str) -> dict | None:
+        """Get a single event by ID. Returns dict or None."""
+        if not self.service:
+            return None
+        try:
+            event = self.service.events().get(calendarId="primary", eventId=event_id).execute()
+            start = event.get("start", {})
+            return {
+                "id": event["id"],
+                "summary": event.get("summary", "(no title)"),
+                "start": start.get("dateTime", start.get("date", "")),
+                "attendees": [
+                    {
+                        "email": a.get("email", ""),
+                        "name": a.get("displayName", ""),
+                        "self": a.get("self", False),
+                    }
+                    for a in event.get("attendees", [])
+                ],
+            }
+        except Exception:
+            logger.exception("Failed to get event %s", event_id)
+            return None
+
+    def find_event_by_name(self, name: str) -> dict | None:
+        """Search today's events for one matching name (case-insensitive)."""
+        events = self.get_today_events()
+        name_lower = name.lower()
+        for e in events:
+            if name_lower in e["summary"].lower():
+                return e
+        return None
+
     def create_event(
         self,
         summary: str,
