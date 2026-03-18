@@ -66,3 +66,30 @@
 4. On due_date: "TODAY" alert, escalate to #artemis-ops
 5. When commitment marked done AND a "forward deliverables"
    follow-up exists: post reminder to #artemis-ops
+
+## PB-006: Availability Request
+
+**Trigger:** Email containing "when are you free", "schedule a call",
+"find a time", "what times work", "send me your availability",
+"when works for you", "do you have time", "are you available",
+"set up a meeting", "book a time"
+
+**Actions:**
+1. Extract requested timeframe from email (default: next 5 business days)
+2. Query calendar for the timeframe period
+3. Find 4-6 open slots based on meeting preferences:
+   - Respect MEETING_HOURS_START / MEETING_HOURS_END
+   - Apply MEETING_BUFFER_MINUTES between events
+   - Exclude focus blocks ("focus", "deep work", "work session")
+   - Prefer spreading slots across multiple days
+4. Post formatted availability to #artemis-ops with numbered slots:
+   - Include sender name, company, subject, and original quote
+   - Include `send [numbers]` / `send all` / `edit` / `cancel` instructions
+5. On `send [numbers]`:
+   - Generate professional reply draft via Claude
+   - Include selected time slots and BOOKING_LINK (if configured)
+   - Post draft to #artemis-ops for approval
+6. On `confirm`:
+   - Send reply via Gmail API
+   - Mark original email as WAITING in inbox zero
+7. NEVER auto-reply — all sends require explicit user confirmation

@@ -5,6 +5,7 @@ import html
 import logging
 import re
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from email.utils import parseaddr
 
 from google.auth.transport.requests import Request
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 
@@ -47,7 +49,10 @@ class GmailClient:
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
         granted = set(creds.scopes or []) if creds else set()
-        required = {"https://www.googleapis.com/auth/gmail.modify"}
+        required = {
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
+        }
         if granted and not required.issubset(granted):
             missing = required - granted
             logger.warning(
@@ -308,6 +313,76 @@ class GmailClient:
             return True
         except Exception:
             logger.exception("Failed to archive message %s", message_id)
+            return False
+
+    def get_message_id_header(self, message_id: str) -> str:
+        """Get the Message-ID header of a Gmail message for reply threading."""
+        if not self.service:
+            return ""
+        try:
+            msg = (
+                self.service.users()
+                .messages()
+                .get(userId="me", id=message_id, format="metadata",
+                     metadataHeaders=["Message-ID"])
+                .execute()
+            )
+            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            return headers.get("Message-ID", "")
+        except Exception:
+            logger.exception("Failed to get Message-ID for %s", message_id)
+            return ""
+
+    def send_reply(
+        self,
+        thread_id: str,
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to: str = "",
+    ) -> bool:
+        """Send a reply in an existing thread.
+
+        Args:
+            thread_id: Gmail thread ID to reply in.
+            to: Recipient email address.
+            subject: Email subject (Re: prefix added if missing).
+            body: Plain text body.
+            in_reply_to: Message-ID header of the message being replied to.
+
+        Returns True on success, False on failure.
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot send")
+            return False
+
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        msg = MIMEText(body)
+        msg["to"] = to
+        msg["subject"] = subject
+
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+
+        # Get sender address
+        my_email = self.get_my_email()
+        if my_email:
+            msg["from"] = my_email
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+        try:
+            self.service.users().messages().send(
+                userId="me",
+                body={"raw": raw, "threadId": thread_id},
+            ).execute()
+            logger.info("Sent reply in thread %s to %s", thread_id, to)
+            return True
+        except Exception:
+            logger.exception("Failed to send reply in thread %s", thread_id)
             return False
 
     def format_for_claude(self, messages: list[dict]) -> str:

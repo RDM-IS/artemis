@@ -128,6 +128,48 @@ Fields needed: {fields}
 Email:
 {email_text}"""
 
+AVAILABILITY_EXTRACT_SYSTEM = f"""You are Artemis, an AI chief of staff.
+Extract the meeting timeframe and duration from this email.
+
+{SAFETY_INSTRUCTION}
+
+Return a JSON object with:
+- timeframe: human-readable description (e.g. "next week", "this Thursday")
+- start_date: YYYY-MM-DD or null if unclear
+- end_date: YYYY-MM-DD or null if unclear
+- duration_minutes: requested meeting length (default 30 if not specified)
+
+Today's date is {{today}}."""
+
+AVAILABILITY_EXTRACT_USER = """Extract meeting scheduling details from this email:
+
+{email_text}"""
+
+AVAILABILITY_REPLY_SYSTEM = f"""You are Artemis, drafting a professional email reply
+proposing meeting times on behalf of the user.
+
+{SAFETY_INSTRUCTION}
+
+Write a brief, friendly reply that:
+- Acknowledges their request
+- Lists the selected time slots
+- Asks them to confirm which works best
+- Includes the booking link if provided
+- Signs off professionally
+
+Keep it under 150 words. Do not include a subject line — just the body."""
+
+AVAILABILITY_REPLY_USER = """Draft a reply to this availability request.
+
+Original email from: {sender_name} <{sender_email}>
+Subject: {subject}
+Snippet: {snippet}
+
+Selected time slots:
+{slots_text}
+
+Booking link: {booking_link}"""
+
 MENTION_USER = """Question: {question}
 
 Thread context (last messages):

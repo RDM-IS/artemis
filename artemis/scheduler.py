@@ -3,6 +3,7 @@
 import json
 import logging
 import multiprocessing
+import time
 from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -107,6 +108,7 @@ class ArtemisScheduler:
         self.scheduler = BackgroundScheduler()
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
+        self._pending_availability: dict[str, dict] = {}
         # Error recovery counters
         self._gmail_fail_count: int = 0
         self._calendar_fail_count: int = 0
@@ -595,6 +597,8 @@ class ArtemisScheduler:
                 self._run_pb003_survey(msg, triage_item)
             elif playbook_id == "PB-004":
                 self._run_pb004_meeting_request(msg, triage_item)
+            elif playbook_id == "PB-006":
+                self._run_pb006_availability(msg, triage_item)
             else:
                 logger.warning("Unknown playbook ID: %s", playbook_id)
                 return
@@ -698,6 +702,101 @@ class ArtemisScheduler:
             config.CHANNEL_OPS,
             f"\U0001f4c5 Meeting request from {msg.get('from', 'unknown')} \u2014 needs response\n"
             f"Subject: {msg.get('subject', '')}",
+        )
+
+    def _run_pb006_availability(self, msg: dict, triage_item: dict):
+        """PB-006: Availability Request — analyze calendar and post slots to ops."""
+        from artemis.availability import (
+            format_slots_mattermost,
+            get_availability,
+            parse_timeframe,
+        )
+        from artemis.briefs import _call_claude
+        from artemis.prompts import AVAILABILITY_EXTRACT_SYSTEM, AVAILABILITY_EXTRACT_USER
+
+        sender_email = msg.get("from_email", "")
+        sender_name = msg.get("from", "").split("<")[0].strip().strip('"') or sender_email
+        subject = msg.get("subject", "")
+        body = msg.get("full_body", msg.get("snippet", ""))
+
+        # Extract timeframe from email using Claude
+        today_str = date.today().isoformat()
+        system = AVAILABILITY_EXTRACT_SYSTEM.replace("{today}", today_str)
+        user_prompt = AVAILABILITY_EXTRACT_USER.format(email_text=UNTRUSTED_PREFIX + body[:3000])
+
+        try:
+            result = _call_claude(system, user_prompt)
+            import json as _json
+            extracted = _json.loads(result)
+            start_date = extracted.get("start_date")
+            end_date = extracted.get("end_date")
+            duration = extracted.get("duration_minutes") or config.DEFAULT_SLOT_DURATION
+
+            if start_date:
+                start_date = date.fromisoformat(start_date)
+            if end_date:
+                end_date = date.fromisoformat(end_date)
+        except Exception:
+            logger.warning("Failed to extract timeframe via Claude — using defaults")
+            start_date = None
+            end_date = None
+            duration = config.DEFAULT_SLOT_DURATION
+
+        # Fallback to default timeframe
+        if not start_date or not end_date:
+            start_date, end_date = parse_timeframe(body)
+
+        # Find availability
+        slots = get_availability(
+            self.calendar,
+            start_date,
+            end_date,
+            slot_duration=int(duration),
+            num_slots=6,
+        )
+
+        # Format and post to ops
+        original_quote = msg.get("snippet", "")[:200]
+        formatted = format_slots_mattermost(
+            slots,
+            sender_name=sender_name,
+            sender_email=sender_email,
+            subject=subject,
+            original_quote=original_quote,
+            booking_link=config.BOOKING_LINK,
+        )
+
+        post_result = self.mm.post_message(config.CHANNEL_OPS, formatted)
+
+        # Track in inbox
+        upsert_thread(
+            msg["thread_id"], subject, sender_email,
+            state=NEEDS_ACTION,
+        )
+
+        # Store pending availability for reply flow in main.py
+        # Keyed by the ops channel so the user can reply in that channel
+        try:
+            from artemis.main import _pending_availability
+            # Use CHANNEL_OPS as key since that's where the user will reply
+            ops_channel = config.CHANNEL_OPS
+            _pending_availability[ops_channel] = {
+                "sender_name": sender_name,
+                "sender_email": sender_email,
+                "subject": subject,
+                "thread_id": msg["thread_id"],
+                "message_id": msg.get("id", ""),
+                "slots": slots,
+                "snippet": original_quote,
+                "created_at": time.time(),
+                "phase": "slot_selection",
+            }
+        except ImportError:
+            logger.warning("Could not import _pending_availability from main")
+
+        logger.info(
+            "PB-006: Posted %d availability slots for %s (%s)",
+            len(slots), sender_name, subject,
         )
 
     def job_commitment_reminders(self):
