@@ -34,6 +34,7 @@ from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.scheduler import ArtemisScheduler
+from artemis.version import format_version_status, get_commit_hash, get_latest_github_version, get_version
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -89,9 +90,14 @@ def health_check():
     mm_status = "connected" if _mm and _mm._bot_user_id else "error"
     job_count = len(_sched.scheduler.get_jobs()) if _sched else 0
     uptime = int(time.time() - _start_time) if _start_time else 0
+    local_hash = get_commit_hash()
+    latest_hash, _ = get_latest_github_version()
 
     return jsonify({
         "status": "ok",
+        "version": get_version(),
+        "latest_commit": latest_hash or "unknown",
+        "up_to_date": bool(local_hash and latest_hash and latest_hash.startswith(local_hash)),
         "gmail": gmail_status,
         "calendar": calendar_status,
         "mattermost": mm_status,
@@ -261,6 +267,16 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_inbox_command(post, question):
         return
 
+    # Version commands
+    q_lower = question.lower().strip()
+    if q_lower in ("version", "what version are you?", "what version", "update check"):
+        channel_id = post.get("channel_id", "")
+        root_id = post.get("root_id") or post["id"]
+        reply = format_version_status()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
     thread_lines = []
     for p in thread[-10:]:
         thread_lines.append(f"{p.get('message', '')}")
@@ -298,8 +314,10 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
     gmail_status = "connected" if gmail and gmail.service else "disconnected"
     cal_status = "connected" if calendar and calendar.service else "disconnected"
     job_count = len(sched.scheduler.get_jobs())
+    version = get_version()
     msg = (
-        f"\u2705 Artemis online \u2014 {ts}. "
+        f"\u2705 Artemis online \u2014 {ts}\n"
+        f"Version: {version}\n"
         f"Gmail: {gmail_status}. Calendar: {cal_status}. "
         f"Scheduler: {job_count} jobs running."
     )

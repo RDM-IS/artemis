@@ -114,6 +114,12 @@ class ArtemisScheduler:
                 id="focus_reminder",
             )
 
+        # Weekly update check — Mondays at 8am
+        self.scheduler.add_job(
+            self.job_update_check, "cron", hour=8, minute=0, day_of_week="mon",
+            id="update_check",
+        )
+
         self.scheduler.start()
         logger.info("Scheduler started")
 
@@ -460,6 +466,29 @@ class ArtemisScheduler:
             )
         except Exception:
             logger.exception("Focus reminder failed")
+
+    def job_update_check(self):
+        """Check GitHub for new commits and post if an update is available."""
+        try:
+            from artemis.version import get_commit_hash, get_latest_github_version
+
+            local_hash = get_commit_hash()
+            latest_hash, latest_date = get_latest_github_version()
+
+            if not latest_hash or not local_hash:
+                return  # can't check — skip silently
+
+            if latest_hash.startswith(local_hash):
+                return  # up to date — stay silent
+
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f504 Artemis update available \u2014 latest commit: {latest_hash} ({latest_date}).\n"
+                f"Run `git pull && pip install -r requirements.txt && restart` to update.",
+            )
+        except Exception:
+            # GitHub unreachable — skip silently per spec
+            logger.debug("Update check failed — skipping")
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""
