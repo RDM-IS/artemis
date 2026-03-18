@@ -7,7 +7,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BUILD_DATE = "2026-03-17"
 COMMIT_HASH = None  # populated at runtime from git
 

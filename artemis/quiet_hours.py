@@ -1,6 +1,7 @@
-"""Quiet hours logic — silence scheduled jobs during off-hours.
+"""Quiet hours session management — silence scheduled jobs during off-hours.
 
-Manages quiet hours checking and timezone overrides stored in SQLite.
+State-based quiet system with manual goodnight/morning, working session
+overrides with inactivity timers, and timezone overrides stored in SQLite.
 """
 
 import logging
@@ -101,6 +102,16 @@ def _parse_time(t: str) -> time:
     return time(int(parts[0]), int(parts[1]))
 
 
+def _now_utc_iso() -> str:
+    """Current UTC time as ISO string."""
+    return datetime.utcnow().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# City / timezone resolution
+# ---------------------------------------------------------------------------
+
+
 def resolve_city_timezone(city_or_tz: str) -> str | None:
     """Resolve a city name or IANA timezone string to an IANA timezone.
 
@@ -108,11 +119,9 @@ def resolve_city_timezone(city_or_tz: str) -> str | None:
     """
     normalized = city_or_tz.strip().lower()
 
-    # Check city map first
     if normalized in _CITY_TIMEZONES:
         return _CITY_TIMEZONES[normalized]
 
-    # Try as raw IANA timezone
     try:
         ZoneInfo(city_or_tz.strip())
         return city_or_tz.strip()
@@ -133,7 +142,6 @@ def get_active_timezone() -> str:
             expires_at = datetime.fromisoformat(row["expires_at"])
             if datetime.utcnow() < expires_at:
                 return row["timezone"]
-            # Expired — clean up silently (scheduler handles announcement)
     except Exception:
         logger.debug("Failed to check timezone override", exc_info=True)
 
@@ -150,12 +158,80 @@ def get_tz_abbrev(tz_name: str | None = None) -> str:
         return "???"
 
 
-def is_quiet_hours() -> bool:
-    """Check if the current time is within the quiet hours window.
+# ---------------------------------------------------------------------------
+# System state (generic key-value store)
+# ---------------------------------------------------------------------------
 
-    Uses the active timezone (override or home). Handles midnight-spanning
-    windows like 20:00-05:00.
-    """
+
+def get_system_value(key: str) -> str | None:
+    """Read a value from the system_state table."""
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT value FROM system_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+    except Exception:
+        logger.debug("Failed to read system_state[%s]", key, exc_info=True)
+        return None
+
+
+def set_system_value(key: str, value: str) -> None:
+    """Upsert a value into the system_state table."""
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, _now_utc_iso()),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Failed to write system_state[%s]", key)
+
+
+# ---------------------------------------------------------------------------
+# Quiet state management
+# ---------------------------------------------------------------------------
+
+
+def _get_quiet_row() -> dict | None:
+    """Read the quiet_state singleton row. Returns dict or None."""
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT * FROM quiet_state WHERE id = 1").fetchone()
+        return dict(row) if row else None
+    except Exception:
+        logger.debug("Failed to read quiet_state", exc_info=True)
+        return None
+
+
+def _upsert_quiet_state(**kwargs) -> None:
+    """Insert or update the quiet_state singleton row."""
+    kwargs["updated_at"] = _now_utc_iso()
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT id FROM quiet_state WHERE id = 1").fetchone()
+        if row:
+            sets = ", ".join(f"{k} = ?" for k in kwargs)
+            conn.execute(
+                f"UPDATE quiet_state SET {sets} WHERE id = 1",
+                list(kwargs.values()),
+            )
+        else:
+            kwargs["id"] = 1
+            cols = ", ".join(kwargs.keys())
+            placeholders = ", ".join("?" for _ in kwargs)
+            conn.execute(
+                f"INSERT INTO quiet_state ({cols}) VALUES ({placeholders})",
+                list(kwargs.values()),
+            )
+        conn.commit()
+    except Exception:
+        logger.exception("Failed to upsert quiet_state")
+
+
+def _is_in_time_window() -> bool:
+    """Check if current time is within the configured quiet hours window."""
     tz_name = get_active_timezone()
     try:
         tz = ZoneInfo(tz_name)
@@ -167,26 +243,221 @@ def is_quiet_hours() -> bool:
     end = _parse_time(config.QUIET_HOURS_END)
 
     if start <= end:
-        # Same-day window (e.g., 01:00-05:00)
         return start <= now < end
     else:
-        # Midnight-spanning window (e.g., 20:00-05:00)
         return now >= start or now < end
 
 
+def is_quiet() -> bool:
+    """Check if Artemis should be in quiet mode.
+
+    Priority:
+    1. override_active=1 → NOT quiet (working session)
+    2. manual_override=1 AND is_quiet=1 → quiet (user said goodnight)
+    3. manual_override=1 AND is_quiet=0 → NOT quiet (user said good morning)
+    4. No manual override → check time-based window
+    """
+    state = _get_quiet_row()
+    if state:
+        if state.get("override_active"):
+            return False  # Working session overrides everything
+        if state.get("manual_override"):
+            return bool(state.get("is_quiet"))
+    # Fall through to time-based check
+    return _is_in_time_window()
+
+
+# Backward compatibility alias
+is_quiet_hours = is_quiet
+
+
+def get_quiet_state() -> dict:
+    """Get the full quiet state as a dict."""
+    state = _get_quiet_row()
+    if state:
+        return state
+    return {
+        "is_quiet": 0,
+        "manual_override": 0,
+        "wake_time": None,
+        "override_active": 0,
+        "override_until": None,
+        "last_interaction": None,
+    }
+
+
+def enter_quiet(manual: bool = False, wake_time: str | None = None) -> str:
+    """Enter quiet mode. Called by cron job or manually via goodnight.
+
+    Returns an announcement string.
+    """
+    _upsert_quiet_state(
+        is_quiet=1,
+        manual_override=1 if manual else 0,
+        wake_time=wake_time,
+        override_active=0,
+        override_until=None,
+    )
+
+    tz_abbrev = get_tz_abbrev()
+    if wake_time:
+        wake_display = _parse_time(wake_time).strftime("%I:%M %p").lstrip("0")
+        return (
+            f"\U0001f319 Goodnight \u2014 going quiet. Jobs paused. "
+            f"I'll resume at {wake_display} {tz_abbrev} or when you say good morning."
+        )
+
+    end_display = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
+    if manual:
+        return (
+            f"\U0001f319 Goodnight \u2014 going quiet. Jobs paused. "
+            f"I'll resume at {end_display} {tz_abbrev} or when you say good morning."
+        )
+
+    # Automatic (cron-triggered)
+    return (
+        f"\U0001f319 Artemis entering quiet hours \u2014 scheduled jobs paused "
+        f"until {end_display} {tz_abbrev}."
+    )
+
+
+def exit_quiet() -> str:
+    """Exit quiet mode. Called by cron job or manually via good morning.
+
+    Returns an announcement string (caller adds overnight summary).
+    """
+    _upsert_quiet_state(
+        is_quiet=0,
+        manual_override=0,
+        wake_time=None,
+        override_active=0,
+        override_until=None,
+    )
+    return ""  # Caller builds the full morning summary
+
+
+def start_override(until_time: str | None = None) -> str:
+    """Start a working session override — suspend quiet hours.
+
+    Returns a confirmation string.
+    """
+    _upsert_quiet_state(
+        override_active=1,
+        override_until=until_time,
+        last_interaction=_now_utc_iso(),
+    )
+
+    if until_time:
+        tz_abbrev = get_tz_abbrev()
+        display = _parse_time(until_time).strftime("%I:%M %p").lstrip("0")
+        return f"\u26a1 Active until {display} {tz_abbrev}. Let's work."
+
+    timeout = config.OVERRIDE_TIMEOUT_MINUTES
+    return (
+        f"\u26a1 Working session started. I'll go quiet after {timeout} minutes "
+        f"of inactivity. Say `@artemis extend` to reset the timer or "
+        f"`@artemis goodnight` when done."
+    )
+
+
+def extend_override() -> str:
+    """Reset the inactivity timer on the working session override."""
+    _upsert_quiet_state(last_interaction=_now_utc_iso())
+    timeout = config.OVERRIDE_TIMEOUT_MINUTES
+    return f"\u23f1 Timer reset \u2014 going quiet after {timeout} min of inactivity."
+
+
+def check_override_expiry() -> str | None:
+    """Check if a working session override has expired due to inactivity or time limit.
+
+    Returns announcement text if expired, None otherwise.
+    Called by the 1-minute scheduler job.
+    """
+    state = _get_quiet_row()
+    if not state or not state.get("override_active"):
+        return None
+
+    now = datetime.utcnow()
+
+    # Check time-based override limit (override until X)
+    until = state.get("override_until")
+    if until:
+        tz_name = get_active_timezone()
+        try:
+            tz = ZoneInfo(tz_name)
+        except (KeyError, ValueError):
+            tz = ZoneInfo(config.HOME_TIMEZONE)
+        local_now = datetime.now(tz).time()
+        until_time = _parse_time(until)
+        if local_now >= until_time:
+            _upsert_quiet_state(override_active=0, override_until=None, is_quiet=1)
+            return (
+                f"\U0001f319 Working session ended (reached {until}). Going quiet. "
+                f"Say `@artemis override` to keep working."
+            )
+
+    # Check inactivity timeout
+    last = state.get("last_interaction")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            elapsed = (now - last_dt).total_seconds() / 60
+            if elapsed >= config.OVERRIDE_TIMEOUT_MINUTES:
+                _upsert_quiet_state(override_active=0, override_until=None, is_quiet=1)
+                return (
+                    f"\U0001f319 No activity for {config.OVERRIDE_TIMEOUT_MINUTES} minutes "
+                    f"\u2014 going quiet. Say `@artemis override` to keep working."
+                )
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def update_last_interaction() -> None:
+    """Record an @mention interaction for inactivity tracking."""
+    state = _get_quiet_row()
+    if state and state.get("override_active"):
+        _upsert_quiet_state(last_interaction=_now_utc_iso())
+
+
+# ---------------------------------------------------------------------------
+# Status display
+# ---------------------------------------------------------------------------
+
+
 def quiet_hours_status() -> str:
-    """Return a formatted status string for quiet hours."""
+    """Return a formatted status string for quiet hours and session state."""
     tz_name = get_active_timezone()
     tz_abbrev = get_tz_abbrev(tz_name)
     start_str = _parse_time(config.QUIET_HOURS_START).strftime("%I:%M %p").lstrip("0")
     end_str = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
+    state = get_quiet_state()
 
-    if is_quiet_hours():
-        status = f"\U0001f319 Quiet hours active ({start_str} - {end_str} {tz_abbrev}). Scheduled jobs paused."
+    lines = []
+
+    # Current quiet state
+    if state.get("override_active"):
+        lines.append(f"\u26a1 Working session active. Quiet hours window: {start_str} - {end_str} {tz_abbrev}.")
+        until = state.get("override_until")
+        if until:
+            display = _parse_time(until).strftime("%I:%M %p").lstrip("0")
+            lines.append(f"\u23f1 Active until {display} {tz_abbrev}.")
+        else:
+            lines.append(f"\u23f1 {config.OVERRIDE_TIMEOUT_MINUTES}-min inactivity timer running.")
+    elif is_quiet():
+        if state.get("manual_override"):
+            lines.append(f"\U0001f319 Quiet (manual goodnight). Window: {start_str} - {end_str} {tz_abbrev}.")
+            wake = state.get("wake_time")
+            if wake:
+                wake_display = _parse_time(wake).strftime("%I:%M %p").lstrip("0")
+                lines.append(f"Wake time: {wake_display} {tz_abbrev}.")
+        else:
+            lines.append(f"\U0001f319 Quiet hours active ({start_str} - {end_str} {tz_abbrev}). Scheduled jobs paused.")
     else:
-        status = f"\u2600\ufe0f Outside quiet hours ({start_str} - {end_str} {tz_abbrev})."
+        lines.append(f"\u2600\ufe0f Outside quiet hours ({start_str} - {end_str} {tz_abbrev}).")
 
-    # Check for active timezone override
+    # Timezone override
     try:
         conn = get_db()
         row = conn.execute(
@@ -197,18 +468,20 @@ def quiet_hours_status() -> str:
             if datetime.utcnow() < expires_at:
                 city = row["city_name"] or row["timezone"]
                 expires_str = expires_at.strftime("%b %d")
-                status += f"\n\U0001f30d Timezone override: {city} ({row['timezone']}) until {expires_str}."
+                lines.append(f"\U0001f30d Timezone: {city} ({row['timezone']}) until {expires_str}.")
     except Exception:
         pass
 
-    return status
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Timezone override CRUD (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> str:
-    """Set a timezone override that expires after `days` days.
-
-    Returns a confirmation message string.
-    """
+    """Set a timezone override that expires after `days` days."""
     expires_at = datetime.utcnow() + timedelta(days=days)
     tz_abbrev = get_tz_abbrev(tz_name)
     start_str = _parse_time(config.QUIET_HOURS_START).strftime("%I:%M %p").lstrip("0")
@@ -225,7 +498,7 @@ def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> s
         conn.commit()
     except Exception:
         logger.exception("Failed to set timezone override")
-        return f"\u26a0\ufe0f Failed to set timezone override — check logs."
+        return "\u26a0\ufe0f Failed to set timezone override \u2014 check logs."
 
     display_city = city_name.title() if city_name else tz_name
     return (
@@ -235,24 +508,21 @@ def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> s
 
 
 def clear_timezone_override() -> str:
-    """Clear the active timezone override. Returns confirmation message."""
+    """Clear the active timezone override."""
     try:
         conn = get_db()
         conn.execute("DELETE FROM timezone_overrides WHERE id = 1")
         conn.commit()
     except Exception:
         logger.exception("Failed to clear timezone override")
-        return "\u26a0\ufe0f Failed to clear timezone override — check logs."
+        return "\u26a0\ufe0f Failed to clear timezone override \u2014 check logs."
 
     home_abbrev = get_tz_abbrev(config.HOME_TIMEZONE)
     return f"\U0001f3e0 Timezone reset to {config.HOME_TIMEZONE} ({home_abbrev}). Welcome back!"
 
 
 def check_expired_overrides() -> str | None:
-    """Check if the timezone override has expired. If so, delete it and return announcement text.
-
-    Returns None if no override expired. Called by scheduler daily.
-    """
+    """Check if the timezone override has expired. Returns announcement or None."""
     try:
         conn = get_db()
         row = conn.execute(
