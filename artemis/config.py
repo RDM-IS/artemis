@@ -67,6 +67,15 @@ TAILSCALE_HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "")
 # Playbooks
 PLAYBOOKS_PATH = Path(os.environ.get("PLAYBOOKS_PATH", "PLAYBOOKS.md"))
 
+# Availability / Meeting Preferences (PB-006)
+MEETING_HOURS_START = os.environ.get("MEETING_HOURS_START", "09:00")
+MEETING_HOURS_END = os.environ.get("MEETING_HOURS_END", "17:00")
+MEETING_BUFFER_MINUTES = int(os.environ.get("MEETING_BUFFER_MINUTES", "15"))
+PREFERRED_MEETING_DAYS = _list(os.environ.get("PREFERRED_MEETING_DAYS", "Mon,Tue,Wed,Thu,Fri"))
+FOCUS_BLOCK_KEYWORDS = _list(os.environ.get("FOCUS_BLOCK_KEYWORDS", "focus,deep work,work session"))
+BOOKING_LINK = os.environ.get("BOOKING_LINK", "")
+DEFAULT_SLOT_DURATION = int(os.environ.get("DEFAULT_SLOT_DURATION", "30"))
+
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
 

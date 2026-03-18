@@ -13,6 +13,12 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 
 from artemis import config
+from artemis.availability import (
+    format_slots_email,
+    format_slots_mattermost,
+    get_availability,
+    parse_timeframe,
+)
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
 from artemis.commitments import get_db, list_commitments, get_commitments_for_client, log_calendar_action
@@ -59,6 +65,10 @@ _last_brief: str = "never"
 # Pending confirmation actions keyed by channel_id
 # Each value is a dict with "type", "data", and "timestamp"
 _pending_confirms: dict[str, dict] = {}
+
+# Pending availability reply flow keyed by channel_id
+# Stores slots and email context for send/confirm/edit flow
+_pending_availability: dict[str, dict] = {}
 
 
 @app.route("/webhook/uptime", methods=["POST"])
@@ -565,6 +575,196 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
     return False
 
 
+def _handle_availability_command(post: dict, question: str) -> bool:
+    """Handle 'send', 'edit', 'cancel' for pending availability replies.
+
+    Also handles 'confirm' for pending draft replies.
+    Returns True if handled.
+    """
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if channel_id not in _pending_availability:
+        return False
+
+    pending = _pending_availability[channel_id]
+
+    # Expire after 30 minutes
+    if time.time() - pending.get("created_at", 0) > 1800:
+        del _pending_availability[channel_id]
+        return False
+
+    # ── Phase 2: Draft confirmation ──
+    if pending.get("phase") == "draft_review":
+        if q_lower == "confirm":
+            # Send the reply via Gmail
+            if _gmail:
+                in_reply_to = ""
+                msg_id = pending.get("message_id", "")
+                if msg_id:
+                    in_reply_to = _gmail.get_message_id_header(msg_id)
+
+                success = _gmail.send_reply(
+                    thread_id=pending["thread_id"],
+                    to=pending["sender_email"],
+                    subject=pending["subject"],
+                    body=pending["draft_body"],
+                    in_reply_to=in_reply_to,
+                )
+
+                if success:
+                    from artemis.inbox import mark_waiting
+                    mark_waiting(pending["thread_id"], waiting_on=pending["sender_name"])
+                    reply = (
+                        f":white_check_mark: Reply sent to {pending['sender_email']}. "
+                        f"Thread marked WAITING on {pending['sender_name']}."
+                    )
+                else:
+                    reply = ":red_circle: Failed to send reply — check logs."
+            else:
+                reply = "Gmail not connected — cannot send."
+
+            del _pending_availability[channel_id]
+            if _mm:
+                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            return True
+
+        elif q_lower in ("cancel", "no"):
+            del _pending_availability[channel_id]
+            if _mm:
+                _mm.post_to_channel_id(channel_id, "Reply cancelled.", root_id=root_id)
+            return True
+
+        elif q_lower == "edit":
+            # Show the raw draft for manual editing
+            draft = pending.get("draft_body", "")
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"Current draft:\n```\n{draft}\n```\nPaste your edited version and I'll use that instead.",
+                    root_id=root_id,
+                )
+            # Stay in draft_review phase — next non-command message will be treated as edited text
+            return True
+
+        else:
+            # Treat any other text as an edited draft replacement
+            pending["draft_body"] = question
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"Draft updated. Reply `confirm` to send or `cancel` to discard.",
+                    root_id=root_id,
+                )
+            return True
+
+    # ── Phase 1: Slot selection ──
+    if q_lower in ("cancel", "no"):
+        del _pending_availability[channel_id]
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Availability reply cancelled.", root_id=root_id)
+        return True
+
+    # Parse "send 1,3,5" or "send all"
+    send_match = re.match(r"send\s+(.+)", q_lower)
+    if not send_match:
+        return False
+
+    selection = send_match.group(1).strip()
+    slots = pending.get("slots", [])
+
+    if selection == "all":
+        selected = slots
+    else:
+        # Parse comma-separated numbers
+        try:
+            indices = [int(x.strip()) for x in selection.split(",")]
+            selected = [slots[i - 1] for i in indices if 0 < i <= len(slots)]
+        except (ValueError, IndexError):
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"Invalid selection. Use `send 1,3,5` or `send all`.",
+                    root_id=root_id,
+                )
+            return True
+
+    if not selected:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "No valid slots selected.", root_id=root_id)
+        return True
+
+    # Generate draft reply via Claude
+    from artemis.briefs import _call_claude
+    from artemis.prompts import AVAILABILITY_REPLY_SYSTEM, AVAILABILITY_REPLY_USER
+
+    slots_text = format_slots_email(selected, config.BOOKING_LINK)
+    user_prompt = AVAILABILITY_REPLY_USER.format(
+        sender_name=pending.get("sender_name", ""),
+        sender_email=pending.get("sender_email", ""),
+        subject=pending.get("subject", ""),
+        snippet=pending.get("snippet", ""),
+        slots_text=slots_text,
+        booking_link=config.BOOKING_LINK or "none",
+    )
+
+    try:
+        draft_body = _call_claude(AVAILABILITY_REPLY_SYSTEM, user_prompt)
+    except Exception:
+        logger.exception("Failed to generate availability reply draft")
+        draft_body = slots_text  # Fallback to raw slot text
+
+    # Move to Phase 2: draft review
+    pending["phase"] = "draft_review"
+    pending["draft_body"] = draft_body
+    pending["selected_slots"] = selected
+    pending["created_at"] = time.time()  # reset timer
+
+    if _mm:
+        _mm.post_to_channel_id(
+            channel_id,
+            f"**Draft reply to {pending.get('sender_email', '')}:**\n\n"
+            f"```\n{draft_body}\n```\n\n"
+            f"Reply `confirm` to send, `edit` to modify, or `cancel` to discard.",
+            root_id=root_id,
+        )
+    return True
+
+
+def _handle_availability_mention(post: dict, question: str) -> bool:
+    """Handle '@artemis availability [timeframe]' or '@artemis when am I free'.
+
+    Direct availability check — no email context, just shows open slots.
+    """
+    q_lower = question.lower().strip()
+
+    # Match "availability ...", "when am i free ...", "when am I free ..."
+    is_avail = q_lower.startswith("availability")
+    is_free = "when am i free" in q_lower or "when are you free" in q_lower
+
+    if not is_avail and not is_free:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Extract timeframe from the rest of the question
+    start_date, end_date = parse_timeframe(question)
+
+    slots = get_availability(_calendar, start_date, end_date)
+    formatted = format_slots_mattermost(slots)
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, formatted, root_id=root_id)
+    return True
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -572,6 +772,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         return
 
     # Try confirmation flows first (yes/confirm/cancel for pending actions)
+    if _handle_availability_command(post, question):
+        return
     if _handle_calendar_confirm(post, question):
         return
     if _handle_delete_confirm(post, question):
@@ -629,6 +831,10 @@ def _handle_mention(post: dict, thread: list[dict]):
             reply = "Gmail not connected"
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    # Availability check command
+    if _handle_availability_mention(post, question):
         return
 
     # Calendar delete command

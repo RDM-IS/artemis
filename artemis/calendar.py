@@ -110,6 +110,72 @@ class CalendarClient:
 
         return events
 
+    def get_events_in_range(self, start_date, end_date) -> list[dict]:
+        """Get all events between start_date and end_date (inclusive).
+
+        Accepts date or datetime objects. Returns same dict shape as get_today_events()
+        plus an 'end' field for duration-aware processing.
+        """
+        from datetime import date as date_type
+
+        if not self.service:
+            logger.error("Calendar not authenticated")
+            return []
+
+        local_tz = ZoneInfo(config.TIMEZONE)
+
+        # Normalize to datetime at start/end of day
+        if isinstance(start_date, date_type) and not isinstance(start_date, datetime):
+            start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=local_tz)
+        else:
+            start_dt = start_date if start_date.tzinfo else start_date.replace(tzinfo=local_tz)
+
+        if isinstance(end_date, date_type) and not isinstance(end_date, datetime):
+            end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=local_tz)
+        else:
+            end_dt = end_date if end_date.tzinfo else end_date.replace(tzinfo=local_tz)
+
+        try:
+            result = (
+                self.service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=start_dt.isoformat(),
+                    timeMax=end_dt.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+        except Exception:
+            logger.exception("Failed to fetch events for range %s to %s", start_date, end_date)
+            return []
+
+        events = []
+        for event in result.get("items", []):
+            attendees = event.get("attendees", [])
+            start = event.get("start", {})
+            end = event.get("end", {})
+            events.append({
+                "id": event["id"],
+                "summary": event.get("summary", "(no title)"),
+                "start": start.get("dateTime", start.get("date", "")),
+                "end": end.get("dateTime", end.get("date", "")),
+                "attendees": [
+                    {
+                        "email": a.get("email", ""),
+                        "name": a.get("displayName", ""),
+                        "self": a.get("self", False),
+                        "response": a.get("responseStatus", ""),
+                    }
+                    for a in attendees
+                ],
+                "description": event.get("description", ""),
+                "location": event.get("location", ""),
+            })
+
+        return events
+
     def get_upcoming_with_externals(self, within_minutes: int | None = None) -> list[dict]:
         """Get upcoming events that have external attendees.
 
