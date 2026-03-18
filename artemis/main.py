@@ -44,10 +44,17 @@ from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.quiet_hours import (
     clear_timezone_override,
+    enter_quiet,
+    exit_quiet,
+    extend_override,
+    get_quiet_state,
+    is_quiet,
     is_quiet_hours,
     quiet_hours_status,
     resolve_city_timezone,
     set_timezone_override,
+    start_override,
+    update_last_interaction,
 )
 from artemis.scheduler import ArtemisScheduler, get_playbook_text
 from artemis.version import format_version_status, get_commit_hash, get_latest_github_version, get_version
@@ -849,11 +856,119 @@ def _handle_timezone_command(post: dict, question: str) -> bool:
     return False
 
 
+def _handle_quiet_command(post: dict, question: str) -> bool:
+    """Handle quiet hours session commands (goodnight, good morning, override, extend).
+
+    Returns True if handled.
+    """
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # ── Goodnight ──
+    if q_lower.startswith("goodnight") or q_lower.startswith("good night"):
+        # Parse optional wake time: "goodnight, wake me at 6am" / "good night, wake me at 6:30"
+        wake_time = None
+        wake_match = re.search(r"wake\s+(?:me\s+)?at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", q_lower)
+        if wake_match:
+            hour = int(wake_match.group(1))
+            minute = int(wake_match.group(2) or 0)
+            ampm = wake_match.group(3)
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            elif ampm == "am" and hour == 12:
+                hour = 0
+            wake_time = f"{hour:02d}:{minute:02d}"
+
+        reply = enter_quiet(manual=True, wake_time=wake_time)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # ── Good morning ──
+    if q_lower in ("good morning", "morning", "gm", "goodmorning"):
+        exit_quiet()
+
+        # Build a quick overnight summary
+        summary_parts = ["\u2600\ufe0f Good morning! Quiet hours ended."]
+
+        # Today's calendar
+        if _calendar and _calendar.service:
+            try:
+                events = _calendar.get_today_events()
+                if events:
+                    summary_parts.append(f"\n\U0001f4c5 **Today:** {len(events)} event(s)")
+                    for e in events[:5]:
+                        summary_parts.append(f"  \u2022 {e['summary']} at {e['start']}")
+            except Exception:
+                logger.debug("Failed to get calendar for morning summary")
+
+        # Due commitments
+        try:
+            from artemis.commitments import get_due_soon
+            due = get_due_soon(days=1)
+            if due:
+                summary_parts.append(f"\n\u2705 **Due today:** {len(due)} commitment(s)")
+                for c in due:
+                    summary_parts.append(f"  \u2022 {c['title']} ({c['client'] or 'n/a'})")
+        except Exception:
+            logger.debug("Failed to get commitments for morning summary")
+
+        # Inbox status
+        try:
+            counts = get_counts()
+            na = counts.get(NEEDS_ACTION, 0)
+            if na:
+                summary_parts.append(f"\n\U0001f4ec **Inbox:** {na} email(s) need action")
+        except Exception:
+            logger.debug("Failed to get inbox for morning summary")
+
+        reply = "\n".join(summary_parts)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # ── Override / working session ──
+    if q_lower in ("override", "let's work", "lets work", "wake up", "override quiet hours"):
+        reply = start_override()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # "override until 10pm" / "override until 22:00"
+    override_until_match = re.match(r"override\s+until\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", q_lower)
+    if override_until_match:
+        hour = int(override_until_match.group(1))
+        minute = int(override_until_match.group(2) or 0)
+        ampm = override_until_match.group(3)
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        until_time = f"{hour:02d}:{minute:02d}"
+        reply = start_override(until_time=until_time)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # ── Extend timer ──
+    if q_lower in ("extend", "extend timer", "more time", "keep going"):
+        reply = extend_override()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    return False
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
     if not question:
         return
+
+    # Track interaction for inactivity detection
+    update_last_interaction()
 
     # Try confirmation flows first (yes/confirm/cancel for pending actions)
     if _handle_availability_command(post, question):
@@ -861,6 +976,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_calendar_confirm(post, question):
         return
     if _handle_delete_confirm(post, question):
+        return
+
+    # Try quiet hours session commands (goodnight, morning, override, extend)
+    if _handle_quiet_command(post, question):
         return
 
     # Try inbox commands (done, wait, snooze, noise, inbox, waiting, snoozed)
@@ -951,9 +1070,12 @@ def _handle_mention(post: dict, thread: list[dict]):
         # Check if Claude's response contains a calendar event to create
         response = _process_calendar_events(response, channel_id=channel_id)
 
-        # Append quiet hours note if active
-        if is_quiet_hours():
-            response += "\n\n\U0001f319 _Quiet hours active. Scheduled jobs paused. I'm here if you need me._"
+        # Append quiet/override status note
+        state = get_quiet_state()
+        if state.get("override_active"):
+            response += "\n\n\u26a1 _Working session active. Inactivity timer running._"
+        elif is_quiet():
+            response += "\n\n\U0001f319 _Quiet hours active. Say `@artemis override` to start a working session._"
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
 
@@ -1063,6 +1185,12 @@ def main():
     _sched = ArtemisScheduler(_mm, _gmail, _calendar)
     _sched.start()
 
+    # Run catch-up processing for any gap since last run
+    try:
+        _sched.run_catchup()
+    except Exception:
+        logger.exception("Startup catch-up failed — continuing normally")
+
     # Post startup message
     _post_startup_message(_mm, _gmail, _calendar, _sched)
 
@@ -1071,6 +1199,9 @@ def main():
 
     def signal_handler(sig, frame):
         logger.info("Shutting down...")
+        # Record last run time for catch-up on next startup
+        from artemis.quiet_hours import set_system_value
+        set_system_value("last_run_at", datetime.utcnow().isoformat())
         _post_shutdown_message(_mm)
         _sched.stop()
         shutdown.set()

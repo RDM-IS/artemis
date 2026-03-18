@@ -56,6 +56,27 @@ CREATE TABLE IF NOT EXISTS timezone_overrides (
 )
 """
 
+CREATE_QUIET_STATE = """
+CREATE TABLE IF NOT EXISTS quiet_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    is_quiet INTEGER NOT NULL DEFAULT 0,
+    manual_override INTEGER NOT NULL DEFAULT 0,
+    wake_time TEXT,
+    override_active INTEGER NOT NULL DEFAULT 0,
+    override_until TEXT,
+    last_interaction TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+CREATE_SYSTEM_STATE = """
+CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or config.SQLITE_PATH
@@ -65,6 +86,8 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute(CREATE_AUDIT_LOG)
     conn.execute(CREATE_CALENDAR_AUDIT)
     conn.execute(CREATE_TIMEZONE_OVERRIDES)
+    conn.execute(CREATE_QUIET_STATE)
+    conn.execute(CREATE_SYSTEM_STATE)
     conn.commit()
     return conn
 

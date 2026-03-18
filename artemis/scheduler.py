@@ -185,6 +185,12 @@ class ArtemisScheduler:
             id="timezone_expiry_check",
         )
 
+        # Working session inactivity check — every 1 minute
+        self.scheduler.add_job(
+            self.job_override_expiry_check, "interval", minutes=1,
+            id="override_expiry_check",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -352,6 +358,13 @@ class ArtemisScheduler:
                     if orig:
                         self.gmail.archive_message(orig["id"])
                         logger.info("Archived [%s] from %s", orig.get("subject", ""), orig.get("from_email", ""))
+
+            # Record successful triage timestamp for catch-up on restart
+            try:
+                from artemis.quiet_hours import set_system_value
+                set_system_value("last_run_at", datetime.utcnow().isoformat())
+            except Exception:
+                pass
 
         except Exception as exc:
             self._record_gmail_failure(str(exc))
@@ -886,54 +899,104 @@ class ArtemisScheduler:
             logger.exception("Commitment reminder chain failed")
 
     def job_quiet_hours_start(self):
-        """Announce quiet hours starting."""
+        """Enter quiet hours and announce."""
         try:
-            from artemis.quiet_hours import get_active_timezone, get_tz_abbrev
+            from artemis.quiet_hours import enter_quiet, get_quiet_state
 
-            tz_abbrev = get_tz_abbrev(get_active_timezone())
-            end_str = config.QUIET_HOURS_END
-            # Parse for display
-            parts = end_str.split(":")
-            from datetime import time as _time
-            end_t = _time(int(parts[0]), int(parts[1]))
-            end_display = end_t.strftime("%I:%M %p").lstrip("0")
+            # Don't override a manual goodnight that's already active
+            state = get_quiet_state()
+            if state.get("manual_override") and state.get("is_quiet"):
+                return  # Already quiet via manual goodnight
 
-            self.mm.post_message(
-                config.CHANNEL_OPS,
-                f"\U0001f319 Artemis entering quiet hours \u2014 scheduled jobs paused "
-                f"until {end_display} {tz_abbrev}.",
-            )
+            announcement = enter_quiet(manual=False)
+            self.mm.post_message(config.CHANNEL_OPS, announcement)
         except Exception:
-            logger.exception("Quiet hours start announcement failed")
+            logger.exception("Quiet hours start failed")
 
     def job_quiet_hours_end(self):
-        """Announce quiet hours ending with overnight summary."""
+        """Exit quiet hours and post overnight summary."""
         try:
-            from artemis.quiet_hours import get_active_timezone, get_tz_abbrev
-            from artemis.inbox import get_stale_needs_action
+            from artemis.quiet_hours import exit_quiet, get_quiet_state
 
-            tz_abbrev = get_tz_abbrev(get_active_timezone())
+            # Don't auto-wake if user has a custom wake time set
+            state = get_quiet_state()
+            wake = state.get("wake_time")
+            if wake:
+                # Check if we've reached the custom wake time
+                from artemis.quiet_hours import get_active_timezone
+                tz_name = get_active_timezone()
+                try:
+                    tz = ZoneInfo(tz_name)
+                except (KeyError, ValueError):
+                    tz = ZoneInfo(config.HOME_TIMEZONE)
+                now_local = datetime.now(tz).time()
+                from datetime import time as _time
+                parts = wake.split(":")
+                wake_time = _time(int(parts[0]), int(parts[1]))
+                if now_local < wake_time:
+                    return  # Not yet time to wake
 
-            # Count overnight emails
-            email_count = 0
-            try:
-                messages = self._poll_gmail_isolated(max_results=50)
-                new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
-                email_count = len(new_messages)
-            except Exception:
-                logger.debug("Failed to count overnight emails")
-
-            # Count pending inbox items
-            inbox_count = len(get_stale_needs_action(hours=0))
-
-            self.mm.post_message(
-                config.CHANNEL_OPS,
-                f"\u2600\ufe0f Artemis resuming \u2014 good morning. "
-                f"Here's what came in overnight: {email_count} emails, "
-                f"{inbox_count} inbox items needing action.",
-            )
+            exit_quiet()
+            summary = self._build_overnight_summary()
+            self.mm.post_message(config.CHANNEL_OPS, summary)
         except Exception:
-            logger.exception("Quiet hours end announcement failed")
+            logger.exception("Quiet hours end failed")
+
+    def _build_overnight_summary(self) -> str:
+        """Build the overnight summary message for quiet hours exit or good morning."""
+        from artemis.inbox import get_stale_needs_action
+
+        lines = ["\u2600\ufe0f Good morning! Here's what came in overnight:"]
+
+        # Overnight emails
+        email_count = 0
+        try:
+            messages = self._poll_gmail_isolated(max_results=50)
+            new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
+            email_count = len(new_messages)
+        except Exception:
+            logger.debug("Failed to count overnight emails")
+
+        inbox_items = get_stale_needs_action(hours=0)
+        inbox_count = len(inbox_items)
+        lines.append(f"\U0001f4ec {email_count} new emails \u2014 {inbox_count} need action")
+
+        # Today's meetings
+        try:
+            events = self.calendar.get_today_events()
+            if events:
+                meeting_parts = []
+                for e in events:
+                    start_str = e.get("start", "")
+                    if "T" in start_str:
+                        try:
+                            t = datetime.fromisoformat(start_str)
+                            display = t.strftime("%I:%M %p").lstrip("0")
+                        except ValueError:
+                            display = start_str
+                    else:
+                        display = "all day"
+                    meeting_parts.append(f"{e['summary']} ({display})")
+                lines.append(f"\U0001f4c5 Today: {', '.join(meeting_parts)}")
+            else:
+                lines.append("\U0001f4c5 No meetings today")
+        except Exception:
+            logger.debug("Failed to fetch today's meetings for summary")
+
+        # Commitments due today
+        try:
+            due = get_due_soon(days=0)
+            if due:
+                for c in due:
+                    lines.append(f"\u2705 Due today: {c['title']} ({c.get('client', 'n/a')})")
+        except Exception:
+            logger.debug("Failed to fetch commitments for summary")
+
+        # Urgent items (high-urgency inbox items)
+        if inbox_count > 5:
+            lines.append(f"\u26a0\ufe0f {inbox_count} items need attention \u2014 consider triaging now")
+
+        return "\n".join(lines)
 
     def job_check_timezone_expiry(self):
         """Check if timezone override has expired and announce if so."""
@@ -945,6 +1008,120 @@ class ArtemisScheduler:
                 self.mm.post_message(config.CHANNEL_OPS, announcement)
         except Exception:
             logger.exception("Timezone expiry check failed")
+
+    def job_override_expiry_check(self):
+        """Check if working session override has expired due to inactivity."""
+        try:
+            from artemis.quiet_hours import check_override_expiry
+
+            announcement = check_override_expiry()
+            if announcement:
+                self.mm.post_message(config.CHANNEL_OPS, announcement)
+        except Exception:
+            logger.debug("Override expiry check failed", exc_info=True)
+
+    def run_catchup(self):
+        """Run catch-up processing after startup to handle missed emails during downtime."""
+        from artemis.quiet_hours import get_system_value, set_system_value
+
+        last_run = get_system_value("last_run_at")
+        now = datetime.utcnow()
+
+        if not last_run:
+            # First run ever — process last 24h
+            gap_hours = 24
+            logger.info("First run — catching up on last 24 hours of email")
+        else:
+            try:
+                last_dt = datetime.fromisoformat(last_run)
+                gap_hours = (now - last_dt).total_seconds() / 3600
+            except (ValueError, TypeError):
+                gap_hours = 24
+
+        if gap_hours < 0.2:  # Less than ~12 minutes — skip
+            logger.info("Catch-up: last run %.1f hours ago — nothing to catch up", gap_hours)
+            return
+
+        logger.info("Catch-up: last run %.1f hours ago — processing gap", gap_hours)
+
+        # Fetch and process emails from the gap
+        emails_processed = 0
+        playbooks_fired = 0
+        try:
+            messages = self._poll_gmail_isolated(max_results=50)
+            if messages:
+                self._record_gmail_success()
+            new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
+
+            if new_messages:
+                from artemis.briefs import triage_emails
+                from artemis.prompts import UNTRUSTED_PREFIX
+
+                for m in new_messages:
+                    self._seen_message_ids.add(m["id"])
+
+                # Track in inbox + triage
+                email_text = self.gmail.format_for_claude(new_messages)
+                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
+
+                for i, item in enumerate(triaged):
+                    orig = new_messages[i] if i < len(new_messages) else None
+                    if orig:
+                        from artemis.inbox import upsert_thread, NEEDS_ACTION, NOISE
+                        sender_type = item.get("sender_type", "")
+                        if sender_type == "noise":
+                            upsert_thread(orig["thread_id"], orig["subject"], orig.get("from_email", ""), state=NOISE)
+                        else:
+                            upsert_thread(orig["thread_id"], orig["subject"], orig.get("from_email", ""), state=NEEDS_ACTION)
+                        emails_processed += 1
+
+                        # Execute playbooks
+                        playbook_match = item.get("playbook_match")
+                        if playbook_match:
+                            body = self.gmail.get_full_message(orig["id"])
+                            if body:
+                                orig["full_body"] = body
+                            self._execute_playbook(playbook_match, orig, item)
+                            playbooks_fired += 1
+
+                        # Archive
+                        self.gmail.archive_message(orig["id"])
+        except Exception:
+            logger.exception("Catch-up email processing failed")
+
+        # Check missed commitment alerts
+        commitment_checks = 0
+        try:
+            active = list_commitments(status="active")
+            today = date.today()
+            for c in active:
+                try:
+                    due = date.fromisoformat(c["due_date"])
+                except (ValueError, TypeError):
+                    continue
+                days_left = (due - today).days
+                if days_left <= 0:
+                    commitment_checks += 1
+        except Exception:
+            logger.debug("Catch-up commitment check failed")
+
+        # Update last_run_at
+        set_system_value("last_run_at", now.isoformat())
+
+        # Post catch-up summary
+        gap_str = f"{gap_hours:.0f} hours" if gap_hours >= 1 else f"{gap_hours * 60:.0f} minutes"
+        if emails_processed or playbooks_fired:
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f504 Catch-up complete \u2014 processed {emails_processed} emails and "
+                f"{commitment_checks} commitment checks since last run ({gap_str} ago). "
+                f"{playbooks_fired} playbooks fired.",
+            )
+        else:
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\u2705 All caught up \u2014 nothing missed since last run {gap_str} ago.",
+            )
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""
