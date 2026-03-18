@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS calendar_audit_log (
 )
 """
 
+CREATE_TIMEZONE_OVERRIDES = """
+CREATE TABLE IF NOT EXISTS timezone_overrides (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    timezone TEXT NOT NULL,
+    set_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL,
+    city_name TEXT NOT NULL DEFAULT ''
+)
+"""
+
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or config.SQLITE_PATH
@@ -54,6 +64,7 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute(CREATE_TABLE)
     conn.execute(CREATE_AUDIT_LOG)
     conn.execute(CREATE_CALENDAR_AUDIT)
+    conn.execute(CREATE_TIMEZONE_OVERRIDES)
     conn.commit()
     return conn
 
