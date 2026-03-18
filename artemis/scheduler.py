@@ -167,6 +167,24 @@ class ArtemisScheduler:
             id="commitment_reminders",
         )
 
+        # Quiet hours entry/exit announcements
+        qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
+        qh_end_h, qh_end_m = config.QUIET_HOURS_END.split(":")
+        self.scheduler.add_job(
+            self.job_quiet_hours_start, "cron",
+            hour=int(qh_start_h), minute=int(qh_start_m), id="quiet_hours_start",
+        )
+        self.scheduler.add_job(
+            self.job_quiet_hours_end, "cron",
+            hour=int(qh_end_h), minute=int(qh_end_m), id="quiet_hours_end",
+        )
+
+        # Timezone override expiry check — daily at noon
+        self.scheduler.add_job(
+            self.job_check_timezone_expiry, "cron", hour=12, minute=0,
+            id="timezone_expiry_check",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -175,6 +193,14 @@ class ArtemisScheduler:
 
     def stop(self):
         self.scheduler.shutdown()
+
+    def _is_quiet(self) -> bool:
+        """Check if quiet hours are active. Used as a guard at the top of scheduled jobs."""
+        try:
+            from artemis.quiet_hours import is_quiet_hours
+            return is_quiet_hours()
+        except Exception:
+            return False
 
     def _poll_gmail_isolated(self, max_results: int = 20) -> list[dict]:
         """Poll Gmail in a subprocess so a segfault can't crash the main process."""
@@ -208,6 +234,8 @@ class ArtemisScheduler:
 
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
+        if self._is_quiet():
+            return
         try:
             messages = self._poll_gmail_isolated(max_results=20)
             if messages:
@@ -331,6 +359,8 @@ class ArtemisScheduler:
 
     def job_post_triage_batch(self):
         """Post batched triage summary."""
+        if self._is_quiet():
+            return
         if not self._pending_triage:
             return
 
@@ -350,6 +380,8 @@ class ArtemisScheduler:
 
     def job_pre_meeting_briefs(self):
         """Generate briefs for upcoming meetings with external attendees."""
+        if self._is_quiet():
+            return
         try:
             events = self.calendar.get_upcoming_with_externals(
                 within_minutes=config.BRIEF_LEAD_TIME_MINUTES
@@ -454,6 +486,8 @@ class ArtemisScheduler:
 
     def job_ssl_check(self):
         """Check SSL certs and alert if expiring."""
+        if self._is_quiet():
+            return
         try:
             results = check_all_ssl()
             alert = format_ssl_alerts(results)
@@ -464,6 +498,8 @@ class ArtemisScheduler:
 
     def job_domain_check(self):
         """Check domain expiry and alert."""
+        if self._is_quiet():
+            return
         try:
             results = check_domain_expiry()
             alert = format_domain_alerts(results)
@@ -474,6 +510,8 @@ class ArtemisScheduler:
 
     def job_inbox_zero_audit(self):
         """Audit inbox threads — nudge stale items, resurface snoozed, detect replies."""
+        if self._is_quiet():
+            return
         try:
             # 1. NEEDS_ACTION older than 24h → nudge
             stale_na = get_stale_needs_action(hours=24)
@@ -531,6 +569,8 @@ class ArtemisScheduler:
 
     def job_inbox_zero_morning(self):
         """Pre-compute inbox zero stats before morning brief (stats are pulled inline)."""
+        if self._is_quiet():
+            return
         # This is a no-op hook — the actual data is pulled by format_morning_inbox_section()
         # during job_morning_brief. This job exists as a named anchor in case
         # we want to do pre-brief inbox processing later.
@@ -538,6 +578,8 @@ class ArtemisScheduler:
 
     def job_focus_reminder(self):
         """Post daily focus reminder for the configured focus client."""
+        if self._is_quiet():
+            return
         try:
             keywords = config.FOCUS_KEYWORDS or [config.FOCUS_CLIENT]
             commitments = []
@@ -563,6 +605,8 @@ class ArtemisScheduler:
 
     def job_update_check(self):
         """Check GitHub for new commits and post if an update is available."""
+        if self._is_quiet():
+            return
         try:
             from artemis.version import get_commit_hash, get_latest_github_version
 
@@ -800,6 +844,8 @@ class ArtemisScheduler:
 
     def job_commitment_reminders(self):
         """PB-005: Commitment Deadline Reminder Chain."""
+        if self._is_quiet():
+            return
         try:
             active = list_commitments(status="active")
             today = date.today()
@@ -838,6 +884,67 @@ class ArtemisScheduler:
 
         except Exception:
             logger.exception("Commitment reminder chain failed")
+
+    def job_quiet_hours_start(self):
+        """Announce quiet hours starting."""
+        try:
+            from artemis.quiet_hours import get_active_timezone, get_tz_abbrev
+
+            tz_abbrev = get_tz_abbrev(get_active_timezone())
+            end_str = config.QUIET_HOURS_END
+            # Parse for display
+            parts = end_str.split(":")
+            from datetime import time as _time
+            end_t = _time(int(parts[0]), int(parts[1]))
+            end_display = end_t.strftime("%I:%M %p").lstrip("0")
+
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f319 Artemis entering quiet hours \u2014 scheduled jobs paused "
+                f"until {end_display} {tz_abbrev}.",
+            )
+        except Exception:
+            logger.exception("Quiet hours start announcement failed")
+
+    def job_quiet_hours_end(self):
+        """Announce quiet hours ending with overnight summary."""
+        try:
+            from artemis.quiet_hours import get_active_timezone, get_tz_abbrev
+            from artemis.inbox import get_stale_needs_action
+
+            tz_abbrev = get_tz_abbrev(get_active_timezone())
+
+            # Count overnight emails
+            email_count = 0
+            try:
+                messages = self._poll_gmail_isolated(max_results=50)
+                new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
+                email_count = len(new_messages)
+            except Exception:
+                logger.debug("Failed to count overnight emails")
+
+            # Count pending inbox items
+            inbox_count = len(get_stale_needs_action(hours=0))
+
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\u2600\ufe0f Artemis resuming \u2014 good morning. "
+                f"Here's what came in overnight: {email_count} emails, "
+                f"{inbox_count} inbox items needing action.",
+            )
+        except Exception:
+            logger.exception("Quiet hours end announcement failed")
+
+    def job_check_timezone_expiry(self):
+        """Check if timezone override has expired and announce if so."""
+        try:
+            from artemis.quiet_hours import check_expired_overrides
+
+            announcement = check_expired_overrides()
+            if announcement:
+                self.mm.post_message(config.CHANNEL_OPS, announcement)
+        except Exception:
+            logger.exception("Timezone expiry check failed")
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""

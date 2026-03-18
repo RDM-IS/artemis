@@ -102,6 +102,11 @@ def get_day_availability(weekday: int) -> tuple[str, str] | None:
         return start.strip(), end.strip()
     return None
 
+# Quiet hours
+QUIET_HOURS_START = os.environ.get("QUIET_HOURS_START", "20:00")
+QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", "05:00")
+HOME_TIMEZONE = os.environ.get("HOME_TIMEZONE", "America/Chicago")
+
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
 

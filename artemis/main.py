@@ -42,6 +42,13 @@ from artemis.inbox import (
 from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
+from artemis.quiet_hours import (
+    clear_timezone_override,
+    is_quiet_hours,
+    quiet_hours_status,
+    resolve_city_timezone,
+    set_timezone_override,
+)
 from artemis.scheduler import ArtemisScheduler, get_playbook_text
 from artemis.version import format_version_status, get_commit_hash, get_latest_github_version, get_version
 
@@ -766,6 +773,82 @@ def _handle_availability_mention(post: dict, question: str) -> bool:
     return True
 
 
+def _handle_timezone_command(post: dict, question: str) -> bool:
+    """Handle timezone override commands.
+
+    Patterns:
+      - "I'm in Paris" / "i'm in Tokyo this week"
+      - "timezone Europe/Paris"
+      - "I'm back home" / "I'm in Milwaukee" / "reset timezone"
+    """
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # Reset patterns
+    if q_lower in ("i'm back home", "im back home", "i'm home", "im home", "reset timezone"):
+        reply = clear_timezone_override()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # "timezone Europe/Paris" — raw IANA
+    if q_lower.startswith("timezone "):
+        tz_input = question[len("timezone "):].strip()
+        tz_name = resolve_city_timezone(tz_input)
+        if tz_name:
+            # Check if it's the home timezone
+            if tz_name == config.HOME_TIMEZONE:
+                reply = clear_timezone_override()
+            else:
+                reply = set_timezone_override(tz_name, city_name=tz_input)
+            if _mm:
+                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            return True
+        else:
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"I don't recognize that timezone: `{tz_input}`. "
+                    f"Try a city name (e.g., Paris, Tokyo) or IANA timezone (e.g., Europe/Paris).",
+                    root_id=root_id,
+                )
+            return True
+
+    # "I'm in [city]" pattern
+    im_in_match = re.match(r"i['\u2019]?m\s+in\s+(.+?)(?:\s+this\s+week|\s+for\s+\d+\s+days?)?$", q_lower)
+    if im_in_match:
+        city = im_in_match.group(1).strip()
+
+        # Extract optional duration
+        days = 7  # default
+        duration_match = re.search(r"for\s+(\d+)\s+days?", q_lower)
+        if duration_match:
+            days = int(duration_match.group(1))
+
+        tz_name = resolve_city_timezone(city)
+        if tz_name:
+            # Home city → reset
+            if tz_name == config.HOME_TIMEZONE:
+                reply = clear_timezone_override()
+            else:
+                reply = set_timezone_override(tz_name, city_name=city, days=days)
+            if _mm:
+                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            return True
+        else:
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"I don't recognize \"{city}\" as a city. "
+                    f"Try `timezone Europe/Paris` with an IANA timezone name instead.",
+                    root_id=root_id,
+                )
+            return True
+
+    return False
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -834,6 +917,17 @@ def _handle_mention(post: dict, thread: list[dict]):
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
 
+    # Quiet hours status
+    if q_lower in ("quiet hours", "quiet hours status", "quiet"):
+        reply = quiet_hours_status()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    # Timezone override: "I'm in [city]" / "timezone [tz]"
+    if _handle_timezone_command(post, question):
+        return
+
     # Availability check command
     if _handle_availability_mention(post, question):
         return
@@ -856,6 +950,10 @@ def _handle_mention(post: dict, thread: list[dict]):
 
         # Check if Claude's response contains a calendar event to create
         response = _process_calendar_events(response, channel_id=channel_id)
+
+        # Append quiet hours note if active
+        if is_quiet_hours():
+            response += "\n\n\U0001f319 _Quiet hours active. Scheduled jobs paused. I'm here if you need me._"
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
 
