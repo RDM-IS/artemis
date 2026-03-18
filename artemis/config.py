@@ -50,6 +50,17 @@ DOMAIN_EXPIRY_DATES = _domain_expiry_map(os.environ.get("DOMAIN_EXPIRY_DATES", "
 # Priority contacts
 PRIORITY_CONTACTS = _list(os.environ.get("PRIORITY_CONTACTS", ""))
 
+# Focus client (e.g. Titanium/TTI)
+FOCUS_CLIENT = os.environ.get("FOCUS_CLIENT", "")
+FOCUS_KEYWORDS = _list(os.environ.get("FOCUS_KEYWORDS", ""))
+
+# Startup
+STARTUP_RETRY_COUNT = int(os.environ.get("STARTUP_RETRY_COUNT", "10"))
+STARTUP_RETRY_DELAY = int(os.environ.get("STARTUP_RETRY_DELAY", "15"))
+
+# Tailscale
+TAILSCALE_HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "")
+
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
 

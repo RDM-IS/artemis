@@ -1,6 +1,7 @@
 """Cron jobs for all scheduled tasks."""
 
 import logging
+import multiprocessing
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,6 +36,24 @@ from artemis.prompts import UNTRUSTED_PREFIX
 
 logger = logging.getLogger(__name__)
 
+_GMAIL_POLL_TIMEOUT = 120  # seconds — kill subprocess if it hangs
+
+
+def _gmail_poll_worker(result_queue: multiprocessing.Queue, max_results: int = 20):
+    """Run Gmail polling in an isolated subprocess to guard against segfaults.
+
+    Writes ("ok", messages_list) or ("error", error_string) to result_queue.
+    """
+    try:
+        from artemis.gmail import GmailClient as _GmailClient
+
+        g = _GmailClient()
+        g.authenticate()
+        messages = g.get_recent_messages(max_results=max_results)
+        result_queue.put(("ok", messages))
+    except Exception as exc:
+        result_queue.put(("error", str(exc)))
+
 
 class ArtemisScheduler:
     def __init__(
@@ -49,6 +68,9 @@ class ArtemisScheduler:
         self.scheduler = BackgroundScheduler()
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
+        # Error recovery counters
+        self._gmail_fail_count: int = 0
+        self._calendar_fail_count: int = 0
 
     def start(self):
         # Inbox triage — every 5 minutes
@@ -85,16 +107,55 @@ class ArtemisScheduler:
             self.job_inbox_zero_morning, "cron", hour=brief_hour, minute=brief_min, id="inbox_zero_morning"
         )
 
+        # Titanium focus reminder — weekdays at 9am
+        if config.FOCUS_CLIENT:
+            self.scheduler.add_job(
+                self.job_focus_reminder, "cron", hour=9, minute=0, day_of_week="mon-fri",
+                id="focus_reminder",
+            )
+
         self.scheduler.start()
         logger.info("Scheduler started")
 
     def stop(self):
         self.scheduler.shutdown()
 
+    def _poll_gmail_isolated(self, max_results: int = 20) -> list[dict]:
+        """Poll Gmail in a subprocess so a segfault can't crash the main process."""
+        q: multiprocessing.Queue = multiprocessing.Queue()
+        proc = multiprocessing.Process(
+            target=_gmail_poll_worker, args=(q, max_results), daemon=True
+        )
+        proc.start()
+        proc.join(timeout=_GMAIL_POLL_TIMEOUT)
+
+        if proc.is_alive():
+            logger.error("Gmail poll subprocess timed out — killing it")
+            proc.kill()
+            proc.join(timeout=5)
+            return []
+
+        if proc.exitcode != 0:
+            logger.error("Gmail poll subprocess exited with code %s (possible segfault)", proc.exitcode)
+            return []
+
+        if q.empty():
+            logger.error("Gmail poll subprocess produced no result")
+            return []
+
+        status, payload = q.get_nowait()
+        if status == "error":
+            logger.error("Gmail poll subprocess error: %s", payload)
+            return []
+
+        return payload
+
     def job_inbox_triage(self):
         """Poll Gmail and classify new messages."""
         try:
-            messages = self.gmail.get_recent_messages(max_results=20)
+            messages = self._poll_gmail_isolated(max_results=20)
+            if messages:
+                self._record_gmail_success()
             new_messages = [
                 m for m in messages if m["id"] not in self._seen_message_ids
             ]
@@ -164,7 +225,8 @@ class ArtemisScheduler:
                     else:
                         self._pending_triage.append(item)
 
-        except Exception:
+        except Exception as exc:
+            self._record_gmail_failure(str(exc))
             logger.exception("Inbox triage failed")
 
     def job_post_triage_batch(self):
@@ -192,6 +254,7 @@ class ArtemisScheduler:
             events = self.calendar.get_upcoming_with_externals(
                 within_minutes=config.BRIEF_LEAD_TIME_MINUTES
             )
+            self._record_calendar_success()
             for event in events:
                 external = event.get("external_attendees", [])
                 attendee_emails = [a["email"] for a in external]
@@ -235,7 +298,8 @@ class ArtemisScheduler:
                     header = f"### Brief: {event['summary']} — {event['start']}\n**Attendees**: {', '.join(attendee_names)}\n\n"
                     self.mm.post_message(config.CHANNEL_BRIEFS, header + brief)
 
-        except Exception:
+        except Exception as exc:
+            self._record_calendar_failure(str(exc))
             logger.exception("Pre-meeting brief generation failed")
 
     def job_morning_brief(self):
@@ -371,3 +435,64 @@ class ArtemisScheduler:
         # during job_morning_brief. This job exists as a named anchor in case
         # we want to do pre-brief inbox processing later.
         logger.debug("Inbox zero morning pre-check complete")
+
+    def job_focus_reminder(self):
+        """Post daily focus reminder for the configured focus client."""
+        try:
+            keywords = config.FOCUS_KEYWORDS or [config.FOCUS_CLIENT]
+            commitments = []
+            for kw in keywords:
+                for c in get_commitments_for_client(kw):
+                    if c["id"] not in {x["id"] for x in commitments}:
+                        commitments.append(c)
+
+            if commitments:
+                commitment_text = "\n".join(
+                    f"- **{c['title']}** (due {c['due_date']})" for c in commitments
+                )
+            else:
+                commitment_text = "No specific commitments on file — check in with the team."
+
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f3af Titanium focus check: {commitment_text}\n\n"
+                f"Everything else is secondary.",
+            )
+        except Exception:
+            logger.exception("Focus reminder failed")
+
+    def _record_gmail_success(self):
+        """Reset Gmail failure counter on success."""
+        self._gmail_fail_count = 0
+
+    def _record_gmail_failure(self, error: str):
+        """Increment Gmail failure counter and alert if threshold reached."""
+        self._gmail_fail_count += 1
+        logger.error("Gmail failure #%d: %s", self._gmail_fail_count, error)
+        if self._gmail_fail_count == 3:
+            try:
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    f"\u26a0\ufe0f Gmail polling has failed 3 times \u2014 check credentials. "
+                    f"Last error: {error[:300]}",
+                )
+            except Exception:
+                logger.exception("Failed to post Gmail failure alert")
+
+    def _record_calendar_success(self):
+        """Reset Calendar failure counter on success."""
+        self._calendar_fail_count = 0
+
+    def _record_calendar_failure(self, error: str):
+        """Increment Calendar failure counter and alert if threshold reached."""
+        self._calendar_fail_count += 1
+        logger.error("Calendar failure #%d: %s", self._calendar_fail_count, error)
+        if self._calendar_fail_count == 3:
+            try:
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    f"\u26a0\ufe0f Calendar API has failed 3 times \u2014 check credentials. "
+                    f"Last error: {error[:300]}",
+                )
+            except Exception:
+                logger.exception("Failed to post Calendar failure alert")
