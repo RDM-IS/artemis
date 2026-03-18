@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -44,7 +45,8 @@ class CalendarClient:
             logger.error("Calendar not authenticated")
             return []
 
-        now = datetime.now(timezone.utc)
+        local_tz = ZoneInfo(config.TIMEZONE)
+        now = datetime.now(local_tz)
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = start_of_day + timedelta(days=1)
 
