@@ -1163,17 +1163,17 @@ def main():
         )
         sys.exit(1)
 
-    # Init Gmail
+    # Init Gmail (pass mm for auth failure alerts)
     _gmail = GmailClient()
     try:
-        _gmail.authenticate()
+        _gmail.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Gmail authentication failed — email features disabled")
 
-    # Init Calendar
+    # Init Calendar (pass mm for auth failure alerts)
     _calendar = CalendarClient()
     try:
-        _calendar.authenticate()
+        _calendar.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Calendar authentication failed — calendar features disabled")
 
