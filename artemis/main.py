@@ -699,7 +699,8 @@ def _handle_availability_command(post: dict, question: str) -> bool:
     from artemis.briefs import _call_claude
     from artemis.prompts import AVAILABILITY_REPLY_SYSTEM, AVAILABILITY_REPLY_USER
 
-    slots_text = format_slots_email(selected, config.BOOKING_LINK)
+    sender_first = pending.get("sender_name", "").split()[0] if pending.get("sender_name", "").strip() else ""
+    slots_text = format_slots_email(selected, sender_first_name=sender_first)
     user_prompt = AVAILABILITY_REPLY_USER.format(
         sender_name=pending.get("sender_name", ""),
         sender_email=pending.get("sender_email", ""),

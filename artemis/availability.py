@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 # Day abbreviation → weekday number (Mon=0 … Sun=6)
 _DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
+# Day priority for slot selection: Monday first, then Wed/Thu afternoons
+_DAY_PRIORITY = [0, 2, 3, 1, 4, 5, 6]  # Mon, Wed, Thu, Tue, Fri, Sat, Sun
+
 
 def _preferred_weekdays() -> set[int]:
     """Convert config PREFERRED_MEETING_DAYS to a set of weekday ints."""
@@ -33,6 +36,13 @@ def _parse_time(t: str) -> time:
     return time(int(parts[0]), int(parts[1]))
 
 
+def _get_tz_abbrev() -> str:
+    """Get the current timezone abbreviation (e.g., CDT, CST)."""
+    tz = ZoneInfo(config.TIMEZONE)
+    now = datetime.now(tz)
+    return now.strftime("%Z")
+
+
 def is_focus_block(summary: str) -> bool:
     """Check if an event title is a focus/deep-work block."""
     lower = summary.lower()
@@ -42,16 +52,27 @@ def is_focus_block(summary: str) -> bool:
     return False
 
 
-def get_business_days(start: date, end: date) -> list[date]:
-    """Return dates between start and end (inclusive) that are preferred meeting days."""
-    preferred = _preferred_weekdays()
+def get_available_days(start: date, end: date) -> list[date]:
+    """Return dates between start and end (inclusive) that have availability windows.
+
+    Uses per-day config (AVAILABILITY_MONDAY etc.) to skip unavailable days.
+    """
     days = []
     current = start
     while current <= end:
-        if current.weekday() in preferred:
+        window = config.get_day_availability(current.weekday())
+        if window is not None:
             days.append(current)
         current += timedelta(days=1)
     return days
+
+
+def get_business_days(start: date, end: date) -> list[date]:
+    """Return dates between start and end (inclusive) that are preferred meeting days.
+
+    Delegates to get_available_days which uses per-day availability config.
+    """
+    return get_available_days(start, end)
 
 
 def parse_timeframe(text: str) -> tuple[date, date]:
@@ -68,21 +89,19 @@ def parse_timeframe(text: str) -> tuple[date, date]:
         d = today + timedelta(days=1)
         return d, d
 
-    # "this week" — rest of the current week (today through Friday)
+    # "this week" — rest of the current week (today through Sunday)
     if "this week" in lower:
-        # Find next Friday (or today if already past)
-        days_until_friday = (4 - today.weekday()) % 7
-        end = today + timedelta(days=days_until_friday) if days_until_friday > 0 else today
+        days_until_sunday = (6 - today.weekday()) % 7
+        end = today + timedelta(days=days_until_sunday) if days_until_sunday > 0 else today
         return today, end
 
     # "next week"
     if "next week" in lower:
-        # Monday of next week
         days_until_monday = (7 - today.weekday()) % 7
         if days_until_monday == 0:
             days_until_monday = 7
         start = today + timedelta(days=days_until_monday)
-        end = start + timedelta(days=4)  # Friday
+        end = start + timedelta(days=6)  # through Sunday
         return start, end
 
     # "next N days" / "next N business days"
@@ -90,10 +109,9 @@ def parse_timeframe(text: str) -> tuple[date, date]:
     if m:
         n = int(m.group(1))
         if m.group(2):  # business days
-            preferred = _preferred_weekdays()
             d, count = today + timedelta(days=1), 0
             while count < n:
-                if d.weekday() in preferred:
+                if config.get_day_availability(d.weekday()) is not None:
                     count += 1
                 if count < n:
                     d += timedelta(days=1)
@@ -134,12 +152,11 @@ def parse_timeframe(text: str) -> tuple[date, date]:
         except ValueError:
             pass
 
-    # Default: next 5 business days
-    preferred = _preferred_weekdays()
+    # Default: next 5 business days (days with availability windows)
     d, count = today + timedelta(days=1), 0
     end = d
     while count < 5:
-        if d.weekday() in preferred:
+        if config.get_day_availability(d.weekday()) is not None:
             count += 1
             end = d
         d += timedelta(days=1)
@@ -156,21 +173,25 @@ def find_open_slots(
 ) -> list[dict]:
     """Find open time slots on a single day given existing events.
 
+    Uses per-day availability config. Returns empty list if day is unavailable.
     Returns list of {"date": date, "start": time, "end": time, "day_name": str}.
     """
     tz = ZoneInfo(config.TIMEZONE)
-    start_t = _parse_time(hours_start or config.MEETING_HOURS_START)
-    end_t = _parse_time(hours_end or config.MEETING_HOURS_END)
+
+    # Check per-day availability window
+    day_window = config.get_day_availability(target_date.weekday())
+    if day_window is None:
+        return []  # Day is unavailable
+
+    # Use per-day window, with optional overrides
+    start_t = _parse_time(hours_start) if hours_start else _parse_time(day_window[0])
+    end_t = _parse_time(hours_end) if hours_end else _parse_time(day_window[1])
     duration = slot_duration or config.DEFAULT_SLOT_DURATION
     buffer = buffer_minutes if buffer_minutes is not None else config.MEETING_BUFFER_MINUTES
 
     # Build occupied intervals as (start_minutes, end_minutes) from midnight
     occupied: list[tuple[int, int]] = []
     for event in events:
-        if is_focus_block(event.get("summary", "")):
-            # Focus blocks are fully blocked
-            pass  # still add them below
-
         start_str = event.get("start", "")
         if not start_str:
             continue
@@ -200,7 +221,7 @@ def find_open_slots(
         else:
             ev_end = ev_start + timedelta(hours=1)
 
-        # Convert to minutes from midnight
+        # Convert to minutes from midnight (with buffer)
         start_min = ev_start.hour * 60 + ev_start.minute - buffer
         end_min = ev_end.hour * 60 + ev_end.minute + buffer
         occupied.append((max(0, start_min), min(24 * 60, end_min)))
@@ -222,10 +243,8 @@ def find_open_slots(
 
     for block_start, block_end in merged:
         if block_start > cursor:
-            # There's a gap from cursor to block_start
             gap_start = cursor
             gap_end = min(block_start, window_end)
-            # Fill with slots
             while gap_start + duration <= gap_end:
                 slot_start = time(gap_start // 60, gap_start % 60)
                 slot_end_min = gap_start + duration
@@ -236,7 +255,7 @@ def find_open_slots(
                     "end": slot_end,
                     "day_name": target_date.strftime("%A"),
                 })
-                gap_start += duration  # no overlapping slots
+                gap_start += duration
         cursor = max(cursor, block_end)
 
     # Remaining gap after last block
@@ -262,52 +281,62 @@ def get_availability(
     start_date: date,
     end_date: date,
     slot_duration: int | None = None,
-    num_slots: int = 6,
+    num_slots: int | None = None,
 ) -> list[dict]:
     """Find open meeting slots across a date range.
 
-    Returns up to num_slots slots spread across the range.
+    Returns up to num_slots slots spread across the range, prioritizing
+    Monday first, then Wed/Thu afternoons. Uses per-day availability windows.
     Each slot: {"date": date, "start": time, "end": time, "day_name": str}
     """
     duration = slot_duration or config.DEFAULT_SLOT_DURATION
-    biz_days = get_business_days(start_date, end_date)
-    if not biz_days:
+    target_slots = num_slots if num_slots is not None else config.DEFAULT_NUM_SLOTS
+    available_days = get_available_days(start_date, end_date)
+    if not available_days:
         return []
 
     # Fetch all events for the range
     events = calendar_client.get_events_in_range(start_date, end_date)
 
-    all_slots: list[dict] = []
-    for day in biz_days:
+    # Collect slots per day
+    slots_by_day: dict[date, list[dict]] = {}
+    for day in available_days:
         day_slots = find_open_slots(events, day, slot_duration=duration)
-        all_slots.extend(day_slots)
+        if day_slots:
+            slots_by_day[day] = day_slots
 
-    if not all_slots:
+    if not slots_by_day:
         return []
 
-    # Spread picks across days: take up to 2 per day, then fill
-    if len(all_slots) <= num_slots:
-        return all_slots
+    # Sort days by priority: Monday (0) first, then Wed (2), Thu (3)
+    sorted_days = sorted(
+        slots_by_day.keys(),
+        key=lambda d: (_DAY_PRIORITY.index(d.weekday()) if d.weekday() in _DAY_PRIORITY else 99, d),
+    )
 
-    # Group by date, pick first 2 from each day, then fill remaining
-    by_date: dict[date, list[dict]] = {}
-    for s in all_slots:
-        by_date.setdefault(s["date"], []).append(s)
-
+    # Pick slots: 1 per day first (spreading across days), then fill
     picked: list[dict] = []
-    for day in biz_days:
-        day_slots = by_date.get(day, [])
-        if day_slots:
-            # Pick first and a mid-afternoon slot if available
-            picked.append(day_slots[0])
-            if len(day_slots) > 1:
-                mid = len(day_slots) // 2
-                if day_slots[mid] != day_slots[0]:
-                    picked.append(day_slots[mid])
-        if len(picked) >= num_slots:
-            break
 
-    return picked[:num_slots]
+    # Round 1: first slot from each day in priority order
+    for day in sorted_days:
+        if len(picked) >= target_slots:
+            break
+        picked.append(slots_by_day[day][0])
+
+    # Round 2: if still need more, take additional from priority days
+    if len(picked) < target_slots:
+        for day in sorted_days:
+            if len(picked) >= target_slots:
+                break
+            for slot in slots_by_day[day][1:]:
+                if slot not in picked:
+                    picked.append(slot)
+                    if len(picked) >= target_slots:
+                        break
+
+    # Sort final picks chronologically
+    picked.sort(key=lambda s: (s["date"], s["start"]))
+    return picked[:target_slots]
 
 
 def format_slots_mattermost(
@@ -323,6 +352,7 @@ def format_slots_mattermost(
     If sender info is provided (email trigger), includes context header.
     Otherwise (direct @mention), just shows slots.
     """
+    tz_abbrev = _get_tz_abbrev()
     parts = []
 
     if sender_email:
@@ -342,35 +372,71 @@ def format_slots_mattermost(
         date_str = slot["date"].strftime("%b %d")
         start_str = slot["start"].strftime("%I:%M %p").lstrip("0")
         end_str = slot["end"].strftime("%I:%M %p").lstrip("0")
-        parts.append(f"{i}. {slot['day_name']} {date_str} — {start_str}-{end_str}")
+        parts.append(f"{i}. {slot['day_name']} {date_str} — {start_str}-{end_str} {tz_abbrev}")
 
-    if booking_link:
-        parts.append(f"\nBooking link: {booking_link}")
+    link = booking_link or config.BOOKING_LINK
+    if link:
+        parts.append(f"\nBooking link: {link}")
 
     if sender_email:
-        parts.append(f"\nReply: `send 1,3,5` or `send all` to draft a reply. `edit` to modify. `cancel` to discard.")
+        parts.append(f"\nReply: `send 1,2,3` or `send all` to draft a reply. `edit` to modify. `cancel` to discard.")
 
     return "\n".join(parts)
 
 
 def format_slots_email(
     slots: list[dict],
+    sender_first_name: str = "",
     booking_link: str = "",
 ) -> str:
-    """Format slots as plain text for an email reply body."""
+    """Format slots as an email reply body matching the standard template.
+
+    Template:
+        Hi [first name],
+
+        Happy to connect. Here are a few times that work on my end:
+
+        - Monday, March 24 — 10:00 AM CDT
+        - Wednesday, March 26 — 4:30 PM CDT
+        - Thursday, March 27 — 4:30 PM CDT
+
+        If none of those work, feel free to grab a time directly from my calendar:
+        [booking link]
+
+        Looking forward to it,
+        Ryan
+    """
     if not slots:
         return "I checked my calendar but don't have openings in that timeframe."
 
-    lines = ["Here are some times that work for me:\n"]
+    tz_abbrev = _get_tz_abbrev()
+    link = booking_link or config.BOOKING_LINK
+
+    lines = []
+
+    # Greeting
+    first_name = sender_first_name.strip() if sender_first_name else ""
+    if first_name:
+        lines.append(f"Hi {first_name},")
+    else:
+        lines.append("Hi,")
+
+    lines.append("")
+    lines.append("Happy to connect. Here are a few times that work on my end:")
+    lines.append("")
+
     for slot in slots:
         date_str = slot["date"].strftime("%A, %B %d")
         start_str = slot["start"].strftime("%I:%M %p").lstrip("0")
-        end_str = slot["end"].strftime("%I:%M %p").lstrip("0")
-        lines.append(f"  - {date_str}: {start_str} - {end_str}")
+        lines.append(f"- {date_str} — {start_str} {tz_abbrev}")
 
-    lines.append("\nLet me know which works best and I'll send a calendar invite.")
+    lines.append("")
+    if link:
+        lines.append("If none of those work, feel free to grab a time directly from my calendar:")
+        lines.append(link)
+        lines.append("")
 
-    if booking_link:
-        lines.append(f"\nOr feel free to book directly: {booking_link}")
+    lines.append("Looking forward to it,")
+    lines.append("Ryan")
 
     return "\n".join(lines)
