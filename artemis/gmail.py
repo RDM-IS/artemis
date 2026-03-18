@@ -1,7 +1,9 @@
 """Gmail OAuth client — inbox polling and thread summarization."""
 
 import base64
+import html
 import logging
+import re
 from datetime import datetime, timezone
 from email.utils import parseaddr
 
@@ -87,6 +89,73 @@ class GmailClient:
                 logger.exception("Failed to get message %s", msg_ref["id"])
 
         return detailed
+
+    def get_full_message(self, message_id: str) -> str:
+        """Fetch the full body of a message.  Prefers text/plain, falls back to HTML.
+
+        Returns the decoded body text (up to 10 000 chars) or empty string on failure.
+        """
+        if not self.service:
+            return ""
+        try:
+            msg = (
+                self.service.users()
+                .messages()
+                .get(userId="me", id=message_id, format="full")
+                .execute()
+            )
+            body = self._extract_body(msg.get("payload", {}))
+            return body[:10_000]
+        except Exception:
+            logger.exception("Failed to get full message %s", message_id)
+            return ""
+
+    @staticmethod
+    def _extract_body(payload: dict) -> str:
+        """Walk a Gmail payload tree and return the best text body."""
+        # Collect candidate parts
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
+
+        def _walk(part: dict) -> None:
+            mime = part.get("mimeType", "")
+            if mime == "text/plain":
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    plain_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
+            elif mime == "text/html":
+                data = part.get("body", {}).get("data", "")
+                if data:
+                    html_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
+            for sub in part.get("parts", []):
+                _walk(sub)
+
+        _walk(payload)
+
+        if plain_parts:
+            return "\n".join(plain_parts)
+
+        if html_parts:
+            return GmailClient._strip_html("\n".join(html_parts))
+
+        return ""
+
+    @staticmethod
+    def _strip_html(raw_html: str) -> str:
+        """Crude HTML-to-text: remove tags and decode entities."""
+        # Remove style/script blocks
+        text = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
+        # Replace <br>, <p>, <div> with newlines
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"</(p|div|tr|li)>", "\n", text, flags=re.IGNORECASE)
+        # Strip remaining tags
+        text = re.sub(r"<[^>]+>", "", text)
+        # Decode HTML entities
+        text = html.unescape(text)
+        # Collapse whitespace
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def get_thread(self, thread_id: str) -> dict | None:
         """Get a full thread with message snippets."""
