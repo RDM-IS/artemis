@@ -40,6 +40,13 @@ from artemis.inbox import (
     WAITING,
 )
 from artemis.gmail import GmailClient
+from artemis.life_ops import (
+    get_db as init_life_ops_db,
+    handle_grocery_command,
+    handle_health_command,
+    handle_workout_command,
+    load_health_plan,
+)
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.quiet_hours import (
@@ -95,11 +102,11 @@ def uptime_webhook():
 
     # alertType 1 = down, 2 = up (Uptime Robot convention)
     if str(alert_type) == "1":
-        msg = f"\U0001f534 **{monitor_name}** is DOWN"
+        msg = f"\u26a0\ufe0f \U0001f534 **{monitor_name}** is DOWN"
     elif str(alert_type) == "2":
-        msg = f"\U0001f7e2 **{monitor_name}** recovered"
+        msg = f"\u26a0\ufe0f \U0001f7e2 **{monitor_name}** recovered"
     else:
-        msg = f"\u2139\ufe0f **{monitor_name}** alert (type={alert_type})"
+        msg = f"\u26a0\ufe0f **{monitor_name}** alert (type={alert_type})"
 
     if url:
         msg += f" — {url}"
@@ -1023,6 +1030,35 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
     return False
 
 
+def _try_life_ops(question: str) -> str | None:
+    """Try workout, grocery, and health commands in order."""
+    q = question.lower()
+    if any(kw in q for kw in [
+        "workout", "let's work out", "lets work out", "bench", "squat", "rdl",
+        "sets", "reps", "lbs", "rest day", "skip today", "taking today off",
+    ]):
+        result = handle_workout_command(question)
+        if result:
+            return result
+    if any(kw in q for kw in [
+        "grocery", "shopping list", "add to list", "going to aldi",
+        "heading to aldi", "need to get", "need ", "put ", "got ",
+        "remove ", "done shopping", "finished shopping", "clear grocery",
+        "what do i need", "aldi list", "shopping at",
+    ]):
+        result = handle_grocery_command(question)
+        if result:
+            return result
+    if any(kw in q for kw in [
+        "calories", "protein", "meal prep", "sunday prep",
+        "weight goal", "daily targets", "what should i eat", "macros",
+    ]):
+        result = handle_health_command(question)
+        if result:
+            return result
+    return None
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -1121,6 +1157,12 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_delete_event(post, question):
         return
 
+    # Life ops commands (workout, grocery, health)
+    life_ops_response = _try_life_ops(question)
+    if life_ops_response and _mm:
+        _mm.post_to_channel_id(channel_id, life_ops_response, root_id=root_id)
+        return
+
     thread_lines = []
     for p in thread[-10:]:
         thread_lines.append(f"{p.get('message', '')}")
@@ -1214,11 +1256,15 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments + inbox_threads + contacts)
+    # Init databases (commitments + inbox_threads + contacts + life_ops)
     from artemis.inbox import get_db as init_inbox_db
     get_db()
     init_inbox_db()
     init_crm_db()
+    init_life_ops_db()
+
+    # Load health plan context
+    load_health_plan()
 
     # Init Mattermost with retry loop
     _mm = MattermostClient()

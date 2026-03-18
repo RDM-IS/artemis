@@ -1,0 +1,36 @@
+{
+  "aldi": {
+    "display_name": "Aldi",
+    "zones": [
+      {
+        "name": "Produce",
+        "order": 1,
+        "keywords": ["salad", "onion", "banana", "lemon",
+                     "produce", "vegetable", "fruit", "pepper",
+                     "tomato fresh", "avocado"]
+      },
+      {
+        "name": "Center aisles — dry goods",
+        "order": 2,
+        "keywords": ["oats", "chia", "pineapple", "beans",
+                     "lentils", "broth", "tomatoes", "spices",
+                     "almond milk", "coffee", "cold brew",
+                     "protein powder", "coconut water",
+                     "olive oil", "chili powder", "cumin",
+                     "paprika", "cayenne", "salt", "garlic"]
+      },
+      {
+        "name": "Frozen",
+        "order": 3,
+        "keywords": ["frozen", "broccoli", "green bean",
+                     "frozen banana"]
+      },
+      {
+        "name": "Refrigerated — back wall",
+        "order": 4,
+        "keywords": ["chicken", "yogurt", "marinated",
+                     "thigh", "dairy", "egg", "meat"]
+      }
+    ]
+  }
+}
