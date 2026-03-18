@@ -276,6 +276,123 @@ def find_open_slots(
     return slots
 
 
+_MIN_SLOT_GAP_MINUTES = 120  # minimum 2 hours between offered slots
+
+
+def _slot_minutes(slot: dict) -> int:
+    """Convert a slot to absolute minutes (days * 1440 + time) for gap checks."""
+    # Use days since epoch for absolute ordering
+    d = slot["date"]
+    day_offset = d.toordinal()
+    return day_offset * 1440 + slot["start"].hour * 60 + slot["start"].minute
+
+
+def _respects_gap(candidate: dict, picked: list[dict]) -> bool:
+    """Check that candidate is at least _MIN_SLOT_GAP_MINUTES from all picked slots."""
+    c_min = _slot_minutes(candidate)
+    for p in picked:
+        if abs(c_min - _slot_minutes(p)) < _MIN_SLOT_GAP_MINUTES:
+            return False
+    return True
+
+
+def _collect_slots_for_range(
+    calendar_client,
+    start_date: date,
+    end_date: date,
+    duration: int,
+) -> dict[date, list[dict]]:
+    """Fetch events and compute open slots per available day in the range."""
+    available_days = get_available_days(start_date, end_date)
+    if not available_days:
+        return {}
+
+    events = calendar_client.get_events_in_range(start_date, end_date)
+
+    slots_by_day: dict[date, list[dict]] = {}
+    for day in available_days:
+        day_slots = find_open_slots(events, day, slot_duration=duration)
+        if day_slots:
+            slots_by_day[day] = day_slots
+    return slots_by_day
+
+
+def _pick_slots(
+    slots_by_day: dict[date, list[dict]],
+    target_slots: int,
+) -> list[dict]:
+    """Pick slots following the preferred spread pattern.
+
+    Preferred spread (for 3 slots):
+      1st: soonest available Monday
+      2nd: soonest available Wednesday or Thursday
+      3rd: next Monday or Wed/Thu after that
+
+    Rules:
+    - Never two slots within 2 hours of each other
+    - Spread across different days first
+    - Only put multiple slots on the same day as a last resort
+    """
+    if not slots_by_day:
+        return []
+
+    # Build a priority-ordered list of (day, slot) candidates.
+    # Priority tiers: Mon=0, Wed=1, Thu=2, everything else=3
+    # Within a tier, sort by date (soonest first).
+    _tier = {0: 0, 2: 1, 3: 2}  # Mon, Wed, Thu
+
+    sorted_days = sorted(
+        slots_by_day.keys(),
+        key=lambda d: (_tier.get(d.weekday(), 3), d),
+    )
+
+    picked: list[dict] = []
+    used_dates: set[date] = set()
+
+    # Round 1: One slot per day, different days only, priority order.
+    # Pick the first slot from each day (earliest in the window).
+    for day in sorted_days:
+        if len(picked) >= target_slots:
+            break
+        candidate = slots_by_day[day][0]
+        if _respects_gap(candidate, picked):
+            picked.append(candidate)
+            used_dates.add(day)
+
+    # Round 2: If still short, try later slots on unused days.
+    if len(picked) < target_slots:
+        for day in sorted_days:
+            if day in used_dates:
+                continue
+            if len(picked) >= target_slots:
+                break
+            for slot in slots_by_day[day]:
+                if _respects_gap(slot, picked):
+                    picked.append(slot)
+                    used_dates.add(day)
+                    break
+            if len(picked) >= target_slots:
+                break
+
+    # Round 3: Last resort — second slot on an already-used day.
+    # Only if we truly can't fill from different days.
+    if len(picked) < target_slots:
+        for day in sorted_days:
+            if len(picked) >= target_slots:
+                break
+            for slot in slots_by_day[day]:
+                if slot in picked:
+                    continue
+                if _respects_gap(slot, picked):
+                    picked.append(slot)
+                    if len(picked) >= target_slots:
+                        break
+
+    # Sort final picks chronologically
+    picked.sort(key=lambda s: (s["date"], s["start"]))
+    return picked[:target_slots]
+
+
 def get_availability(
     calendar_client,
     start_date: date,
@@ -287,56 +404,41 @@ def get_availability(
 
     Returns up to num_slots slots spread across the range, prioritizing
     Monday first, then Wed/Thu afternoons. Uses per-day availability windows.
+
+    If the initial range doesn't yield enough distinct-day slots, automatically
+    extends the search up to 14 days out to find slots on different days.
+
     Each slot: {"date": date, "start": time, "end": time, "day_name": str}
     """
     duration = slot_duration or config.DEFAULT_SLOT_DURATION
     target_slots = num_slots if num_slots is not None else config.DEFAULT_NUM_SLOTS
-    available_days = get_available_days(start_date, end_date)
-    if not available_days:
-        return []
 
-    # Fetch all events for the range
-    events = calendar_client.get_events_in_range(start_date, end_date)
+    # Collect slots for the requested range
+    slots_by_day = _collect_slots_for_range(calendar_client, start_date, end_date, duration)
 
-    # Collect slots per day
-    slots_by_day: dict[date, list[dict]] = {}
-    for day in available_days:
-        day_slots = find_open_slots(events, day, slot_duration=duration)
-        if day_slots:
-            slots_by_day[day] = day_slots
+    # Check if we have enough distinct days
+    distinct_days = len(slots_by_day)
+    if distinct_days < target_slots:
+        # Extend search up to 14 days from start_date to find more days
+        extended_end = start_date + timedelta(days=14)
+        if extended_end > end_date:
+            extra_slots = _collect_slots_for_range(
+                calendar_client,
+                end_date + timedelta(days=1),
+                extended_end,
+                duration,
+            )
+            slots_by_day.update(extra_slots)
+            if len(slots_by_day) > distinct_days:
+                logger.info(
+                    "Extended availability search to %s — found %d days (was %d)",
+                    extended_end, len(slots_by_day), distinct_days,
+                )
 
     if not slots_by_day:
         return []
 
-    # Sort days by priority: Monday (0) first, then Wed (2), Thu (3)
-    sorted_days = sorted(
-        slots_by_day.keys(),
-        key=lambda d: (_DAY_PRIORITY.index(d.weekday()) if d.weekday() in _DAY_PRIORITY else 99, d),
-    )
-
-    # Pick slots: 1 per day first (spreading across days), then fill
-    picked: list[dict] = []
-
-    # Round 1: first slot from each day in priority order
-    for day in sorted_days:
-        if len(picked) >= target_slots:
-            break
-        picked.append(slots_by_day[day][0])
-
-    # Round 2: if still need more, take additional from priority days
-    if len(picked) < target_slots:
-        for day in sorted_days:
-            if len(picked) >= target_slots:
-                break
-            for slot in slots_by_day[day][1:]:
-                if slot not in picked:
-                    picked.append(slot)
-                    if len(picked) >= target_slots:
-                        break
-
-    # Sort final picks chronologically
-    picked.sort(key=lambda s: (s["date"], s["start"]))
-    return picked[:target_slots]
+    return _pick_slots(slots_by_day, target_slots)
 
 
 def format_slots_mattermost(
