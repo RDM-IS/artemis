@@ -39,6 +39,9 @@ GMAIL_TOKEN_PATH = Path(os.environ.get("GMAIL_TOKEN_PATH", "token.json"))
 CALENDAR_CREDENTIALS_PATH = Path(os.environ.get("CALENDAR_CREDENTIALS_PATH", "credentials.json"))
 CALENDAR_TOKEN_PATH = Path(os.environ.get("CALENDAR_TOKEN_PATH", "token.json"))
 
+# Timezone
+TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
+
 # Scheduling
 BRIEF_LEAD_TIME_MINUTES = int(os.environ.get("BRIEF_LEAD_TIME_MINUTES", "90"))
 MORNING_BRIEF_TIME = os.environ.get("MORNING_BRIEF_TIME", "07:30")
