@@ -24,7 +24,12 @@ class CalendarClient:
         self.service = None
         self.scope_mismatch: bool = False
 
-    def authenticate(self):
+    def authenticate(self, mm_client=None):
+        """Authenticate with Google Calendar API.
+
+        Args:
+            mm_client: Optional MattermostClient to post auth failure alerts.
+        """
         creds = None
         token_path = config.CALENDAR_TOKEN_PATH
         creds_path = config.CALENDAR_CREDENTIALS_PATH
@@ -34,11 +39,31 @@ class CalendarClient:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except Exception as exc:
+                    logger.error("Calendar token refresh failed: %s", exc)
+                    if mm_client:
+                        try:
+                            mm_client.post_message(
+                                config.CHANNEL_OPS,
+                                "\U0001f510 Calendar authentication expired — manual re-authentication "
+                                "required. Run: `python setup_oauth.py`",
+                            )
+                        except Exception:
+                            logger.debug("Failed to post auth alert to Mattermost")
+                    # Continue with degraded mode — no Calendar
+                    self.service = None
+                    return
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
                 creds = flow.run_local_server(port=0)
+
+        # Persist refreshed token
+        try:
             token_path.write_text(creds.to_json())
+        except Exception:
+            logger.warning("Failed to persist Calendar token to %s", token_path)
 
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
@@ -55,8 +80,24 @@ class CalendarClient:
             )
             self.scope_mismatch = True
 
+        self._creds = creds
         self.service = build("calendar", "v3", credentials=creds)
         logger.info("Calendar authenticated")
+
+    def _refresh_if_needed(self) -> bool:
+        """Refresh credentials if expired and re-save token. Returns True if valid."""
+        creds = getattr(self, "_creds", None)
+        if not creds:
+            return bool(self.service)
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                config.CALENDAR_TOKEN_PATH.write_text(creds.to_json())
+                logger.debug("Calendar token refreshed and saved")
+            except Exception:
+                logger.exception("Calendar token refresh failed mid-session")
+                return False
+        return True
 
     def get_today_events(self) -> list[dict]:
         """Get all events for today."""
