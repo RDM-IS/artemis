@@ -89,9 +89,21 @@ You have access to:
 - Inbox zero thread tracker (NEEDS_ACTION, WAITING, SNOOZED states)
 - CRM contacts and leads
 - Standing playbooks (PLAYBOOKS.md) for automatic email handling
+- Calendar event creation
 
 When an email or situation matches a playbook trigger, execute the playbook
-actions automatically without asking."""
+actions automatically without asking.
+
+When asked to schedule or create a calendar event, include a JSON block in your
+response with this exact format (the system will parse it and create the event):
+
+```calendar_event
+{{"summary": "Meeting title", "date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM", "description": "optional notes", "attendees": ["email@example.com"]}}
+```
+
+Only include the calendar_event block when you are confident about the details.
+If details are ambiguous, ask for clarification instead. Never claim an event
+was created — the system will confirm creation with the actual event ID."""
 
 PLAYBOOK_EXTRACT_SYSTEM = f"""You are Artemis, an AI chief of staff.
 Extract structured data from an email to execute a playbook action.
