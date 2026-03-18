@@ -14,9 +14,13 @@ from flask import Flask, request, jsonify
 
 from artemis import config
 from artemis.availability import (
+    MODE_MEETING,
+    MODE_WORK_BLOCK,
     format_slots_email,
     format_slots_mattermost,
     get_availability,
+    has_avoid_day_slots,
+    format_avoid_day_warning,
     parse_timeframe,
 )
 from artemis.briefs import handle_mention
@@ -738,10 +742,31 @@ def _handle_availability_command(post: dict, question: str) -> bool:
     return True
 
 
+def _detect_availability_mode(text: str) -> str:
+    """Detect whether user wants MEETING or WORK_BLOCK availability.
+
+    WORK_BLOCK keywords: "work block", "focus time", "head down", "working session",
+    "schedule time to work on", "block time", "SCORE prep", "development", "deep work"
+
+    Everything else defaults to MEETING.
+    """
+    lower = text.lower()
+    _WORK_BLOCK_KEYWORDS = [
+        "work block", "focus time", "head down", "working session",
+        "schedule time to work on", "block time", "score prep",
+        "development time", "deep work", "focus session",
+    ]
+    for kw in _WORK_BLOCK_KEYWORDS:
+        if kw in lower:
+            return MODE_WORK_BLOCK
+    return MODE_MEETING
+
+
 def _handle_availability_mention(post: dict, question: str) -> bool:
     """Handle '@artemis availability [timeframe]' or '@artemis when am I free'.
 
     Direct availability check — no email context, just shows open slots.
+    Detects MEETING vs WORK_BLOCK mode from keywords.
     """
     q_lower = question.lower().strip()
 
@@ -760,10 +785,10 @@ def _handle_availability_mention(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
         return True
 
-    # Extract timeframe from the rest of the question
+    mode = _detect_availability_mode(question)
     start_date, end_date = parse_timeframe(question)
 
-    slots = get_availability(_calendar, start_date, end_date)
+    slots = get_availability(_calendar, start_date, end_date, mode=mode)
     formatted = format_slots_mattermost(slots)
 
     if _mm:
@@ -892,9 +917,10 @@ def _handle_scheduling_mention(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
         return True
 
-    # Extract timeframe from the question, then look up real slots
+    # Detect mode and extract timeframe
+    mode = _detect_availability_mode(question)
     start_date, end_date = parse_timeframe(question)
-    slots = get_availability(_calendar, start_date, end_date)
+    slots = get_availability(_calendar, start_date, end_date, mode=mode)
 
     if not slots:
         reply = (

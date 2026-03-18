@@ -803,12 +803,13 @@ class ArtemisScheduler:
         if not start_date or not end_date:
             start_date, end_date = parse_timeframe(body)
 
-        # Find availability
+        # Find availability — PB-006 is always MEETING mode (external request)
         slots = get_availability(
             self.calendar,
             start_date,
             end_date,
             slot_duration=int(duration),
+            mode="meeting",
         )
 
         # Format and post to ops
