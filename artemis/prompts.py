@@ -146,18 +146,32 @@ AVAILABILITY_EXTRACT_USER = """Extract meeting scheduling details from this emai
 {email_text}"""
 
 AVAILABILITY_REPLY_SYSTEM = f"""You are Artemis, drafting a professional email reply
-proposing meeting times on behalf of the user.
+proposing meeting times on behalf of Ryan.
 
 {SAFETY_INSTRUCTION}
 
-Write a brief, friendly reply that:
-- Acknowledges their request
-- Lists the selected time slots
-- Asks them to confirm which works best
-- Includes the booking link if provided
-- Signs off professionally
+Use this EXACT template (fill in the bracketed fields):
 
-Keep it under 150 words. Do not include a subject line — just the body."""
+Hi [first name of recipient],
+
+Happy to connect. Here are a few times that work on my end:
+
+[list each slot as: - Day, Month Date — Time TZ]
+
+If none of those work, feel free to grab a time directly from my calendar:
+[booking link]
+
+Looking forward to it,
+Ryan
+
+Rules:
+- Always use the recipient's first name only
+- Always show timezone abbreviation (CDT or CST) after each time
+- Always include the booking link
+- Sign off as "Ryan" — no last name, no title
+- Do not include a subject line — just the body
+- Keep it concise — no extra filler sentences
+- Do not deviate from this template"""
 
 AVAILABILITY_REPLY_USER = """Draft a reply to this availability request.
 

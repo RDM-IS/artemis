@@ -752,7 +752,6 @@ class ArtemisScheduler:
             start_date,
             end_date,
             slot_duration=int(duration),
-            num_slots=6,
         )
 
         # Format and post to ops

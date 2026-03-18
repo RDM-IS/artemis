@@ -73,8 +73,34 @@ MEETING_HOURS_END = os.environ.get("MEETING_HOURS_END", "17:00")
 MEETING_BUFFER_MINUTES = int(os.environ.get("MEETING_BUFFER_MINUTES", "15"))
 PREFERRED_MEETING_DAYS = _list(os.environ.get("PREFERRED_MEETING_DAYS", "Mon,Tue,Wed,Thu,Fri"))
 FOCUS_BLOCK_KEYWORDS = _list(os.environ.get("FOCUS_BLOCK_KEYWORDS", "focus,deep work,work session"))
-BOOKING_LINK = os.environ.get("BOOKING_LINK", "")
+BOOKING_LINK = os.environ.get("BOOKING_LINK", "https://calendar.app.google/W21n5XJQ1CUcGkLM9")
 DEFAULT_SLOT_DURATION = int(os.environ.get("DEFAULT_SLOT_DURATION", "30"))
+DEFAULT_NUM_SLOTS = int(os.environ.get("DEFAULT_NUM_SLOTS", "3"))
+
+# Per-day availability windows (HH:MM-HH:MM or "unavailable")
+AVAILABILITY_MONDAY = os.environ.get("AVAILABILITY_MONDAY", "07:00-18:00")
+AVAILABILITY_TUESDAY = os.environ.get("AVAILABILITY_TUESDAY", "unavailable")
+AVAILABILITY_WEDNESDAY = os.environ.get("AVAILABILITY_WEDNESDAY", "16:30-18:00")
+AVAILABILITY_THURSDAY = os.environ.get("AVAILABILITY_THURSDAY", "16:30-18:00")
+AVAILABILITY_FRIDAY = os.environ.get("AVAILABILITY_FRIDAY", "unavailable")
+AVAILABILITY_SATURDAY = os.environ.get("AVAILABILITY_SATURDAY", "unavailable")
+AVAILABILITY_SUNDAY = os.environ.get("AVAILABILITY_SUNDAY", "unavailable")
+
+
+def get_day_availability(weekday: int) -> tuple[str, str] | None:
+    """Return (start, end) hours for a weekday (Mon=0), or None if unavailable."""
+    _day_configs = [
+        AVAILABILITY_MONDAY, AVAILABILITY_TUESDAY, AVAILABILITY_WEDNESDAY,
+        AVAILABILITY_THURSDAY, AVAILABILITY_FRIDAY, AVAILABILITY_SATURDAY,
+        AVAILABILITY_SUNDAY,
+    ]
+    val = _day_configs[weekday].strip().lower()
+    if val == "unavailable":
+        return None
+    if "-" in val:
+        start, end = val.split("-", 1)
+        return start.strip(), end.strip()
+    return None
 
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
