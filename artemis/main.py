@@ -134,10 +134,12 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
         if events:
             parts.append("\n**Today's calendar:**")
             for e in events:
-                attendees = ", ".join(
-                    a["name"] or a["email"] for a in e["attendees"] if not a.get("self")
-                )
-                parts.append(f"- {e['summary']} at {e['start']} — {attendees or 'no external attendees'}")
+                external = [a for a in e["attendees"] if not a.get("self")]
+                if external:
+                    attendee_str = ", ".join(a["name"] or a["email"] for a in external)
+                else:
+                    attendee_str = "(solo)"
+                parts.append(f"- {e['summary']} at {e['start']} — {attendee_str}")
         else:
             parts.append("\n**Today's calendar:** No events scheduled.")
     except Exception:
