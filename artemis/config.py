@@ -64,6 +64,9 @@ STARTUP_RETRY_DELAY = int(os.environ.get("STARTUP_RETRY_DELAY", "15"))
 # Tailscale
 TAILSCALE_HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "")
 
+# Playbooks
+PLAYBOOKS_PATH = Path(os.environ.get("PLAYBOOKS_PATH", "PLAYBOOKS.md"))
+
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
 

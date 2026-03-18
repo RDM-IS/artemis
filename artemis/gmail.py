@@ -14,7 +14,10 @@ from artemis import config
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
 
 
 class GmailClient:
@@ -206,6 +209,23 @@ class GmailClient:
         except Exception:
             logger.exception("get_my_last_message_snippet failed for thread %s", thread_id)
             return ""
+
+    def archive_message(self, message_id: str) -> bool:
+        """Remove message from inbox (archive).  Returns True on success."""
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot archive")
+            return False
+        try:
+            self.service.users().messages().modify(
+                userId="me",
+                id=message_id,
+                body={"removeLabelIds": ["INBOX"]},
+            ).execute()
+            logger.info("Archived message %s", message_id)
+            return True
+        except Exception:
+            logger.exception("Failed to archive message %s", message_id)
+            return False
 
     def format_for_claude(self, messages: list[dict]) -> str:
         """Format messages for Claude with UNTRUSTED prefix."""

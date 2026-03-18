@@ -14,6 +14,7 @@ from artemis import config
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
 from artemis.commitments import get_db, list_commitments, get_commitments_for_client
+from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.inbox import (
     format_inbox_status,
     format_snoozed_list,
@@ -33,7 +34,7 @@ from artemis.inbox import (
 from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
-from artemis.scheduler import ArtemisScheduler
+from artemis.scheduler import ArtemisScheduler, get_playbook_text
 from artemis.version import format_version_status, get_commit_hash, get_latest_github_version, get_version
 
 logging.basicConfig(
@@ -269,12 +270,52 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_inbox_command(post, question):
         return
 
-    # Version commands
+    # Direct commands
     q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
     if q_lower in ("version", "what version are you?", "what version", "update check"):
-        channel_id = post.get("channel_id", "")
-        root_id = post.get("root_id") or post["id"]
         reply = format_version_status()
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "contacts":
+        contacts = list_contacts()
+        reply = format_contacts_list(contacts)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "leads":
+        leads = list_contacts(status="lead")
+        reply = format_contacts_list(leads)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "playbooks":
+        pb_text = get_playbook_text()
+        reply = pb_text if pb_text else "No playbooks loaded."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower.startswith("archive "):
+        short_id = q_lower.split("archive ", 1)[1].strip()
+        tid = resolve_thread_id(short_id)
+        if tid and _gmail:
+            success = _gmail.archive_message(tid)
+            if success:
+                mark_done(tid)
+                reply = f"Archived and marked DONE"
+            else:
+                reply = f"Failed to archive — check logs"
+        elif not tid:
+            reply = f"Thread not found: {short_id}"
+        else:
+            reply = "Gmail not connected"
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
@@ -344,10 +385,11 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init database (commitments + inbox_threads tables)
+    # Init databases (commitments + inbox_threads + contacts)
     from artemis.inbox import get_db as init_inbox_db
     get_db()
     init_inbox_db()
+    init_crm_db()
 
     # Init Mattermost with retry loop
     _mm = MattermostClient()
