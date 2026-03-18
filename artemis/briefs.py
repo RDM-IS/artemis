@@ -49,10 +49,11 @@ def _call_claude(
         return ""
 
 
-def triage_emails(emails_text: str) -> list[dict]:
-    """Classify emails by urgency and sender type."""
+def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
+    """Classify emails by urgency and sender type, with playbook matching."""
+    system = TRIAGE_SYSTEM.replace("{playbooks}", playbook_text or "")
     result = _call_claude(
-        TRIAGE_SYSTEM,
+        system,
         TRIAGE_USER.format(emails=emails_text),
         max_tokens=1000,
     )

@@ -1,15 +1,23 @@
 """Cron jobs for all scheduled tasks."""
 
+import json
 import logging
 import multiprocessing
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from artemis import config
 from artemis.briefs import generate_meeting_brief, generate_morning_brief, triage_emails
 from artemis.calendar import CalendarClient
-from artemis.commitments import get_due_soon, get_start_alerts, get_commitments_for_client
+from artemis.commitments import (
+    add_commitment,
+    get_due_soon,
+    get_start_alerts,
+    get_commitments_for_client,
+    list_commitments,
+)
+from artemis.crm import upsert_contact
 from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.inbox import (
@@ -33,10 +41,41 @@ from artemis.monitors import (
     format_ssl_alerts,
 )
 from artemis.prompts import UNTRUSTED_PREFIX
+from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
 
 _GMAIL_POLL_TIMEOUT = 120  # seconds — kill subprocess if it hangs
+
+# ---------------------------------------------------------------------------
+# Playbook helpers
+# ---------------------------------------------------------------------------
+
+_playbook_text: str = ""
+
+
+def load_playbooks() -> str:
+    """Read PLAYBOOKS.md from disk and cache it.  Returns the raw text."""
+    global _playbook_text
+    try:
+        path = config.PLAYBOOKS_PATH
+        if path.exists():
+            _playbook_text = path.read_text(encoding="utf-8")
+            logger.info("Loaded playbooks from %s (%d bytes)", path, len(_playbook_text))
+        else:
+            logger.warning("Playbooks file not found at %s", path)
+            _playbook_text = ""
+    except Exception:
+        logger.exception("Failed to load playbooks")
+        _playbook_text = ""
+    return _playbook_text
+
+
+def get_playbook_text() -> str:
+    """Return cached playbook text (load if empty)."""
+    if not _playbook_text:
+        return load_playbooks()
+    return _playbook_text
 
 
 def _gmail_poll_worker(result_queue: multiprocessing.Queue, max_results: int = 20):
@@ -120,6 +159,15 @@ class ArtemisScheduler:
             id="update_check",
         )
 
+        # PB-005: Commitment deadline reminders — weekdays at 8:15am
+        self.scheduler.add_job(
+            self.job_commitment_reminders, "cron", hour=8, minute=15, day_of_week="mon-fri",
+            id="commitment_reminders",
+        )
+
+        # Load playbooks at startup
+        load_playbooks()
+
         self.scheduler.start()
         logger.info("Scheduler started")
 
@@ -157,7 +205,7 @@ class ArtemisScheduler:
         return payload
 
     def job_inbox_triage(self):
-        """Poll Gmail and classify new messages."""
+        """Poll Gmail, classify new messages, archive, and execute playbooks."""
         try:
             messages = self._poll_gmail_isolated(max_results=20)
             if messages:
@@ -180,31 +228,43 @@ class ArtemisScheduler:
             ]
 
             for msg in priority_msgs:
-                # Track in inbox zero
-                upsert_thread(
-                    msg["thread_id"], msg["subject"], msg["from_email"],
-                    state=NEEDS_ACTION,
-                )
-                post = self.mm.post_message(
-                    config.CHANNEL_OPS,
-                    f"**Priority email** from {msg['from']}\n"
-                    f"Subject: {msg['subject']}\n"
-                    f"> {msg['snippet'][:200]}\n\n"
-                    f"Reply: `done {msg['thread_id'][:12]}` · `wait {msg['thread_id'][:12]}` · "
-                    f"`snooze {msg['thread_id'][:12]} 3d` · `noise {msg['thread_id'][:12]}`",
-                )
-                if post.get("id"):
-                    set_mattermost_post_id(msg["thread_id"], post["id"])
+                # Track in inbox zero — safety: only archive if upsert succeeds
+                try:
+                    upsert_thread(
+                        msg["thread_id"], msg["subject"], msg["from_email"],
+                        state=NEEDS_ACTION,
+                    )
+                    post = self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        f"**Priority email** from {msg['from']}\n"
+                        f"Subject: {msg['subject']}\n"
+                        f"> {msg['snippet'][:200]}\n\n"
+                        f"Reply: `done {msg['thread_id'][:12]}` · `wait {msg['thread_id'][:12]}` · "
+                        f"`snooze {msg['thread_id'][:12]} 3d` · `noise {msg['thread_id'][:12]}`",
+                    )
+                    if post.get("id"):
+                        set_mattermost_post_id(msg["thread_id"], post["id"])
+                    # Archive after successful tracking
+                    self.gmail.archive_message(msg["id"])
+                    logger.info("Archived [%s] from %s", msg["subject"], msg["from_email"])
+                except Exception:
+                    logger.exception(
+                        "Failed to track priority email — NOT archiving %s", msg["id"]
+                    )
+                    self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        f"\u26a0\ufe0f Failed to track priority email from {msg['from']} — left in inbox",
+                    )
 
             if non_priority:
                 email_text = self.gmail.format_for_claude(non_priority)
-                triaged = triage_emails(email_text)
+                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
 
                 # Zip triage results back with original messages for thread tracking
                 for i, item in enumerate(triaged):
                     urgency = item.get("urgency", "low")
                     sender_type = item.get("sender_type", "")
-                    # Try to match back to original message for thread_id
+                    playbook_match = item.get("playbook_match")
                     orig = non_priority[i] if i < len(non_priority) else None
 
                     if urgency in ("high", "medium") and orig:
@@ -230,6 +290,15 @@ class ArtemisScheduler:
                         )
                     else:
                         self._pending_triage.append(item)
+
+                    # Execute playbook if matched
+                    if playbook_match and orig:
+                        self._execute_playbook(playbook_match, orig, item)
+
+                    # Archive every processed email
+                    if orig:
+                        self.gmail.archive_message(orig["id"])
+                        logger.info("Archived [%s] from %s", orig.get("subject", ""), orig.get("from_email", ""))
 
         except Exception as exc:
             self._record_gmail_failure(str(exc))
@@ -489,6 +558,165 @@ class ArtemisScheduler:
         except Exception:
             # GitHub unreachable — skip silently per spec
             logger.debug("Update check failed — skipping")
+
+    def _execute_playbook(self, playbook_id: str, msg: dict, triage_item: dict):
+        """Execute a matched playbook's actions for a triaged email."""
+        try:
+            logger.info("Executing playbook %s for [%s]", playbook_id, msg.get("subject", ""))
+
+            if playbook_id == "PB-001":
+                self._run_pb001_demo_lead(msg, triage_item)
+            elif playbook_id == "PB-002":
+                self._run_pb002_meeting_followup(msg, triage_item)
+            elif playbook_id == "PB-003":
+                self._run_pb003_survey(msg, triage_item)
+            elif playbook_id == "PB-004":
+                self._run_pb004_meeting_request(msg, triage_item)
+            else:
+                logger.warning("Unknown playbook ID: %s", playbook_id)
+                return
+
+            logger.info("Playbook %s completed for [%s]", playbook_id, msg.get("subject", ""))
+
+        except Exception:
+            logger.exception("Playbook %s failed for [%s]", playbook_id, msg.get("subject", ""))
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\u26a0\ufe0f Playbook {playbook_id} failed on [{msg.get('subject', '?')}]: "
+                f"check logs for details",
+            )
+
+    def _run_pb001_demo_lead(self, msg: dict, triage_item: dict):
+        """PB-001: Demo Access Notification — create lead + follow-up commitment."""
+        sender_email = msg.get("from_email", "")
+        sender_name = msg.get("from", "").split("<")[0].strip().strip('"') or sender_email
+        # Use sender's domain as company fallback
+        company = sender_email.split("@")[1] if "@" in sender_email else "Prospect"
+
+        upsert_contact(
+            name=sender_name,
+            email=sender_email,
+            company=company,
+            source="artemis-demo",
+            status="lead",
+        )
+
+        nbd = next_business_day()
+        add_commitment(
+            title=f"Follow up with {sender_name} re: demo access",
+            due_date=nbd.isoformat(),
+            effort_days=1,
+            client=company,
+        )
+
+        self.mm.post_message(
+            config.CHANNEL_OPS,
+            f"\U0001f3af New demo lead: {sender_name} ({company}) \u2014 "
+            f"follow-up scheduled for {nbd.isoformat()}",
+        )
+
+    def _run_pb002_meeting_followup(self, msg: dict, triage_item: dict):
+        """PB-002: Meeting Follow-up — create commitments for action items."""
+        sender_email = msg.get("from_email", "")
+        sender_name = msg.get("from", "").split("<")[0].strip().strip('"') or sender_email
+        company = sender_email.split("@")[1] if "@" in sender_email else ""
+        summary = triage_item.get("one_line_summary", msg.get("subject", ""))
+
+        # Default due date: 5 days from now
+        due = (date.today() + timedelta(days=5)).isoformat()
+
+        add_commitment(
+            title=f"Follow up: {summary[:80]}",
+            due_date=due,
+            effort_days=2,
+            client=company,
+        )
+        add_commitment(
+            title=f"Send deliverables to {sender_name}",
+            due_date=due,
+            effort_days=1,
+            client=company,
+        )
+
+        self.mm.post_message(
+            config.CHANNEL_COMMITMENTS,
+            f"\U0001f4cb Meeting follow-up from {sender_name}:\n"
+            f"- Follow up: {summary[:80]} (due {due})\n"
+            f"- Send deliverables to {sender_name} (due {due})",
+        )
+        self.mm.post_message(
+            config.CHANNEL_OPS,
+            f"\U0001f4cb {sender_name} follow-up processed \u2014 "
+            f"2 commitments created, due {due}",
+        )
+
+    def _run_pb003_survey(self, msg: dict, triage_item: dict):
+        """PB-003: Survey/Feedback Request — mark NEEDS_ACTION, batch for brief."""
+        due = (date.today() + timedelta(days=2)).isoformat()
+        upsert_thread(
+            msg["thread_id"], msg["subject"], msg.get("from_email", ""),
+            state=NEEDS_ACTION, due_date=due, notes="Quick task \u2014 estimated 2-5 minutes",
+        )
+        # Only post to ops if sender is priority contact
+        if self.gmail.is_priority_sender(msg.get("from_email", "")):
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f4dd Survey/feedback request from {msg.get('from', 'unknown')} \u2014 due {due}",
+            )
+        # Otherwise batched into morning brief automatically
+
+    def _run_pb004_meeting_request(self, msg: dict, triage_item: dict):
+        """PB-004: Meeting Request / Calendar Invite — post to ops."""
+        upsert_thread(
+            msg["thread_id"], msg["subject"], msg.get("from_email", ""),
+            state=NEEDS_ACTION,
+        )
+        self.mm.post_message(
+            config.CHANNEL_OPS,
+            f"\U0001f4c5 Meeting request from {msg.get('from', 'unknown')} \u2014 needs response\n"
+            f"Subject: {msg.get('subject', '')}",
+        )
+
+    def job_commitment_reminders(self):
+        """PB-005: Commitment Deadline Reminder Chain."""
+        try:
+            active = list_commitments(status="active")
+            today = date.today()
+
+            for c in active:
+                try:
+                    due = date.fromisoformat(c["due_date"])
+                except (ValueError, TypeError):
+                    continue
+
+                days_left = (due - today).days
+                effort = c.get("effort_days", 1)
+
+                if days_left == 0:
+                    self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        f"\U0001f6a8 **TODAY**: {c['title']} is due today! (client: {c.get('client', 'n/a')})",
+                    )
+                elif days_left == 1:
+                    self.mm.post_message(
+                        config.CHANNEL_COMMITMENTS,
+                        f"\U0001f534 **Due tomorrow**: {c['title']} (client: {c.get('client', 'n/a')})",
+                    )
+                elif days_left == effort:
+                    self.mm.post_message(
+                        config.CHANNEL_COMMITMENTS,
+                        f"\u26a0\ufe0f **Start today**: {c['title']} \u2014 needs {effort}d effort, "
+                        f"due {c['due_date']} (client: {c.get('client', 'n/a')})",
+                    )
+                elif days_left == 5:
+                    self.mm.post_message(
+                        config.CHANNEL_COMMITMENTS,
+                        f"\U0001f4c5 **5 days out**: {c['title']} due {c['due_date']} "
+                        f"(client: {c.get('client', 'n/a')})",
+                    )
+
+        except Exception:
+            logger.exception("Commitment reminder chain failed")
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""

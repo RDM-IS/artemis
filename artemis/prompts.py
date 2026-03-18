@@ -18,6 +18,13 @@ For each email, provide:
 - sender_type: client, prospect, vendor, noise
 - one_line_summary: a single sentence summary
 - needs_action: true or false
+- playbook_match: the playbook ID that matches (e.g. "PB-001"), or null if none match
+
+You have access to standing playbooks that define automatic handling procedures.
+When an email matches a playbook trigger, include the playbook ID so it can be
+executed automatically.
+
+{{playbooks}}
 
 Respond in JSON format as a list of objects."""
 
@@ -79,7 +86,27 @@ You have access to:
 - Recent Gmail threads
 - Today's calendar
 - Open commitments
-- Inbox zero thread tracker (NEEDS_ACTION, WAITING, SNOOZED states)"""
+- Inbox zero thread tracker (NEEDS_ACTION, WAITING, SNOOZED states)
+- CRM contacts and leads
+- Standing playbooks (PLAYBOOKS.md) for automatic email handling
+
+When an email or situation matches a playbook trigger, execute the playbook
+actions automatically without asking."""
+
+PLAYBOOK_EXTRACT_SYSTEM = f"""You are Artemis, an AI chief of staff.
+Extract structured data from an email to execute a playbook action.
+
+{SAFETY_INSTRUCTION}
+
+Return a JSON object with the fields requested. Use null for any field
+you cannot confidently extract. Do not guess or fabricate data."""
+
+PLAYBOOK_EXTRACT_USER = """Extract the following fields from this email for playbook {playbook_id}:
+
+Fields needed: {fields}
+
+Email:
+{email_text}"""
 
 MENTION_USER = """Question: {question}
 
