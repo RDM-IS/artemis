@@ -369,6 +369,23 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
     except Exception:
         logger.exception("Failed to post startup message")
 
+    # Scope mismatch warnings (non-fatal)
+    scope_warnings = []
+    if gmail and getattr(gmail, "scope_mismatch", False):
+        scope_warnings.append("Gmail token missing `gmail.modify` scope — archive will not work.")
+    if calendar and getattr(calendar, "scope_mismatch", False):
+        scope_warnings.append("Calendar token missing `calendar.readonly` scope.")
+    if scope_warnings:
+        warning = (
+            "\u26a0\ufe0f OAuth token has wrong scopes \u2014 re-authentication required.\n"
+            + "\n".join(f"- {w}" for w in scope_warnings)
+            + "\nRun: `python setup_oauth.py`"
+        )
+        try:
+            mm.post_message(config.CHANNEL_OPS, warning)
+        except Exception:
+            logger.exception("Failed to post scope warning")
+
 
 def _post_shutdown_message(mm: MattermostClient):
     """Post shutdown notice to #artemis-ops."""

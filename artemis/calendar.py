@@ -19,6 +19,7 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 class CalendarClient:
     def __init__(self):
         self.service = None
+        self.scope_mismatch: bool = False
 
     def authenticate(self):
         creds = None
@@ -35,6 +36,18 @@ class CalendarClient:
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
                 creds = flow.run_local_server(port=0)
             token_path.write_text(creds.to_json())
+
+        # Validate scopes — warn but don't crash
+        self.scope_mismatch = False
+        granted = set(creds.scopes or []) if creds else set()
+        required = {"https://www.googleapis.com/auth/calendar.readonly"}
+        if granted and not required.issubset(granted):
+            missing = required - granted
+            logger.warning(
+                "Calendar token missing scopes: %s — re-authenticate.",
+                ", ".join(missing),
+            )
+            self.scope_mismatch = True
 
         self.service = build("calendar", "v3", credentials=creds)
         logger.info("Calendar authenticated")

@@ -26,6 +26,7 @@ class GmailClient:
     def __init__(self):
         self.service = None
         self._last_history_id: str | None = None
+        self.scope_mismatch: bool = False
 
     def authenticate(self):
         creds = None
@@ -42,6 +43,19 @@ class GmailClient:
                 flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
                 creds = flow.run_local_server(port=0)
             token_path.write_text(creds.to_json())
+
+        # Validate scopes — warn but don't crash
+        self.scope_mismatch = False
+        granted = set(creds.scopes or []) if creds else set()
+        required = {"https://www.googleapis.com/auth/gmail.modify"}
+        if granted and not required.issubset(granted):
+            missing = required - granted
+            logger.warning(
+                "Gmail token missing scopes: %s — archive will not work. "
+                "Delete token.json and re-authenticate.",
+                ", ".join(missing),
+            )
+            self.scope_mismatch = True
 
         self.service = build("gmail", "v1", credentials=creds)
         logger.info("Gmail authenticated")
