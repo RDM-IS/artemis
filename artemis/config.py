@@ -27,9 +27,9 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://localhost:8065")
 MATTERMOST_BOT_TOKEN = os.environ.get("MATTERMOST_BOT_TOKEN", "")
 MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")
-CHANNEL_OPS = os.environ.get("CHANNEL_OPS", "artemis-ops")
-CHANNEL_BRIEFS = os.environ.get("CHANNEL_BRIEFS", "artemis-briefs")
-CHANNEL_COMMITMENTS = os.environ.get("CHANNEL_COMMITMENTS", "artemis-commitments")
+CHANNEL_OPS = os.environ.get("CHANNEL_OPS", "artemis-ryan")
+CHANNEL_BRIEFS = os.environ.get("CHANNEL_BRIEFS", "artemis-ryan")
+CHANNEL_COMMITMENTS = os.environ.get("CHANNEL_COMMITMENTS", "artemis-ryan")
 
 # Gmail
 GMAIL_CREDENTIALS_PATH = Path(os.environ.get("GMAIL_CREDENTIALS_PATH", "credentials.json"))
@@ -110,6 +110,9 @@ OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
+
+# Weekly staples (grocery)
+WEEKLY_STAPLES = os.environ.get("WEEKLY_STAPLES", "")
 
 # Logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
