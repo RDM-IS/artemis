@@ -2,11 +2,13 @@
 
 import json
 import logging
+import re
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Event
+from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 
@@ -260,6 +262,64 @@ def _handle_inbox_command(post: dict, question: str) -> bool:
     return True
 
 
+def _process_calendar_events(response: str) -> str:
+    """Parse calendar_event blocks from Claude's response and create real events.
+
+    Replaces the JSON block with a confirmation or failure message.
+    """
+    pattern = r"```calendar_event\s*\n(.*?)\n```"
+    matches = list(re.finditer(pattern, response, re.DOTALL))
+    if not matches:
+        return response
+
+    if not _calendar or not _calendar.service:
+        # Replace all calendar blocks with failure notice
+        return re.sub(
+            pattern,
+            "\n> :red_circle: Calendar not connected — event NOT created.\n",
+            response,
+            flags=re.DOTALL,
+        )
+
+    local_tz = ZoneInfo(config.TIMEZONE)
+
+    for match in reversed(matches):  # reverse so replacements don't shift indices
+        try:
+            data = json.loads(match.group(1))
+            summary = data["summary"]
+            date_str = data["date"]
+            start_time = data["start_time"]
+            end_time = data["end_time"]
+            description = data.get("description")
+            attendees = data.get("attendees")
+
+            start_dt = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
+            start_dt = start_dt.replace(tzinfo=local_tz)
+            end_dt = datetime.strptime(f"{date_str} {end_time}", "%Y-%m-%d %H:%M")
+            end_dt = end_dt.replace(tzinfo=local_tz)
+
+            event_id = _calendar.create_event(
+                summary=summary,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                description=description,
+                attendees=attendees,
+            )
+
+            if event_id:
+                replacement = f"\n> :white_check_mark: Event created: **{summary}** on {date_str} {start_time}–{end_time} (ID: `{event_id}`)\n"
+            else:
+                replacement = f"\n> :red_circle: Failed to create event: **{summary}** — check logs.\n"
+
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("Failed to parse calendar_event block: %s", e)
+            replacement = f"\n> :warning: Could not parse calendar event — {e}\n"
+
+        response = response[:match.start()] + replacement + response[match.end():]
+
+    return response
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -331,6 +391,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     if response and _mm:
         channel_id = post.get("channel_id", "")
         root_id = post.get("root_id") or post["id"]
+
+        # Check if Claude's response contains a calendar event to create
+        response = _process_calendar_events(response)
+
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
 
 
@@ -374,7 +438,7 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
     if gmail and getattr(gmail, "scope_mismatch", False):
         scope_warnings.append("Gmail token missing `gmail.modify` scope — archive will not work.")
     if calendar and getattr(calendar, "scope_mismatch", False):
-        scope_warnings.append("Calendar token missing `calendar.readonly` scope.")
+        scope_warnings.append("Calendar token missing required scopes (`calendar.readonly` and/or `calendar.events`).")
     if scope_warnings:
         warning = (
             "\u26a0\ufe0f OAuth token has wrong scopes \u2014 re-authentication required.\n"

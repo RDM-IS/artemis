@@ -13,7 +13,10 @@ from artemis import config
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+]
 
 
 class CalendarClient:
@@ -40,7 +43,10 @@ class CalendarClient:
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
         granted = set(creds.scopes or []) if creds else set()
-        required = {"https://www.googleapis.com/auth/calendar.readonly"}
+        required = {
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.events",
+        }
         if granted and not required.issubset(granted):
             missing = required - granted
             logger.warning(
@@ -134,6 +140,66 @@ class CalendarClient:
             result.append(event)
 
         return result
+
+    def create_event(
+        self,
+        summary: str,
+        start_datetime: datetime,
+        end_datetime: datetime,
+        description: str | None = None,
+        attendees: list[str] | None = None,
+        reminder_minutes: int = 15,
+    ) -> str | None:
+        """Create a calendar event.
+
+        Returns the event ID on success, or None on failure.
+        """
+        if not self.service:
+            logger.error("Calendar not authenticated — cannot create event")
+            return None
+
+        local_tz = ZoneInfo(config.TIMEZONE)
+
+        # Ensure datetimes are timezone-aware
+        if start_datetime.tzinfo is None:
+            start_datetime = start_datetime.replace(tzinfo=local_tz)
+        if end_datetime.tzinfo is None:
+            end_datetime = end_datetime.replace(tzinfo=local_tz)
+
+        body: dict = {
+            "summary": summary,
+            "start": {
+                "dateTime": start_datetime.isoformat(),
+                "timeZone": config.TIMEZONE,
+            },
+            "end": {
+                "dateTime": end_datetime.isoformat(),
+                "timeZone": config.TIMEZONE,
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [{"method": "popup", "minutes": reminder_minutes}],
+            },
+        }
+
+        if description:
+            body["description"] = description
+
+        if attendees:
+            body["attendees"] = [{"email": email} for email in attendees]
+
+        try:
+            event = (
+                self.service.events()
+                .insert(calendarId="primary", body=body)
+                .execute()
+            )
+            event_id = event.get("id", "")
+            logger.info("Created calendar event %s: %s", event_id, summary)
+            return event_id
+        except Exception:
+            logger.exception("Failed to create calendar event: %s", summary)
+            return None
 
     def format_events_for_brief(self, events: list[dict]) -> str:
         """Format events for inclusion in a morning brief."""
