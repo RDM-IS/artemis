@@ -4,6 +4,8 @@ import json
 import logging
 import signal
 import sys
+import time
+from datetime import datetime, timezone
 from threading import Event
 
 from flask import Flask, request, jsonify
@@ -45,6 +47,10 @@ app = Flask(__name__)
 _mm: MattermostClient | None = None
 _gmail: GmailClient | None = None
 _calendar: CalendarClient | None = None
+_start_time: float = 0.0
+_sched: ArtemisScheduler | None = None
+_last_triage: str = "never"
+_last_brief: str = "never"
 
 
 @app.route("/webhook/uptime", methods=["POST"])
@@ -75,16 +81,43 @@ def uptime_webhook():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for external monitoring."""
+    gmail_status = "connected" if _gmail and _gmail.service else "error"
+    calendar_status = "connected" if _calendar and _calendar.service else "error"
+    mm_status = "connected" if _mm and _mm._bot_user_id else "error"
+    job_count = len(_sched.scheduler.get_jobs()) if _sched else 0
+    uptime = int(time.time() - _start_time) if _start_time else 0
+
+    return jsonify({
+        "status": "ok",
+        "gmail": gmail_status,
+        "calendar": calendar_status,
+        "mattermost": mm_status,
+        "scheduler_jobs": job_count,
+        "uptime_seconds": uptime,
+        "last_triage": _last_triage,
+        "last_brief": _last_brief,
+    })
+
+
 def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient) -> str:
     """Build data context for an @mention response."""
     parts = []
+
+    # Time awareness
+    now = datetime.now()
+    day_name = now.strftime("%A")
+    time_str = now.strftime("%I:%M %p")
+    parts.append(f"**Current time:** {day_name}, {time_str}")
 
     # Recent emails
     try:
         messages = gmail.get_recent_messages(max_results=10)
         if messages:
-            parts.append("**Recent emails:**")
-            for m in messages[:5]:
+            parts.append("\n**Recent emails (last 3 threads):**")
+            for m in messages[:3]:
                 parts.append(f"- From: {m['from']} | Subject: {m['subject']} | {m['snippet'][:100]}")
     except Exception:
         logger.exception("Failed to get emails for mention context")
@@ -99,6 +132,8 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
                     a["name"] or a["email"] for a in e["attendees"] if not a.get("self")
                 )
                 parts.append(f"- {e['summary']} at {e['start']} — {attendees or 'no external attendees'}")
+        else:
+            parts.append("\n**Today's calendar:** No events scheduled.")
     except Exception:
         logger.exception("Failed to get calendar for mention context")
 
@@ -117,8 +152,7 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
         counts = get_counts()
         na_count = counts.get(NEEDS_ACTION, 0)
         w_count = counts.get(WAITING, 0)
-        if na_count or w_count:
-            parts.append(f"\n**Inbox zero:** {na_count} need action, {w_count} waiting")
+        parts.append(f"\n**Inbox zero:** {na_count} need action, {w_count} waiting")
     except Exception:
         logger.exception("Failed to get inbox status for mention context")
 
@@ -241,9 +275,53 @@ def _handle_mention(post: dict, thread: list[dict]):
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
 
 
-def main():
-    global _mm, _gmail, _calendar
+def _connect_mattermost_with_retry(mm: MattermostClient) -> bool:
+    """Try to connect to Mattermost with configurable retries."""
+    for attempt in range(1, config.STARTUP_RETRY_COUNT + 1):
+        try:
+            mm.get_bot_user_id()
+            logger.info("Mattermost connected on attempt %d (bot user: %s)", attempt, mm._bot_user_id)
+            return True
+        except Exception:
+            logger.warning(
+                "Mattermost connection attempt %d/%d failed — retrying in %ds",
+                attempt, config.STARTUP_RETRY_COUNT, config.STARTUP_RETRY_DELAY,
+            )
+            if attempt < config.STARTUP_RETRY_COUNT:
+                time.sleep(config.STARTUP_RETRY_DELAY)
+    return False
 
+
+def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: CalendarClient, sched: ArtemisScheduler):
+    """Post startup status to #artemis-ops."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    gmail_status = "connected" if gmail and gmail.service else "disconnected"
+    cal_status = "connected" if calendar and calendar.service else "disconnected"
+    job_count = len(sched.scheduler.get_jobs())
+    msg = (
+        f"\u2705 Artemis online \u2014 {ts}. "
+        f"Gmail: {gmail_status}. Calendar: {cal_status}. "
+        f"Scheduler: {job_count} jobs running."
+    )
+    try:
+        mm.post_message(config.CHANNEL_OPS, msg)
+    except Exception:
+        logger.exception("Failed to post startup message")
+
+
+def _post_shutdown_message(mm: MattermostClient):
+    """Post shutdown notice to #artemis-ops."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        mm.post_message(config.CHANNEL_OPS, f"\U0001f534 Artemis going offline \u2014 {ts}.")
+    except Exception:
+        logger.exception("Failed to post shutdown message")
+
+
+def main():
+    global _mm, _gmail, _calendar, _start_time, _sched
+
+    _start_time = time.time()
     logger.info("Starting Artemis...")
 
     # Init database (commitments + inbox_threads tables)
@@ -251,13 +329,13 @@ def main():
     get_db()
     init_inbox_db()
 
-    # Init Mattermost
+    # Init Mattermost with retry loop
     _mm = MattermostClient()
-    try:
-        _mm.get_bot_user_id()
-        logger.info("Mattermost connected (bot user: %s)", _mm._bot_user_id)
-    except Exception:
-        logger.error("Failed to connect to Mattermost — check MATTERMOST_URL and MATTERMOST_BOT_TOKEN")
+    if not _connect_mattermost_with_retry(_mm):
+        logger.error(
+            "Failed to connect to Mattermost after %d attempts — giving up",
+            config.STARTUP_RETRY_COUNT,
+        )
         sys.exit(1)
 
     # Init Gmail
@@ -279,15 +357,19 @@ def main():
     _mm.start_websocket()
 
     # Start scheduler
-    sched = ArtemisScheduler(_mm, _gmail, _calendar)
-    sched.start()
+    _sched = ArtemisScheduler(_mm, _gmail, _calendar)
+    _sched.start()
 
-    # Start Flask for uptime webhook
+    # Post startup message
+    _post_startup_message(_mm, _gmail, _calendar, _sched)
+
+    # Start Flask for uptime webhook + health check
     shutdown = Event()
 
     def signal_handler(sig, frame):
         logger.info("Shutting down...")
-        sched.stop()
+        _post_shutdown_message(_mm)
+        _sched.stop()
         shutdown.set()
 
     signal.signal(signal.SIGINT, signal_handler)

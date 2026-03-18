@@ -140,15 +140,15 @@ def _cli():
     parser = argparse.ArgumentParser(description="Artemis commitment tracker")
     sub = parser.add_subparsers(dest="command")
 
-    add_p = sub.add_parser("add", help="Add a commitment")
+    add_p = sub.add_parser("add", aliases=["a"], help="Add a commitment")
     add_p.add_argument("title")
     add_p.add_argument("--due", required=True, help="Due date (YYYY-MM-DD)")
     add_p.add_argument("--effort", type=int, default=1, help="Effort in days")
     add_p.add_argument("--client", default="", help="Client name")
 
-    sub.add_parser("list", help="List active commitments")
+    sub.add_parser("list", aliases=["ls"], help="List active commitments")
 
-    done_p = sub.add_parser("done", help="Mark a commitment as done")
+    done_p = sub.add_parser("done", aliases=["d"], help="Mark a commitment as done")
     done_p.add_argument("id", type=int)
 
     block_p = sub.add_parser("block", help="Mark a commitment as blocked")
@@ -156,16 +156,16 @@ def _cli():
 
     args = parser.parse_args()
 
-    if args.command == "add":
+    if args.command in ("add", "a"):
         cid = add_commitment(args.title, args.due, args.effort, args.client)
         print(f"Added commitment #{cid}: {args.title} (due {args.due})")
-    elif args.command == "list":
+    elif args.command in ("list", "ls"):
         for c in list_commitments():
             print(
                 f"  #{c['id']} [{c['status']}] {c['title']} — due {c['due_date']} "
                 f"(effort: {c['effort_days']}d, client: {c['client'] or 'n/a'})"
             )
-    elif args.command == "done":
+    elif args.command in ("done", "d"):
         update_status(args.id, "done")
         print(f"Marked #{args.id} as done")
     elif args.command == "block":
