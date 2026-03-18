@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify
 from artemis import config
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
-from artemis.commitments import get_db, list_commitments, get_commitments_for_client
+from artemis.commitments import get_db, list_commitments, get_commitments_for_client, log_calendar_action
 from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.inbox import (
     format_inbox_status,
@@ -55,6 +55,10 @@ _start_time: float = 0.0
 _sched: ArtemisScheduler | None = None
 _last_triage: str = "never"
 _last_brief: str = "never"
+
+# Pending confirmation actions keyed by channel_id
+# Each value is a dict with "type", "data", and "timestamp"
+_pending_confirms: dict[str, dict] = {}
 
 
 @app.route("/webhook/uptime", methods=["POST"])
@@ -262,10 +266,13 @@ def _handle_inbox_command(post: dict, question: str) -> bool:
     return True
 
 
-def _process_calendar_events(response: str) -> str:
+def _process_calendar_events(response: str, channel_id: str = "") -> str:
     """Parse calendar_event blocks from Claude's response and create real events.
 
-    Replaces the JSON block with a confirmation or failure message.
+    Safety rules:
+    - Events with external attendees are drafted, not created — requires confirmation.
+    - Duplicate/conflict detection within ±2 hours — warns before creating.
+    - All creations are audit-logged.
     """
     pattern = r"```calendar_event\s*\n(.*?)\n```"
     matches = list(re.finditer(pattern, response, re.DOTALL))
@@ -273,7 +280,6 @@ def _process_calendar_events(response: str) -> str:
         return response
 
     if not _calendar or not _calendar.service:
-        # Replace all calendar blocks with failure notice
         return re.sub(
             pattern,
             "\n> :red_circle: Calendar not connected — event NOT created.\n",
@@ -283,7 +289,7 @@ def _process_calendar_events(response: str) -> str:
 
     local_tz = ZoneInfo(config.TIMEZONE)
 
-    for match in reversed(matches):  # reverse so replacements don't shift indices
+    for match in reversed(matches):
         try:
             data = json.loads(match.group(1))
             summary = data["summary"]
@@ -291,23 +297,90 @@ def _process_calendar_events(response: str) -> str:
             start_time = data["start_time"]
             end_time = data["end_time"]
             description = data.get("description")
-            attendees = data.get("attendees")
+            attendees = data.get("attendees") or []
 
             start_dt = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
             start_dt = start_dt.replace(tzinfo=local_tz)
             end_dt = datetime.strptime(f"{date_str} {end_time}", "%Y-%m-%d %H:%M")
             end_dt = end_dt.replace(tzinfo=local_tz)
 
+            # ── Rule 1: External attendee gating ──
+            if attendees:
+                attendee_str = ", ".join(attendees)
+                # Store as pending — don't create yet
+                _pending_confirms[channel_id] = {
+                    "type": "calendar_create_external",
+                    "data": data,
+                    "timestamp": time.time(),
+                }
+                replacement = (
+                    f"\n> :calendar: **Proposed** calendar invite to {attendee_str} "
+                    f"for **{summary}** on {date_str} {start_time}–{end_time}.\n"
+                    f"> Reply `confirm` to send or `cancel` to discard.\n"
+                )
+                log_calendar_action(
+                    action="draft",
+                    event_id="pending",
+                    summary=summary,
+                    attendees=attendee_str,
+                    user_approved=False,
+                    notes="Awaiting user confirmation for external attendees",
+                )
+                response = response[:match.start()] + replacement + response[match.end():]
+                continue
+
+            # ── Rule 2: Duplicate / conflict detection ──
+            nearby = _calendar.get_events_around(start_dt, window_hours=2)
+            conflict = None
+            for existing in nearby:
+                # Same attendee overlap or similar name on same day
+                if summary.lower() in existing["summary"].lower() or existing["summary"].lower() in summary.lower():
+                    conflict = existing
+                    break
+                # Check time overlap
+                try:
+                    ex_start = datetime.fromisoformat(existing["start"])
+                    if abs((ex_start - start_dt).total_seconds()) < 3600:  # within 1 hour
+                        conflict = existing
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+            if conflict:
+                _pending_confirms[channel_id] = {
+                    "type": "calendar_create_conflict",
+                    "data": data,
+                    "conflict": conflict,
+                    "timestamp": time.time(),
+                }
+                replacement = (
+                    f"\n> :warning: You already have **{conflict['summary']}** at {conflict['start']} on that day.\n"
+                    f"> Create **{summary}** at {start_time} anyway? Reply `yes` to confirm.\n"
+                )
+                response = response[:match.start()] + replacement + response[match.end():]
+                continue
+
+            # ── No blockers — create directly ──
             event_id = _calendar.create_event(
                 summary=summary,
                 start_datetime=start_dt,
                 end_datetime=end_dt,
                 description=description,
-                attendees=attendees,
             )
 
             if event_id:
-                replacement = f"\n> :white_check_mark: Event created: **{summary}** on {date_str} {start_time}–{end_time} (ID: `{event_id}`)\n"
+                log_calendar_action(
+                    action="create",
+                    event_id=event_id,
+                    summary=summary,
+                    attendees="",
+                    auto_created=True,
+                    notes="Internal event, no attendees",
+                )
+                replacement = (
+                    f"\n> :white_check_mark: Event created: **{summary}** on "
+                    f"{date_str} {start_time}–{end_time} (ID: `{event_id}`)\n"
+                )
             else:
                 replacement = f"\n> :red_circle: Failed to create event: **{summary}** — check logs.\n"
 
@@ -320,13 +393,191 @@ def _process_calendar_events(response: str) -> str:
     return response
 
 
+def _handle_calendar_confirm(post: dict, question: str) -> bool:
+    """Handle confirmation replies for pending calendar actions. Returns True if handled."""
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if channel_id not in _pending_confirms:
+        return False
+
+    pending = _pending_confirms[channel_id]
+    # Expire after 10 minutes
+    if time.time() - pending["timestamp"] > 600:
+        del _pending_confirms[channel_id]
+        return False
+
+    if q_lower not in ("confirm", "yes", "cancel", "no"):
+        return False
+
+    local_tz = ZoneInfo(config.TIMEZONE)
+    data = pending["data"]
+
+    if q_lower in ("cancel", "no"):
+        del _pending_confirms[channel_id]
+        log_calendar_action(
+            action="cancelled",
+            event_id="pending",
+            summary=data.get("summary", ""),
+            notes="User cancelled pending event",
+        )
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar event cancelled.", root_id=root_id)
+        return True
+
+    # confirm / yes
+    if q_lower in ("confirm", "yes"):
+        summary = data["summary"]
+        date_str = data["date"]
+        start_time_str = data["start_time"]
+        end_time_str = data["end_time"]
+        description = data.get("description")
+        attendees = data.get("attendees") or []
+
+        start_dt = datetime.strptime(f"{date_str} {start_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        end_dt = datetime.strptime(f"{date_str} {end_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+
+        event_id = _calendar.create_event(
+            summary=summary,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            description=description,
+            attendees=attendees if attendees else None,
+        )
+
+        attendee_str = ", ".join(attendees) if attendees else ""
+        if event_id:
+            log_calendar_action(
+                action="create",
+                event_id=event_id,
+                summary=summary,
+                attendees=attendee_str,
+                user_approved=True,
+                notes=f"Confirmed by user (type: {pending['type']})",
+            )
+            reply = (
+                f":white_check_mark: Event created: **{summary}** on "
+                f"{date_str} {start_time_str}–{end_time_str} (ID: `{event_id}`)"
+            )
+        else:
+            reply = f":red_circle: Failed to create event: **{summary}** — check logs."
+
+        del _pending_confirms[channel_id]
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    return False
+
+
+def _handle_delete_event(post: dict, question: str) -> bool:
+    """Handle '@artemis delete event <id_or_name>'. Returns True if handled."""
+    q_lower = question.lower().strip()
+    if not q_lower.startswith("delete event "):
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    identifier = question.strip()[len("delete event "):].strip()
+
+    if not identifier:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Usage: `delete event <event_id or event name>`", root_id=root_id)
+        return True
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Try as event ID first, then search by name
+    event = _calendar.get_event(identifier)
+    if not event:
+        event = _calendar.find_event_by_name(identifier)
+
+    if not event:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, f"Event not found: {identifier}", root_id=root_id)
+        return True
+
+    # Store pending deletion — require confirmation
+    _pending_confirms[channel_id] = {
+        "type": "calendar_delete",
+        "data": {"event_id": event["id"], "summary": event["summary"], "start": event["start"]},
+        "timestamp": time.time(),
+    }
+
+    reply = (
+        f"Delete **{event['summary']}** at {event['start']}?\n"
+        f"Reply `yes` to confirm."
+    )
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _handle_delete_confirm(post: dict, question: str) -> bool:
+    """Handle 'yes' confirmation for pending event deletions."""
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if channel_id not in _pending_confirms:
+        return False
+
+    pending = _pending_confirms[channel_id]
+    if pending["type"] != "calendar_delete":
+        return False
+
+    if time.time() - pending["timestamp"] > 600:
+        del _pending_confirms[channel_id]
+        return False
+
+    if q_lower not in ("yes", "no", "cancel"):
+        return False
+
+    data = pending["data"]
+    del _pending_confirms[channel_id]
+
+    if q_lower in ("no", "cancel"):
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Deletion cancelled.", root_id=root_id)
+        return True
+
+    if q_lower == "yes":
+        success = _calendar.delete_event(data["event_id"])
+        if success:
+            log_calendar_action(
+                action="delete",
+                event_id=data["event_id"],
+                summary=data["summary"],
+                user_approved=True,
+                notes="Deleted by user via @mention",
+            )
+            reply = f":white_check_mark: Deleted **{data['summary']}**."
+        else:
+            reply = f":red_circle: Failed to delete **{data['summary']}** — check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    return False
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
     if not question:
         return
 
-    # Try inbox commands first (done, wait, snooze, noise, inbox, waiting, snoozed)
+    # Try confirmation flows first (yes/confirm/cancel for pending actions)
+    if _handle_calendar_confirm(post, question):
+        return
+    if _handle_delete_confirm(post, question):
+        return
+
+    # Try inbox commands (done, wait, snooze, noise, inbox, waiting, snoozed)
     if _handle_inbox_command(post, question):
         return
 
@@ -380,6 +631,10 @@ def _handle_mention(post: dict, thread: list[dict]):
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
 
+    # Calendar delete command
+    if _handle_delete_event(post, question):
+        return
+
     thread_lines = []
     for p in thread[-10:]:
         thread_lines.append(f"{p.get('message', '')}")
@@ -393,7 +648,7 @@ def _handle_mention(post: dict, thread: list[dict]):
         root_id = post.get("root_id") or post["id"]
 
         # Check if Claude's response contains a calendar event to create
-        response = _process_calendar_events(response)
+        response = _process_calendar_events(response, channel_id=channel_id)
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
 

@@ -32,6 +32,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
 )
 """
 
+CREATE_CALENDAR_AUDIT = """
+CREATE TABLE IF NOT EXISTS calendar_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    action TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    attendees TEXT NOT NULL DEFAULT '',
+    user_approved INTEGER NOT NULL DEFAULT 0,
+    auto_created INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT ''
+)
+"""
+
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or config.SQLITE_PATH
@@ -39,8 +53,29 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute(CREATE_TABLE)
     conn.execute(CREATE_AUDIT_LOG)
+    conn.execute(CREATE_CALENDAR_AUDIT)
     conn.commit()
     return conn
+
+
+def log_calendar_action(
+    action: str,
+    event_id: str,
+    summary: str = "",
+    attendees: str = "",
+    user_approved: bool = False,
+    auto_created: bool = False,
+    notes: str = "",
+    db: sqlite3.Connection | None = None,
+) -> None:
+    """Log a calendar write action (create/delete) to the audit trail."""
+    conn = db or get_db()
+    conn.execute(
+        "INSERT INTO calendar_audit_log (action, event_id, summary, attendees, user_approved, auto_created, notes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (action, event_id, summary, attendees, int(user_approved), int(auto_created), notes),
+    )
+    conn.commit()
 
 
 def add_commitment(
