@@ -25,7 +25,7 @@ from artemis.availability import (
 )
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
-from artemis.commitments import get_db, list_commitments, get_commitments_for_client, log_calendar_action
+from artemis.commitments import add_commitment, get_db, list_commitments, get_commitments_for_client, log_calendar_action
 from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.inbox import (
     format_inbox_status,
@@ -491,6 +491,10 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
     if q_lower not in ("confirm", "yes", "cancel", "no"):
         return False
 
+    # Only handle calendar create types here; other types handled by their own handlers
+    if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
+        return False
+
     local_tz = ZoneInfo(config.TIMEZONE)
     data = pending["data"]
 
@@ -643,6 +647,147 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
         return True
 
     return False
+
+
+# ---------- Bulk convert work sessions to tasks ----------
+
+_CONVERT_PATTERNS = [
+    re.compile(r"convert\s+(them|these|work\s*sessions?)\s+to\s+tasks?", re.I),
+    re.compile(r"delete\s+(and|&|\+)\s+add\s+(them\s+)?as\s+tasks?", re.I),
+    re.compile(r"convert\s+to\s+tasks?", re.I),
+    re.compile(r"make\s+(them|these)\s+tasks?", re.I),
+]
+
+
+def _handle_convert_to_tasks(post: dict, question: str) -> bool:
+    """Handle bulk convert-work-sessions-to-tasks flow. Returns True if handled."""
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # ---- Phase 2: confirmation of a pending bulk_convert ----
+    if channel_id in _pending_confirms:
+        pending = _pending_confirms[channel_id]
+        if pending["type"] == "bulk_convert_to_tasks":
+            if time.time() - pending["timestamp"] > 600:
+                del _pending_confirms[channel_id]
+                return False
+            if q_lower in ("yes", "confirm", "execute"):
+                events = pending["events"]
+                deleted = 0
+                added = 0
+                errors = []
+                for ev in events:
+                    ok = _calendar.delete_event(ev["event_id"])
+                    if ok:
+                        log_calendar_action(
+                            action="delete",
+                            event_id=ev["event_id"],
+                            summary=ev["summary"],
+                            user_approved=True,
+                            notes="Bulk convert to task",
+                        )
+                        deleted += 1
+                    else:
+                        errors.append(f"Failed to delete: {ev['summary']}")
+                    add_commitment(
+                        title=ev["summary"],
+                        due_date="",
+                        effort_days=2,
+                    )
+                    added += 1
+                del _pending_confirms[channel_id]
+                parts = [f":white_check_mark: Deleted {deleted} event(s), added {added} task(s)."]
+                if errors:
+                    parts.append("\n".join(errors))
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, "\n".join(parts), root_id=root_id)
+                return True
+            if q_lower in ("no", "cancel"):
+                del _pending_confirms[channel_id]
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, "Bulk convert cancelled.", root_id=root_id)
+                return True
+            # Not a yes/no — fall through so other handlers can try
+            return False
+
+    # ---- Phase 1: detect convert intent ----
+    if not any(p.search(question) for p in _CONVERT_PATTERNS):
+        return False
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Extract event names from the thread context (look for quoted or listed items)
+    # Also search for "work session" events in the next 14 days as a fallback
+    summaries: list[str] = []
+
+    # Try to pull names from the message (e.g., lines starting with bullet/dash/number)
+    for line in question.split("\n"):
+        line = line.strip().lstrip("-*•0123456789.) ").strip()
+        if line and line.lower() not in (
+            "convert them to tasks",
+            "convert these to tasks",
+            "convert to tasks",
+            "delete and add as tasks",
+        ):
+            summaries.append(line)
+
+    # Fallback: search for "work session" events in the next 14 days
+    if not summaries:
+        from datetime import date, timedelta
+        start = date.today()
+        end = start + timedelta(days=14)
+        all_events = _calendar.get_events_in_range(start, end)
+        for ev in all_events:
+            if "work session" in ev["summary"].lower():
+                summaries.append(ev["summary"])
+
+    if not summaries:
+        if _mm:
+            _mm.post_to_channel_id(
+                channel_id,
+                "I didn't find any work session events to convert. "
+                "List the event names or I'll look for events with 'Work Session' in the title.",
+                root_id=root_id,
+            )
+        return True
+
+    # Look up each event
+    found_events = []
+    not_found = []
+    for name in summaries:
+        ev = _calendar.find_event_by_name(name, days_ahead=14)
+        if ev:
+            found_events.append({"event_id": ev["id"], "summary": ev["summary"], "start": ev["start"]})
+        else:
+            not_found.append(name)
+
+    if not found_events:
+        msg = "No matching calendar events found for:\n" + "\n".join(f"- {n}" for n in not_found)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, msg, root_id=root_id)
+        return True
+
+    # Store pending and show confirmation
+    _pending_confirms[channel_id] = {
+        "type": "bulk_convert_to_tasks",
+        "events": found_events,
+        "timestamp": time.time(),
+    }
+
+    lines = ["**Ready to execute:**"]
+    lines.append(f"- Delete **{len(found_events)}** Work Session event(s) from calendar :white_check_mark:")
+    lines.append(f"- Add **{len(found_events)}** commitment(s) to task list :white_check_mark:")
+    if not_found:
+        lines.append(f"\n:warning: Not found (skipped): {', '.join(not_found)}")
+    lines.append("\nReply **yes** to confirm all.")
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+    return True
 
 
 def _handle_availability_command(post: dict, question: str) -> bool:
@@ -1338,6 +1483,10 @@ def _handle_mention(post: dict, thread: list[dict]):
 
     # Calendar delete command
     if _handle_delete_event(post, question):
+        return
+
+    # Bulk convert work sessions to tasks
+    if _handle_convert_to_tasks(post, question):
         return
 
     # Life ops commands (workout, grocery, health)
