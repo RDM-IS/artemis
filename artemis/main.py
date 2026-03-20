@@ -174,63 +174,31 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     except Exception:
         logger.exception("Failed to get emails for mention context")
 
-    # Detect if the question implies a multi-day timeframe
-    q_lower = (question or "").lower()
-    _MULTI_DAY_HINTS = [
-        "tomorrow", "through", "week", "next few days",
-        "friday", "saturday", "sunday", "monday", "tuesday",
-        "wednesday", "thursday", "weekend", "upcoming",
-        "rest of the week", "this week", "next week",
-    ]
-    is_multi_day = any(hint in q_lower for hint in _MULTI_DAY_HINTS)
-
-    # Today's calendar (always included)
+    # Calendar from cache
     try:
-        events = calendar.get_today_events()
-        if events:
-            parts.append("\n**Today's calendar:**")
-            for e in events:
-                external = [a for a in e["attendees"] if not a.get("self")]
-                if external:
-                    attendee_str = ", ".join(a["name"] or a["email"] for a in external)
-                else:
-                    attendee_str = "(solo)"
-                parts.append(f"- {e['summary']} at {e['start']} — {attendee_str}")
-        else:
-            parts.append("\n**Today's calendar:** No events scheduled.")
-    except Exception:
-        logger.exception("Failed to get calendar for mention context")
+        from artemis import calendar_cache
+        from collections import defaultdict
+        from datetime import datetime as dt
 
-    # Multi-day calendar context when question implies a range
-    if is_multi_day and calendar and calendar.service:
-        try:
-            from datetime import date as _date
-            start_date, end_date = parse_timeframe(question)
-            today = _date.today()
-            # Only fetch if the range extends beyond today
-            if end_date > today:
-                range_start = today + timedelta(days=1) if start_date <= today else start_date
-                range_events = calendar.get_events_in_range(range_start, end_date)
-                if range_events:
-                    start_label = range_start.strftime("%a")
-                    end_label = end_date.strftime("%a")
-                    parts.append(f"\n**Upcoming calendar ({start_label}–{end_label}):**")
-                    for e in range_events:
-                        start_str = e.get("start", "")
-                        try:
-                            ev_start = datetime.fromisoformat(start_str)
-                            day_str = ev_start.strftime("%a %b %d")
-                            time_display = ev_start.strftime("%I:%M %p").lstrip("0")
-                        except (ValueError, TypeError):
-                            day_str = start_str
-                            time_display = ""
-                        external = [a for a in e.get("attendees", []) if not a.get("self")]
-                        attendee_str = ", ".join(
-                            a.get("name") or a.get("email", "") for a in external
-                        ) if external else "(solo)"
-                        parts.append(f"- {day_str}: {e.get('summary', '(no title)')} at {time_display} — {attendee_str}")
-        except Exception:
-            logger.exception("Failed to get multi-day calendar for mention context")
+        events = calendar_cache.get_events()
+        if events:
+            parts.append(f"\n**Calendar ({calendar_cache.status()}):**")
+            by_day: dict = defaultdict(list)
+            for e in events:
+                day_key = e["start"][:10]
+                by_day[day_key].append(e)
+            for day in sorted(by_day.keys()):
+                label = dt.strptime(day, "%Y-%m-%d").strftime("%a %b %-d")
+                parts.append(f"\n  {label}")
+                for e in by_day[day]:
+                    external = [a for a in e.get("attendees", []) if not a.get("self")]
+                    attendee_str = ", ".join(a.get("name") or a.get("email", "") for a in external) if external else "(solo)"
+                    time_str = e["start"][11:16] if "T" in e["start"] else "all-day"
+                    parts.append(f"  - {e['summary']} at {time_str} — {attendee_str}")
+        else:
+            parts.append("\n**Calendar:** No events in window.")
+    except Exception:
+        logger.exception("Failed to build calendar context from cache")
 
     # Open commitments
     try:
@@ -1620,6 +1588,12 @@ def main():
         _calendar.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Calendar authentication failed — calendar features disabled")
+
+    # Load calendar cache on boot
+    if _calendar and _calendar.service:
+        from artemis import calendar_cache
+        calendar_cache.refresh(_calendar)
+        logger.info(calendar_cache.status())
 
     # Register @mention handler
     _mm.on_mention(_handle_mention)
