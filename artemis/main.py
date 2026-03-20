@@ -150,8 +150,12 @@ def health_check():
     })
 
 
-def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient) -> str:
-    """Build data context for an @mention response."""
+def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient, question: str = "") -> str:
+    """Build data context for an @mention response.
+
+    If the question references a multi-day timeframe, includes events for that
+    range in addition to today's calendar.
+    """
     parts = []
 
     # Time awareness
@@ -170,7 +174,17 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     except Exception:
         logger.exception("Failed to get emails for mention context")
 
-    # Today's calendar
+    # Detect if the question implies a multi-day timeframe
+    q_lower = (question or "").lower()
+    _MULTI_DAY_HINTS = [
+        "tomorrow", "through", "week", "next few days",
+        "friday", "saturday", "sunday", "monday", "tuesday",
+        "wednesday", "thursday", "weekend", "upcoming",
+        "rest of the week", "this week", "next week",
+    ]
+    is_multi_day = any(hint in q_lower for hint in _MULTI_DAY_HINTS)
+
+    # Today's calendar (always included)
     try:
         events = calendar.get_today_events()
         if events:
@@ -186,6 +200,37 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
             parts.append("\n**Today's calendar:** No events scheduled.")
     except Exception:
         logger.exception("Failed to get calendar for mention context")
+
+    # Multi-day calendar context when question implies a range
+    if is_multi_day and calendar and calendar.service:
+        try:
+            from datetime import date as _date
+            start_date, end_date = parse_timeframe(question)
+            today = _date.today()
+            # Only fetch if the range extends beyond today
+            if end_date > today:
+                range_start = today + timedelta(days=1) if start_date <= today else start_date
+                range_events = calendar.get_events_in_range(range_start, end_date)
+                if range_events:
+                    start_label = range_start.strftime("%a")
+                    end_label = end_date.strftime("%a")
+                    parts.append(f"\n**Upcoming calendar ({start_label}–{end_label}):**")
+                    for e in range_events:
+                        start_str = e.get("start", "")
+                        try:
+                            ev_start = datetime.fromisoformat(start_str)
+                            day_str = ev_start.strftime("%a %b %d")
+                            time_display = ev_start.strftime("%I:%M %p").lstrip("0")
+                        except (ValueError, TypeError):
+                            day_str = start_str
+                            time_display = ""
+                        external = [a for a in e.get("attendees", []) if not a.get("self")]
+                        attendee_str = ", ".join(
+                            a.get("name") or a.get("email", "") for a in external
+                        ) if external else "(solo)"
+                        parts.append(f"- {day_str}: {e.get('summary', '(no title)')} at {time_display} — {attendee_str}")
+        except Exception:
+            logger.exception("Failed to get multi-day calendar for mention context")
 
     # Open commitments
     try:
@@ -872,6 +917,114 @@ def _handle_timezone_command(post: dict, question: str) -> bool:
     return False
 
 
+def _handle_calendar_view_mention(post: dict, question: str) -> bool:
+    """Handle requests to VIEW scheduled events (not find open slots).
+
+    Patterns: "what's on my calendar", "show me my calendar", "events this week",
+    "do you see my calendar", "calendar tomorrow", "show events through Friday", etc.
+
+    Returns True if handled.
+    """
+    q_lower = question.lower().strip()
+
+    # Calendar view intent patterns
+    _VIEW_PATTERNS = [
+        r"\b(show|see|view|display|pull up|check)\s+(me\s+)?(my\s+)?(calendar|events|schedule|sessions|meetings)",
+        r"\bwhat.?s?\s+on\s+(my\s+)?(calendar|schedule)",
+        r"\bdo\s+you\s+see\s+(my\s+)?(calendar|events|schedule|sessions|work\s+sessions|meetings)",
+        r"^(calendar|events|meetings|schedule)\b",
+        r"\b(my\s+)?(calendar|events|meetings)\s+(for|this|next|tomorrow|today)",
+    ]
+
+    is_view = False
+    for pattern in _VIEW_PATTERNS:
+        if re.search(pattern, q_lower):
+            is_view = True
+            break
+
+    if not is_view:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Parse timeframe from the question (defaults to next 5 business days)
+    start_date, end_date = parse_timeframe(question)
+
+    # For bare "calendar" / "events" with no timeframe hint, default to today
+    bare_match = re.match(r"^(calendar|events|meetings|schedule|my calendar|my events)$", q_lower)
+    if bare_match:
+        from datetime import date as _date
+        start_date = _date.today()
+        end_date = _date.today()
+
+    events = _calendar.get_events_in_range(start_date, end_date)
+
+    if not events:
+        date_range_str = _format_date_range(start_date, end_date)
+        reply = f":calendar: No events scheduled {date_range_str}."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # Group events by day
+    from collections import defaultdict
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        start_str = e.get("start", "")
+        try:
+            ev_start = datetime.fromisoformat(start_str)
+            day_key = ev_start.strftime("%a %b %d")
+            time_str = ev_start.strftime("%I:%M %p").lstrip("0")
+        except (ValueError, TypeError):
+            # All-day events — just a date string like "2026-03-20"
+            try:
+                from datetime import date as _date
+                d = _date.fromisoformat(start_str)
+                day_key = d.strftime("%a %b %d")
+                time_str = "all day"
+            except (ValueError, TypeError):
+                day_key = "Unknown"
+                time_str = ""
+
+        by_day[day_key].append({
+            "summary": e.get("summary", "(no title)"),
+            "time": time_str,
+            "attendees": e.get("attendees", []),
+        })
+
+    # Format response
+    lines = [":calendar: **Scheduled events:**"]
+    for day_label, day_events in by_day.items():
+        lines.append(f"\n**{day_label}**")
+        for ev in day_events:
+            external = [a for a in ev["attendees"] if not a.get("self")]
+            if external:
+                attendee_str = " — " + ", ".join(
+                    a.get("name") or a.get("email", "") for a in external
+                )
+            else:
+                attendee_str = ""
+            lines.append(f"- {ev['summary']} at {ev['time']}{attendee_str}")
+
+    reply = "\n".join(lines)
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _format_date_range(start_date, end_date) -> str:
+    """Format a date range for display (e.g., 'Thu Mar 20 – Fri Mar 21')."""
+    if start_date == end_date:
+        return f"on {start_date.strftime('%a %b %d')}"
+    return f"{start_date.strftime('%a %b %d')} – {end_date.strftime('%a %b %d')}"
+
+
 def _handle_scheduling_mention(post: dict, question: str) -> bool:
     """Detect scheduling/availability questions and respond with real calendar slots.
 
@@ -1171,6 +1324,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_timezone_command(post, question):
         return
 
+    # Calendar view: "what's on my calendar", "show events", "calendar this week"
+    if _handle_calendar_view_mention(post, question):
+        return
+
     # Scheduling intent detection (real slots, never vague language)
     if _handle_scheduling_mention(post, question):
         return
@@ -1194,7 +1351,7 @@ def _handle_mention(post: dict, thread: list[dict]):
         thread_lines.append(f"{p.get('message', '')}")
     thread_context = "\n".join(thread_lines)
 
-    data_context = _build_mention_context(post, _gmail, _calendar)
+    data_context = _build_mention_context(post, _gmail, _calendar, question=question)
 
     response = handle_mention(question, thread_context, data_context)
     if response and _mm:
