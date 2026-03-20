@@ -90,12 +90,24 @@ class MattermostClient:
                 # Ignore own messages
                 if post["user_id"] == bot_id:
                     return
-                # Check for @mention
+                # Check for @mention or active thread participation
                 message = post.get("message", "")
-                if f"@artemis" not in message.lower() and bot_id not in post.get(
-                    "props", {}
-                ).get("mentioned_user_ids", []):
+                has_mention = (
+                    "@artemis" in message.lower()
+                    or bot_id in post.get("props", {}).get("mentioned_user_ids", [])
+                )
+                in_active_thread = bool(post.get("root_id"))
+                if not has_mention and not in_active_thread:
                     return
+                if not has_mention and in_active_thread:
+                    thread_id = post["root_id"]
+                    try:
+                        thread_posts = self.get_thread_posts(thread_id, limit=50)
+                        bot_participated = any(p["user_id"] == bot_id for p in thread_posts)
+                        if not bot_participated:
+                            return
+                    except Exception:
+                        return
                 if self._mention_handler:
                     thread_id = post.get("root_id") or post["id"]
                     thread = self.get_thread_posts(thread_id)
