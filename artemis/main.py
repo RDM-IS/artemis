@@ -480,8 +480,8 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
     if q_lower not in ("confirm", "yes", "cancel", "no"):
         return False
 
-    # Only handle calendar_create type here; other types handled by their own handlers
-    if pending.get("type") not in (None, "calendar_create"):
+    # Only handle calendar create types here; other types handled by their own handlers
+    if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
         return False
 
     local_tz = ZoneInfo(config.TIMEZONE)
