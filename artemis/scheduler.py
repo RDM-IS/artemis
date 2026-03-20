@@ -276,7 +276,7 @@ class ArtemisScheduler:
                         msg["full_body"] = body
                     post = self.mm.post_message(
                         config.CHANNEL_OPS,
-                        f"**Priority email** from {msg['from']}\n"
+                        f"\U0001f4ec **Priority email** from {msg['from']}\n"
                         f"Subject: {msg['subject']}\n"
                         f"> {msg['snippet'][:200]}\n\n"
                         f"Reply: `done {msg['thread_id'][:12]}` · `wait {msg['thread_id'][:12]}` · "
@@ -329,7 +329,7 @@ class ArtemisScheduler:
                     if urgency == "high":
                         self.mm.post_message(
                             config.CHANNEL_OPS,
-                            f"**High urgency email**: {item.get('one_line_summary', 'New email')}",
+                            f"\U0001f4ec **High urgency email**: {item.get('one_line_summary', 'New email')}",
                         )
                     else:
                         self._pending_triage.append(item)
@@ -378,7 +378,7 @@ class ArtemisScheduler:
             return
 
         try:
-            lines = ["**Inbox triage summary:**\n"]
+            lines = ["\U0001f4ec **Inbox triage summary:**\n"]
             for item in self._pending_triage:
                 urgency = item.get("urgency", "?")
                 sender_type = item.get("sender_type", "?")
@@ -491,7 +491,7 @@ class ArtemisScheduler:
             )
 
             if brief:
-                full_brief = f"**Good morning! Here's your brief:**\n\n{brief}\n\n**Inbox Zero:**\n{inbox_section}"
+                full_brief = f"\u2600\ufe0f **Good morning! Here's your brief:**\n\n{brief}\n\n\U0001f4ec **Inbox Zero:**\n{inbox_section}"
                 self.mm.post_message(config.CHANNEL_OPS, full_brief)
 
         except Exception:
@@ -505,7 +505,7 @@ class ArtemisScheduler:
             results = check_all_ssl()
             alert = format_ssl_alerts(results)
             if alert:
-                self.mm.post_message(config.CHANNEL_OPS, f"**SSL Certificate Alerts:**\n{alert}")
+                self.mm.post_message(config.CHANNEL_OPS, f"\u26a0\ufe0f **SSL Certificate Alerts:**\n{alert}")
         except Exception:
             logger.exception("SSL check failed")
 
@@ -517,7 +517,7 @@ class ArtemisScheduler:
             results = check_domain_expiry()
             alert = format_domain_alerts(results)
             if alert:
-                self.mm.post_message(config.CHANNEL_OPS, f"**Domain Expiry Alerts:**\n{alert}")
+                self.mm.post_message(config.CHANNEL_OPS, f"\u26a0\ufe0f **Domain Expiry Alerts:**\n{alert}")
         except Exception:
             logger.exception("Domain check failed")
 
@@ -532,7 +532,7 @@ class ArtemisScheduler:
                 if can_nudge(t["id"], min_hours=12):
                     self.mm.post_message(
                         config.CHANNEL_OPS,
-                        f"**Nudge:** This thread still needs action:\n"
+                        f"\U0001f4ec **Nudge:** This thread still needs action:\n"
                         f"**{t['subject']}** from {t['sender']}\n\n"
                         f"Reply: `done {t['id'][:12]}` · `wait {t['id'][:12]}` · "
                         f"`snooze {t['id'][:12]} 3d` · `noise {t['id'][:12]}`",
@@ -549,7 +549,7 @@ class ArtemisScheduler:
                     mark_needs_action(t["id"])
                     self.mm.post_message(
                         config.CHANNEL_OPS,
-                        f"**Reply received** on: **{t['subject']}** — moved back to NEEDS_ACTION\n\n"
+                        f"\U0001f4ec **Reply received** on: **{t['subject']}** \u2014 moved back to NEEDS_ACTION\n\n"
                         f"Reply: `done {t['id'][:12]}` · `wait {t['id'][:12]}` · "
                         f"`snooze {t['id'][:12]} 3d`",
                     )
@@ -559,7 +559,7 @@ class ArtemisScheduler:
                     context = f' re: "{snippet}"' if snippet else ""
                     self.mm.post_message(
                         config.CHANNEL_OPS,
-                        f"**Still waiting on {who}{context}** — no reply in 3+ days\n"
+                        f"\U0001f4ec **Still waiting on {who}{context}** \u2014 no reply in 3+ days\n"
                         f"Thread: **{t['subject']}**\n\n"
                         f"Reply: `done {t['id'][:12]}` · `snooze {t['id'][:12]} 3d`",
                     )
@@ -571,7 +571,7 @@ class ArtemisScheduler:
                 mark_needs_action(t["id"])
                 self.mm.post_message(
                     config.CHANNEL_OPS,
-                    f"**Resurfaced (snooze ended):**\n"
+                    f"\U0001f4ec **Resurfaced (snooze ended):**\n"
                     f"**{t['subject']}** from {t['sender']}\n\n"
                     f"Reply: `done {t['id'][:12]}` · `wait {t['id'][:12]}` · "
                     f"`snooze {t['id'][:12]} 3d` · `noise {t['id'][:12]}`",
@@ -803,12 +803,13 @@ class ArtemisScheduler:
         if not start_date or not end_date:
             start_date, end_date = parse_timeframe(body)
 
-        # Find availability
+        # Find availability — PB-006 is always MEETING mode (external request)
         slots = get_availability(
             self.calendar,
             start_date,
             end_date,
             slot_duration=int(duration),
+            mode="meeting",
         )
 
         # Format and post to ops

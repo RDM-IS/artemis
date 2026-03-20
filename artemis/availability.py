@@ -1,7 +1,12 @@
 """Availability slot finder — calendar analysis for scheduling.
 
-Pure functions that take events and preferences, return open time slots.
-Used by both PB-006 (email trigger) and @mention commands.
+Two modes:
+- MEETING: external, requires another person. Respects per-day meeting windows,
+  warns about avoid days (Tue/Fri), never suggests unavailable days.
+- WORK_BLOCK: internal, solo. Full day availability (07:00-22:00 by default).
+  Respects existing calendar events, DO NOT SCHEDULE blocks, and quiet hours.
+
+Used by PB-006 (email trigger, always MEETING mode) and @mention commands.
 """
 
 import logging
@@ -52,15 +57,23 @@ def is_focus_block(summary: str) -> bool:
     return False
 
 
-def get_available_days(start: date, end: date) -> list[date]:
+# Availability modes
+MODE_MEETING = "meeting"
+MODE_WORK_BLOCK = "work_block"
+
+
+def get_available_days(
+    start: date, end: date, mode: str = MODE_MEETING
+) -> list[date]:
     """Return dates between start and end (inclusive) that have availability windows.
 
-    Uses per-day config (AVAILABILITY_MONDAY etc.) to skip unavailable days.
+    mode: "meeting" or "work_block".
+    For meeting mode, avoid days ARE included (caller handles warnings).
     """
     days = []
     current = start
     while current <= end:
-        window = config.get_day_availability(current.weekday())
+        window = config.get_day_availability(current.weekday(), mode=mode)
         if window is not None:
             days.append(current)
         current += timedelta(days=1)
@@ -68,11 +81,8 @@ def get_available_days(start: date, end: date) -> list[date]:
 
 
 def get_business_days(start: date, end: date) -> list[date]:
-    """Return dates between start and end (inclusive) that are preferred meeting days.
-
-    Delegates to get_available_days which uses per-day availability config.
-    """
-    return get_available_days(start, end)
+    """Return dates between start and end (inclusive) that are preferred meeting days."""
+    return get_available_days(start, end, mode=MODE_MEETING)
 
 
 def parse_timeframe(text: str) -> tuple[date, date]:
@@ -170,22 +180,30 @@ def find_open_slots(
     hours_end: str | None = None,
     slot_duration: int | None = None,
     buffer_minutes: int | None = None,
+    mode: str = MODE_MEETING,
 ) -> list[dict]:
     """Find open time slots on a single day given existing events.
 
-    Uses per-day availability config. Returns empty list if day is unavailable.
-    Returns list of {"date": date, "start": time, "end": time, "day_name": str}.
+    mode: "meeting" or "work_block".
+    For work_block mode, also respects quiet hours (caps end at QUIET_HOURS_START).
+    Returns list of {"date": date, "start": time, "end": time, "day_name": str, "is_avoid_day": bool}.
     """
     tz = ZoneInfo(config.TIMEZONE)
 
     # Check per-day availability window
-    day_window = config.get_day_availability(target_date.weekday())
+    day_window = config.get_day_availability(target_date.weekday(), mode=mode)
     if day_window is None:
         return []  # Day is unavailable
 
     # Use per-day window, with optional overrides
     start_t = _parse_time(hours_start) if hours_start else _parse_time(day_window[0])
     end_t = _parse_time(hours_end) if hours_end else _parse_time(day_window[1])
+
+    # Work block mode: cap end at quiet hours start
+    if mode == MODE_WORK_BLOCK:
+        quiet_start = _parse_time(config.QUIET_HOURS_START)
+        if end_t > quiet_start:
+            end_t = quiet_start
     duration = slot_duration or config.DEFAULT_SLOT_DURATION
     buffer = buffer_minutes if buffer_minutes is not None else config.MEETING_BUFFER_MINUTES
 
@@ -235,7 +253,10 @@ def find_open_slots(
         else:
             merged.append((s, e))
 
-    # Find gaps in the meeting window
+    # Check if this is a meeting avoid day
+    avoid_day = (mode == MODE_MEETING and config.is_meeting_avoid_day(target_date.weekday()))
+
+    # Find gaps in the availability window
     window_start = start_t.hour * 60 + start_t.minute
     window_end = end_t.hour * 60 + end_t.minute
     slots = []
@@ -254,6 +275,7 @@ def find_open_slots(
                     "start": slot_start,
                     "end": slot_end,
                     "day_name": target_date.strftime("%A"),
+                    "is_avoid_day": avoid_day,
                 })
                 gap_start += duration
         cursor = max(cursor, block_end)
@@ -270,6 +292,7 @@ def find_open_slots(
                 "start": slot_start,
                 "end": slot_end,
                 "day_name": target_date.strftime("%A"),
+                "is_avoid_day": avoid_day,
             })
             gap_start += duration
 
@@ -301,9 +324,10 @@ def _collect_slots_for_range(
     start_date: date,
     end_date: date,
     duration: int,
+    mode: str = MODE_MEETING,
 ) -> dict[date, list[dict]]:
     """Fetch events and compute open slots per available day in the range."""
-    available_days = get_available_days(start_date, end_date)
+    available_days = get_available_days(start_date, end_date, mode=mode)
     if not available_days:
         return {}
 
@@ -311,7 +335,7 @@ def _collect_slots_for_range(
 
     slots_by_day: dict[date, list[dict]] = {}
     for day in available_days:
-        day_slots = find_open_slots(events, day, slot_duration=duration)
+        day_slots = find_open_slots(events, day, slot_duration=duration, mode=mode)
         if day_slots:
             slots_by_day[day] = day_slots
     return slots_by_day
@@ -320,13 +344,20 @@ def _collect_slots_for_range(
 def _pick_slots(
     slots_by_day: dict[date, list[dict]],
     target_slots: int,
+    mode: str = MODE_MEETING,
 ) -> list[dict]:
     """Pick slots following the preferred spread pattern.
 
-    Preferred spread (for 3 slots):
+    Meeting mode spread (for 3 slots):
       1st: soonest available Monday
       2nd: soonest available Wednesday or Thursday
       3rd: next Monday or Wed/Thu after that
+      Avoid days (Tue/Fri) only used if no other slots available.
+
+    Work block mode preferences:
+      - Weekday evenings first (7pm-10pm) for small tasks
+      - Weekend mornings (8am-12pm) for large blocks
+      - Saturday for 3+ hour blocks
 
     Rules:
     - Never two slots within 2 hours of each other
@@ -336,22 +367,27 @@ def _pick_slots(
     if not slots_by_day:
         return []
 
-    # Build a priority-ordered list of (day, slot) candidates.
-    # Priority tiers: Mon=0, Wed=1, Thu=2, everything else=3
-    # Within a tier, sort by date (soonest first).
-    _tier = {0: 0, 2: 1, 3: 2}  # Mon, Wed, Thu
+    if mode == MODE_WORK_BLOCK:
+        return _pick_work_block_slots(slots_by_day, target_slots)
 
-    sorted_days = sorted(
-        slots_by_day.keys(),
+    # Meeting mode: prefer non-avoid days, then use avoid days as fallback
+    _tier = {0: 0, 2: 1, 3: 2}  # Mon, Wed, Thu preferred
+
+    # Separate avoid days from preferred days
+    preferred_days = sorted(
+        [d for d in slots_by_day.keys() if not config.is_meeting_avoid_day(d.weekday())],
         key=lambda d: (_tier.get(d.weekday(), 3), d),
+    )
+    avoid_days = sorted(
+        [d for d in slots_by_day.keys() if config.is_meeting_avoid_day(d.weekday())],
+        key=lambda d: d,
     )
 
     picked: list[dict] = []
     used_dates: set[date] = set()
 
-    # Round 1: One slot per day, different days only, priority order.
-    # Pick the first slot from each day (earliest in the window).
-    for day in sorted_days:
+    # Round 1: Preferred days first, one slot per day.
+    for day in preferred_days:
         if len(picked) >= target_slots:
             break
         candidate = slots_by_day[day][0]
@@ -359,9 +395,9 @@ def _pick_slots(
             picked.append(candidate)
             used_dates.add(day)
 
-    # Round 2: If still short, try later slots on unused days.
+    # Round 2: Still short — try more slots on unused preferred days.
     if len(picked) < target_slots:
-        for day in sorted_days:
+        for day in preferred_days:
             if day in used_dates:
                 continue
             if len(picked) >= target_slots:
@@ -371,13 +407,10 @@ def _pick_slots(
                     picked.append(slot)
                     used_dates.add(day)
                     break
-            if len(picked) >= target_slots:
-                break
 
-    # Round 3: Last resort — second slot on an already-used day.
-    # Only if we truly can't fill from different days.
+    # Round 3: Last resort on preferred days — second slot same day.
     if len(picked) < target_slots:
-        for day in sorted_days:
+        for day in preferred_days:
             if len(picked) >= target_slots:
                 break
             for slot in slots_by_day[day]:
@@ -388,7 +421,79 @@ def _pick_slots(
                     if len(picked) >= target_slots:
                         break
 
+    # Round 4: Avoid days — only if still can't fill.
+    if len(picked) < target_slots and avoid_days:
+        for day in avoid_days:
+            if len(picked) >= target_slots:
+                break
+            for slot in slots_by_day[day]:
+                if _respects_gap(slot, picked):
+                    picked.append(slot)
+                    used_dates.add(day)
+                    break
+
     # Sort final picks chronologically
+    picked.sort(key=lambda s: (s["date"], s["start"]))
+    return picked[:target_slots]
+
+
+def _pick_work_block_slots(
+    slots_by_day: dict[date, list[dict]],
+    target_slots: int,
+) -> list[dict]:
+    """Pick work block slots with preference for evenings and weekend mornings."""
+
+    def _slot_preference(slot: dict) -> tuple[int, int]:
+        """Lower = more preferred."""
+        weekday = slot["date"].weekday()
+        hour = slot["start"].hour
+        is_weekend = weekday >= 5
+
+        # Weekday evening (19:00-22:00) — best for small tasks
+        if not is_weekend and 19 <= hour < 22:
+            return (0, hour)
+        # Weekend morning (8:00-12:00) — great for large blocks
+        if is_weekend and 8 <= hour < 12:
+            return (1, hour)
+        # Saturday afternoon — good for longer work
+        if weekday == 5 and 12 <= hour < 18:
+            return (2, hour)
+        # Weekday morning/afternoon (available but less preferred)
+        if not is_weekend:
+            return (3, hour)
+        # Everything else
+        return (4, hour)
+
+    all_slots = []
+    for day_slots in slots_by_day.values():
+        all_slots.extend(day_slots)
+
+    # Sort by preference, then pick with gap enforcement
+    all_slots.sort(key=_slot_preference)
+
+    picked: list[dict] = []
+    used_dates: set[date] = set()
+
+    # First pass: different days, preferred order
+    for slot in all_slots:
+        if len(picked) >= target_slots:
+            break
+        if slot["date"] in used_dates:
+            continue
+        if _respects_gap(slot, picked):
+            picked.append(slot)
+            used_dates.add(slot["date"])
+
+    # Second pass: same day if needed
+    if len(picked) < target_slots:
+        for slot in all_slots:
+            if len(picked) >= target_slots:
+                break
+            if slot in picked:
+                continue
+            if _respects_gap(slot, picked):
+                picked.append(slot)
+
     picked.sort(key=lambda s: (s["date"], s["start"]))
     return picked[:target_slots]
 
@@ -399,27 +504,23 @@ def get_availability(
     end_date: date,
     slot_duration: int | None = None,
     num_slots: int | None = None,
+    mode: str = MODE_MEETING,
 ) -> list[dict]:
-    """Find open meeting slots across a date range.
+    """Find open slots across a date range.
 
-    Returns up to num_slots slots spread across the range, prioritizing
-    Monday first, then Wed/Thu afternoons. Uses per-day availability windows.
+    mode: "meeting" (external, per-day windows) or "work_block" (internal, full days).
 
-    If the initial range doesn't yield enough distinct-day slots, automatically
-    extends the search up to 14 days out to find slots on different days.
-
-    Each slot: {"date": date, "start": time, "end": time, "day_name": str}
+    Returns up to num_slots slots spread across the range. Each slot:
+    {"date": date, "start": time, "end": time, "day_name": str, "is_avoid_day": bool}
     """
     duration = slot_duration or config.DEFAULT_SLOT_DURATION
     target_slots = num_slots if num_slots is not None else config.DEFAULT_NUM_SLOTS
 
-    # Collect slots for the requested range
-    slots_by_day = _collect_slots_for_range(calendar_client, start_date, end_date, duration)
+    slots_by_day = _collect_slots_for_range(calendar_client, start_date, end_date, duration, mode=mode)
 
     # Check if we have enough distinct days
     distinct_days = len(slots_by_day)
     if distinct_days < target_slots:
-        # Extend search up to 14 days from start_date to find more days
         extended_end = start_date + timedelta(days=14)
         if extended_end > end_date:
             extra_slots = _collect_slots_for_range(
@@ -427,6 +528,7 @@ def get_availability(
                 end_date + timedelta(days=1),
                 extended_end,
                 duration,
+                mode=mode,
             )
             slots_by_day.update(extra_slots)
             if len(slots_by_day) > distinct_days:
@@ -438,7 +540,28 @@ def get_availability(
     if not slots_by_day:
         return []
 
-    return _pick_slots(slots_by_day, target_slots)
+    return _pick_slots(slots_by_day, target_slots, mode=mode)
+
+
+def has_avoid_day_slots(slots: list[dict]) -> bool:
+    """Check if any picked slots are on meeting-avoid days."""
+    return any(s.get("is_avoid_day") for s in slots)
+
+
+def format_avoid_day_warning(slots: list[dict]) -> str:
+    """Generate a warning string for avoid-day slots."""
+    avoid_names = set()
+    for s in slots:
+        if s.get("is_avoid_day"):
+            avoid_names.add(s["day_name"])
+    if not avoid_names:
+        return ""
+    days_str = "/".join(sorted(avoid_names))
+    return (
+        f"\u26a0\ufe0f {days_str} {'is a' if len(avoid_names) == 1 else 'are'} protected day"
+        f"{'s' if len(avoid_names) > 1 else ''}. "
+        f"Suggesting anyway because no other slots available this week. Confirm?"
+    )
 
 
 def format_slots_mattermost(
@@ -479,6 +602,10 @@ def format_slots_mattermost(
     link = booking_link or config.BOOKING_LINK
     if link:
         parts.append(f"\nBooking link: {link}")
+
+    # Avoid-day warning for meeting mode
+    if has_avoid_day_slots(slots):
+        parts.append(f"\n{format_avoid_day_warning(slots)}")
 
     if sender_email:
         parts.append(f"\nReply: `send 1,2,3` or `send all` to draft a reply. `edit` to modify. `cancel` to discard.")

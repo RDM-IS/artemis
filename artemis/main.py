@@ -14,9 +14,13 @@ from flask import Flask, request, jsonify
 
 from artemis import config
 from artemis.availability import (
+    MODE_MEETING,
+    MODE_WORK_BLOCK,
     format_slots_email,
     format_slots_mattermost,
     get_availability,
+    has_avoid_day_slots,
+    format_avoid_day_warning,
     parse_timeframe,
 )
 from artemis.briefs import handle_mention
@@ -40,6 +44,13 @@ from artemis.inbox import (
     WAITING,
 )
 from artemis.gmail import GmailClient
+from artemis.life_ops import (
+    get_db as init_life_ops_db,
+    handle_grocery_command,
+    handle_health_command,
+    handle_workout_command,
+    load_health_plan,
+)
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.quiet_hours import (
@@ -95,11 +106,11 @@ def uptime_webhook():
 
     # alertType 1 = down, 2 = up (Uptime Robot convention)
     if str(alert_type) == "1":
-        msg = f"\U0001f534 **{monitor_name}** is DOWN"
+        msg = f"\u26a0\ufe0f \U0001f534 **{monitor_name}** is DOWN"
     elif str(alert_type) == "2":
-        msg = f"\U0001f7e2 **{monitor_name}** recovered"
+        msg = f"\u26a0\ufe0f \U0001f7e2 **{monitor_name}** recovered"
     else:
-        msg = f"\u2139\ufe0f **{monitor_name}** alert (type={alert_type})"
+        msg = f"\u26a0\ufe0f **{monitor_name}** alert (type={alert_type})"
 
     if url:
         msg += f" — {url}"
@@ -921,10 +932,31 @@ def _handle_availability_command(post: dict, question: str) -> bool:
     return True
 
 
+def _detect_availability_mode(text: str) -> str:
+    """Detect whether user wants MEETING or WORK_BLOCK availability.
+
+    WORK_BLOCK keywords: "work block", "focus time", "head down", "working session",
+    "schedule time to work on", "block time", "SCORE prep", "development", "deep work"
+
+    Everything else defaults to MEETING.
+    """
+    lower = text.lower()
+    _WORK_BLOCK_KEYWORDS = [
+        "work block", "focus time", "head down", "working session",
+        "schedule time to work on", "block time", "score prep",
+        "development time", "deep work", "focus session",
+    ]
+    for kw in _WORK_BLOCK_KEYWORDS:
+        if kw in lower:
+            return MODE_WORK_BLOCK
+    return MODE_MEETING
+
+
 def _handle_availability_mention(post: dict, question: str) -> bool:
     """Handle '@artemis availability [timeframe]' or '@artemis when am I free'.
 
     Direct availability check — no email context, just shows open slots.
+    Detects MEETING vs WORK_BLOCK mode from keywords.
     """
     q_lower = question.lower().strip()
 
@@ -943,10 +975,10 @@ def _handle_availability_mention(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
         return True
 
-    # Extract timeframe from the rest of the question
+    mode = _detect_availability_mode(question)
     start_date, end_date = parse_timeframe(question)
 
-    slots = get_availability(_calendar, start_date, end_date)
+    slots = get_availability(_calendar, start_date, end_date, mode=mode)
     formatted = format_slots_mattermost(slots)
 
     if _mm:
@@ -1183,9 +1215,10 @@ def _handle_scheduling_mention(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
         return True
 
-    # Extract timeframe from the question, then look up real slots
+    # Detect mode and extract timeframe
+    mode = _detect_availability_mode(question)
     start_date, end_date = parse_timeframe(question)
-    slots = get_availability(_calendar, start_date, end_date)
+    slots = get_availability(_calendar, start_date, end_date, mode=mode)
 
     if not slots:
         reply = (
@@ -1321,6 +1354,35 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
     return False
 
 
+def _try_life_ops(question: str) -> str | None:
+    """Try workout, grocery, and health commands in order."""
+    q = question.lower()
+    if any(kw in q for kw in [
+        "workout", "let's work out", "lets work out", "bench", "squat", "rdl",
+        "sets", "reps", "lbs", "rest day", "skip today", "taking today off",
+    ]):
+        result = handle_workout_command(question)
+        if result:
+            return result
+    if any(kw in q for kw in [
+        "grocery", "shopping list", "add to list", "going to aldi",
+        "heading to aldi", "need to get", "need ", "put ", "got ",
+        "remove ", "done shopping", "finished shopping", "clear grocery",
+        "what do i need", "aldi list", "shopping at",
+    ]):
+        result = handle_grocery_command(question)
+        if result:
+            return result
+    if any(kw in q for kw in [
+        "calories", "protein", "meal prep", "sunday prep",
+        "weight goal", "daily targets", "what should i eat", "macros",
+    ]):
+        result = handle_health_command(question)
+        if result:
+            return result
+    return None
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -1427,6 +1489,12 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_convert_to_tasks(post, question):
         return
 
+    # Life ops commands (workout, grocery, health)
+    life_ops_response = _try_life_ops(question)
+    if life_ops_response and _mm:
+        _mm.post_to_channel_id(channel_id, life_ops_response, root_id=root_id)
+        return
+
     thread_lines = []
     for p in thread[-10:]:
         thread_lines.append(f"{p.get('message', '')}")
@@ -1520,11 +1588,15 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments + inbox_threads + contacts)
+    # Init databases (commitments + inbox_threads + contacts + life_ops)
     from artemis.inbox import get_db as init_inbox_db
     get_db()
     init_inbox_db()
     init_crm_db()
+    init_life_ops_db()
+
+    # Load health plan context
+    load_health_plan()
 
     # Init Mattermost with retry loop
     _mm = MattermostClient()
