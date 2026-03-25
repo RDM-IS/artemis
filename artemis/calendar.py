@@ -334,9 +334,12 @@ class CalendarClient:
             logger.exception("Failed to get event %s", event_id)
             return None
 
-    def find_event_by_name(self, name: str) -> dict | None:
-        """Search today's events for one matching name (case-insensitive)."""
-        events = self.get_today_events()
+    def find_event_by_name(self, name: str, days_ahead: int = 7) -> dict | None:
+        """Search today + days_ahead days for an event matching name (case-insensitive)."""
+        from datetime import date, timedelta
+        start = date.today()
+        end = start + timedelta(days=days_ahead)
+        events = self.get_events_in_range(start, end)
         name_lower = name.lower()
         for e in events:
             if name_lower in e["summary"].lower():

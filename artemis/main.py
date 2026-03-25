@@ -25,7 +25,7 @@ from artemis.availability import (
 )
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
-from artemis.commitments import get_db, list_commitments, get_commitments_for_client, log_calendar_action
+from artemis.commitments import add_commitment, get_db, list_commitments, get_commitments_for_client, log_calendar_action
 from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.crm_client import CRMClient
 from artemis.inbox import (
@@ -151,8 +151,12 @@ def health_check():
     })
 
 
-def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient) -> str:
-    """Build data context for an @mention response."""
+def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient, question: str = "") -> str:
+    """Build data context for an @mention response.
+
+    If the question references a multi-day timeframe, includes events for that
+    range in addition to today's calendar.
+    """
     parts = []
 
     # Time awareness
@@ -171,22 +175,31 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     except Exception:
         logger.exception("Failed to get emails for mention context")
 
-    # Today's calendar
+    # Calendar from cache
     try:
-        events = calendar.get_today_events()
+        from artemis import calendar_cache
+        from collections import defaultdict
+        from datetime import datetime as dt
+
+        events = calendar_cache.get_events()
         if events:
-            parts.append("\n**Today's calendar:**")
+            parts.append(f"\n**Calendar ({calendar_cache.status()}):**")
+            by_day: dict = defaultdict(list)
             for e in events:
-                external = [a for a in e["attendees"] if not a.get("self")]
-                if external:
-                    attendee_str = ", ".join(a["name"] or a["email"] for a in external)
-                else:
-                    attendee_str = "(solo)"
-                parts.append(f"- {e['summary']} at {e['start']} — {attendee_str}")
+                day_key = e["start"][:10]
+                by_day[day_key].append(e)
+            for day in sorted(by_day.keys()):
+                label = dt.strptime(day, "%Y-%m-%d").strftime("%a %b %-d")
+                parts.append(f"\n  {label}")
+                for e in by_day[day]:
+                    external = [a for a in e.get("attendees", []) if not a.get("self")]
+                    attendee_str = ", ".join(a.get("name") or a.get("email", "") for a in external) if external else "(solo)"
+                    time_str = e["start"][11:16] if "T" in e["start"] else "all-day"
+                    parts.append(f"  - {e['summary']} at {time_str} — {attendee_str}")
         else:
-            parts.append("\n**Today's calendar:** No events scheduled.")
+            parts.append("\n**Calendar:** No events in window.")
     except Exception:
-        logger.exception("Failed to get calendar for mention context")
+        logger.exception("Failed to build calendar context from cache")
 
     # Open commitments
     try:
@@ -447,6 +460,10 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
     if q_lower not in ("confirm", "yes", "cancel", "no"):
         return False
 
+    # Only handle calendar create types here; other types handled by their own handlers
+    if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
+        return False
+
     local_tz = ZoneInfo(config.TIMEZONE)
     data = pending["data"]
 
@@ -599,6 +616,147 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
         return True
 
     return False
+
+
+# ---------- Bulk convert work sessions to tasks ----------
+
+_CONVERT_PATTERNS = [
+    re.compile(r"convert\s+(them|these|work\s*sessions?)\s+to\s+tasks?", re.I),
+    re.compile(r"delete\s+(and|&|\+)\s+add\s+(them\s+)?as\s+tasks?", re.I),
+    re.compile(r"convert\s+to\s+tasks?", re.I),
+    re.compile(r"make\s+(them|these)\s+tasks?", re.I),
+]
+
+
+def _handle_convert_to_tasks(post: dict, question: str) -> bool:
+    """Handle bulk convert-work-sessions-to-tasks flow. Returns True if handled."""
+    q_lower = question.lower().strip()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # ---- Phase 2: confirmation of a pending bulk_convert ----
+    if channel_id in _pending_confirms:
+        pending = _pending_confirms[channel_id]
+        if pending["type"] == "bulk_convert_to_tasks":
+            if time.time() - pending["timestamp"] > 600:
+                del _pending_confirms[channel_id]
+                return False
+            if q_lower in ("yes", "confirm", "execute"):
+                events = pending["events"]
+                deleted = 0
+                added = 0
+                errors = []
+                for ev in events:
+                    ok = _calendar.delete_event(ev["event_id"])
+                    if ok:
+                        log_calendar_action(
+                            action="delete",
+                            event_id=ev["event_id"],
+                            summary=ev["summary"],
+                            user_approved=True,
+                            notes="Bulk convert to task",
+                        )
+                        deleted += 1
+                    else:
+                        errors.append(f"Failed to delete: {ev['summary']}")
+                    add_commitment(
+                        title=ev["summary"],
+                        due_date="",
+                        effort_days=2,
+                    )
+                    added += 1
+                del _pending_confirms[channel_id]
+                parts = [f":white_check_mark: Deleted {deleted} event(s), added {added} task(s)."]
+                if errors:
+                    parts.append("\n".join(errors))
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, "\n".join(parts), root_id=root_id)
+                return True
+            if q_lower in ("no", "cancel"):
+                del _pending_confirms[channel_id]
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, "Bulk convert cancelled.", root_id=root_id)
+                return True
+            # Not a yes/no — fall through so other handlers can try
+            return False
+
+    # ---- Phase 1: detect convert intent ----
+    if not any(p.search(question) for p in _CONVERT_PATTERNS):
+        return False
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Extract event names from the thread context (look for quoted or listed items)
+    # Also search for "work session" events in the next 14 days as a fallback
+    summaries: list[str] = []
+
+    # Try to pull names from the message (e.g., lines starting with bullet/dash/number)
+    for line in question.split("\n"):
+        line = line.strip().lstrip("-*•0123456789.) ").strip()
+        if line and line.lower() not in (
+            "convert them to tasks",
+            "convert these to tasks",
+            "convert to tasks",
+            "delete and add as tasks",
+        ):
+            summaries.append(line)
+
+    # Fallback: search for "work session" events in the next 14 days
+    if not summaries:
+        from datetime import date, timedelta
+        start = date.today()
+        end = start + timedelta(days=14)
+        all_events = _calendar.get_events_in_range(start, end)
+        for ev in all_events:
+            if "work session" in ev["summary"].lower():
+                summaries.append(ev["summary"])
+
+    if not summaries:
+        if _mm:
+            _mm.post_to_channel_id(
+                channel_id,
+                "I didn't find any work session events to convert. "
+                "List the event names or I'll look for events with 'Work Session' in the title.",
+                root_id=root_id,
+            )
+        return True
+
+    # Look up each event
+    found_events = []
+    not_found = []
+    for name in summaries:
+        ev = _calendar.find_event_by_name(name, days_ahead=14)
+        if ev:
+            found_events.append({"event_id": ev["id"], "summary": ev["summary"], "start": ev["start"]})
+        else:
+            not_found.append(name)
+
+    if not found_events:
+        msg = "No matching calendar events found for:\n" + "\n".join(f"- {n}" for n in not_found)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, msg, root_id=root_id)
+        return True
+
+    # Store pending and show confirmation
+    _pending_confirms[channel_id] = {
+        "type": "bulk_convert_to_tasks",
+        "events": found_events,
+        "timestamp": time.time(),
+    }
+
+    lines = ["**Ready to execute:**"]
+    lines.append(f"- Delete **{len(found_events)}** Work Session event(s) from calendar :white_check_mark:")
+    lines.append(f"- Add **{len(found_events)}** commitment(s) to task list :white_check_mark:")
+    if not_found:
+        lines.append(f"\n:warning: Not found (skipped): {', '.join(not_found)}")
+    lines.append("\nReply **yes** to confirm all.")
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+    return True
 
 
 def _handle_availability_command(post: dict, question: str) -> bool:
@@ -871,6 +1029,114 @@ def _handle_timezone_command(post: dict, question: str) -> bool:
             return True
 
     return False
+
+
+def _handle_calendar_view_mention(post: dict, question: str) -> bool:
+    """Handle requests to VIEW scheduled events (not find open slots).
+
+    Patterns: "what's on my calendar", "show me my calendar", "events this week",
+    "do you see my calendar", "calendar tomorrow", "show events through Friday", etc.
+
+    Returns True if handled.
+    """
+    q_lower = question.lower().strip()
+
+    # Calendar view intent patterns
+    _VIEW_PATTERNS = [
+        r"\b(show|see|view|display|pull up|check)\s+(me\s+)?(my\s+)?(calendar|events|schedule|sessions|meetings)",
+        r"\bwhat.?s?\s+on\s+(my\s+)?(calendar|schedule)",
+        r"\bdo\s+you\s+see\s+(my\s+)?(calendar|events|schedule|sessions|work\s+sessions|meetings)",
+        r"^(calendar|events|meetings|schedule)\b",
+        r"\b(my\s+)?(calendar|events|meetings)\s+(for|this|next|tomorrow|today)",
+    ]
+
+    is_view = False
+    for pattern in _VIEW_PATTERNS:
+        if re.search(pattern, q_lower):
+            is_view = True
+            break
+
+    if not is_view:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    if not _calendar or not _calendar.service:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Calendar not connected.", root_id=root_id)
+        return True
+
+    # Parse timeframe from the question (defaults to next 5 business days)
+    start_date, end_date = parse_timeframe(question)
+
+    # For bare "calendar" / "events" with no timeframe hint, default to today
+    bare_match = re.match(r"^(calendar|events|meetings|schedule|my calendar|my events)$", q_lower)
+    if bare_match:
+        from datetime import date as _date
+        start_date = _date.today()
+        end_date = _date.today()
+
+    events = _calendar.get_events_in_range(start_date, end_date)
+
+    if not events:
+        date_range_str = _format_date_range(start_date, end_date)
+        reply = f":calendar: No events scheduled {date_range_str}."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    # Group events by day
+    from collections import defaultdict
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for e in events:
+        start_str = e.get("start", "")
+        try:
+            ev_start = datetime.fromisoformat(start_str)
+            day_key = ev_start.strftime("%a %b %d")
+            time_str = ev_start.strftime("%I:%M %p").lstrip("0")
+        except (ValueError, TypeError):
+            # All-day events — just a date string like "2026-03-20"
+            try:
+                from datetime import date as _date
+                d = _date.fromisoformat(start_str)
+                day_key = d.strftime("%a %b %d")
+                time_str = "all day"
+            except (ValueError, TypeError):
+                day_key = "Unknown"
+                time_str = ""
+
+        by_day[day_key].append({
+            "summary": e.get("summary", "(no title)"),
+            "time": time_str,
+            "attendees": e.get("attendees", []),
+        })
+
+    # Format response
+    lines = [":calendar: **Scheduled events:**"]
+    for day_label, day_events in by_day.items():
+        lines.append(f"\n**{day_label}**")
+        for ev in day_events:
+            external = [a for a in ev["attendees"] if not a.get("self")]
+            if external:
+                attendee_str = " — " + ", ".join(
+                    a.get("name") or a.get("email", "") for a in external
+                )
+            else:
+                attendee_str = ""
+            lines.append(f"- {ev['summary']} at {ev['time']}{attendee_str}")
+
+    reply = "\n".join(lines)
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _format_date_range(start_date, end_date) -> str:
+    """Format a date range for display (e.g., 'Thu Mar 20 – Fri Mar 21')."""
+    if start_date == end_date:
+        return f"on {start_date.strftime('%a %b %d')}"
+    return f"{start_date.strftime('%a %b %d')} – {end_date.strftime('%a %b %d')}"
 
 
 def _handle_scheduling_mention(post: dict, question: str) -> bool:
@@ -1186,6 +1452,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_timezone_command(post, question):
         return
 
+    # Calendar view: "what's on my calendar", "show events", "calendar this week"
+    if _handle_calendar_view_mention(post, question):
+        return
+
     # Scheduling intent detection (real slots, never vague language)
     if _handle_scheduling_mention(post, question):
         return
@@ -1198,6 +1468,11 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_delete_event(post, question):
         return
 
+    # Bulk convert work sessions to tasks
+    if _handle_convert_to_tasks(post, question):
+        return
+
+
     # Life ops commands (workout, grocery, health)
     life_ops_response = _try_life_ops(question)
     if life_ops_response and _mm:
@@ -1209,7 +1484,7 @@ def _handle_mention(post: dict, thread: list[dict]):
         thread_lines.append(f"{p.get('message', '')}")
     thread_context = "\n".join(thread_lines)
 
-    data_context = _build_mention_context(post, _gmail, _calendar)
+    data_context = _build_mention_context(post, _gmail, _calendar, question=question)
 
     response = handle_mention(question, thread_context, data_context)
     if response and _mm:
@@ -1329,6 +1604,12 @@ def main():
         _calendar.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Calendar authentication failed — calendar features disabled")
+
+    # Load calendar cache on boot
+    if _calendar and _calendar.service:
+        from artemis import calendar_cache
+        calendar_cache.refresh(_calendar)
+        logger.info(calendar_cache.status())
 
     # Register @mention handler
     _mm.on_mention(_handle_mention)
