@@ -64,6 +64,10 @@ STARTUP_RETRY_DELAY = int(os.environ.get("STARTUP_RETRY_DELAY", "15"))
 # Tailscale
 TAILSCALE_HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "")
 
+# CRM API
+CRM_API_URL = os.environ.get("CRM_API_URL", "")
+CRM_API_KEY = os.environ.get("CRM_API_KEY", "")
+
 # Playbooks
 PLAYBOOKS_PATH = Path(os.environ.get("PLAYBOOKS_PATH", "PLAYBOOKS.md"))
 

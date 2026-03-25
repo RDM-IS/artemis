@@ -27,6 +27,7 @@ from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
 from artemis.commitments import get_db, list_commitments, get_commitments_for_client, log_calendar_action
 from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
+from artemis.crm_client import CRMClient
 from artemis.inbox import (
     format_inbox_status,
     format_snoozed_list,
@@ -1131,6 +1132,20 @@ def _handle_mention(post: dict, thread: list[dict]):
     if q_lower == "leads":
         leads = list_contacts(status="lead")
         reply = format_contacts_list(leads)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "crm status":
+        crm = CRMClient()
+        if crm.is_available():
+            try:
+                reply = crm.format_status()
+            except Exception:
+                logger.exception("CRM status fetch failed")
+                reply = "\u26a0\ufe0f CRM API error — check logs."
+        else:
+            reply = "CRM API not configured (CRM_API_URL / CRM_API_KEY not set)."
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
