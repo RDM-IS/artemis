@@ -42,6 +42,7 @@ from artemis.monitors import (
     format_ssl_alerts,
 )
 from artemis.prompts import UNTRUSTED_PREFIX
+from artemis.crm_client import CRMClient
 from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ class ArtemisScheduler:
         self.mm = mm
         self.gmail = gmail
         self.calendar = calendar
+        self.crm = CRMClient()
         self.scheduler = BackgroundScheduler()
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
@@ -477,17 +479,39 @@ class ArtemisScheduler:
                     lines.append(f"- {e['summary']} at {e['start'][:16]} (solo)")
                 meetings_text = "\n".join(lines) if lines else "No meetings in next 3 days."
 
-            # Commitments due soon
-            due_soon = get_due_soon(days=3)
-            start_alerts = get_start_alerts()
+            # Commitments due soon — try CRM API first, fall back to SQLite
             commitment_lines = []
-            for c in due_soon:
-                commitment_lines.append(f"- **{c['title']}** due {c['due_date']} (client: {c['client'] or 'n/a'})")
-            for c in start_alerts:
-                if c["id"] not in {d["id"] for d in due_soon}:
-                    commitment_lines.append(
-                        f"- **{c['title']}** due {c['due_date']} — needs {c['effort_days']}d effort, start now!"
-                    )
+            if self.crm.is_available():
+                try:
+                    open_commitments = self.crm.get_commitments(status="open")
+                    today = date.today()
+                    for c in open_commitments:
+                        due_str = c.get("due_date", "")
+                        if not due_str:
+                            continue
+                        try:
+                            due = date.fromisoformat(due_str[:10])
+                        except ValueError:
+                            continue
+                        days_left = (due - today).days
+                        desc = c.get("description", c.get("title", ""))
+                        client = c.get("client", c.get("contact_name", "n/a"))
+                        if days_left <= 3:
+                            commitment_lines.append(f"- **{desc}** due {due_str[:10]} (client: {client})")
+                except Exception:
+                    logger.warning("CRM API failed for morning brief commitments — falling back to SQLite")
+                    commitment_lines = []
+
+            if not commitment_lines:
+                due_soon = get_due_soon(days=3)
+                start_alerts = get_start_alerts()
+                for c in due_soon:
+                    commitment_lines.append(f"- **{c['title']}** due {c['due_date']} (client: {c['client'] or 'n/a'})")
+                for c in start_alerts:
+                    if c["id"] not in {d["id"] for d in due_soon}:
+                        commitment_lines.append(
+                            f"- **{c['title']}** due {c['due_date']} — needs {c['effort_days']}d effort, start now!"
+                        )
             commitments_text = "\n".join(commitment_lines) if commitment_lines else "No commitments due soon."
 
             # Top inbox items
@@ -709,12 +733,25 @@ class ArtemisScheduler:
         )
 
         nbd = next_business_day()
-        add_commitment(
-            title=f"Follow up with {sender_name} re: demo access",
-            due_date=nbd.isoformat(),
-            effort_days=1,
-            client=company,
-        )
+
+        # Create commitment via CRM API if available, else SQLite
+        commitment_title = f"Follow up with {sender_name} re: demo access"
+        if self.crm.is_available():
+            try:
+                contact = self.crm.find_contact_by_email(sender_email)
+                contact_id = contact.get("id") if contact else None
+                self.crm.create_commitment({
+                    "description": commitment_title,
+                    "due_date": nbd.isoformat(),
+                    "contact_id": contact_id,
+                    "status": "open",
+                })
+                logger.info("PB-001: Created CRM commitment for %s", sender_name)
+            except Exception:
+                logger.warning("CRM commitment creation failed — falling back to SQLite")
+                add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
+        else:
+            add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
 
         self.mm.post_message(
             config.CHANNEL_OPS,
@@ -732,18 +769,33 @@ class ArtemisScheduler:
         # Default due date: 5 days from now
         due = (date.today() + timedelta(days=5)).isoformat()
 
-        add_commitment(
-            title=f"Follow up: {summary[:80]}",
-            due_date=due,
-            effort_days=2,
-            client=company,
-        )
-        add_commitment(
-            title=f"Send deliverables to {sender_name}",
-            due_date=due,
-            effort_days=1,
-            client=company,
-        )
+        followup_title = f"Follow up: {summary[:80]}"
+        deliver_title = f"Send deliverables to {sender_name}"
+
+        if self.crm.is_available():
+            try:
+                contact = self.crm.find_contact_by_email(sender_email)
+                contact_id = contact.get("id") if contact else None
+                self.crm.create_commitment({
+                    "description": followup_title,
+                    "due_date": due,
+                    "contact_id": contact_id,
+                    "status": "open",
+                })
+                self.crm.create_commitment({
+                    "description": deliver_title,
+                    "due_date": due,
+                    "contact_id": contact_id,
+                    "status": "open",
+                })
+                logger.info("PB-002: Created CRM commitments for %s", sender_name)
+            except Exception:
+                logger.warning("CRM commitment creation failed — falling back to SQLite")
+                add_commitment(title=followup_title, due_date=due, effort_days=2, client=company)
+                add_commitment(title=deliver_title, due_date=due, effort_days=1, client=company)
+        else:
+            add_commitment(title=followup_title, due_date=due, effort_days=2, client=company)
+            add_commitment(title=deliver_title, due_date=due, effort_days=1, client=company)
 
         self.mm.post_message(
             config.CHANNEL_COMMITMENTS,
@@ -884,7 +936,28 @@ class ArtemisScheduler:
         if self._is_quiet():
             return
         try:
-            active = list_commitments(status="active")
+            # Try CRM API first, fall back to SQLite
+            active = None
+            if self.crm.is_available():
+                try:
+                    crm_commitments = self.crm.get_commitments(status="open")
+                    # Normalize CRM fields to match SQLite shape
+                    active = []
+                    for c in crm_commitments:
+                        active.append({
+                            "id": c.get("id", ""),
+                            "title": c.get("description", c.get("title", "")),
+                            "due_date": (c.get("due_date", "") or "")[:10],
+                            "effort_days": c.get("effort_days", 1),
+                            "client": c.get("client", c.get("contact_name", "")),
+                            "status": c.get("status", "active"),
+                        })
+                except Exception:
+                    logger.warning("CRM API failed for commitment reminders — falling back to SQLite")
+                    active = None
+
+            if active is None:
+                active = list_commitments(status="active")
             today = date.today()
 
             for c in active:
