@@ -34,8 +34,23 @@ class CRMClient:
     # Base request handler
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _ensure_trailing_slash(path: str) -> str:
+        """Add trailing slash to collection endpoints (API Gateway requirement).
+
+        Collection paths like /organizations need a trailing slash.
+        Item paths like /organizations/{id} and /health do not.
+        """
+        if path.endswith("/"):
+            return path
+        segments = path.rstrip("/").split("/")
+        if len(segments) == 2 and segments[1] not in ("health",):
+            return path + "/"
+        return path
+
     def _request(self, method: str, path: str, **kwargs) -> dict | list | None:
         """Make an authenticated request. Returns parsed JSON or None on failure."""
+        path = self._ensure_trailing_slash(path)
         url = f"{self.base_url}{path}"
         try:
             resp = requests.request(
