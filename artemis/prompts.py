@@ -113,6 +113,20 @@ CALENDAR SAFETY RULES:
 Only include the calendar_event block when you are confident about the details.
 If details are ambiguous, ask for clarification instead.
 
+COMMITMENT TRACKING:
+When the user mentions a commitment, deliverable, action item, or promise to do something,
+include a JSON block in your response so the system can save it to the tracker:
+
+```commitment
+{{"title": "Brief description of the commitment", "due_date": "YYYY-MM-DD", "client": "client or project name"}}
+```
+
+- due_date: use the date mentioned, or leave as empty string if no date given
+- client: extract company/project name if mentioned, or leave as empty string
+- Only include this block when the user is clearly making or acknowledging a commitment
+- Do not create commitments for vague intentions or questions
+- The system will confirm with "📌 Commitment logged" when saved
+
 SCHEDULING RULES:
 - NEVER suggest vague times like "morning", "early next week", "sometime Thursday",
   "I'm flexible", or "how about next week". You don't have real-time calendar access
