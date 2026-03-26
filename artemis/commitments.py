@@ -1,7 +1,9 @@
 """SQLite-backed commitment tracker with CLI."""
 
 import argparse
+import difflib
 import logging
+import re
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -189,6 +191,121 @@ def get_commitments_for_client(
         (f"%{client}%",),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Schema migration — add closed_at if missing
+# ---------------------------------------------------------------------------
+
+def _migrate_closed_at(db: sqlite3.Connection) -> None:
+    """Add closed_at column to commitments table if it doesn't exist."""
+    try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(commitments)").fetchall()}
+        if "closed_at" not in cols:
+            db.execute("ALTER TABLE commitments ADD COLUMN closed_at TEXT")
+            db.commit()
+            logger.info("Migration: added closed_at column to commitments table")
+    except Exception:
+        logger.exception("Migration failed for closed_at column")
+
+
+# ---------------------------------------------------------------------------
+# Close commitment with fuzzy matching
+# ---------------------------------------------------------------------------
+
+def close_commitment(
+    title_query: str, db: sqlite3.Connection | None = None
+) -> dict:
+    """Close a commitment by fuzzy-matching the title.
+
+    Returns a result dict:
+      {"status": "closed", "title": str, "id": int}
+      {"status": "ambiguous", "matches": list[dict]}
+      {"status": "not_found", "open": list[dict]}
+    """
+    conn = db or get_db()
+    _migrate_closed_at(conn)
+
+    open_commitments = list_commitments(status="active", db=conn)
+    if not open_commitments:
+        return {"status": "not_found", "open": []}
+
+    titles = [c["title"] for c in open_commitments]
+    matches = difflib.get_close_matches(title_query, titles, n=5, cutoff=0.6)
+
+    if len(matches) == 1:
+        matched_title = matches[0]
+        matched = next(c for c in open_commitments if c["title"] == matched_title)
+        conn.execute(
+            "UPDATE commitments SET status = 'closed', closed_at = datetime('now') WHERE id = ?",
+            (matched["id"],),
+        )
+        conn.commit()
+        logger.info("Closed commitment #%d: %s", matched["id"], matched_title)
+        return {"status": "closed", "title": matched_title, "id": matched["id"]}
+
+    if len(matches) > 1:
+        matched_items = [c for c in open_commitments if c["title"] in matches]
+        return {"status": "ambiguous", "matches": matched_items}
+
+    return {"status": "not_found", "open": open_commitments}
+
+
+def format_close_result(result: dict) -> str:
+    """Format the close_commitment result for Mattermost."""
+    if result["status"] == "closed":
+        return f"\u2705 Commitment closed: *{result['title']}*"
+
+    if result["status"] == "ambiguous":
+        lines = ["Found multiple matches \u2014 which did you mean?"]
+        for i, c in enumerate(result["matches"], 1):
+            lines.append(f"{i}. {c['title']}")
+        return "\n".join(lines)
+
+    # not_found
+    open_items = result.get("open", [])
+    if not open_items:
+        return "No open commitments."
+    lines = ["No match found. Open commitments:"]
+    for c in open_items:
+        lines.append(f"\u2022 {c['title']}")
+    return "\n".join(lines)
+
+
+def format_commitments_list(commitments: list[dict]) -> str:
+    """Format a list of commitments for Mattermost."""
+    if not commitments:
+        return "No open commitments."
+    lines = [f"\u2705 **Open commitments ({len(commitments)}):**"]
+    for c in commitments:
+        created = c.get("created_at", "")[:10]
+        client = c.get("client", "")
+        client_str = f" ({client})" if client else ""
+        lines.append(f"\u2022 **{c['title']}**{client_str} \u2014 due {c['due_date']}, created {created}")
+    return "\n".join(lines)
+
+
+def parse_close_title(text: str) -> str | None:
+    """Extract a title from 'close commitment "TITLE"' or 'close "TITLE"'.
+
+    Also handles without quotes: 'close commitment TITLE'.
+    Returns the extracted title or None.
+    """
+    # Try quoted extraction first
+    m = re.search(r'close\s+(?:commitment\s+)?"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Try unquoted: everything after 'close commitment' or 'close'
+    m = re.search(r'close\s+commitment\s+(.+)', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'close\s+(.+)', text, re.IGNORECASE)
+    if m:
+        val = m.group(1).strip()
+        # Don't match bare 'close' with no argument
+        if val and val.lower() not in ("commitment", "commitments"):
+            return val
+    return None
 
 
 def log_claude_call(

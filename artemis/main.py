@@ -25,7 +25,17 @@ from artemis.availability import (
 )
 from artemis.briefs import handle_mention
 from artemis.calendar import CalendarClient
-from artemis.commitments import add_commitment, get_db, list_commitments, get_commitments_for_client, log_calendar_action
+from artemis.commitments import (
+    add_commitment,
+    close_commitment,
+    format_close_result,
+    format_commitments_list,
+    get_db,
+    list_commitments,
+    get_commitments_for_client,
+    log_calendar_action,
+    parse_close_title,
+)
 from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.crm_client import CRMClient
 from artemis.inbox import (
@@ -1412,6 +1422,24 @@ def _handle_mention(post: dict, thread: list[dict]):
                 reply = "\u26a0\ufe0f CRM API error — check logs."
         else:
             reply = "CRM API not configured (CRM_API_URL / CRM_API_KEY not set)."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower in ("list commitments", "commitments", "open commitments"):
+        open_items = list_commitments(status="active")
+        reply = format_commitments_list(open_items)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower.startswith("close "):
+        title = parse_close_title(question)
+        if title:
+            result = close_commitment(title)
+            reply = format_close_result(result)
+        else:
+            reply = 'Usage: `close commitment "Title"` or `close "Title"`'
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
