@@ -41,13 +41,9 @@ class CRMClient:
         Collection paths like /organizations need a trailing slash.
         Item paths like /organizations/{id} and /health do not.
         """
-        # Skip paths that already end with / or target a specific resource by ID
         if path.endswith("/"):
             return path
-        # Split into segments: e.g. "/contacts/abc-123" → ["", "contacts", "abc-123"]
         segments = path.rstrip("/").split("/")
-        # If last segment looks like a UUID or specific resource ID, leave it alone
-        # Collection endpoints have exactly one segment after the leading slash
         if len(segments) == 2 and segments[1] not in ("health",):
             return path + "/"
         return path
