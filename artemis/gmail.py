@@ -169,40 +169,66 @@ class GmailClient:
                 .execute()
             )
             body = self._extract_body(msg.get("payload", {}))
-            return body[:10_000]
+            truncated = body[:10_000]
+            logger.debug(
+                "get_full_message(%s): extracted %d chars (truncated to %d)",
+                message_id, len(body), len(truncated),
+            )
+            return truncated
         except Exception:
             logger.exception("Failed to get full message %s", message_id)
             return ""
 
     @staticmethod
     def _extract_body(payload: dict) -> str:
-        """Walk a Gmail payload tree and return the best text body."""
-        # Collect candidate parts
+        """Walk a Gmail payload tree and return the best text body.
+
+        Handles:
+        - Multipart messages: recurses into parts, prefers text/plain over text/html
+        - Single-part messages: reads body.data directly from the root payload
+        - Strips excessive whitespace while preserving paragraph breaks
+        """
         plain_parts: list[str] = []
         html_parts: list[str] = []
 
         def _walk(part: dict) -> None:
             mime = part.get("mimeType", "")
-            if mime == "text/plain":
-                data = part.get("body", {}).get("data", "")
-                if data:
-                    plain_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
-            elif mime == "text/html":
-                data = part.get("body", {}).get("data", "")
-                if data:
-                    html_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
+            data = part.get("body", {}).get("data", "")
+
+            if mime == "text/plain" and data:
+                plain_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
+            elif mime == "text/html" and data:
+                html_parts.append(base64.urlsafe_b64decode(data).decode("utf-8", errors="replace"))
+
             for sub in part.get("parts", []):
                 _walk(sub)
 
         _walk(payload)
 
+        # Fallback: single-part message where body.data is on the root
+        # but mimeType is not text/plain or text/html (rare edge case)
+        if not plain_parts and not html_parts:
+            root_data = payload.get("body", {}).get("data", "")
+            if root_data:
+                try:
+                    decoded = base64.urlsafe_b64decode(root_data).decode("utf-8", errors="replace")
+                    plain_parts.append(decoded)
+                except Exception:
+                    pass
+
         if plain_parts:
-            return "\n".join(plain_parts)
+            text = "\n".join(plain_parts)
+        elif html_parts:
+            text = GmailClient._strip_html("\n".join(html_parts))
+        else:
+            return ""
 
-        if html_parts:
-            return GmailClient._strip_html("\n".join(html_parts))
+        # Normalize whitespace: collapse runs of spaces/tabs, preserve paragraph breaks
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
 
-        return ""
+        return text
 
     @staticmethod
     def _strip_html(raw_html: str) -> str:
