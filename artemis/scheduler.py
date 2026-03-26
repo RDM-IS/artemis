@@ -42,6 +42,11 @@ from artemis.monitors import (
     format_ssl_alerts,
 )
 from artemis.prompts import UNTRUSTED_PREFIX
+from artemis.billing import (
+    check_billing_scopes,
+    get_billing_messages,
+    process_billing_message,
+)
 from artemis.crm_client import CRMClient
 from artemis.utils import next_business_day
 
@@ -168,6 +173,16 @@ class ArtemisScheduler:
             self.job_commitment_reminders, "cron", hour=8, minute=15, day_of_week="mon-fri",
             id="commitment_reminders",
         )
+
+        # PB-007: Billing intake — every 15 minutes (check for billing-labeled emails)
+        scopes_ok, missing = check_billing_scopes()
+        if scopes_ok:
+            self.scheduler.add_job(
+                self.job_billing_intake, "interval", minutes=15, id="billing_intake",
+            )
+            logger.info("PB-007 billing intake enabled")
+        else:
+            logger.warning("PB-007 billing intake disabled — missing scopes: %s", missing)
 
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
@@ -703,6 +718,9 @@ class ArtemisScheduler:
                 self._run_pb004_meeting_request(msg, triage_item)
             elif playbook_id == "PB-006":
                 self._run_pb006_availability(msg, triage_item)
+            elif playbook_id == "PB-007":
+                # PB-007 runs on its own schedule via label scanning, not triage
+                logger.debug("PB-007 matched in triage — handled by billing_intake job")
             else:
                 logger.warning("Unknown playbook ID: %s", playbook_id)
                 return
@@ -994,6 +1012,45 @@ class ArtemisScheduler:
 
         except Exception:
             logger.exception("Commitment reminder chain failed")
+
+    def job_billing_intake(self):
+        """PB-007: Scan for billing-labeled emails and process them."""
+        if self._is_quiet():
+            return
+        try:
+            message_ids = get_billing_messages(self.gmail)
+            if not message_ids:
+                return
+
+            logger.info("PB-007: Found %d unprocessed billing email(s)", len(message_ids))
+            for msg_id in message_ids:
+                try:
+                    result = process_billing_message(
+                        self.gmail, msg_id, mm_client=self.mm
+                    )
+                    if result.get("success"):
+                        logger.info(
+                            "PB-007: Processed billing email — %s (%s)",
+                            result.get("subject", "?"), result.get("amount", "no amount"),
+                        )
+                    else:
+                        logger.error(
+                            "PB-007: Failed to process %s — %s",
+                            msg_id, result.get("error", "unknown"),
+                        )
+                except Exception:
+                    logger.exception("PB-007: Error processing billing message %s", msg_id)
+                    # Post failure alert — never silently drop an expense
+                    try:
+                        self.mm.post_message(
+                            config.CHANNEL_OPS,
+                            f"\u26a0\ufe0f PB-007 billing intake failed on message {msg_id[:12]}… "
+                            f"— check logs. Email NOT processed.",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("PB-007 billing intake job failed")
 
     def job_quiet_hours_start(self):
         """Enter quiet hours and announce."""

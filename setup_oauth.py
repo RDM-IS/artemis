@@ -20,6 +20,9 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
+    # PB-007: Billing intake — Drive uploads and Sheets logging
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 CALENDAR_SCOPES = [

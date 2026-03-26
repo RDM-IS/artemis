@@ -93,3 +93,43 @@
    - Send reply via Gmail API
    - Mark original email as WAITING in inbox zero
 7. NEVER auto-reply — all sends require explicit user confirmation
+
+## PB-007: Billing Intake
+
+**Trigger:** Email has Gmail label "artemis/billing" (applied to emails
+arriving at billing@rdm.is)
+
+**OAuth Requirements:** drive.file, spreadsheets scopes (added to
+setup_oauth.py — re-run if missing)
+
+**Actions:**
+1. Fetch full email body and all attachments via Gmail API
+2. Extract: sender name, sender domain, subject, date, dollar amounts
+   (regex: `\$[\d,]+\.?\d*` or `[\d,]+\.\d{2}`)
+3. Classify expense category by keyword matching on subject + sender:
+   - Infrastructure (AWS, Azure, etc.)
+   - SaaS / Software (GitHub, Notion, Anthropic, etc.)
+   - Legal, Insurance, Hardware, Sales & Outreach, or Misc
+4. For each attachment (PDF, PNG, JPG, XLSX):
+   a. Upload to Google Drive (RDMIS/Expenses/2026/)
+   b. Set sharing to "anyone with link can view"
+   c. Collect shareable link
+   If no attachment: generate Gmail deep link
+5. Append row to expense tracking Google Sheet:
+   [Date, Vendor, Description, Category, Amount, Payment Method,
+    Founder Loan?, Reimbursed?, Reimbursed Date, Document Link, Notes]
+   - Founder Loan = "Yes" by default (pre-MSA)
+   - Notes = "Auto-logged by Artemis. Review required." if uncertain
+6. Mark message ID as processed in SQLite (prevents re-processing)
+7. Post to #artemis-ryan:
+   📄 Billing intake logged — sender, amount, category, attachment link
+   React with ✅ if correct or reply to correct fields
+
+**Error Handling:**
+- Drive upload fails → use Gmail link instead, flag in Notes
+- Sheets append fails → post all data to Mattermost for manual entry
+- Multiple amounts found → use largest, note all in Notes field
+- Never silently drop an expense
+
+**Testing:** `python -m artemis.test_billing --dry-run` (no writes)
+**Unit tests:** `python -m artemis.test_billing --unit`
