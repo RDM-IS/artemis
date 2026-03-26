@@ -161,6 +161,9 @@ class GmailClient:
         """
         if not self.service:
             return ""
+        if not self._refresh_if_needed():
+            logger.warning("get_full_message: token refresh failed")
+            return ""
         try:
             msg = (
                 self.service.users()
@@ -170,10 +173,7 @@ class GmailClient:
             )
             body = self._extract_body(msg.get("payload", {}))
             truncated = body[:10_000]
-            logger.debug(
-                "get_full_message(%s): extracted %d chars (truncated to %d)",
-                message_id, len(body), len(truncated),
-            )
+            logger.info("Fetched full body: %d chars (msg %s)", len(truncated), message_id)
             return truncated
         except Exception:
             logger.exception("Failed to get full message %s", message_id)
@@ -466,6 +466,6 @@ class GmailClient:
                 f"From: {msg['from']}\n"
                 f"Subject: {msg['subject']}\n"
                 f"Date: {msg['date']}\n"
-                f"Preview: {msg['snippet']}\n"
+                f"Preview: {msg.get('full_body', msg.get('snippet', ''))[:500]}\n"
             )
         return UNTRUSTED_PREFIX + "\n---\n".join(parts)
