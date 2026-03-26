@@ -225,6 +225,60 @@ def extract_headers(message: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Forwarded email vendor extraction
+# ---------------------------------------------------------------------------
+
+_FORWARDED_FROM_RE = re.compile(
+    r"From:\s*([^\n<]+)?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+)",
+    re.IGNORECASE,
+)
+
+# Subdomains to strip when deriving vendor name from domain
+_STRIP_SUBDOMAINS = {"mg", "mail", "email", "e", "noreply", "billing", "notifications", "notify"}
+
+
+def _vendor_from_domain(domain: str) -> str:
+    """Derive a clean vendor name from an email domain.
+
+    'mg.github.com' → 'GitHub', 'billing.anthropic.com' → 'Anthropic'
+    """
+    parts = domain.lower().split(".")
+    # Strip known non-brand subdomains and TLD
+    if len(parts) >= 3:
+        brand_parts = [p for p in parts[:-1] if p not in _STRIP_SUBDOMAINS]
+        if brand_parts:
+            return brand_parts[-1].title()
+    # Two-part domain: just use the name portion
+    if len(parts) >= 2:
+        return parts[-2].title()
+    return domain.title()
+
+
+def extract_forwarded_vendor(subject: str, body_text: str, fallback_name: str, fallback_domain: str) -> str:
+    """Extract the original vendor from a forwarded email.
+
+    If the subject starts with Fwd:/FW:, searches the body for the original
+    'From:' line and extracts the vendor name. Falls back to the envelope sender.
+    """
+    if not re.match(r"^(fwd?|fw)\s*:", subject, re.IGNORECASE):
+        return fallback_name or _vendor_from_domain(fallback_domain)
+
+    m = _FORWARDED_FROM_RE.search(body_text)
+    if m:
+        display_name = (m.group(1) or "").strip().strip('"')
+        email_addr = m.group(2)
+        if display_name:
+            return display_name
+        # No display name — derive from email domain
+        if "@" in email_addr:
+            domain = email_addr.split("@")[1]
+            return _vendor_from_domain(domain)
+
+    # No original From found — fall back to envelope sender
+    return fallback_name or _vendor_from_domain(fallback_domain)
+
+
+# ---------------------------------------------------------------------------
 # Main processing function
 # ---------------------------------------------------------------------------
 
@@ -274,12 +328,20 @@ def process_billing_message(
     body_text = gmail_client._extract_body(msg.get("payload", {}))
     combined_text = f"{subject} {body_text}"
     amount_str, all_amounts = best_amount(combined_text)
-    category = classify_category(subject, sender_full)
+
+    # Vendor extraction: handle forwarded emails
+    vendor = extract_forwarded_vendor(subject, body_text, sender_name, sender_domain)
+    category = classify_category(subject, f"{sender_full} {vendor}")
+
+    # Founder Loan detection
+    founder_loan_explicit = bool(re.search(r"founder\s+loan", combined_text, re.IGNORECASE))
 
     result.update({
         "amount": amount_str,
         "all_amounts": all_amounts,
         "category": category,
+        "vendor": vendor,
+        "founder_loan_explicit": founder_loan_explicit,
     })
 
     # 3. Process attachments
@@ -324,6 +386,8 @@ def process_billing_message(
         notes_parts.append("No attachment — Gmail link used")
     if not drive_links and attachments:
         notes_parts.append("Drive upload failed — Gmail link used")
+    if founder_loan_explicit:
+        notes_parts.append("Founder Loan flagged in email.")
     if notes_parts:
         notes = "Auto-logged by Artemis. Review required. " + "; ".join(notes_parts)
     else:
@@ -334,7 +398,7 @@ def process_billing_message(
     # 5. Append to Sheets
     row = {
         "date": date.today().strftime("%m/%d/%Y"),
-        "vendor": sender_name or sender_domain,
+        "vendor": vendor,
         "description": subject,
         "category": category,
         "amount": amount_str,
