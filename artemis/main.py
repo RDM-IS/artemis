@@ -452,6 +452,53 @@ def _process_calendar_events(response: str, channel_id: str = "") -> str:
     return response
 
 
+def _process_commitments(response: str, channel_id: str = "") -> str:
+    """Parse commitment blocks from Claude's response and save to SQLite.
+
+    Format: ```commitment\n{"title": "...", "due_date": "...", "client": "..."}\n```
+    Returns the response with blocks replaced by confirmation messages.
+    """
+    pattern = r"```commitment\s*\n(.*?)\n```"
+    matches = list(re.finditer(pattern, response, re.DOTALL))
+    if not matches:
+        return response
+
+    for match in reversed(matches):
+        try:
+            data = json.loads(match.group(1))
+            title = data.get("title", "").strip()
+            due_date = data.get("due_date", "").strip()
+            client = data.get("client", "").strip()
+
+            if not title:
+                logger.warning("Empty commitment title in Claude response — skipping")
+                replacement = ""
+            else:
+                logger.debug("Saving commitment: %s (due=%s, client=%s)", title, due_date, client)
+                try:
+                    cid = add_commitment(
+                        title=title,
+                        due_date=due_date or "",
+                        effort_days=1,
+                        client=client,
+                    )
+                    logger.info("Commitment #%d saved: %s", cid, title)
+                    due_str = f" (due {due_date})" if due_date else ""
+                    client_str = f" [{client}]" if client else ""
+                    replacement = f"\n> \U0001f4cc Commitment logged: **{title}**{due_str}{client_str}\n"
+                except Exception:
+                    logger.exception("Failed to save commitment: %s", title)
+                    replacement = f"\n> \u26a0\ufe0f Failed to save commitment: {title} — check logs\n"
+
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("Failed to parse commitment block: %s", e)
+            replacement = f"\n> \u26a0\ufe0f Could not parse commitment — {e}\n"
+
+        response = response[:match.start()] + replacement + response[match.end():]
+
+    return response
+
+
 def _handle_calendar_confirm(post: dict, question: str) -> bool:
     """Handle confirmation replies for pending calendar actions. Returns True if handled."""
     q_lower = question.lower().strip()
@@ -669,12 +716,17 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
                         deleted += 1
                     else:
                         errors.append(f"Failed to delete: {ev['summary']}")
-                    add_commitment(
-                        title=ev["summary"],
-                        due_date="",
-                        effort_days=2,
-                    )
-                    added += 1
+                    try:
+                        logger.debug("Bulk convert: saving commitment '%s'", ev["summary"])
+                        add_commitment(
+                            title=ev["summary"],
+                            due_date="",
+                            effort_days=2,
+                        )
+                        added += 1
+                    except Exception:
+                        logger.exception("Failed to save commitment during bulk convert: %s", ev["summary"])
+                        errors.append(f"Failed to save task: {ev['summary']}")
                 del _pending_confirms[channel_id]
                 parts = [f":white_check_mark: Deleted {deleted} event(s), added {added} task(s)."]
                 if errors:
@@ -1521,6 +1573,9 @@ def _handle_mention(post: dict, thread: list[dict]):
 
         # Check if Claude's response contains a calendar event to create
         response = _process_calendar_events(response, channel_id=channel_id)
+
+        # Check if Claude's response contains commitments to save
+        response = _process_commitments(response, channel_id=channel_id)
 
         # Append quiet/override status note
         state = get_quiet_state()
