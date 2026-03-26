@@ -1,0 +1,449 @@
+"""PB-007: Billing Intake — process billing-labeled emails into expense tracking.
+
+Scans for Gmail messages with the 'artemis/billing' label, extracts expense
+data, uploads attachments to Drive, logs to Sheets, and posts to Mattermost.
+"""
+
+import base64
+import logging
+import re
+import sqlite3
+from datetime import date
+from email.utils import parseaddr
+
+from artemis import config
+from artemis.commitments import get_db
+from artemis.google_drive import get_or_create_expense_folder, upload_attachment
+from artemis.google_sheets import append_expense_row, get_sheet_url
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQLite state tracking — processed billing message IDs
+# ---------------------------------------------------------------------------
+
+_CREATE_PROCESSED = """
+CREATE TABLE IF NOT EXISTS processed_billing (
+    message_id TEXT PRIMARY KEY,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+
+def _ensure_table(db: sqlite3.Connection) -> None:
+    db.execute(_CREATE_PROCESSED)
+    db.commit()
+
+
+def is_processed(message_id: str, db: sqlite3.Connection | None = None) -> bool:
+    conn = db or get_db()
+    _ensure_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM processed_billing WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return row is not None
+
+
+def mark_processed(message_id: str, db: sqlite3.Connection | None = None) -> None:
+    conn = db or get_db()
+    _ensure_table(conn)
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_billing (message_id) VALUES (?)",
+        (message_id,),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Amount extraction
+# ---------------------------------------------------------------------------
+
+# Matches $1,234.56 or $1234 or 1,234.56 (with two decimal places)
+_AMOUNT_RE = re.compile(r"\$[\d,]+\.?\d*|[\d,]+\.\d{2}")
+
+
+def extract_amounts(text: str) -> list[str]:
+    """Extract all dollar amounts from text. Returns list of matched strings."""
+    return _AMOUNT_RE.findall(text)
+
+
+def parse_amount(raw: str) -> float:
+    """Parse a raw amount string like '$1,234.56' into a float."""
+    cleaned = raw.replace("$", "").replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+def best_amount(text: str) -> tuple[str, list[str]]:
+    """Extract the best (largest) amount from text.
+
+    Returns (best_amount_str, all_amounts_found).
+    If multiple found, best is the largest.
+    """
+    found = extract_amounts(text)
+    if not found:
+        return "", []
+    if len(found) == 1:
+        return found[0], found
+    # Pick the largest
+    parsed = [(a, parse_amount(a)) for a in found]
+    parsed.sort(key=lambda x: x[1], reverse=True)
+    return parsed[0][0], found
+
+
+# ---------------------------------------------------------------------------
+# Category classification
+# ---------------------------------------------------------------------------
+
+_CATEGORY_MAP = [
+    (["aws", "azure", "digitalocean", "hetzner", "vercel", "namecheap", "hostinger"],
+     "Infrastructure"),
+    (["google", "notion", "github", "anthropic", "openai", "slack", "zoom"],
+     "SaaS / Software"),
+    (["attorney", "legal", "law", "trademark", "llc"],
+     "Legal"),
+    (["insurance", "liability", "e&o"],
+     "Insurance"),
+    (["apple", "dell", "bestbuy", "newegg", "hardware"],
+     "Hardware"),
+    (["score", "linkedin", "ads", "marketing"],
+     "Sales & Outreach"),
+]
+
+
+def classify_category(subject: str, sender: str) -> str:
+    """Classify an expense category from subject + sender text (case-insensitive)."""
+    combined = f"{subject} {sender}".lower()
+    for keywords, category in _CATEGORY_MAP:
+        for kw in keywords:
+            if kw in combined:
+                return category
+    return "Misc"
+
+
+# ---------------------------------------------------------------------------
+# Gmail helpers — attachment download
+# ---------------------------------------------------------------------------
+
+
+def get_billing_messages(gmail_client) -> list[dict]:
+    """Fetch messages with the 'artemis/billing' label that haven't been processed."""
+    if not gmail_client.service:
+        return []
+
+    try:
+        # Find the label ID for 'artemis/billing'
+        labels = gmail_client.service.users().labels().list(userId="me").execute()
+        label_id = None
+        for lbl in labels.get("labels", []):
+            if lbl["name"].lower() == "artemis/billing":
+                label_id = lbl["id"]
+                break
+
+        if not label_id:
+            logger.warning("Gmail label 'artemis/billing' not found")
+            return []
+
+        # List messages with that label
+        results = gmail_client.service.users().messages().list(
+            userId="me", labelIds=[label_id], maxResults=20
+        ).execute()
+
+        messages = []
+        for msg_ref in results.get("messages", []):
+            if is_processed(msg_ref["id"]):
+                continue
+            messages.append(msg_ref["id"])
+
+        return messages
+    except Exception:
+        logger.exception("Failed to fetch billing messages")
+        return []
+
+
+def get_message_full(gmail_client, message_id: str) -> dict | None:
+    """Fetch a full message with all parts for body + attachment extraction."""
+    if not gmail_client.service:
+        return None
+    try:
+        return gmail_client.service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+    except Exception:
+        logger.exception("Failed to fetch full message %s", message_id)
+        return None
+
+
+def extract_attachments(gmail_client, message: dict) -> list[dict]:
+    """Extract all attachments from a full message.
+
+    Returns list of {"filename": str, "mime_type": str, "data": bytes}.
+    """
+    attachments = []
+    msg_id = message.get("id", "")
+
+    def _walk_parts(parts):
+        for part in parts:
+            filename = part.get("filename", "")
+            mime = part.get("mimeType", "")
+            body = part.get("body", {})
+
+            if filename and body.get("attachmentId"):
+                # Download attachment data
+                try:
+                    att = gmail_client.service.users().messages().attachments().get(
+                        userId="me", messageId=msg_id, id=body["attachmentId"]
+                    ).execute()
+                    data = base64.urlsafe_b64decode(att["data"])
+                    attachments.append({
+                        "filename": filename,
+                        "mime_type": mime,
+                        "data": data,
+                    })
+                except Exception:
+                    logger.exception("Failed to download attachment %s", filename)
+
+            # Recurse into sub-parts
+            if part.get("parts"):
+                _walk_parts(part["parts"])
+
+    payload = message.get("payload", {})
+    if payload.get("parts"):
+        _walk_parts(payload["parts"])
+
+    return attachments
+
+
+def extract_headers(message: dict) -> dict:
+    """Extract key headers from a full message."""
+    headers = {}
+    for h in message.get("payload", {}).get("headers", []):
+        headers[h["name"].lower()] = h["value"]
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Main processing function
+# ---------------------------------------------------------------------------
+
+
+def process_billing_message(
+    gmail_client,
+    message_id: str,
+    mm_client=None,
+    dry_run: bool = False,
+) -> dict:
+    """Process a single billing email.
+
+    Returns a dict with all extracted/logged data for confirmation.
+    If dry_run=True, skips Drive upload, Sheets append, and Mattermost post.
+    """
+    result = {
+        "message_id": message_id,
+        "success": False,
+        "error": None,
+        "drive_link": "",
+        "sheet_url": get_sheet_url(),
+    }
+
+    # 1. Fetch full message
+    msg = get_message_full(gmail_client, message_id)
+    if not msg:
+        result["error"] = "Failed to fetch message"
+        return result
+
+    headers = extract_headers(msg)
+    sender_full = headers.get("from", "")
+    sender_name, sender_email = parseaddr(sender_full)
+    sender_name = sender_name or sender_email
+    sender_domain = sender_email.split("@")[1] if "@" in sender_email else ""
+    subject = headers.get("subject", "(no subject)")
+    msg_date = headers.get("date", "")
+
+    result.update({
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "sender_domain": sender_domain,
+        "subject": subject,
+        "date": msg_date,
+    })
+
+    # 2. Extract body text and amounts
+    body_text = gmail_client._extract_body(msg.get("payload", {}))
+    combined_text = f"{subject} {body_text}"
+    amount_str, all_amounts = best_amount(combined_text)
+    category = classify_category(subject, sender_full)
+
+    result.update({
+        "amount": amount_str,
+        "all_amounts": all_amounts,
+        "category": category,
+    })
+
+    # 3. Process attachments
+    attachments = extract_attachments(gmail_client, msg)
+    drive_links = []
+
+    if attachments and not dry_run:
+        folder_id = get_or_create_expense_folder()
+        if folder_id:
+            for att in attachments:
+                file_id, link = upload_attachment(
+                    att["filename"], att["data"], att["mime_type"], folder_id
+                )
+                if link:
+                    drive_links.append(link)
+                else:
+                    logger.warning("Drive upload failed for %s — using Gmail link", att["filename"])
+        else:
+            logger.warning("Could not create expense folder — using Gmail links")
+    elif attachments and dry_run:
+        for att in attachments:
+            drive_links.append(f"[DRY RUN] Would upload: {att['filename']} ({att['mime_type']})")
+
+    # Fallback to Gmail deep link if no attachments or all uploads failed
+    gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
+    doc_link = drive_links[0] if drive_links else gmail_link
+
+    result.update({
+        "attachments": [a["filename"] for a in attachments],
+        "drive_links": drive_links,
+        "document_link": doc_link,
+        "gmail_link": gmail_link,
+    })
+
+    # 4. Build notes
+    notes_parts = []
+    if not amount_str:
+        notes_parts.append("No amount detected")
+    if len(all_amounts) > 1:
+        notes_parts.append(f"Multiple amounts found: {', '.join(all_amounts)}")
+    if not attachments:
+        notes_parts.append("No attachment — Gmail link used")
+    if not drive_links and attachments:
+        notes_parts.append("Drive upload failed — Gmail link used")
+    if notes_parts:
+        notes = "Auto-logged by Artemis. Review required. " + "; ".join(notes_parts)
+    else:
+        notes = "Auto-logged by Artemis."
+
+    result["notes"] = notes
+
+    # 5. Append to Sheets
+    row = {
+        "date": date.today().strftime("%m/%d/%Y"),
+        "vendor": sender_name or sender_domain,
+        "description": subject,
+        "category": category,
+        "amount": amount_str,
+        "payment_method": "",
+        "founder_loan": "Yes",
+        "reimbursed": "No",
+        "reimbursed_date": "",
+        "document_link": doc_link,
+        "notes": notes,
+    }
+
+    if not dry_run:
+        sheet_ok = append_expense_row(row)
+        if not sheet_ok:
+            result["error"] = "Sheets append failed"
+            logger.error("PB-007: Sheets append failed for %s", message_id)
+    else:
+        sheet_ok = True
+        result["dry_run_row"] = row
+
+    # 6. Mark as processed
+    if not dry_run:
+        mark_processed(message_id)
+
+    # 7. Post to Mattermost
+    if mm_client and not dry_run:
+        amount_display = amount_str if amount_str else "\u26a0 None found \u2014 review required"
+        attachment_display = doc_link
+        if drive_links:
+            attachment_display = " | ".join(drive_links)
+
+        mm_msg = (
+            f"\U0001f4c4 **Billing intake logged**\n"
+            f"**From:** {sender_name} <{sender_email}>\n"
+            f"**Subject:** {subject}\n"
+            f"**Amount detected:** {amount_display}\n"
+            f"**Category:** {category}\n"
+            f"**Founder Loan:** Yes \u00b7 **Reimbursed:** No\n"
+            f"**Attachment:** {attachment_display}\n"
+            f"**Sheet:** {result['sheet_url']}\n\n"
+            f"_React with \u2705 if correct or reply to correct any fields._"
+        )
+
+        try:
+            mm_client.post_message(config.CHANNEL_OPS, mm_msg)
+        except Exception:
+            logger.exception("Failed to post billing intake to Mattermost")
+            # Even if MM fails, the data is in Sheets — don't mark as error
+
+    elif mm_client and not sheet_ok and not dry_run:
+        # Sheets failed — post all data so Ryan can manually enter
+        mm_msg = (
+            f"\u26a0\ufe0f **Billing intake FAILED to log to Sheets**\n"
+            f"**From:** {sender_name} <{sender_email}>\n"
+            f"**Subject:** {subject}\n"
+            f"**Amount:** {amount_str or 'not detected'}\n"
+            f"**Category:** {category}\n"
+            f"**Gmail link:** {gmail_link}\n\n"
+            f"_Please add this manually to the expense sheet._"
+        )
+        try:
+            mm_client.post_message(config.CHANNEL_OPS, mm_msg)
+        except Exception:
+            logger.exception("Failed to post billing failure alert")
+
+    result["success"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Scope checking
+# ---------------------------------------------------------------------------
+
+_BILLING_SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+
+def check_billing_scopes() -> tuple[bool, list[str]]:
+    """Check if current OAuth token has Drive and Sheets scopes.
+
+    Returns (all_present, list_of_missing_scopes).
+    """
+    token_path = config.GMAIL_TOKEN_PATH
+    if not token_path.exists():
+        return False, _BILLING_SCOPES[:]
+
+    try:
+        creds = Credentials.from_authorized_user_file(str(token_path))
+        granted = set(creds.scopes or [])
+        missing = [s for s in _BILLING_SCOPES if s not in granted]
+        return len(missing) == 0, missing
+    except Exception:
+        return False, _BILLING_SCOPES[:]
+
+
+def print_scope_migration_instructions(missing: list[str]) -> None:
+    """Print instructions for re-authorizing with new scopes."""
+    print("\n" + "=" * 60)
+    print("PB-007 BILLING INTAKE: OAuth scope update required")
+    print("=" * 60)
+    print(f"\nMissing scopes: {', '.join(missing)}")
+    print("\nTo fix:")
+    print("  1. Delete token.json:")
+    print(f"     rm {config.GMAIL_TOKEN_PATH}")
+    print("  2. Re-run setup_oauth.py to authorize with all scopes:")
+    print("     python setup_oauth.py")
+    print("  3. Approve ALL permission prompts in the browser")
+    print("  4. Restart Artemis")
+    print("\nArtemis will continue running without billing intake until")
+    print("the token is updated.\n")

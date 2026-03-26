@@ -1545,6 +1545,15 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
         scope_warnings.append("Gmail token missing `gmail.modify` scope — archive will not work.")
     if calendar and getattr(calendar, "scope_mismatch", False):
         scope_warnings.append("Calendar token missing required scopes (`calendar.readonly` and/or `calendar.events`).")
+    # Check PB-007 billing scopes (non-fatal — just disables billing intake)
+    from artemis.billing import check_billing_scopes, print_scope_migration_instructions
+    billing_ok, billing_missing = check_billing_scopes()
+    if not billing_ok:
+        scope_warnings.append(
+            f"PB-007 billing scopes missing ({', '.join(billing_missing)}) — billing intake disabled."
+        )
+        print_scope_migration_instructions(billing_missing)
+
     if scope_warnings:
         warning = (
             "\u26a0\ufe0f OAuth token has wrong scopes \u2014 re-authentication required.\n"
