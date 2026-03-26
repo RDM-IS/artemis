@@ -354,13 +354,27 @@ class CalendarClient:
         description: str | None = None,
         attendees: list[str] | None = None,
         reminder_minutes: int = 15,
+        _user_approved_external: bool = False,
     ) -> str | None:
         """Create a calendar event.
 
         Returns the event ID on success, or None on failure.
+
+        HARD GUARDRAIL: If attendees contains any external email (not @rdm.is
+        or @gmail.com), creation is BLOCKED unless _user_approved_external=True.
+        This cannot be disabled by any config, env var, or mode.
         """
         if not self.service:
             logger.error("Calendar not authenticated — cannot create event")
+            return None
+
+        # ── HARD GUARDRAIL: External attendee check ──
+        from artemis.guardrails import check_external_attendees
+        check = check_external_attendees(
+            summary, attendees, user_approved=_user_approved_external
+        )
+        if not check["allowed"]:
+            logger.error("GUARDRAIL BLOCKED: %s", check["reason"])
             return None
 
         local_tz = ZoneInfo(config.TIMEZONE)

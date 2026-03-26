@@ -514,8 +514,14 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
         del _pending_confirms[channel_id]
         return False
 
-    if q_lower not in ("confirm", "yes", "cancel", "no"):
+    if q_lower not in ("confirm", "yes", "cancel", "no", "approve", "deny"):
         return False
+
+    # Map approve/deny to yes/cancel for unified handling
+    if q_lower == "approve":
+        q_lower = "yes"
+    elif q_lower == "deny":
+        q_lower = "cancel"
 
     # Only handle calendar create types here; other types handled by their own handlers
     if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
@@ -526,11 +532,17 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
 
     if q_lower in ("cancel", "no"):
         del _pending_confirms[channel_id]
+        # Log guardrail denial if this was an external attendee block
+        if pending.get("type") == "calendar_create_external":
+            from artemis.guardrails import get_external_attendees, log_violation
+            ext = get_external_attendees(data.get("attendees") or [])
+            if ext:
+                log_violation(data.get("summary", ""), ext, "denied")
         log_calendar_action(
             action="cancelled",
             event_id="pending",
             summary=data.get("summary", ""),
-            notes="User cancelled pending event",
+            notes="User cancelled/denied pending event",
         )
         if _mm:
             _mm.post_to_channel_id(channel_id, "Calendar event cancelled.", root_id=root_id)
@@ -554,6 +566,7 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
             end_datetime=end_dt,
             description=description,
             attendees=attendees if attendees else None,
+            _user_approved_external=True,  # User explicitly confirmed via Mattermost
         )
 
         attendee_str = ", ".join(attendees) if attendees else ""
