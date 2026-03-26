@@ -352,11 +352,22 @@ class ArtemisScheduler:
                         self._pending_triage.append(item)
 
                     # Fetch full body for playbook matches or known CRM contacts
-                    # (limited to _MAX_FULL_FETCHES per cycle to control API costs)
-                    if orig and full_body_fetches < _MAX_FULL_FETCHES:
-                        needs_full = bool(playbook_match)
-                        if not needs_full:
-                            needs_full = bool(get_contact(orig.get("from_email", "")))
+                    # Playbook matches ALWAYS get full body (not subject to cap)
+                    if orig and playbook_match and "full_body" not in orig:
+                        body = self.gmail.get_full_message(orig["id"])
+                        if body:
+                            orig["full_body"] = body
+                            logger.info(
+                                "Fetched full body for playbook %s [%s] (%d chars)",
+                                playbook_match, orig.get("subject", ""), len(body),
+                            )
+                        else:
+                            logger.warning(
+                                "Full body fetch FAILED for playbook %s [%s] — playbook will use snippet (%d chars)",
+                                playbook_match, orig.get("subject", ""), len(orig.get("snippet", "")),
+                            )
+                    elif orig and full_body_fetches < _MAX_FULL_FETCHES:
+                        needs_full = bool(get_contact(orig.get("from_email", "")))
                         if needs_full:
                             body = self.gmail.get_full_message(orig["id"])
                             if body:
@@ -369,6 +380,12 @@ class ArtemisScheduler:
 
                     # Execute playbook if matched
                     if playbook_match and orig:
+                        body_source = "full_body" if "full_body" in orig else "snippet"
+                        body_len = len(orig.get("full_body", orig.get("snippet", "")))
+                        logger.info(
+                            "Executing %s for [%s] with %s (%d chars)",
+                            playbook_match, orig.get("subject", ""), body_source, body_len,
+                        )
                         self._execute_playbook(playbook_match, orig, item)
 
                     # Archive every processed email
