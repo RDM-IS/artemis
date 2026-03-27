@@ -488,8 +488,10 @@ def check_billing_scopes() -> tuple[bool, list[str]]:
         return False, _BILLING_SCOPES[:]
 
     try:
-        creds = Credentials.from_authorized_user_file(str(token_path))
-        granted = set(creds.scopes or [])
+        import json
+        with open(token_path) as f:
+            data = json.load(f)
+        granted = set(data.get("scopes", []))
         missing = [s for s in _BILLING_SCOPES if s not in granted]
         return len(missing) == 0, missing
     except Exception:
