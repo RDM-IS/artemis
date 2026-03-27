@@ -18,6 +18,7 @@ cd ..
 zip -r function.zip app/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 zip -r function.zip ../migrations/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 zip -r function.zip ../tests/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+zip -r function.zip ../knowledge/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 
 export PATH="$PATH:/usr/local/bin:$HOME/.local/bin"
 echo "Deploying..."
