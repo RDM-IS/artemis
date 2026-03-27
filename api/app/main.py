@@ -2,12 +2,16 @@ from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from mangum import Mangum
 from sqlalchemy import text
-import boto3
-import json
 import os
 import subprocess
 import sys
 
+# Ensure repo root is on sys.path so knowledge.secrets is importable
+_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from knowledge.secrets import get_crm_api_key
 from .database import get_db
 from .routers import (
     organizations, contacts, deals, interactions,
@@ -16,18 +20,12 @@ from .routers import (
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
 
-def get_api_key_value() -> str:
-    secret_name = os.environ.get("CRM_API_KEY_SECRET", "rdmis/dev/crm-api-key")
-    client = boto3.client("secretsmanager", region_name="us-east-1")
-    response = client.get_secret_value(SecretId=secret_name)
-    return json.loads(response["SecretString"])["api_key"]
-
 _API_KEY = None
 
 def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
     global _API_KEY
     if _API_KEY is None:
-        _API_KEY = get_api_key_value()
+        _API_KEY = get_crm_api_key()
     if api_key != _API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return api_key

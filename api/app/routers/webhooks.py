@@ -1,23 +1,15 @@
 import hashlib
 import hmac
-import os
-import json
-import boto3
 from fastapi import APIRouter, Request, HTTPException, Depends
 from sqlalchemy.orm import Session
 from ..database import get_db
 from ..models import Invoice, Deal
+from knowledge.secrets import get_zoho_webhook_secret
 
 router = APIRouter()
 
-def get_zoho_secret() -> str:
-    secret_name = os.environ.get("ZOHO_SECRET_ARN", "rdmis/dev/zoho-webhook-secret")
-    client = boto3.client("secretsmanager", region_name="us-east-1")
-    response = client.get_secret_value(SecretId=secret_name)
-    return json.loads(response["SecretString"])["webhook_secret"]
-
 def verify_zoho_signature(payload: bytes, signature: str) -> bool:
-    secret = get_zoho_secret()
+    secret = get_zoho_webhook_secret()
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 

@@ -1,14 +1,15 @@
-import boto3
-import json
 import os
+import sys
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-def get_rds_credentials() -> dict:
-    secret_name = os.environ.get("RDS_SECRET_ARN")
-    client = boto3.client("secretsmanager", region_name="us-east-1")
-    response = client.get_secret_value(SecretId=secret_name)
-    return json.loads(response["SecretString"])
+# Ensure repo root is on sys.path so knowledge.secrets is importable
+_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from knowledge.secrets import get_rds_credentials
+
 
 def build_database_url() -> str:
     creds = get_rds_credentials()

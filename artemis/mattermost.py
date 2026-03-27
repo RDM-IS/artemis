@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 
 class MattermostClient:
     def __init__(self):
-        self.url = config.MATTERMOST_URL.rstrip("/")
-        self.token = config.MATTERMOST_BOT_TOKEN
+        from knowledge.secrets import get_mattermost_credentials
+        mm_creds = get_mattermost_credentials()
+        self.url = mm_creds.get("url", config.MATTERMOST_URL).rstrip("/")
+        self.token = mm_creds.get("token", "")
         self.team_id = config.MATTERMOST_TEAM_ID
         self.headers = {
             "Authorization": f"Bearer {self.token}",

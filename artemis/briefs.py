@@ -29,7 +29,8 @@ def _call_claude(
     max_tokens: int = 1000,
 ) -> str:
     """Make a Claude API call with audit logging."""
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    from knowledge.secrets import get_anthropic_key
+    client = anthropic.Anthropic(api_key=get_anthropic_key())
     prompt_hash = hashlib.sha256(
         (system + user_message).encode()
     ).hexdigest()[:16]

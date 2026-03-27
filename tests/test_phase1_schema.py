@@ -1,6 +1,6 @@
 """Phase 1 schema validation — 15 checks against the live acos schema.
 
-Reads credentials from AWS Secrets Manager. Never uses plaintext passwords.
+Reads credentials from AWS Secrets Manager via knowledge.secrets.
 
 Required env vars:
     RDS_SECRET_ARN  — ARN of the RDS secret in Secrets Manager
@@ -10,36 +10,30 @@ Required env vars:
 Run: RDS_SECRET_ARN=arn:... RDS_HOST=... python tests/test_phase1_schema.py
 """
 
-import json
 import os
 import sys
 
-import boto3
 import psycopg2
 import psycopg2.extras
 
 # Add parent dir so we can import knowledge
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from knowledge.secrets import get_rds_credentials
+
 
 def get_conn():
-    secret_arn = os.environ.get("RDS_SECRET_ARN")
     host = os.environ.get("RDS_HOST")
     db = os.environ.get("RDS_DB", "crm")
 
-    if not secret_arn:
-        print("ERROR: RDS_SECRET_ARN not set")
-        sys.exit(1)
     if not host:
         print("ERROR: RDS_HOST not set")
         sys.exit(1)
 
     try:
-        client = boto3.client("secretsmanager", region_name="us-east-1")
-        response = client.get_secret_value(SecretId=secret_arn)
-        creds = json.loads(response["SecretString"])
+        creds = get_rds_credentials()
     except Exception as e:
-        print(f"ERROR: Failed to fetch credentials from Secrets Manager: {e}")
+        print(f"ERROR: Failed to get RDS credentials: {e}")
         sys.exit(1)
 
     return psycopg2.connect(

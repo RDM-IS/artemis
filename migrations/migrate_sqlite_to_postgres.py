@@ -1,17 +1,19 @@
-"""Migrate SQLite data to PostgreSQL (acos + crm schemas).
+"""Migrate SQLite data to PostgreSQL (acos + public schemas).
 
 Migrates:
-  commitments        → crm.commitments (if table exists)
+  commitments        → public.commitments (if table exists)
   guardrail_violations → acos.guardrail_violations
 
-Reads:
-  DATABASE_URL    — PostgreSQL connection string
+Reads credentials from AWS Secrets Manager via knowledge.secrets.
+
+Required env vars:
+  RDS_SECRET_ARN  — ARN of the RDS secret in Secrets Manager
+  RDS_HOST        — RDS endpoint hostname
+  RDS_DB          — database name (default: crm)
   SQLITE_DB_PATH  — path to artemis.db
 
-Idempotent — skips duplicates on created_at + event_summary match.
-
 Usage:
-    DATABASE_URL=... SQLITE_DB_PATH=artemis.db python migrations/migrate_sqlite_to_postgres.py
+    RDS_SECRET_ARN=arn:... RDS_HOST=... python migrations/migrate_sqlite_to_postgres.py
 """
 
 import os
@@ -20,13 +22,34 @@ import sys
 
 import psycopg2
 
+# Ensure repo root is on sys.path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from knowledge.secrets import get_rds_credentials
+
 
 def get_pg():
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        print("ERROR: DATABASE_URL not set")
+    host = os.environ.get("RDS_HOST")
+    db = os.environ.get("RDS_DB", "crm")
+
+    if not host:
+        print("ERROR: RDS_HOST not set")
         sys.exit(1)
-    return psycopg2.connect(url)
+
+    try:
+        creds = get_rds_credentials()
+    except Exception as e:
+        print(f"ERROR: Failed to get RDS credentials: {e}")
+        sys.exit(1)
+
+    return psycopg2.connect(
+        host=host,
+        port=5432,
+        dbname=db,
+        user=creds["username"],
+        password=creds["password"],
+        connect_timeout=10,
+    )
 
 
 def get_sqlite():
@@ -56,13 +79,13 @@ def table_exists_pg(conn, schema: str, name: str) -> bool:
 
 
 def migrate_commitments(sqlite_conn, pg_conn):
-    """Migrate commitments from SQLite to crm.commitments."""
+    """Migrate commitments from SQLite to public.commitments."""
     if not table_exists_sqlite(sqlite_conn, "commitments"):
         print("  [SKIP] commitments table not found in SQLite")
         return
 
-    if not table_exists_pg(pg_conn, "crm", "commitments"):
-        print("  [SKIP] crm.commitments table not found in PostgreSQL")
+    if not table_exists_pg(pg_conn, "public", "commitments"):
+        print("  [SKIP] public.commitments table not found in PostgreSQL")
         return
 
     rows = sqlite_conn.execute("SELECT * FROM commitments").fetchall()
@@ -75,7 +98,7 @@ def migrate_commitments(sqlite_conn, pg_conn):
         with pg_conn.cursor() as cur:
             # Check for duplicate by title + created_at
             cur.execute(
-                "SELECT 1 FROM crm.commitments WHERE description = %s",
+                "SELECT 1 FROM public.commitments WHERE description = %s",
                 (r.get("title", ""),),
             )
             if cur.fetchone():
@@ -84,7 +107,7 @@ def migrate_commitments(sqlite_conn, pg_conn):
 
             try:
                 cur.execute(
-                    """INSERT INTO crm.commitments (description, due_date, status, created_at)
+                    """INSERT INTO public.commitments (description, due_date, status, created_at)
                        VALUES (%s, %s, %s, %s)""",
                     (
                         r.get("title", ""),

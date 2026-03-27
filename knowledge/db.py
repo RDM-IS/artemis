@@ -1,7 +1,8 @@
 """ACOS knowledge layer — PostgreSQL connection pool and core operations.
 
 All entity, relationship, audit, velocity, and guardrail operations
-go through this module. Reads DATABASE_URL from environment.
+go through this module. Credentials come from AWS Secrets Manager
+via knowledge.secrets.
 """
 
 import os
@@ -28,11 +29,21 @@ class PromotionBlockedError(Exception):
 def init_pool(min_conn: int = 2, max_conn: int = 10):
     """Initialize the connection pool. Call once at startup."""
     global _pool
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        logger.error("DATABASE_URL not set — knowledge layer disabled")
+    try:
+        from knowledge.secrets import get_rds_credentials
+        creds = get_rds_credentials()
+    except Exception as e:
+        logger.error("Failed to get RDS credentials — knowledge layer disabled: %s", e)
         return
-    _pool = psycopg2.pool.ThreadedConnectionPool(min_conn, max_conn, url)
+
+    host = os.environ.get("RDS_HOST")
+    db = os.environ.get("RDS_DB", "crm")
+    if not host:
+        logger.error("RDS_HOST not set — knowledge layer disabled")
+        return
+
+    dsn = f"host={host} port=5432 dbname={db} user={creds['username']} password={creds['password']} connect_timeout=10"
+    _pool = psycopg2.pool.ThreadedConnectionPool(min_conn, max_conn, dsn)
     logger.info("Knowledge DB pool initialized (%d-%d connections)", min_conn, max_conn)
 
 
