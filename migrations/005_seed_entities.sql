@@ -13,7 +13,7 @@ INSERT INTO acos.entities (
     NULL,
     'VP Enterprise Data & AI at TTI (Techtronic Industries). Primary Gate 2 contact for Lucint pilot. $125K pilot, 90-day delivery window. Meeting with Pivar = Gate 2 unlocked.',
     ARRAY['tier-1', 'gate-2', 'active-deal', 'tti', 'decision-maker'],
-    (SELECT id FROM crm.contacts WHERE name ILIKE '%Pivar%' OR email ILIKE '%pivar%' LIMIT 1)
+    (SELECT id FROM public.contacts WHERE name ILIKE '%Pivar%' OR email ILIKE '%pivar%' LIMIT 1)
 )
 ON CONFLICT DO NOTHING;
 

@@ -16,6 +16,6 @@ SELECT
     c.title           AS crm_tier,
     c.last_contacted  AS crm_last_interaction_at
 FROM acos.entities e
-LEFT JOIN crm.contacts c ON e.crm_contact_id = c.id
+LEFT JOIN public.contacts c ON e.crm_contact_id = c.id
 WHERE e.layer = 'gold'
   AND e.entity_type = 'Person';
