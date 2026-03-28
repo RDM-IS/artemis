@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 import anthropic
 
@@ -36,8 +37,10 @@ def detect_scheduling_request(email_body: str, sender: str) -> dict | None:
         )
         text = response.content[0].text.strip()
         # Strip markdown fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        text = re.sub(r'^```json\s*', '', text)
+        text = re.sub(r'^```\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        text = text.strip()
 
         result = json.loads(text)
     except Exception:

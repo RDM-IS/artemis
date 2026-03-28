@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta
 
@@ -956,7 +957,11 @@ class ArtemisScheduler:
         try:
             result = _call_claude(system, user_prompt)
             import json as _json
-            extracted = _json.loads(result)
+            cleaned = result.strip()
+            cleaned = re.sub(r'^```json\s*', '', cleaned)
+            cleaned = re.sub(r'^```\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+            extracted = _json.loads(cleaned.strip())
             start_date = extracted.get("start_date")
             end_date = extracted.get("end_date")
             duration = extracted.get("duration_minutes") or config.DEFAULT_SLOT_DURATION

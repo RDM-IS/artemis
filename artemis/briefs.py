@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import re
 
 import anthropic
 
@@ -20,6 +21,15 @@ from artemis.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences that LLMs sometimes wrap around JSON."""
+    text = text.strip()
+    text = re.sub(r'^```json\s*', '', text)
+    text = re.sub(r'^```\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return text.strip()
 
 
 def _call_claude(
@@ -61,7 +71,7 @@ def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
     if not result:
         return []
     try:
-        return json.loads(result)
+        return json.loads(_strip_fences(result))
     except json.JSONDecodeError:
         logger.error("Failed to parse triage response: %s", result[:200])
         return []
