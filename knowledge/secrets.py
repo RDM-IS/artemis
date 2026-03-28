@@ -63,9 +63,33 @@ def get_twilio_credentials() -> dict:
 
 
 def get_gmail_credentials() -> dict:
-    """Returns Gmail OAuth credentials dict.
+    """Returns parsed credentials.json dict.
     Secret name: rdmis/dev/gmail-oauth"""
     return get_secret("rdmis/dev/gmail-oauth")
+
+
+def get_gmail_token() -> dict:
+    """Returns parsed token.json dict.
+    Secret name: rdmis/dev/gmail-token"""
+    return get_secret("rdmis/dev/gmail-token")
+
+
+def get_calendar_token() -> dict:
+    """Returns parsed calendar_token.json dict.
+    Secret name: rdmis/dev/calendar-token"""
+    return get_secret("rdmis/dev/calendar-token")
+
+
+def put_secret(secret_name: str, secret_dict: dict) -> None:
+    """Write a secret value back to Secrets Manager.
+    Used for persisting refreshed OAuth tokens.
+    Bypasses lru_cache — the in-memory Credentials object
+    is already up to date; next cold start re-fetches."""
+    client = boto3.client("secretsmanager", region_name=REGION)
+    client.put_secret_value(
+        SecretId=secret_name,
+        SecretString=json.dumps(secret_dict),
+    )
 
 
 def get_crm_api_key() -> str:

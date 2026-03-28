@@ -2,6 +2,7 @@
 
 import base64
 import html
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from artemis import config
+from knowledge.secrets import get_gmail_credentials, get_gmail_token, put_secret
 
 logger = logging.getLogger(__name__)
 
@@ -36,22 +38,26 @@ class GmailClient:
     def authenticate(self, mm_client=None):
         """Authenticate with Gmail API.
 
+        Loads OAuth token from Secrets Manager (rdmis/dev/gmail-token).
+        On refresh, writes the updated token back to Secrets Manager.
+
         Args:
             mm_client: Optional MattermostClient to post auth failure alerts.
         """
         creds = None
-        token_path = config.GMAIL_TOKEN_PATH
-        creds_path = config.GMAIL_CREDENTIALS_PATH
 
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        # Load token from Secrets Manager
+        try:
+            token_data = get_gmail_token()
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        except Exception:
+            logger.debug("No Gmail token in Secrets Manager — will attempt interactive flow")
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
                 except Exception as exc:
-                    err_str = str(exc).lower()
                     logger.error("Gmail token refresh failed: %s", exc)
                     if mm_client:
                         try:
@@ -66,14 +72,16 @@ class GmailClient:
                     self.service = None
                     return
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
+                # Interactive flow — local dev only (won't work on Lambda/EC2)
+                client_config = get_gmail_credentials()
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
                 creds = flow.run_local_server(port=0)
 
-        # Persist refreshed token
+        # Persist refreshed token to Secrets Manager
         try:
-            token_path.write_text(creds.to_json())
+            put_secret("rdmis/dev/gmail-token", json.loads(creds.to_json()))
         except Exception:
-            logger.warning("Failed to persist Gmail token to %s", token_path)
+            logger.warning("Failed to persist Gmail token to Secrets Manager")
 
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
@@ -103,8 +111,8 @@ class GmailClient:
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                config.GMAIL_TOKEN_PATH.write_text(creds.to_json())
-                logger.debug("Gmail token refreshed and saved")
+                put_secret("rdmis/dev/gmail-token", json.loads(creds.to_json()))
+                logger.debug("Gmail token refreshed and saved to Secrets Manager")
             except Exception:
                 logger.exception("Gmail token refresh failed mid-session")
                 return False

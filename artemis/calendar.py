@@ -1,5 +1,6 @@
 """Google Calendar client — meeting detection."""
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from artemis import config
+from knowledge.secrets import get_gmail_credentials, get_calendar_token, put_secret
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +29,20 @@ class CalendarClient:
     def authenticate(self, mm_client=None):
         """Authenticate with Google Calendar API.
 
+        Loads OAuth token from Secrets Manager (rdmis/dev/calendar-token).
+        On refresh, writes the updated token back to Secrets Manager.
+
         Args:
             mm_client: Optional MattermostClient to post auth failure alerts.
         """
         creds = None
-        token_path = config.CALENDAR_TOKEN_PATH
-        creds_path = config.CALENDAR_CREDENTIALS_PATH
 
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        # Load token from Secrets Manager
+        try:
+            token_data = get_calendar_token()
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        except Exception:
+            logger.debug("No Calendar token in Secrets Manager — will attempt interactive flow")
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
@@ -56,14 +63,16 @@ class CalendarClient:
                     self.service = None
                     return
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
+                # Interactive flow — local dev only (won't work on Lambda/EC2)
+                client_config = get_gmail_credentials()
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
                 creds = flow.run_local_server(port=0)
 
-        # Persist refreshed token
+        # Persist refreshed token to Secrets Manager
         try:
-            token_path.write_text(creds.to_json())
+            put_secret("rdmis/dev/calendar-token", json.loads(creds.to_json()))
         except Exception:
-            logger.warning("Failed to persist Calendar token to %s", token_path)
+            logger.warning("Failed to persist Calendar token to Secrets Manager")
 
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
@@ -92,8 +101,8 @@ class CalendarClient:
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                config.CALENDAR_TOKEN_PATH.write_text(creds.to_json())
-                logger.debug("Calendar token refreshed and saved")
+                put_secret("rdmis/dev/calendar-token", json.loads(creds.to_json()))
+                logger.debug("Calendar token refreshed and saved to Secrets Manager")
             except Exception:
                 logger.exception("Calendar token refresh failed mid-session")
                 return False
