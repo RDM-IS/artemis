@@ -14,19 +14,30 @@ logger = logging.getLogger(__name__)
 
 
 class MattermostClient:
+    TEAM_NAME = "rdmis"
+
     def __init__(self):
-        from knowledge.secrets import get_mattermost_credentials
+        from knowledge.secrets import get_mattermost_credentials, get_mattermost_url
         mm_creds = get_mattermost_credentials()
-        self.url = mm_creds.get("url", config.MATTERMOST_URL).rstrip("/")
+        self.url = get_mattermost_url().rstrip("/")
         self.token = mm_creds.get("token", "")
-        self.team_id = config.MATTERMOST_TEAM_ID
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
+        self._team_id: str | None = None
         self._channel_ids: dict[str, str] = {}
         self._bot_user_id: str | None = None
         self._mention_handler = None
+
+    @property
+    def team_id(self) -> str:
+        """Resolve team ID from the Mattermost API on first access."""
+        if not self._team_id:
+            resp = self._api("GET", f"/teams/name/{self.TEAM_NAME}")
+            self._team_id = resp.json()["id"]
+            logger.debug("Resolved team '%s' → %s", self.TEAM_NAME, self._team_id)
+        return self._team_id
 
     def _api(self, method: str, path: str, **kwargs) -> requests.Response:
         resp = requests.request(
