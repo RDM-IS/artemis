@@ -2,7 +2,6 @@
 
 import json
 import logging
-import multiprocessing
 import time
 from datetime import date, datetime, timedelta
 
@@ -52,8 +51,6 @@ from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
 
-_GMAIL_POLL_TIMEOUT = 120  # seconds — kill subprocess if it hangs
-
 # ---------------------------------------------------------------------------
 # Playbook helpers
 # ---------------------------------------------------------------------------
@@ -83,22 +80,6 @@ def get_playbook_text() -> str:
     if not _playbook_text:
         return load_playbooks()
     return _playbook_text
-
-
-def _gmail_poll_worker(result_queue: multiprocessing.Queue, max_results: int = 20):
-    """Run Gmail polling in an isolated subprocess to guard against segfaults.
-
-    Writes ("ok", messages_list) or ("error", error_string) to result_queue.
-    """
-    try:
-        from artemis.gmail import GmailClient as _GmailClient
-
-        g = _GmailClient()
-        g.authenticate()
-        messages = g.get_recent_messages(max_results=max_results)
-        result_queue.put(("ok", messages))
-    except Exception as exc:
-        result_queue.put(("error", str(exc)))
 
 
 class ArtemisScheduler:
@@ -225,42 +206,24 @@ class ArtemisScheduler:
         except Exception:
             return False
 
-    def _poll_gmail_isolated(self, max_results: int = 20) -> list[dict]:
-        """Poll Gmail in a subprocess so a segfault can't crash the main process."""
-        q: multiprocessing.Queue = multiprocessing.Queue()
-        proc = multiprocessing.Process(
-            target=_gmail_poll_worker, args=(q, max_results), daemon=True
-        )
-        proc.start()
-        proc.join(timeout=_GMAIL_POLL_TIMEOUT)
-
-        if proc.is_alive():
-            logger.error("Gmail poll subprocess timed out — killing it")
-            proc.kill()
-            proc.join(timeout=5)
+    def _poll_gmail(self, max_results: int = 20) -> list[dict]:
+        """Poll Gmail inline using the already-authenticated GmailClient."""
+        if not self.gmail or not self.gmail.service:
+            logger.warning("Gmail not authenticated — skipping poll")
             return []
-
-        if proc.exitcode != 0:
-            logger.error("Gmail poll subprocess exited with code %s (possible segfault)", proc.exitcode)
+        try:
+            self.gmail._refresh_if_needed()
+            return self.gmail.get_recent_messages(max_results=max_results)
+        except Exception:
+            logger.exception("Gmail poll failed")
             return []
-
-        if q.empty():
-            logger.error("Gmail poll subprocess produced no result")
-            return []
-
-        status, payload = q.get_nowait()
-        if status == "error":
-            logger.error("Gmail poll subprocess error: %s", payload)
-            return []
-
-        return payload
 
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
         if self._is_quiet():
             return
         try:
-            messages = self._poll_gmail_isolated(max_results=20)
+            messages = self._poll_gmail(max_results=20)
             if messages:
                 self._record_gmail_success()
             new_messages = [
@@ -1122,7 +1085,7 @@ class ArtemisScheduler:
         # Overnight emails
         email_count = 0
         try:
-            messages = self._poll_gmail_isolated(max_results=50)
+            messages = self._poll_gmail(max_results=50)
             new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
             email_count = len(new_messages)
         except Exception:
@@ -1219,7 +1182,7 @@ class ArtemisScheduler:
         emails_processed = 0
         playbooks_fired = 0
         try:
-            messages = self._poll_gmail_isolated(max_results=50)
+            messages = self._poll_gmail(max_results=50)
             if messages:
                 self._record_gmail_success()
             new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
