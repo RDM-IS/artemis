@@ -389,12 +389,18 @@ class ArtemisScheduler:
                 return
 
             duration = result["suggested_duration_minutes"]
+            date_constraint = result.get("date_constraint")
+            buffer_minutes = result.get("buffer_minutes", 0)
             sender_email = result["sender"]
             sender_name = msg.get("from", sender_email).split("<")[0].strip().strip('"')
 
             # Find free blocks
             free_blocks = self.calendar.find_free_blocks(
-                duration_minutes=duration, days_ahead=5, max_results=3
+                duration_minutes=duration,
+                days_ahead=5,
+                max_results=3,
+                date_constraint=date_constraint,
+                buffer_minutes=buffer_minutes,
             )
             if not free_blocks:
                 logger.info("Scheduling request from %s but no free blocks found", sender_email)

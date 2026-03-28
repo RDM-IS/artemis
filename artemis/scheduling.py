@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from datetime import date as _date_type, datetime
 
 import anthropic
 
@@ -15,7 +16,15 @@ _DETECTION_SYSTEM = (
     "You classify whether an email contains a request to schedule a meeting or call. "
     "Reply with JSON only — no markdown fences, no explanation.\n"
     "Schema: {\"detected\": bool, \"duration_minutes\": 30|60|90|null, "
-    "\"confidence\": 0.0-1.0, \"relevant_text\": string|null}"
+    "\"confidence\": 0.0-1.0, \"relevant_text\": string|null, "
+    "\"date_constraint\": \"YYYY-MM-DD\"|null, "
+    "\"buffer_minutes\": int|null}\n"
+    "date_constraint: if the sender requests a specific date (e.g. 'April 7', "
+    "'next Tuesday'), return that date as YYYY-MM-DD. null if flexible.\n"
+    "buffer_minutes: if the sender mentions a travel buffer or asks for the "
+    "meeting to be placed inside a larger time block (e.g. '60 minutes in "
+    "the middle of a 120 minute block to allow travel'), return half the "
+    "difference as buffer_minutes (e.g. (120-60)/2 = 30). null if not mentioned."
 )
 
 
@@ -54,10 +63,27 @@ def detect_scheduling_request(email_body: str, sender: str) -> dict | None:
     if duration not in (30, 60, 90):
         duration = 30  # default
 
+    # Parse date constraint
+    date_constraint = None
+    raw_date = result.get("date_constraint")
+    if raw_date:
+        try:
+            date_constraint = _date_type.fromisoformat(raw_date)
+        except (ValueError, TypeError):
+            pass
+
+    # Parse buffer minutes
+    buffer_minutes = 0
+    raw_buffer = result.get("buffer_minutes")
+    if isinstance(raw_buffer, (int, float)) and raw_buffer > 0:
+        buffer_minutes = int(raw_buffer)
+
     return {
         "type": "scheduling_request",
         "sender": sender,
         "suggested_duration_minutes": duration,
+        "date_constraint": date_constraint,
+        "buffer_minutes": buffer_minutes,
         "raw_request": result.get("relevant_text", ""),
         "confidence": result["confidence"],
     }
@@ -80,7 +106,7 @@ def draft_scheduling_response(
     except Exception:
         links = {}
     duration_key = f"{duration_minutes}min"
-    booking_link = links.get(duration_key, links.get("30min", ""))
+    booking_link = links.get(duration_key, "")
 
     # Format time slots
     slot_lines = []

@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
@@ -451,6 +451,8 @@ class CalendarClient:
         days_ahead: int = 5,
         max_results: int = 3,
         business_hours_only: bool = True,
+        date_constraint: date | None = None,
+        buffer_minutes: int = 0,
     ) -> list[dict]:
         """Find free blocks in the calendar for scheduling.
 
@@ -460,9 +462,13 @@ class CalendarClient:
 
         Business hours: 9 AM - 5 PM CT. 15 min buffer around events.
         Skips weekends.
-        """
-        from datetime import date as date_type
 
+        date_constraint: if set, only return blocks on that specific date.
+        buffer_minutes: extra clear time required before and after the meeting
+            slot (e.g. travel buffer). The calendar must be free for
+            buffer_minutes + duration_minutes + buffer_minutes, but only the
+            middle duration_minutes is returned as the offered slot.
+        """
         if not self.service:
             logger.error("Calendar not authenticated")
             return []
@@ -491,11 +497,18 @@ class CalendarClient:
                 continue
 
         busy.sort(key=lambda x: x[0])
-        duration = timedelta(minutes=duration_minutes)
+        meeting_dur = timedelta(minutes=duration_minutes)
+        travel_buf = timedelta(minutes=buffer_minutes)
+        total_needed = meeting_dur + travel_buf * 2
         blocks = []
 
         for day_offset in range(1, days_ahead + 1):
             check_date = today + timedelta(days=day_offset)
+
+            # If a specific date was requested, skip all other dates
+            if date_constraint and check_date != date_constraint:
+                continue
+
             # Skip weekends
             if check_date.weekday() >= 5:
                 continue
@@ -521,12 +534,12 @@ class CalendarClient:
 
             # Walk through the day in 30-min increments
             cursor = day_start
-            while cursor + duration <= day_end:
-                slot_end = cursor + duration
+            while cursor + total_needed <= day_end:
+                window_end = cursor + total_needed
                 # Check overlap with any busy period
                 conflict = False
                 for b_start, b_end in busy:
-                    if cursor < b_end and slot_end > b_start:
+                    if cursor < b_end and window_end > b_start:
                         conflict = True
                         # Jump cursor past this busy block
                         cursor = b_end
@@ -534,11 +547,14 @@ class CalendarClient:
                 if conflict:
                     continue
 
+                # Offer only the middle meeting slot (after travel buffer)
+                slot_start = cursor + travel_buf
+                slot_end = slot_start + meeting_dur
                 blocks.append({
-                    "start": cursor,
+                    "start": slot_start,
                     "end": slot_end,
-                    "date_label": cursor.strftime("%a %b %-d"),
-                    "time_label": cursor.strftime("%-I:%M %p CT"),
+                    "date_label": slot_start.strftime("%a %b %-d"),
+                    "time_label": slot_start.strftime("%-I:%M %p CT"),
                 })
                 if len(blocks) >= max_results:
                     return blocks
