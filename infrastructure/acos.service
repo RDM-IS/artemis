@@ -1,0 +1,18 @@
+[Unit]
+Description=ACOS AI Chief of Staff
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/artemis
+ExecStart=/usr/bin/python3.11 -m artemis.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/home/ec2-user/artemis
+Environment=AWS_DEFAULT_REGION=us-east-1
+
+[Install]
+WantedBy=multi-user.target
