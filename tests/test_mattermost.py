@@ -8,12 +8,12 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import requests
-from knowledge.secrets import get_mattermost_credentials
+from knowledge.secrets import get_mattermost_credentials, get_mattermost_url
 
 
 def main():
     creds = get_mattermost_credentials()
-    url = creds["url"].rstrip("/")
+    url = get_mattermost_url().rstrip("/")
     token = creds["token"]
     channel_id = creds["channel_id"]
     headers = {

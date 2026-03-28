@@ -43,9 +43,17 @@ def get_anthropic_key() -> str:
 
 
 def get_mattermost_credentials() -> dict:
-    """Returns {url, token, channel_id}.
+    """Returns {url, token, channel_id, and optionally int_url}.
     Secret name: rdmis/dev/mattermost"""
     return get_secret("rdmis/dev/mattermost")
+
+
+def get_mattermost_url() -> str:
+    """Returns int_url if available (EC2 internal),
+    falls back to url (external).
+    Use this everywhere instead of hardcoding url."""
+    creds = get_mattermost_credentials()
+    return creds.get("int_url") or creds["url"]
 
 
 def get_twilio_credentials() -> dict:
