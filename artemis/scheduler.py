@@ -190,6 +190,12 @@ class ArtemisScheduler:
             id="override_expiry_check",
         )
 
+        # Action item reminders — every 30 minutes
+        self.scheduler.add_job(
+            self.job_action_item_reminders, "interval", minutes=30,
+            id="action_item_reminders",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -402,6 +408,38 @@ class ArtemisScheduler:
                 original_subject=msg.get("subject", "Meeting"),
             )
 
+            # Serialize free_blocks for JSON storage (datetimes aren't serializable)
+            blocks_for_storage = [
+                {"date_label": b["date_label"], "time_label": b["time_label"],
+                 "start": b["start"].isoformat(), "end": b["end"].isoformat()}
+                for b in free_blocks
+            ]
+
+            # Persist action item
+            from knowledge.db import execute_write
+            is_priority = self.gmail.is_priority_sender(sender_email)
+            action_item = execute_write(
+                """INSERT INTO acos.action_items
+                   (item_type, status, priority, title, description, metadata, due_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, now() + interval '24 hours')
+                   RETURNING id""",
+                (
+                    "scheduling_request",
+                    "pending",
+                    "high" if is_priority else "normal",
+                    f"Schedule {duration}min with {sender_name}",
+                    result.get("raw_request", "")[:500],
+                    json.dumps({
+                        **draft,
+                        "free_blocks": blocks_for_storage,
+                        "duration_minutes": duration,
+                        "thread_id": msg.get("thread_id", ""),
+                        "confidence": result["confidence"],
+                    }),
+                ),
+            )
+            item_id = str(action_item["id"])[:8] if action_item else "?"
+
             # Post approval request to Mattermost
             slots_preview = " | ".join(
                 f"{b['date_label']} {b['time_label']}" for b in free_blocks
@@ -413,12 +451,13 @@ class ArtemisScheduler:
                 f"Request: \"{result['raw_request'][:150]}\"\n\n"
                 f"**Proposed slots:** {slots_preview}\n\n"
                 f"**Draft reply:**\n> {draft['body'][:500]}\n\n"
-                f"\u2705 `approve sched {msg['thread_id'][:12]}` · "
-                f"\u274c `skip sched {msg['thread_id'][:12]}`",
+                f"\u2705 `approve sched {item_id}` · "
+                f"\u274c `skip sched {item_id}` · "
+                f"\U0001f4a4 `snooze sched {item_id}`",
             )
             logger.info(
-                "Scheduling request detected from %s (%dmin, confidence=%.2f)",
-                sender_email, duration, result["confidence"],
+                "Scheduling request detected from %s (%dmin, confidence=%.2f, action_item=%s)",
+                sender_email, duration, result["confidence"], item_id,
             )
         except Exception:
             logger.debug("Scheduling detection error for %s", msg.get("from_email", ""), exc_info=True)
@@ -1213,6 +1252,65 @@ class ArtemisScheduler:
                 self.mm.post_message(config.CHANNEL_OPS, announcement)
         except Exception:
             logger.debug("Override expiry check failed", exc_info=True)
+
+    def job_action_item_reminders(self):
+        """Remind about pending action items and auto-expire stale ones."""
+        if self._is_quiet():
+            return
+        try:
+            from knowledge.db import execute_query, execute_write
+
+            # Find pending items needing a reminder
+            pending = execute_query("""
+                SELECT id, item_type, title, created_at, reminder_count, priority
+                FROM acos.action_items
+                WHERE status = 'pending'
+                  AND (snoozed_until IS NULL OR snoozed_until < now())
+                  AND (last_reminded_at IS NULL
+                       OR last_reminded_at < now() - interval '2 hours')
+                ORDER BY priority DESC, created_at ASC
+            """)
+
+            for item in pending:
+                item_id = str(item["id"])[:8]
+                age = datetime.utcnow() - item["created_at"].replace(tzinfo=None)
+
+                # Auto-expire items older than 7 days
+                if age.days >= 7:
+                    execute_write(
+                        """UPDATE acos.action_items
+                           SET status = 'expired', resolved_at = now(),
+                               resolved_by = 'auto-expire', updated_at = now()
+                           WHERE id = %s""",
+                        (item["id"],),
+                    )
+                    self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        f"\u23f0 **Expired:** {item['title']} (no action after 7 days)",
+                    )
+                    continue
+
+                # Post reminder
+                age_str = f"{age.days}d {age.seconds // 3600}h" if age.days else f"{age.seconds // 3600}h"
+                priority_tag = " \U0001f534" if item["priority"] == "high" else ""
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    f"\u23f0 **Pending action{priority_tag}:** {item['title']}\n"
+                    f"Waiting since: {age_str} ago (reminded {item['reminder_count']}x)\n"
+                    f"\u2705 `approve sched {item_id}` · "
+                    f"\u274c `skip sched {item_id}` · "
+                    f"\U0001f4a4 `snooze sched {item_id}`",
+                )
+                execute_write(
+                    """UPDATE acos.action_items
+                       SET reminder_count = reminder_count + 1,
+                           last_reminded_at = now(), updated_at = now()
+                       WHERE id = %s""",
+                    (item["id"],),
+                )
+
+        except Exception:
+            logger.debug("Action item reminders failed", exc_info=True)
 
     def run_catchup(self):
         """Run catch-up processing after startup to handle missed emails during downtime."""
