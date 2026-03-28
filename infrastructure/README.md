@@ -74,6 +74,22 @@ cd ~/artemis/api && bash deploy.sh
 | `rdmis/dev/gmail-token` | (token.json content) | Gmail OAuth token |
 | `rdmis/dev/calendar-token` | (calendar_token.json content) | Calendar OAuth token |
 | `rdmis/dev/twilio` | account_sid, auth_token, from_number | Twilio SMS |
+| `rdmis/dev/booking-links` | 30min, 60min, 90min | Google Calendar booking URLs |
+
+## Booking Links
+
+Store Google Calendar appointment schedule URLs in Secrets Manager:
+
+```json
+{
+  "30min": "PASTE_GOOGLE_CALENDAR_30MIN_URL",
+  "60min": "PASTE_GOOGLE_CALENDAR_60MIN_URL",
+  "90min": "PASTE_GOOGLE_CALENDAR_90MIN_URL"
+}
+```
+
+Create via: Calendar > Create > Appointment schedule > set duration > copy booking link.
+Secret name: `rdmis/dev/booking-links`
 
 ## Required Environment Variables
 

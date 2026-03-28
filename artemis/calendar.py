@@ -444,3 +444,106 @@ class CalendarClient:
             attendee_str = ", ".join(attendee_names) if attendee_names else "(solo)"
             lines.append(f"- **{e['summary']}** at {e['start']} — {attendee_str}")
         return "\n".join(lines)
+
+    def find_free_blocks(
+        self,
+        duration_minutes: int,
+        days_ahead: int = 5,
+        max_results: int = 3,
+        business_hours_only: bool = True,
+    ) -> list[dict]:
+        """Find free blocks in the calendar for scheduling.
+
+        Returns up to max_results blocks as:
+        [{"start": datetime, "end": datetime, "date_label": "Tue Mar 31",
+          "time_label": "10:00 AM CT"}]
+
+        Business hours: 9 AM - 5 PM CT. 15 min buffer around events.
+        Skips weekends.
+        """
+        from datetime import date as date_type
+
+        if not self.service:
+            logger.error("Calendar not authenticated")
+            return []
+
+        local_tz = ZoneInfo(config.TIMEZONE)
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+
+        # Fetch events for the search window
+        end_date = today + timedelta(days=days_ahead + 1)
+        events = self.get_events_in_range(tomorrow, end_date)
+
+        # Parse event times into (start, end) datetime pairs
+        busy = []
+        buffer = timedelta(minutes=15)
+        for e in events:
+            try:
+                e_start = datetime.fromisoformat(e["start"])
+                e_end = datetime.fromisoformat(e["end"])
+                if e_start.tzinfo is None:
+                    e_start = e_start.replace(tzinfo=local_tz)
+                if e_end.tzinfo is None:
+                    e_end = e_end.replace(tzinfo=local_tz)
+                busy.append((e_start - buffer, e_end + buffer))
+            except (ValueError, KeyError):
+                continue
+
+        busy.sort(key=lambda x: x[0])
+        duration = timedelta(minutes=duration_minutes)
+        blocks = []
+
+        for day_offset in range(1, days_ahead + 1):
+            check_date = today + timedelta(days=day_offset)
+            # Skip weekends
+            if check_date.weekday() >= 5:
+                continue
+
+            if business_hours_only:
+                day_start = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    9, 0, tzinfo=local_tz,
+                )
+                day_end = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    17, 0, tzinfo=local_tz,
+                )
+            else:
+                day_start = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    8, 0, tzinfo=local_tz,
+                )
+                day_end = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    20, 0, tzinfo=local_tz,
+                )
+
+            # Walk through the day in 30-min increments
+            cursor = day_start
+            while cursor + duration <= day_end:
+                slot_end = cursor + duration
+                # Check overlap with any busy period
+                conflict = False
+                for b_start, b_end in busy:
+                    if cursor < b_end and slot_end > b_start:
+                        conflict = True
+                        # Jump cursor past this busy block
+                        cursor = b_end
+                        break
+                if conflict:
+                    continue
+
+                blocks.append({
+                    "start": cursor,
+                    "end": slot_end,
+                    "date_label": cursor.strftime("%a %b %-d"),
+                    "time_label": cursor.strftime("%-I:%M %p CT"),
+                })
+                if len(blocks) >= max_results:
+                    return blocks
+
+                # Advance by 30 min to find next slot
+                cursor += timedelta(minutes=30)
+
+        return blocks

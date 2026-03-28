@@ -101,6 +101,12 @@ def put_secret(secret_name: str, secret_dict: dict) -> None:
     )
 
 
+def get_booking_links() -> dict:
+    """Returns {30min, 60min, 90min} booking URLs.
+    Secret name: rdmis/dev/booking-links"""
+    return get_secret("rdmis/dev/booking-links")
+
+
 def get_crm_api_key() -> str:
     """Returns CRM API key string.
     Secret name: rdmis/dev/crm-api-key"""

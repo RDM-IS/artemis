@@ -47,6 +47,7 @@ from artemis.billing import (
     process_billing_message,
 )
 from artemis.crm_client import CRMClient
+from artemis.scheduling import detect_scheduling_request, draft_scheduling_response
 from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
@@ -351,6 +352,12 @@ class ArtemisScheduler:
                         )
                         self._execute_playbook(playbook_match, orig, item)
 
+                    # Scheduling request detection (Learning mode — approval required)
+                    if orig:
+                        email_text = orig.get("full_body") or orig.get("snippet", "")
+                        if email_text:
+                            self._check_scheduling_request(orig, email_text)
+
                     # Archive every processed email
                     if orig:
                         self.gmail.archive_message(orig["id"])
@@ -366,6 +373,55 @@ class ArtemisScheduler:
         except Exception as exc:
             self._record_gmail_failure(str(exc))
             logger.exception("Inbox triage failed")
+
+    def _check_scheduling_request(self, msg: dict, email_text: str):
+        """Detect scheduling requests and post approval to Mattermost (Learning mode)."""
+        try:
+            result = detect_scheduling_request(email_text, msg.get("from_email", ""))
+            if not result:
+                return
+
+            duration = result["suggested_duration_minutes"]
+            sender_email = result["sender"]
+            sender_name = msg.get("from", sender_email).split("<")[0].strip().strip('"')
+
+            # Find free blocks
+            free_blocks = self.calendar.find_free_blocks(
+                duration_minutes=duration, days_ahead=5, max_results=3
+            )
+            if not free_blocks:
+                logger.info("Scheduling request from %s but no free blocks found", sender_email)
+                return
+
+            # Draft response
+            draft = draft_scheduling_response(
+                sender_name=sender_name,
+                sender_email=sender_email,
+                duration_minutes=duration,
+                free_blocks=free_blocks,
+                original_subject=msg.get("subject", "Meeting"),
+            )
+
+            # Post approval request to Mattermost
+            slots_preview = " | ".join(
+                f"{b['date_label']} {b['time_label']}" for b in free_blocks
+            )
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f4c5 **Scheduling request** from {sender_name} ({sender_email})\n"
+                f"Duration: {duration} min | Confidence: {result['confidence']:.0%}\n"
+                f"Request: \"{result['raw_request'][:150]}\"\n\n"
+                f"**Proposed slots:** {slots_preview}\n\n"
+                f"**Draft reply:**\n> {draft['body'][:500]}\n\n"
+                f"\u2705 `approve sched {msg['thread_id'][:12]}` · "
+                f"\u274c `skip sched {msg['thread_id'][:12]}`",
+            )
+            logger.info(
+                "Scheduling request detected from %s (%dmin, confidence=%.2f)",
+                sender_email, duration, result["confidence"],
+            )
+        except Exception:
+            logger.debug("Scheduling detection error for %s", msg.get("from_email", ""), exc_info=True)
 
     def job_post_triage_batch(self):
         """Post batched triage summary."""
