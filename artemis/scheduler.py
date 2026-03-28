@@ -452,10 +452,14 @@ class ArtemisScheduler:
     def job_morning_brief(self):
         """Generate and post the daily morning brief."""
         try:
-            # Today + next 3 days from cache
+            # Refresh calendar cache before building the brief
             from artemis import calendar_cache
-            start = date.today()
-            end = start + timedelta(days=3)
+            if self.calendar and self.calendar.service:
+                calendar_cache.refresh(self.calendar)
+
+            # Today + next 7 days
+            start = date.today() + timedelta(days=1)
+            end = date.today() + timedelta(days=7)
             upcoming_events = calendar_cache.get_events_in_range(start, end)
 
             # Filter to external events for brief
@@ -472,7 +476,7 @@ class ArtemisScheduler:
                 lines = []
                 for e in upcoming_events:
                     lines.append(f"- {e['summary']} at {e['start'][:16]} (solo)")
-                meetings_text = "\n".join(lines) if lines else "No meetings in next 3 days."
+                meetings_text = "\n".join(lines) if lines else "No meetings in the next 7 days."
 
             # Commitments due soon — try CRM API first, fall back to SQLite
             commitment_lines = []
