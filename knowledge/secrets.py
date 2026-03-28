@@ -56,6 +56,15 @@ def get_mattermost_url() -> str:
     return creds.get("int_url") or creds["url"]
 
 
+def get_mattermost_ws_url() -> str:
+    """WebSocket URL derived from public url.
+    https:// becomes wss://
+    http:// becomes ws://
+    Always uses the public url (not int_url) to avoid CORS blocks."""
+    url = get_mattermost_credentials()["url"]
+    return url.replace("https://", "wss://").replace("http://", "ws://")
+
+
 def get_twilio_credentials() -> dict:
     """Returns {account_sid, auth_token, from_number}.
     Secret name: rdmis/dev/twilio"""

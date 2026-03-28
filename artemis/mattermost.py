@@ -91,7 +91,8 @@ class MattermostClient:
 
     def start_websocket(self):
         """Connect to Mattermost websocket and listen for mentions."""
-        ws_url = self.url.replace("http", "ws") + "/api/v4/websocket"
+        from knowledge.secrets import get_mattermost_ws_url
+        ws_url = get_mattermost_ws_url().rstrip("/") + "/api/v4/websocket"
         bot_id = self.get_bot_user_id()
 
         def on_message(ws, raw):
