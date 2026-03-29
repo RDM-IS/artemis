@@ -1462,13 +1462,17 @@ def _handle_action_item_command(post: dict, question: str) -> bool:
         if action == "approve":
             # Send the draft email
             sent = False
-            if _gmail and _gmail.service and metadata.get("to"):
-                thread_id = metadata.get("thread_id", "")
-                sent = _gmail.send_reply(
+            to_addr = metadata.get("to", "")
+            subject = metadata.get("subject", "")
+            body = metadata.get("body", "")
+            thread_id = metadata.get("thread_id") or None
+
+            if _gmail and _gmail.service and to_addr:
+                sent = _gmail.send_email(
+                    to=to_addr,
+                    subject=subject,
+                    body=body,
                     thread_id=thread_id,
-                    to=metadata["to"],
-                    subject=metadata.get("subject", ""),
-                    body=metadata.get("body", ""),
                 )
 
             execute_write(
@@ -1478,13 +1482,25 @@ def _handle_action_item_command(post: dict, question: str) -> bool:
                    WHERE id = %s""",
                 (item["id"],),
             )
-            status_msg = "sent" if sent else "approved (email send failed — check logs)"
-            if _mm:
-                _mm.post_to_channel_id(
-                    channel_id,
-                    f"\u2705 **Approved:** {item['title']} — email {status_msg}",
-                    root_id=root_id,
+
+            if sent:
+                sender_name = item.get("title", "").replace(f"Schedule {metadata.get('duration_minutes', '')}min with ", "")
+                if _mm:
+                    _mm.post_to_channel_id(
+                        channel_id,
+                        f"\u2705 Reply sent to {to_addr}",
+                        root_id=root_id,
+                    )
+            else:
+                # Fallback: show copy-paste draft so it's not lost
+                fallback = (
+                    f"\u26a0\ufe0f Email send failed — copy-paste draft below:\n\n"
+                    f"**To:** {to_addr}\n"
+                    f"**Subject:** {subject}\n"
+                    f"```\n{body}\n```"
                 )
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, fallback, root_id=root_id)
 
         elif action == "skip":
             execute_write(

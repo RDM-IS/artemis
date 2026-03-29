@@ -464,6 +464,78 @@ class GmailClient:
             logger.exception("Failed to send reply in thread %s", thread_id)
             return False
 
+    def send_email(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str | None = None,
+    ) -> bool:
+        """Send an email via Gmail API.
+
+        If thread_id is provided, sends as a reply in that thread
+        (fetches Message-ID for proper In-Reply-To threading).
+        Otherwise sends a new standalone email.
+
+        Returns True on success, False on failure.
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot send")
+            return False
+
+        if not self._refresh_if_needed():
+            logger.error("Gmail credentials invalid — cannot send")
+            return False
+
+        # If replying in a thread, get the Message-ID for threading headers
+        in_reply_to = ""
+        if thread_id:
+            try:
+                thread = (
+                    self.service.users()
+                    .threads()
+                    .get(userId="me", id=thread_id, format="metadata",
+                         metadataHeaders=["Message-ID"])
+                    .execute()
+                )
+                msgs = thread.get("messages", [])
+                if msgs:
+                    last_msg = msgs[-1]
+                    headers = {
+                        h["name"]: h["value"]
+                        for h in last_msg.get("payload", {}).get("headers", [])
+                    }
+                    in_reply_to = headers.get("Message-ID", "")
+            except Exception:
+                logger.debug("Could not fetch Message-ID for thread %s", thread_id)
+
+        msg = MIMEText(body)
+        msg["to"] = to
+        msg["subject"] = subject
+
+        my_email = self.get_my_email()
+        if my_email:
+            msg["from"] = my_email
+
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        send_body: dict = {"raw": raw}
+        if thread_id:
+            send_body["threadId"] = thread_id
+
+        try:
+            self.service.users().messages().send(
+                userId="me", body=send_body,
+            ).execute()
+            logger.info("Sent email to %s (thread=%s)", to, thread_id or "new")
+            return True
+        except Exception:
+            logger.exception("Failed to send email to %s", to)
+            return False
+
     def format_for_claude(self, messages: list[dict]) -> str:
         """Format messages for Claude with UNTRUSTED prefix."""
         from artemis.prompts import UNTRUSTED_PREFIX
