@@ -7,51 +7,37 @@ data, uploads attachments to Drive, logs to Sheets, and posts to Mattermost.
 import base64
 import logging
 import re
-import sqlite3
 from datetime import date
 from email.utils import parseaddr
 
 from artemis import config
-from artemis.commitments import get_db
 from artemis.google_drive import get_or_create_expense_folder, upload_attachment
 from artemis.google_sheets import append_expense_row, get_sheet_url
+from knowledge.db import execute_one, execute_write
+from knowledge.secrets import get_gmail_token
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SQLite state tracking — processed billing message IDs
+# Postgres state tracking — processed billing message IDs
 # ---------------------------------------------------------------------------
 
-_CREATE_PROCESSED = """
-CREATE TABLE IF NOT EXISTS processed_billing (
-    message_id TEXT PRIMARY KEY,
-    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
-)
-"""
 
-
-def _ensure_table(db: sqlite3.Connection) -> None:
-    db.execute(_CREATE_PROCESSED)
-    db.commit()
-
-
-def is_processed(message_id: str, db: sqlite3.Connection | None = None) -> bool:
-    conn = db or get_db()
-    _ensure_table(conn)
-    row = conn.execute(
-        "SELECT 1 FROM processed_billing WHERE message_id = ?", (message_id,)
-    ).fetchone()
+def is_processed(message_id: str) -> bool:
+    """Check if a billing message has already been processed (via RDS Postgres)."""
+    row = execute_one(
+        "SELECT 1 FROM acos.processed_billing WHERE message_id = %s",
+        (message_id,),
+    )
     return row is not None
 
 
-def mark_processed(message_id: str, db: sqlite3.Connection | None = None) -> None:
-    conn = db or get_db()
-    _ensure_table(conn)
-    conn.execute(
-        "INSERT OR IGNORE INTO processed_billing (message_id) VALUES (?)",
+def mark_processed(message_id: str) -> None:
+    """Mark a billing message as processed (via RDS Postgres)."""
+    execute_write(
+        "INSERT INTO acos.processed_billing (message_id) VALUES (%s) ON CONFLICT DO NOTHING",
         (message_id,),
     )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -481,18 +467,16 @@ _BILLING_SCOPES = [
 def check_billing_scopes() -> tuple[bool, list[str]]:
     """Check if current OAuth token has Drive and Sheets scopes.
 
+    Reads the token from Secrets Manager (not a local file).
     Returns (all_present, list_of_missing_scopes).
     """
-    token_path = config.GMAIL_TOKEN_PATH
-    if not token_path.exists():
-        return False, _BILLING_SCOPES[:]
-
     try:
-        creds = Credentials.from_authorized_user_file(str(token_path))
-        granted = set(creds.scopes or [])
+        token_dict = get_gmail_token()
+        granted = set(token_dict.get("scopes", []))
         missing = [s for s in _BILLING_SCOPES if s not in granted]
         return len(missing) == 0, missing
     except Exception:
+        logger.debug("Could not read Gmail token from Secrets Manager for scope check")
         return False, _BILLING_SCOPES[:]
 
 
