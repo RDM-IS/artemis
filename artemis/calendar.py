@@ -1,7 +1,8 @@
 """Google Calendar client — meeting detection."""
 
+import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
@@ -10,6 +11,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 from artemis import config
+from knowledge.secrets import get_gmail_credentials, get_calendar_token, put_secret
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +29,20 @@ class CalendarClient:
     def authenticate(self, mm_client=None):
         """Authenticate with Google Calendar API.
 
+        Loads OAuth token from Secrets Manager (rdmis/dev/calendar-token).
+        On refresh, writes the updated token back to Secrets Manager.
+
         Args:
             mm_client: Optional MattermostClient to post auth failure alerts.
         """
         creds = None
-        token_path = config.CALENDAR_TOKEN_PATH
-        creds_path = config.CALENDAR_CREDENTIALS_PATH
 
-        if token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        # Load token from Secrets Manager
+        try:
+            token_data = get_calendar_token()
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+        except Exception:
+            logger.debug("No Calendar token in Secrets Manager — will attempt interactive flow")
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
@@ -56,14 +63,16 @@ class CalendarClient:
                     self.service = None
                     return
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
+                # Interactive flow — local dev only (won't work on Lambda/EC2)
+                client_config = get_gmail_credentials()
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
                 creds = flow.run_local_server(port=0)
 
-        # Persist refreshed token
+        # Persist refreshed token to Secrets Manager
         try:
-            token_path.write_text(creds.to_json())
+            put_secret("rdmis/dev/calendar-token", json.loads(creds.to_json()))
         except Exception:
-            logger.warning("Failed to persist Calendar token to %s", token_path)
+            logger.warning("Failed to persist Calendar token to Secrets Manager")
 
         # Validate scopes — warn but don't crash
         self.scope_mismatch = False
@@ -92,8 +101,8 @@ class CalendarClient:
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                config.CALENDAR_TOKEN_PATH.write_text(creds.to_json())
-                logger.debug("Calendar token refreshed and saved")
+                put_secret("rdmis/dev/calendar-token", json.loads(creds.to_json()))
+                logger.debug("Calendar token refreshed and saved to Secrets Manager")
             except Exception:
                 logger.exception("Calendar token refresh failed mid-session")
                 return False
@@ -354,13 +363,27 @@ class CalendarClient:
         description: str | None = None,
         attendees: list[str] | None = None,
         reminder_minutes: int = 15,
+        _user_approved_external: bool = False,
     ) -> str | None:
         """Create a calendar event.
 
         Returns the event ID on success, or None on failure.
+
+        HARD GUARDRAIL: If attendees contains any external email (not @rdm.is
+        or @gmail.com), creation is BLOCKED unless _user_approved_external=True.
+        This cannot be disabled by any config, env var, or mode.
         """
         if not self.service:
             logger.error("Calendar not authenticated — cannot create event")
+            return None
+
+        # ── HARD GUARDRAIL: External attendee check ──
+        from artemis.guardrails import check_external_attendees
+        check = check_external_attendees(
+            summary, attendees, user_approved=_user_approved_external
+        )
+        if not check["allowed"]:
+            logger.error("GUARDRAIL BLOCKED: %s", check["reason"])
             return None
 
         local_tz = ZoneInfo(config.TIMEZONE)
@@ -421,3 +444,122 @@ class CalendarClient:
             attendee_str = ", ".join(attendee_names) if attendee_names else "(solo)"
             lines.append(f"- **{e['summary']}** at {e['start']} — {attendee_str}")
         return "\n".join(lines)
+
+    def find_free_blocks(
+        self,
+        duration_minutes: int,
+        days_ahead: int = 5,
+        max_results: int = 3,
+        business_hours_only: bool = True,
+        date_constraint: date | None = None,
+        buffer_minutes: int = 0,
+    ) -> list[dict]:
+        """Find free blocks in the calendar for scheduling.
+
+        Returns up to max_results blocks as:
+        [{"start": datetime, "end": datetime, "date_label": "Tue Mar 31",
+          "time_label": "10:00 AM CT"}]
+
+        Business hours: 9 AM - 5 PM CT. 15 min buffer around events.
+        Skips weekends.
+
+        date_constraint: if set, only return blocks on that specific date.
+        buffer_minutes: extra clear time required before and after the meeting
+            slot (e.g. travel buffer). The calendar must be free for
+            buffer_minutes + duration_minutes + buffer_minutes, but only the
+            middle duration_minutes is returned as the offered slot.
+        """
+        if not self.service:
+            logger.error("Calendar not authenticated")
+            return []
+
+        local_tz = ZoneInfo(config.TIMEZONE)
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+
+        # Fetch events for the search window
+        end_date = today + timedelta(days=days_ahead + 1)
+        events = self.get_events_in_range(tomorrow, end_date)
+
+        # Parse event times into (start, end) datetime pairs
+        busy = []
+        buffer = timedelta(minutes=15)
+        for e in events:
+            try:
+                e_start = datetime.fromisoformat(e["start"])
+                e_end = datetime.fromisoformat(e["end"])
+                if e_start.tzinfo is None:
+                    e_start = e_start.replace(tzinfo=local_tz)
+                if e_end.tzinfo is None:
+                    e_end = e_end.replace(tzinfo=local_tz)
+                busy.append((e_start - buffer, e_end + buffer))
+            except (ValueError, KeyError):
+                continue
+
+        busy.sort(key=lambda x: x[0])
+        meeting_dur = timedelta(minutes=duration_minutes)
+        travel_buf = timedelta(minutes=buffer_minutes)
+        total_needed = meeting_dur + travel_buf * 2
+        blocks = []
+
+        for day_offset in range(1, days_ahead + 1):
+            check_date = today + timedelta(days=day_offset)
+
+            # If a specific date was requested, skip all other dates
+            if date_constraint and check_date != date_constraint:
+                continue
+
+            # Skip weekends
+            if check_date.weekday() >= 5:
+                continue
+
+            if business_hours_only:
+                day_start = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    9, 0, tzinfo=local_tz,
+                )
+                day_end = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    17, 0, tzinfo=local_tz,
+                )
+            else:
+                day_start = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    8, 0, tzinfo=local_tz,
+                )
+                day_end = datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    20, 0, tzinfo=local_tz,
+                )
+
+            # Walk through the day in 30-min increments
+            cursor = day_start
+            while cursor + total_needed <= day_end:
+                window_end = cursor + total_needed
+                # Check overlap with any busy period
+                conflict = False
+                for b_start, b_end in busy:
+                    if cursor < b_end and window_end > b_start:
+                        conflict = True
+                        # Jump cursor past this busy block
+                        cursor = b_end
+                        break
+                if conflict:
+                    continue
+
+                # Offer only the middle meeting slot (after travel buffer)
+                slot_start = cursor + travel_buf
+                slot_end = slot_start + meeting_dur
+                blocks.append({
+                    "start": slot_start,
+                    "end": slot_end,
+                    "date_label": slot_start.strftime("%a %b %-d"),
+                    "time_label": slot_start.strftime("%-I:%M %p CT"),
+                })
+                if len(blocks) >= max_results:
+                    return blocks
+
+                # Advance by 30 min to find next slot
+                cursor += timedelta(minutes=30)
+
+        return blocks

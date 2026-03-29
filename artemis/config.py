@@ -20,12 +20,8 @@ def _domain_expiry_map(val: str) -> dict[str, str]:
     return result
 
 
-# Anthropic
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# Mattermost
+# Mattermost (non-secret config — token comes from knowledge.secrets)
 MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://localhost:8065")
-MATTERMOST_BOT_TOKEN = os.environ.get("MATTERMOST_BOT_TOKEN", "")
 MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")
 CHANNEL_OPS = os.environ.get("CHANNEL_OPS", "artemis-ryan")
 CHANNEL_BRIEFS = os.environ.get("CHANNEL_BRIEFS", "artemis-ryan")
@@ -64,9 +60,8 @@ STARTUP_RETRY_DELAY = int(os.environ.get("STARTUP_RETRY_DELAY", "15"))
 # Tailscale
 TAILSCALE_HOSTNAME = os.environ.get("TAILSCALE_HOSTNAME", "")
 
-# CRM API
+# CRM API (key comes from knowledge.secrets)
 CRM_API_URL = os.environ.get("CRM_API_URL", "")
-CRM_API_KEY = os.environ.get("CRM_API_KEY", "")
 
 # Playbooks
 PLAYBOOKS_PATH = Path(os.environ.get("PLAYBOOKS_PATH", "PLAYBOOKS.md"))

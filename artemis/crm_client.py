@@ -20,15 +20,17 @@ class CRMClient:
     """Thin wrapper around the RDMIS CRM API."""
 
     def __init__(self):
+        from knowledge.secrets import get_crm_api_key
         self.base_url = config.CRM_API_URL.rstrip("/")
+        self._api_key = get_crm_api_key() if self.base_url else ""
         self._headers = {
-            "X-API-Key": config.CRM_API_KEY,
+            "X-API-Key": self._api_key,
             "Content-Type": "application/json",
         }
 
     def is_available(self) -> bool:
         """Return True if CRM API is configured (URL and key present)."""
-        return bool(self.base_url and config.CRM_API_KEY)
+        return bool(self.base_url and self._api_key)
 
     # ------------------------------------------------------------------
     # Base request handler
