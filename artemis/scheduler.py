@@ -285,12 +285,19 @@ class ArtemisScheduler:
                     )
 
             if non_priority:
-                email_text = self.gmail.format_for_claude(non_priority)
-                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
-
-                # Zip triage results back with original messages for thread tracking
+                # Pre-fetch full bodies (capped) so triage sees real content
                 full_body_fetches = 0
                 _MAX_FULL_FETCHES = 5
+                for msg in non_priority:
+                    if full_body_fetches >= _MAX_FULL_FETCHES:
+                        break
+                    body = self.gmail.get_full_message(msg["id"])
+                    if body:
+                        msg["full_body"] = body
+                        full_body_fetches += 1
+
+                email_text = self.gmail.format_for_claude(non_priority)
+                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
 
                 for i, item in enumerate(triaged):
                     urgency = item.get("urgency", "low")
@@ -1362,6 +1369,12 @@ class ArtemisScheduler:
 
                 for m in new_messages:
                     self._seen_message_ids.add(m["id"])
+
+                # Pre-fetch full bodies so triage sees real content
+                for msg in new_messages[:5]:
+                    body = self.gmail.get_full_message(msg["id"])
+                    if body:
+                        msg["full_body"] = body
 
                 # Track in inbox + triage
                 email_text = self.gmail.format_for_claude(new_messages)

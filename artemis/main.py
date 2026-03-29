@@ -175,13 +175,20 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     time_str = now.strftime("%I:%M %p")
     parts.append(f"**Current time:** {day_name}, {time_str}")
 
-    # Recent emails
+    # Recent emails — fetch full bodies so Claude has real content
     try:
         messages = gmail.get_recent_messages(max_results=10)
         if messages:
-            parts.append("\n**Recent emails (last 3 threads):**")
-            for m in messages[:3]:
-                parts.append(f"- From: {m['from']} | Subject: {m['subject']} | {m['snippet'][:100]}")
+            parts.append("\n**Recent emails (last 5 threads):**")
+            for m in messages[:5]:
+                body = gmail.get_full_message(m["id"])
+                if body:
+                    parts.append(
+                        f"- From: {m['from']} | Subject: {m['subject']}\n"
+                        f"  Body: {body[:1000]}"
+                    )
+                else:
+                    parts.append(f"- From: {m['from']} | Subject: {m['subject']} | {m['snippet'][:200]}")
     except Exception:
         logger.exception("Failed to get emails for mention context")
 
