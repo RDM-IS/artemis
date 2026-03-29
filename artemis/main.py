@@ -1468,11 +1468,18 @@ def _handle_action_item_command(post: dict, question: str) -> bool:
             thread_id = metadata.get("thread_id") or None
 
             if _gmail and _gmail.service and to_addr:
+                logger.info("Approval handler: sending email to %s (thread=%s)", to_addr, thread_id)
                 sent = _gmail.send_email(
                     to=to_addr,
                     subject=subject,
                     body=body,
                     thread_id=thread_id,
+                )
+                logger.info("Approval handler: send result=%s for %s", sent, to_addr)
+            else:
+                logger.warning(
+                    "Approval handler: cannot send — gmail=%s, service=%s, to=%s",
+                    bool(_gmail), bool(_gmail and _gmail.service), to_addr,
                 )
 
             execute_write(

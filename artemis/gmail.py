@@ -526,14 +526,16 @@ class GmailClient:
         if thread_id:
             send_body["threadId"] = thread_id
 
+        logger.info("Attempting Gmail send to %s (thread=%s)", to, thread_id or "new")
         try:
-            self.service.users().messages().send(
+            result = self.service.users().messages().send(
                 userId="me", body=send_body,
             ).execute()
-            logger.info("Sent email to %s (thread=%s)", to, thread_id or "new")
+            logger.info("Gmail send success: message_id=%s to=%s", result.get("id"), to)
             return True
-        except Exception:
-            logger.exception("Failed to send email to %s", to)
+        except Exception as e:
+            logger.error("Gmail send failed: %s", e)
+            logger.exception("Gmail send exception details for %s", to)
             return False
 
     def format_for_claude(self, messages: list[dict]) -> str:

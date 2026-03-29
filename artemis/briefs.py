@@ -71,7 +71,11 @@ def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
     if not result:
         return []
     try:
-        return json.loads(_strip_fences(result))
+        data = json.loads(_strip_fences(result))
+        # Claude may return a bare array or a wrapped object like {"items": [...]}
+        if isinstance(data, list):
+            return data
+        return data.get("items", [data])
     except json.JSONDecodeError:
         logger.error("Failed to parse triage response: %s", result[:200])
         return []
