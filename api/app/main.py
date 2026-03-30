@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from mangum import Mangum
 from sqlalchemy import text
@@ -15,7 +16,8 @@ from knowledge.secrets import get_crm_api_key
 from .database import get_db
 from .routers import (
     organizations, contacts, deals, interactions,
-    commitments, invoices, founder_loans, webhooks
+    commitments, invoices, founder_loans, webhooks,
+    dashboard,
 )
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
@@ -32,6 +34,14 @@ def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
 
 app = FastAPI(title="RDMIS CRM API", version="0.1.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(organizations.router, prefix="/organizations", tags=["organizations"], dependencies=[Depends(verify_api_key)])
 app.include_router(contacts.router, prefix="/contacts", tags=["contacts"], dependencies=[Depends(verify_api_key)])
 app.include_router(deals.router, prefix="/deals", tags=["deals"], dependencies=[Depends(verify_api_key)])
@@ -40,6 +50,7 @@ app.include_router(commitments.router, prefix="/commitments", tags=["commitments
 app.include_router(invoices.router, prefix="/invoices", tags=["invoices"], dependencies=[Depends(verify_api_key)])
 app.include_router(founder_loans.router, prefix="/founder-loans", tags=["founder-loans"], dependencies=[Depends(verify_api_key)])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
+app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"], dependencies=[Depends(verify_api_key)])
 
 @app.get("/health")
 @app.get("/default/rdmis-crm-api/health")
