@@ -44,6 +44,7 @@ from artemis.monitors import (
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.billing import (
     check_billing_scopes,
+    ensure_billing_label,
     get_billing_messages,
     process_billing_message,
 )
@@ -1110,10 +1111,37 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("Commitment reminder chain failed")
 
+    _billing_label_checked: bool = False
+
     def job_billing_intake(self):
         """PB-007: Scan for billing-labeled emails and process them."""
         if self._is_quiet():
             return
+
+        # One-time label creation check per process lifetime
+        if not self._billing_label_checked:
+            label_id = ensure_billing_label(self.gmail)
+            if label_id:
+                # Check if we just created it (no messages would exist yet)
+                # by comparing to cached state — only announce once
+                if not getattr(self, "_billing_label_announced", False):
+                    try:
+                        results = self.gmail.service.users().messages().list(
+                            userId="me", labelIds=[label_id], maxResults=1
+                        ).execute()
+                        if not results.get("messages"):
+                            self.mm.post_message(
+                                config.CHANNEL_OPS,
+                                "\U0001f4c1 Created Gmail label **artemis/billing** — "
+                                "tag expense emails with this label for automatic intake",
+                            )
+                    except Exception:
+                        pass
+                    self._billing_label_announced = True
+                self._billing_label_checked = True
+            else:
+                logger.warning("PB-007: Could not ensure artemis/billing label")
+
         try:
             message_ids = get_billing_messages(self.gmail)
             if not message_ids:

@@ -114,12 +114,46 @@ def classify_category(subject: str, sender: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def ensure_billing_label(gmail_client) -> str | None:
+    """Ensure the 'artemis/billing' Gmail label exists. Creates it if missing.
+
+    Returns the label ID, or None on failure.
+    """
+    if not gmail_client.service:
+        return None
+
+    try:
+        labels = gmail_client.service.users().labels().list(userId="me").execute()
+        for lbl in labels.get("labels", []):
+            if lbl["name"].lower() == "artemis/billing":
+                return lbl["id"]
+
+        # Label doesn't exist — create it
+        new_label = gmail_client.service.users().labels().create(
+            userId="me",
+            body={
+                "name": "artemis/billing",
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
+        ).execute()
+        label_id = new_label["id"]
+        logger.info("Created Gmail label 'artemis/billing' (id=%s)", label_id)
+        return label_id
+    except Exception:
+        logger.exception("Failed to ensure artemis/billing label")
+        return None
+
+
 def get_billing_messages(gmail_client) -> list[dict]:
     """Fetch messages with the 'artemis/billing' label that haven't been processed."""
     if not gmail_client.service:
         return []
 
     try:
+        # Refresh credentials to avoid stale SSL connections
+        gmail_client.authenticate()
+
         # Find the label ID for 'artemis/billing'
         labels = gmail_client.service.users().labels().list(userId="me").execute()
         label_id = None
