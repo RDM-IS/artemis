@@ -8,6 +8,7 @@ const API_BASE =
   "https://inolj7bn99.execute-api.us-east-1.amazonaws.com/default/rdmis-crm-api";
 const API_KEY = "kBAuGh_itvJI797R1L3CKuRIbwGXIgwy2beeg1VqVxw";
 const REFRESH_MS = 60_000;
+const EXIT_DATE = new Date("2026-09-30");
 
 // ---------------------------------------------------------------------------
 // Brand tokens
@@ -28,8 +29,27 @@ const C = {
 const FONT_BODY = "Georgia, serif";
 const FONT_MONO = "'Courier New', Courier, monospace";
 
+const GATE_LABELS = {
+  0: "Prospect",
+  1: "Pitch",
+  2: "Pilot Signed",
+  3: "Pilot Complete",
+  4: "MSA Signed",
+  5: "Implementation",
+};
+
+const STATUS_COLOR = {
+  hot: C.SIGNAL,
+  warm: C.ORACLE,
+  active: C.MOONSTONE,
+  prospect: C.MIST,
+  cold: C.MIST,
+  closed: C.GREEN,
+  unknown: C.MIST,
+};
+
 // ---------------------------------------------------------------------------
-// Mock data — fallback when API is unreachable
+// Mock data
 // ---------------------------------------------------------------------------
 
 const MOCK = {
@@ -51,70 +71,123 @@ const MOCK = {
     {
       id: "mock-1",
       company_name: "TTI",
-      contact_name: "Brian Pivar",
-      stage: "Gate 2",
+      contact_name: "Brian Pivar + Srinivasan Narayanan",
+      gate: 1,
+      stage: "Gate 1",
       value_cents: 12500000,
       status: "warm",
-      next_action: "Follow-up Apr 2",
-      updated_at: "2026-03-26",
+      next_action: "Srinivasan call Thu Apr 3",
+      updated_at: "2026-03-30",
     },
     {
-      id: "mock-2",
-      company_name: "Milwaukee Tool",
-      contact_name: "Srinivasan",
-      stage: "Intro",
-      value_cents: 0,
-      status: "active",
-      next_action: "Discovery call scheduled",
-      updated_at: "2026-03-28",
+      id: "mock-p1",
+      company_name: "Stanley Black & Decker",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
     },
     {
-      id: "mock-3",
-      company_name: "Acme",
-      contact_name: "Clive",
-      stage: "Demo",
-      value_cents: 8000000,
-      status: "hot",
-      next_action: "Demo Apr 7",
-      updated_at: "2026-03-29",
+      id: "mock-p2",
+      company_name: "Spectrum Brands",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
+    },
+    {
+      id: "mock-p3",
+      company_name: "ITW",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
+    },
+    {
+      id: "mock-p4",
+      company_name: "Emerson",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
+    },
+    {
+      id: "mock-p5",
+      company_name: "Roper Technologies",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
+    },
+    {
+      id: "mock-p6",
+      company_name: "Kawasaki",
+      contact_name: "",
+      gate: 0,
+      stage: "Gate 0",
+      value_cents: 12500000,
+      status: "prospect",
+      next_action: "Not contacted",
+      updated_at: null,
     },
   ],
   action_items: [
     {
       id: "ai-1",
-      item_type: "scheduling_request",
       priority: "high",
-      title: "Clive demo Apr 7",
-      description: "Prepare demo environment",
-      due_at: "2026-04-07T09:00:00",
-      created_at: "2026-03-29T10:00:00",
+      title: "Send Lucint briefing to Brad + Srinivasan",
+      due_at: "2026-04-01T09:00:00",
+      gate_label: "Gate 1",
     },
     {
       id: "ai-2",
-      item_type: "follow_up",
       priority: "high",
-      title: "Brian followup Apr 2",
-      description: "Send revised SOW",
+      title: "Follow up Brian Pivar LinkedIn",
       due_at: "2026-04-02T09:00:00",
-      created_at: "2026-03-28T14:00:00",
+      gate_label: "Gate 1",
     },
     {
       id: "ai-3",
-      item_type: "follow_up",
-      priority: "normal",
-      title: "Brad advisory Apr 3",
-      description: "Advisory board prep",
+      priority: "high",
+      title: "SCORE call — Brad + Srinivasan",
       due_at: "2026-04-03T09:00:00",
-      created_at: "2026-03-27T11:00:00",
+      gate_label: "Gate 1",
     },
     {
       id: "ai-4",
-      item_type: "follow_up",
       priority: "normal",
-      title: "Databricks Apr 1",
-      description: "Partnership review",
+      title: "Activate Databricks credits",
       due_at: "2026-04-01T09:00:00",
-      created_at: "2026-03-26T16:00:00",
+      gate_label: "Gate 0",
+    },
+    {
+      id: "ai-5",
+      priority: "normal",
+      title: "Merge PR #33 aws-build \u2192 main",
+      due_at: new Date().toISOString(),
+      gate_label: "Gate 0",
+    },
+    {
+      id: "ai-6",
+      priority: "normal",
+      title: "Attorney engagement for NDA template",
+      due_at: null,
+      gate_label: null,
     },
   ],
   acos: {
@@ -152,7 +225,7 @@ function cents(v) {
 }
 
 function relativeTime(iso) {
-  if (!iso) return "—";
+  if (!iso) return "\u2014";
   const d = new Date(iso);
   const now = new Date();
   const diffMs = now - d;
@@ -165,14 +238,40 @@ function relativeTime(iso) {
   return `${days}d ago`;
 }
 
-const STATUS_COLOR = {
-  hot: C.SIGNAL,
-  warm: C.ORACLE,
-  active: C.MOONSTONE,
-  cold: C.MIST,
-  closed: C.GREEN,
-  unknown: C.MIST,
-};
+function daysToExit() {
+  return Math.ceil((EXIT_DATE - new Date()) / 86_400_000);
+}
+
+/** Extract a gate number from a deal or action item. */
+function parseGate(item) {
+  // Prefer explicit gate field
+  if (item.gate != null) return item.gate;
+  // Try stage string like "Gate 2"
+  const m = (item.stage || item.gate_label || "").match(/gate\s*(\d)/i);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/** Group action items by gate label. */
+function groupByGate(items) {
+  const groups = {};
+  for (const item of items) {
+    const g = parseGate(item);
+    const label =
+      g != null ? `Gate ${g} \u2014 ${GATE_LABELS[g] || "Unknown"}` : "General";
+    if (!groups[label]) groups[label] = [];
+    groups[label].push(item);
+  }
+  // Sort groups: numbered gates first (ascending), then General last
+  const sorted = Object.entries(groups).sort((a, b) => {
+    const gA = a[0].match(/Gate (\d)/);
+    const gB = b[0].match(/Gate (\d)/);
+    if (gA && gB) return parseInt(gA[1]) - parseInt(gB[1]);
+    if (gA) return -1;
+    if (gB) return 1;
+    return 0;
+  });
+  return sorted;
+}
 
 // ---------------------------------------------------------------------------
 // Sub-components
@@ -185,10 +284,10 @@ function Panel({ title, children, style }) {
         background: C.SHADOW,
         border: `1px solid ${C.MIST}`,
         borderRadius: 4,
-        padding: "16px 20px",
+        padding: "14px 18px",
         display: "flex",
         flexDirection: "column",
-        gap: 12,
+        gap: 10,
         overflow: "hidden",
         ...style,
       }}
@@ -201,12 +300,13 @@ function Panel({ title, children, style }) {
           textTransform: "uppercase",
           color: C.MOONSTONE,
           borderBottom: `1px solid ${C.MIST}`,
-          paddingBottom: 8,
+          paddingBottom: 6,
+          flexShrink: 0,
         }}
       >
         {title}
       </div>
-      <div style={{ flex: 1, overflowY: "auto" }}>{children}</div>
+      <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>{children}</div>
     </div>
   );
 }
@@ -216,11 +316,11 @@ function ProgressBar({ value, max, color }) {
   return (
     <div
       style={{
-        height: 6,
+        height: 5,
         background: C.MIST,
         borderRadius: 3,
         overflow: "hidden",
-        marginTop: 4,
+        marginTop: 3,
       }}
     >
       <div
@@ -236,36 +336,54 @@ function ProgressBar({ value, max, color }) {
   );
 }
 
-function StatusBadge({ status }) {
+function GateBadge({ gate }) {
+  const isProspect = gate === 0;
   return (
     <span
       style={{
         fontFamily: FONT_MONO,
-        fontSize: 10,
+        fontSize: 9,
         letterSpacing: 1,
         textTransform: "uppercase",
-        padding: "2px 8px",
+        padding: "2px 7px",
         borderRadius: 3,
-        background: STATUS_COLOR[status] || C.MIST,
-        color: status === "cold" || status === "active" ? C.ARROW : C.VOID,
+        background: isProspect ? C.MIST : C.EMBER,
+        color: C.ARROW,
+        whiteSpace: "nowrap",
       }}
     >
-      {status}
+      Gate {gate}
     </span>
   );
 }
 
-function Stat({ label, value, mono, color }) {
+function StatusDot({ status }) {
   return (
-    <div style={{ marginBottom: 8 }}>
+    <span
+      style={{
+        display: "inline-block",
+        width: 7,
+        height: 7,
+        borderRadius: "50%",
+        background: STATUS_COLOR[status] || C.MIST,
+        boxShadow: `0 0 5px ${STATUS_COLOR[status] || C.MIST}`,
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
+function Stat({ label, value, mono, color, small }) {
+  return (
+    <div style={{ marginBottom: small ? 4 : 6 }}>
       <div
         style={{
           fontFamily: FONT_MONO,
-          fontSize: 10,
+          fontSize: 9,
           color: C.MOONSTONE,
           letterSpacing: 1,
           textTransform: "uppercase",
-          marginBottom: 2,
+          marginBottom: 1,
         }}
       >
         {label}
@@ -273,7 +391,7 @@ function Stat({ label, value, mono, color }) {
       <div
         style={{
           fontFamily: mono ? FONT_MONO : FONT_BODY,
-          fontSize: mono ? 14 : 16,
+          fontSize: small ? 12 : 14,
           color: color || C.ARROW,
         }}
       >
@@ -284,7 +402,114 @@ function Stat({ label, value, mono, color }) {
 }
 
 // ---------------------------------------------------------------------------
-// Panel: Survival
+// Panel: Pipeline (gate-sorted deal cards)
+// ---------------------------------------------------------------------------
+
+function PipelinePanel({ data }) {
+  const sorted = [...data].sort((a, b) => {
+    const gA = parseGate(a) ?? 99;
+    const gB = parseGate(b) ?? 99;
+    if (gA !== gB) return gA - gB;
+    return 0;
+  });
+
+  return (
+    <Panel title="Pipeline" style={{ flex: 1, minHeight: 0 }}>
+      {sorted.length === 0 && (
+        <div style={{ color: C.MOONSTONE, fontStyle: "italic" }}>
+          No deals
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {sorted.map((deal) => {
+          const gate = parseGate(deal) ?? 0;
+          const isProspect = gate === 0;
+          return (
+            <div
+              key={deal.id}
+              style={{
+                background: C.VOID,
+                border: `1px solid ${C.MIST}`,
+                borderRadius: 4,
+                padding: "9px 12px",
+                opacity: isProspect ? 0.5 : 1,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: 3,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <StatusDot status={deal.status} />
+                  <span style={{ fontWeight: "bold", fontSize: 14 }}>
+                    {deal.company_name}
+                  </span>
+                </div>
+                <GateBadge gate={gate} />
+              </div>
+
+              {deal.contact_name && (
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: C.MOONSTONE,
+                    marginBottom: 3,
+                    paddingLeft: 15,
+                  }}
+                >
+                  {deal.contact_name}
+                </div>
+              )}
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  paddingLeft: 15,
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: FONT_MONO,
+                    fontSize: 12,
+                    color: C.ORACLE,
+                  }}
+                >
+                  {cents(deal.value_cents)}
+                </span>
+                {deal.next_action && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      color: C.ARROW,
+                      opacity: 0.6,
+                      fontStyle: "italic",
+                      textAlign: "right",
+                      maxWidth: "60%",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {deal.next_action}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Panel: Survival (compact)
 // ---------------------------------------------------------------------------
 
 function SurvivalPanel({ data }) {
@@ -294,11 +519,11 @@ function SurvivalPanel({ data }) {
 
   return (
     <Panel title="Survival">
-      <div style={{ marginBottom: 8 }}>
+      <div style={{ marginBottom: 4 }}>
         <div
           style={{
             fontFamily: FONT_MONO,
-            fontSize: 10,
+            fontSize: 9,
             color: C.MOONSTONE,
             letterSpacing: 1,
             textTransform: "uppercase",
@@ -306,11 +531,11 @@ function SurvivalPanel({ data }) {
         >
           MRR
         </div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
           <span
             style={{
               fontFamily: FONT_MONO,
-              fontSize: 32,
+              fontSize: 24,
               fontWeight: "bold",
               color: mrr > 0 ? C.GREEN : C.SIGNAL,
             }}
@@ -318,7 +543,7 @@ function SurvivalPanel({ data }) {
             {cents(mrr)}
           </span>
           <span
-            style={{ fontFamily: FONT_MONO, fontSize: 13, color: C.MOONSTONE }}
+            style={{ fontFamily: FONT_MONO, fontSize: 11, color: C.MOONSTONE }}
           >
             / {cents(target)}
           </span>
@@ -326,200 +551,113 @@ function SurvivalPanel({ data }) {
         <ProgressBar value={mrr} max={target} color={C.ORACLE} />
       </div>
 
-      <Stat
-        label="Runway"
-        value={
-          data.runway_months != null
-            ? `${data.runway_months} months`
-            : "Pre-Revenue"
-        }
-        color={data.pre_revenue ? C.ORACLE : C.GREEN}
-      />
-      <Stat
-        label="Founder Loan Balance"
-        value={cents(data.founder_loan_balance_cents)}
-        mono
-      />
-
-      <div
-        style={{
-          borderTop: `1px solid ${C.MIST}`,
-          paddingTop: 8,
-          marginTop: 4,
-        }}
-      >
-        <div
-          style={{
-            fontFamily: FONT_MONO,
-            fontSize: 10,
-            color: C.MOONSTONE,
-            letterSpacing: 1,
-            textTransform: "uppercase",
-            marginBottom: 6,
-          }}
-        >
-          Expenses — {exp.month || "—"}
-        </div>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr 1fr",
-            gap: 8,
-          }}
-        >
-          <Stat label="Total" value={cents(exp.total_cents)} mono />
-          <Stat label="Infra" value={cents(exp.infra_cents)} mono />
-          <Stat label="SaaS" value={cents(exp.saas_cents)} mono />
-        </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+        <Stat
+          label="Runway"
+          value={
+            data.runway_months != null
+              ? `${data.runway_months}mo`
+              : "Pre-Revenue"
+          }
+          color={data.pre_revenue ? C.ORACLE : C.GREEN}
+          small
+        />
+        <Stat
+          label="Founder Loan"
+          value={cents(data.founder_loan_balance_cents)}
+          mono
+          small
+        />
+        <Stat
+          label={`Expenses ${exp.month || ""}`}
+          value={cents(exp.total_cents)}
+          mono
+          small
+        />
       </div>
     </Panel>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Panel: Pipeline
-// ---------------------------------------------------------------------------
-
-function PipelinePanel({ data }) {
-  return (
-    <Panel title="Pipeline">
-      {data.length === 0 && (
-        <div style={{ color: C.MOONSTONE, fontStyle: "italic" }}>
-          No active deals
-        </div>
-      )}
-      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {data.map((deal) => (
-          <div
-            key={deal.id}
-            style={{
-              background: C.VOID,
-              border: `1px solid ${C.MIST}`,
-              borderRadius: 4,
-              padding: "10px 14px",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                marginBottom: 4,
-              }}
-            >
-              <span style={{ fontWeight: "bold", fontSize: 15 }}>
-                {deal.company_name}
-              </span>
-              <StatusBadge status={deal.status} />
-            </div>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                fontSize: 13,
-                color: C.MOONSTONE,
-                marginBottom: 4,
-              }}
-            >
-              <span>{deal.contact_name}</span>
-              <span style={{ fontFamily: FONT_MONO, fontSize: 12 }}>
-                {deal.stage}
-              </span>
-            </div>
-            {deal.value_cents > 0 && (
-              <div
-                style={{
-                  fontFamily: FONT_MONO,
-                  fontSize: 14,
-                  color: C.ORACLE,
-                  marginBottom: 4,
-                }}
-              >
-                {cents(deal.value_cents)}
-              </div>
-            )}
-            {deal.next_action && (
-              <div
-                style={{
-                  fontSize: 12,
-                  color: C.ARROW,
-                  opacity: 0.7,
-                  fontStyle: "italic",
-                }}
-              >
-                {deal.next_action}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-    </Panel>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Panel: Action Items
+// Panel: Action Items (grouped by gate)
 // ---------------------------------------------------------------------------
 
 function ActionItemsPanel({ data }) {
+  const groups = groupByGate(data);
+
   return (
-    <Panel title="Action Items">
+    <Panel title="Action Items" style={{ flex: 1, minHeight: 0 }}>
       {data.length === 0 && (
         <div
           style={{
             color: C.GREEN,
             fontStyle: "italic",
-            padding: "12px 0",
+            padding: "8px 0",
           }}
         >
           All clear
         </div>
       )}
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {data.map((item) => (
-          <div
-            key={item.id}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              padding: "6px 10px",
-              background: C.VOID,
-              border: `1px solid ${C.MIST}`,
-              borderRadius: 4,
-              borderLeft: `3px solid ${
-                item.priority === "high" ? C.SIGNAL : C.MIST
-              }`,
-            }}
-          >
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 14 }}>{item.title}</div>
-              {item.description && (
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: C.MOONSTONE,
-                    marginTop: 2,
-                  }}
-                >
-                  {item.description}
-                </div>
-              )}
-            </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {groups.map(([label, items]) => (
+          <div key={label}>
             <div
               style={{
                 fontFamily: FONT_MONO,
                 fontSize: 10,
-                color: C.MOONSTONE,
-                whiteSpace: "nowrap",
+                letterSpacing: 1,
+                textTransform: "uppercase",
+                color: C.ORACLE,
+                marginBottom: 6,
               }}
             >
-              {item.due_at
-                ? new Date(item.due_at).toLocaleDateString("en-US", {
-                    month: "short",
-                    day: "numeric",
-                  })
-                : ""}
+              {label}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {items.map((item) => (
+                <div
+                  key={item.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "5px 10px",
+                    background: C.VOID,
+                    border: `1px solid ${C.MIST}`,
+                    borderRadius: 4,
+                    borderLeft: `3px solid ${
+                      item.priority === "high" ? C.SIGNAL : C.MIST
+                    }`,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 12,
+                      height: 12,
+                      border: `1.5px solid ${C.MOONSTONE}`,
+                      borderRadius: 2,
+                      flexShrink: 0,
+                    }}
+                  />
+                  <div style={{ flex: 1, fontSize: 13 }}>{item.title}</div>
+                  <div
+                    style={{
+                      fontFamily: FONT_MONO,
+                      fontSize: 10,
+                      color: C.MOONSTONE,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {item.due_at
+                      ? new Date(item.due_at).toLocaleDateString("en-US", {
+                          month: "short",
+                          day: "numeric",
+                        })
+                      : ""}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         ))}
@@ -529,29 +667,36 @@ function ActionItemsPanel({ data }) {
 }
 
 // ---------------------------------------------------------------------------
-// Panel: ACOS Health
+// Panel: ACOS Health (compact)
 // ---------------------------------------------------------------------------
 
 function AcosHealthPanel({ data }) {
   const isOnline = data.status === "online";
   return (
     <Panel title="ACOS Health">
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          marginBottom: 6,
+        }}
+      >
         <div
           style={{
-            width: 10,
-            height: 10,
+            width: 8,
+            height: 8,
             borderRadius: "50%",
             background: isOnline ? C.GREEN : C.SIGNAL,
             boxShadow: isOnline
-              ? `0 0 8px ${C.GREEN}`
-              : `0 0 8px ${C.SIGNAL}`,
+              ? `0 0 6px ${C.GREEN}`
+              : `0 0 6px ${C.SIGNAL}`,
           }}
         />
         <span
           style={{
             fontFamily: FONT_MONO,
-            fontSize: 14,
+            fontSize: 12,
             color: isOnline ? C.GREEN : C.SIGNAL,
             textTransform: "uppercase",
             letterSpacing: 2,
@@ -561,15 +706,21 @@ function AcosHealthPanel({ data }) {
         </span>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-        <Stat label="Version" value={data.version || "—"} mono />
-        <Stat label="Jobs Running" value={data.jobs_running ?? "—"} mono />
-        <Stat label="Last Brief" value={relativeTime(data.last_brief)} mono />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+        <Stat label="Version" value={data.version || "\u2014"} mono small />
+        <Stat label="Jobs" value={data.jobs_running ?? "\u2014"} mono small />
+        <Stat
+          label="Last Brief"
+          value={relativeTime(data.last_brief)}
+          mono
+          small
+        />
         <Stat
           label="Uptime"
-          value={data.uptime_pct != null ? `${data.uptime_pct}%` : "—"}
+          value={data.uptime_pct != null ? `${data.uptime_pct}%` : "\u2014"}
           mono
           color={C.GREEN}
+          small
         />
       </div>
     </Panel>
@@ -582,7 +733,7 @@ function AcosHealthPanel({ data }) {
 
 export default function Dashboard() {
   const [data, setData] = useState(null);
-  const [source, setSource] = useState(null); // "live" | "mock"
+  const [source, setSource] = useState(null);
   const [lastFetch, setLastFetch] = useState(null);
 
   const fetchData = useCallback(async () => {
@@ -628,6 +779,8 @@ export default function Dashboard() {
     );
   }
 
+  const days = daysToExit();
+
   return (
     <div
       style={{
@@ -635,11 +788,11 @@ export default function Dashboard() {
         display: "flex",
         flexDirection: "column",
         background: C.VOID,
-        padding: 16,
-        gap: 12,
+        padding: 14,
+        gap: 10,
       }}
     >
-      {/* Header */}
+      {/* ── Header ── */}
       <div
         style={{
           display: "flex",
@@ -677,34 +830,62 @@ export default function Dashboard() {
             {source === "live" ? "LIVE" : "MOCK"}
           </span>
         </div>
+
         <div
           style={{
             fontFamily: FONT_MONO,
-            fontSize: 10,
-            color: C.MOONSTONE,
+            fontSize: 13,
+            letterSpacing: 1,
+            color: days <= 90 ? C.SIGNAL : C.ORACLE,
           }}
         >
-          {lastFetch
-            ? `Updated ${lastFetch.toLocaleTimeString()}`
-            : ""}
+          {days > 0 ? `${days} days to exit` : "EXIT DAY"}
+        </div>
+
+        <div
+          style={{ fontFamily: FONT_MONO, fontSize: 10, color: C.MOONSTONE }}
+        >
+          {lastFetch ? `Updated ${lastFetch.toLocaleTimeString()}` : ""}
         </div>
       </div>
 
-      {/* Grid */}
+      {/* ── Body: left column + right column ── */}
       <div
         style={{
           flex: 1,
           display: "grid",
           gridTemplateColumns: "1fr 1fr",
-          gridTemplateRows: "1fr 1fr",
-          gap: 12,
+          gap: 10,
           minHeight: 0,
         }}
       >
-        <SurvivalPanel data={data.survival || MOCK.survival} />
-        <PipelinePanel data={data.pipeline || MOCK.pipeline} />
-        <ActionItemsPanel data={data.action_items || MOCK.action_items} />
-        <AcosHealthPanel data={data.acos || MOCK.acos} />
+        {/* Left column: Pipeline + Survival */}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+            minHeight: 0,
+          }}
+        >
+          <PipelinePanel data={data.pipeline || MOCK.pipeline} />
+          <SurvivalPanel data={data.survival || MOCK.survival} />
+        </div>
+
+        {/* Right column: Action Items + ACOS Health */}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+            minHeight: 0,
+          }}
+        >
+          <ActionItemsPanel
+            data={data.action_items || MOCK.action_items}
+          />
+          <AcosHealthPanel data={data.acos || MOCK.acos} />
+        </div>
       </div>
     </div>
   );
