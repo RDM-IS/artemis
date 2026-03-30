@@ -14,17 +14,30 @@ logger = logging.getLogger(__name__)
 
 
 class MattermostClient:
+    TEAM_NAME = "rdmis"
+
     def __init__(self):
-        self.url = config.MATTERMOST_URL.rstrip("/")
-        self.token = config.MATTERMOST_BOT_TOKEN
-        self.team_id = config.MATTERMOST_TEAM_ID
+        from knowledge.secrets import get_mattermost_credentials, get_mattermost_url
+        mm_creds = get_mattermost_credentials()
+        self.url = get_mattermost_url().rstrip("/")
+        self.token = mm_creds.get("token", "")
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
         }
+        self._team_id: str | None = None
         self._channel_ids: dict[str, str] = {}
         self._bot_user_id: str | None = None
         self._mention_handler = None
+
+    @property
+    def team_id(self) -> str:
+        """Resolve team ID from the Mattermost API on first access."""
+        if not self._team_id:
+            resp = self._api("GET", f"/teams/name/{self.TEAM_NAME}")
+            self._team_id = resp.json()["id"]
+            logger.debug("Resolved team '%s' → %s", self.TEAM_NAME, self._team_id)
+        return self._team_id
 
     def _api(self, method: str, path: str, **kwargs) -> requests.Response:
         resp = requests.request(
@@ -78,7 +91,8 @@ class MattermostClient:
 
     def start_websocket(self):
         """Connect to Mattermost websocket and listen for mentions."""
-        ws_url = self.url.replace("http", "ws") + "/api/v4/websocket"
+        from knowledge.secrets import get_mattermost_ws_url
+        ws_url = get_mattermost_ws_url().rstrip("/") + "/api/v4/websocket"
         bot_id = self.get_bot_user_id()
 
         def on_message(ws, raw):

@@ -2,7 +2,7 @@
 
 import json
 import logging
-import multiprocessing
+import re
 import time
 from datetime import date, datetime, timedelta
 
@@ -44,15 +44,15 @@ from artemis.monitors import (
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.billing import (
     check_billing_scopes,
+    ensure_billing_label,
     get_billing_messages,
     process_billing_message,
 )
 from artemis.crm_client import CRMClient
+from artemis.scheduling import detect_scheduling_request, draft_scheduling_response
 from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
-
-_GMAIL_POLL_TIMEOUT = 120  # seconds — kill subprocess if it hangs
 
 # ---------------------------------------------------------------------------
 # Playbook helpers
@@ -83,22 +83,6 @@ def get_playbook_text() -> str:
     if not _playbook_text:
         return load_playbooks()
     return _playbook_text
-
-
-def _gmail_poll_worker(result_queue: multiprocessing.Queue, max_results: int = 20):
-    """Run Gmail polling in an isolated subprocess to guard against segfaults.
-
-    Writes ("ok", messages_list) or ("error", error_string) to result_queue.
-    """
-    try:
-        from artemis.gmail import GmailClient as _GmailClient
-
-        g = _GmailClient()
-        g.authenticate()
-        messages = g.get_recent_messages(max_results=max_results)
-        result_queue.put(("ok", messages))
-    except Exception as exc:
-        result_queue.put(("error", str(exc)))
 
 
 class ArtemisScheduler:
@@ -208,6 +192,12 @@ class ArtemisScheduler:
             id="override_expiry_check",
         )
 
+        # Action item reminders — every 30 minutes
+        self.scheduler.add_job(
+            self.job_action_item_reminders, "interval", minutes=30,
+            id="action_item_reminders",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -225,42 +215,24 @@ class ArtemisScheduler:
         except Exception:
             return False
 
-    def _poll_gmail_isolated(self, max_results: int = 20) -> list[dict]:
-        """Poll Gmail in a subprocess so a segfault can't crash the main process."""
-        q: multiprocessing.Queue = multiprocessing.Queue()
-        proc = multiprocessing.Process(
-            target=_gmail_poll_worker, args=(q, max_results), daemon=True
-        )
-        proc.start()
-        proc.join(timeout=_GMAIL_POLL_TIMEOUT)
-
-        if proc.is_alive():
-            logger.error("Gmail poll subprocess timed out — killing it")
-            proc.kill()
-            proc.join(timeout=5)
+    def _poll_gmail(self, max_results: int = 20) -> list[dict]:
+        """Poll Gmail inline using the already-authenticated GmailClient."""
+        if not self.gmail or not self.gmail.service:
+            logger.warning("Gmail not authenticated — skipping poll")
             return []
-
-        if proc.exitcode != 0:
-            logger.error("Gmail poll subprocess exited with code %s (possible segfault)", proc.exitcode)
+        try:
+            self.gmail._refresh_if_needed()
+            return self.gmail.get_recent_messages(max_results=max_results)
+        except Exception:
+            logger.exception("Gmail poll failed")
             return []
-
-        if q.empty():
-            logger.error("Gmail poll subprocess produced no result")
-            return []
-
-        status, payload = q.get_nowait()
-        if status == "error":
-            logger.error("Gmail poll subprocess error: %s", payload)
-            return []
-
-        return payload
 
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
         if self._is_quiet():
             return
         try:
-            messages = self._poll_gmail_isolated(max_results=20)
+            messages = self._poll_gmail(max_results=20)
             if messages:
                 self._record_gmail_success()
             new_messages = [
@@ -395,6 +367,12 @@ class ArtemisScheduler:
                         )
                         self._execute_playbook(playbook_match, orig, item)
 
+                    # Scheduling request detection (Learning mode — approval required)
+                    if orig:
+                        email_text = orig.get("full_body") or orig.get("snippet", "")
+                        if email_text:
+                            self._check_scheduling_request(orig, email_text)
+
                     # Archive every processed email
                     if orig:
                         self.gmail.archive_message(orig["id"])
@@ -410,6 +388,94 @@ class ArtemisScheduler:
         except Exception as exc:
             self._record_gmail_failure(str(exc))
             logger.exception("Inbox triage failed")
+
+    def _check_scheduling_request(self, msg: dict, email_text: str):
+        """Detect scheduling requests and post approval to Mattermost (Learning mode)."""
+        try:
+            result = detect_scheduling_request(email_text, msg.get("from_email", ""))
+            if not result:
+                return
+
+            duration = result["suggested_duration_minutes"]
+            date_constraint = result.get("date_constraint")
+            buffer_minutes = result.get("buffer_minutes", 0)
+            sender_email = result["sender"]
+            sender_name = msg.get("from", sender_email).split("<")[0].strip().strip('"')
+
+            # Find free blocks
+            free_blocks = self.calendar.find_free_blocks(
+                duration_minutes=duration,
+                days_ahead=5,
+                max_results=3,
+                date_constraint=date_constraint,
+                buffer_minutes=buffer_minutes,
+            )
+            if not free_blocks:
+                logger.info("Scheduling request from %s but no free blocks found", sender_email)
+                return
+
+            # Draft response
+            draft = draft_scheduling_response(
+                sender_name=sender_name,
+                sender_email=sender_email,
+                duration_minutes=duration,
+                free_blocks=free_blocks,
+                original_subject=msg.get("subject", "Meeting"),
+            )
+
+            # Serialize free_blocks for JSON storage (datetimes aren't serializable)
+            blocks_for_storage = [
+                {"date_label": b["date_label"], "time_label": b["time_label"],
+                 "start": b["start"].isoformat(), "end": b["end"].isoformat()}
+                for b in free_blocks
+            ]
+
+            # Persist action item
+            from knowledge.db import execute_write
+            is_priority = self.gmail.is_priority_sender(sender_email)
+            action_item = execute_write(
+                """INSERT INTO acos.action_items
+                   (item_type, status, priority, title, description, metadata, due_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, now() + interval '24 hours')
+                   RETURNING id""",
+                (
+                    "scheduling_request",
+                    "pending",
+                    "high" if is_priority else "normal",
+                    f"Schedule {duration}min with {sender_name}",
+                    result.get("raw_request", "")[:500],
+                    json.dumps({
+                        **draft,
+                        "free_blocks": blocks_for_storage,
+                        "duration_minutes": duration,
+                        "thread_id": msg.get("thread_id", ""),
+                        "confidence": result["confidence"],
+                    }),
+                ),
+            )
+            item_id = str(action_item["id"])[:8] if action_item else "?"
+
+            # Post approval request to Mattermost
+            slots_preview = " | ".join(
+                f"{b['date_label']} {b['time_label']}" for b in free_blocks
+            )
+            self.mm.post_message(
+                config.CHANNEL_OPS,
+                f"\U0001f4c5 **Scheduling request** from {sender_name} ({sender_email})\n"
+                f"Duration: {duration} min | Confidence: {result['confidence']:.0%}\n"
+                f"Request: \"{result['raw_request'][:150]}\"\n\n"
+                f"**Proposed slots:** {slots_preview}\n\n"
+                f"**Draft reply:**\n> {draft['body'][:500]}\n\n"
+                f"\u2705 `approve sched {item_id}` · "
+                f"\u274c `skip sched {item_id}` · "
+                f"\U0001f4a4 `snooze sched {item_id}`",
+            )
+            logger.info(
+                "Scheduling request detected from %s (%dmin, confidence=%.2f, action_item=%s)",
+                sender_email, duration, result["confidence"], item_id,
+            )
+        except Exception:
+            logger.debug("Scheduling detection error for %s", msg.get("from_email", ""), exc_info=True)
 
     def job_post_triage_batch(self):
         """Post batched triage summary."""
@@ -496,10 +562,14 @@ class ArtemisScheduler:
     def job_morning_brief(self):
         """Generate and post the daily morning brief."""
         try:
-            # Today + next 3 days from cache
+            # Refresh calendar cache before building the brief
             from artemis import calendar_cache
-            start = date.today()
-            end = start + timedelta(days=3)
+            if self.calendar and self.calendar.service:
+                calendar_cache.refresh(self.calendar)
+
+            # Today + next 7 days
+            start = date.today() + timedelta(days=1)
+            end = date.today() + timedelta(days=7)
             upcoming_events = calendar_cache.get_events_in_range(start, end)
 
             # Filter to external events for brief
@@ -516,7 +586,7 @@ class ArtemisScheduler:
                 lines = []
                 for e in upcoming_events:
                     lines.append(f"- {e['summary']} at {e['start'][:16]} (solo)")
-                meetings_text = "\n".join(lines) if lines else "No meetings in next 3 days."
+                meetings_text = "\n".join(lines) if lines else "No meetings in the next 7 days."
 
             # Commitments due soon — try CRM API first, fall back to SQLite
             commitment_lines = []
@@ -901,7 +971,11 @@ class ArtemisScheduler:
         try:
             result = _call_claude(system, user_prompt)
             import json as _json
-            extracted = _json.loads(result)
+            cleaned = result.strip()
+            cleaned = re.sub(r'^```json\s*', '', cleaned)
+            cleaned = re.sub(r'^```\s*', '', cleaned)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+            extracted = _json.loads(cleaned.strip())
             start_date = extracted.get("start_date")
             end_date = extracted.get("end_date")
             duration = extracted.get("duration_minutes") or config.DEFAULT_SLOT_DURATION
@@ -1037,10 +1111,37 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("Commitment reminder chain failed")
 
+    _billing_label_checked: bool = False
+
     def job_billing_intake(self):
         """PB-007: Scan for billing-labeled emails and process them."""
         if self._is_quiet():
             return
+
+        # One-time label creation check per process lifetime
+        if not self._billing_label_checked:
+            label_id = ensure_billing_label(self.gmail)
+            if label_id:
+                # Check if we just created it (no messages would exist yet)
+                # by comparing to cached state — only announce once
+                if not getattr(self, "_billing_label_announced", False):
+                    try:
+                        results = self.gmail.service.users().messages().list(
+                            userId="me", labelIds=[label_id], maxResults=1
+                        ).execute()
+                        if not results.get("messages"):
+                            self.mm.post_message(
+                                config.CHANNEL_OPS,
+                                "\U0001f4c1 Created Gmail label **artemis/billing** — "
+                                "tag expense emails with this label for automatic intake",
+                            )
+                    except Exception:
+                        pass
+                    self._billing_label_announced = True
+                self._billing_label_checked = True
+            else:
+                logger.warning("PB-007: Could not ensure artemis/billing label")
+
         try:
             message_ids = get_billing_messages(self.gmail)
             if not message_ids:
@@ -1129,7 +1230,7 @@ class ArtemisScheduler:
         # Overnight emails
         email_count = 0
         try:
-            messages = self._poll_gmail_isolated(max_results=50)
+            messages = self._poll_gmail(max_results=50)
             new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]
             email_count = len(new_messages)
         except Exception:
@@ -1198,6 +1299,65 @@ class ArtemisScheduler:
         except Exception:
             logger.debug("Override expiry check failed", exc_info=True)
 
+    def job_action_item_reminders(self):
+        """Remind about pending action items and auto-expire stale ones."""
+        if self._is_quiet():
+            return
+        try:
+            from knowledge.db import execute_query, execute_write
+
+            # Find pending items needing a reminder
+            pending = execute_query("""
+                SELECT id, item_type, title, created_at, reminder_count, priority
+                FROM acos.action_items
+                WHERE status = 'pending'
+                  AND (snoozed_until IS NULL OR snoozed_until < now())
+                  AND (last_reminded_at IS NULL
+                       OR last_reminded_at < now() - interval '2 hours')
+                ORDER BY priority DESC, created_at ASC
+            """)
+
+            for item in pending:
+                item_id = str(item["id"])[:8]
+                age = datetime.utcnow() - item["created_at"].replace(tzinfo=None)
+
+                # Auto-expire items older than 7 days
+                if age.days >= 7:
+                    execute_write(
+                        """UPDATE acos.action_items
+                           SET status = 'expired', resolved_at = now(),
+                               resolved_by = 'auto-expire', updated_at = now()
+                           WHERE id = %s""",
+                        (item["id"],),
+                    )
+                    self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        f"\u23f0 **Expired:** {item['title']} (no action after 7 days)",
+                    )
+                    continue
+
+                # Post reminder
+                age_str = f"{age.days}d {age.seconds // 3600}h" if age.days else f"{age.seconds // 3600}h"
+                priority_tag = " \U0001f534" if item["priority"] == "high" else ""
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    f"\u23f0 **Pending action{priority_tag}:** {item['title']}\n"
+                    f"Waiting since: {age_str} ago (reminded {item['reminder_count']}x)\n"
+                    f"\u2705 `approve sched {item_id}` · "
+                    f"\u274c `skip sched {item_id}` · "
+                    f"\U0001f4a4 `snooze sched {item_id}`",
+                )
+                execute_write(
+                    """UPDATE acos.action_items
+                       SET reminder_count = reminder_count + 1,
+                           last_reminded_at = now(), updated_at = now()
+                       WHERE id = %s""",
+                    (item["id"],),
+                )
+
+        except Exception:
+            logger.debug("Action item reminders failed", exc_info=True)
+
     def run_catchup(self):
         """Run catch-up processing after startup to handle missed emails during downtime."""
         from artemis.quiet_hours import get_system_value, set_system_value
@@ -1226,7 +1386,7 @@ class ArtemisScheduler:
         emails_processed = 0
         playbooks_fired = 0
         try:
-            messages = self._poll_gmail_isolated(max_results=50)
+            messages = self._poll_gmail(max_results=50)
             if messages:
                 self._record_gmail_success()
             new_messages = [m for m in messages if m["id"] not in self._seen_message_ids]

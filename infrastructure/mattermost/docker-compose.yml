@@ -1,0 +1,20 @@
+services:
+  mattermost:
+    image: mattermost/mattermost-team-edition:latest
+    container_name: mattermost
+    restart: unless-stopped
+    ports:
+      - "8065:8065"
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: ${MM_SQLSETTINGS_DATASOURCE}
+      MM_SERVICESETTINGS_SITEURL: https://artemis.rdm.is
+      MM_SERVICESETTINGS_LISTENADDRESS: ":8065"
+      MM_SERVICESETTINGS_ALLOWEDUNTRUSTEDINTERNALCONNECTIONS: "localhost 127.0.0.1"
+    volumes:
+      - ./config:/mattermost/config
+      - ./data:/mattermost/data
+      - ./logs:/mattermost/logs
+      - ./plugins:/mattermost/plugins
+      - ./client/plugins:/mattermost/client/plugins
+      - ./bleve-indexes:/mattermost/bleve-indexes

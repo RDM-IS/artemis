@@ -9,3 +9,5 @@ dist/
 build/
 .venv/
 venv/
+api/package/
+api/function.zip

@@ -521,8 +521,14 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
         del _pending_confirms[channel_id]
         return False
 
-    if q_lower not in ("confirm", "yes", "cancel", "no"):
+    if q_lower not in ("confirm", "yes", "cancel", "no", "approve", "deny"):
         return False
+
+    # Map approve/deny to yes/cancel for unified handling
+    if q_lower == "approve":
+        q_lower = "yes"
+    elif q_lower == "deny":
+        q_lower = "cancel"
 
     # Only handle calendar create types here; other types handled by their own handlers
     if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
@@ -533,11 +539,17 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
 
     if q_lower in ("cancel", "no"):
         del _pending_confirms[channel_id]
+        # Log guardrail denial if this was an external attendee block
+        if pending.get("type") == "calendar_create_external":
+            from artemis.guardrails import get_external_attendees, log_violation
+            ext = get_external_attendees(data.get("attendees") or [])
+            if ext:
+                log_violation(data.get("summary", ""), ext, "denied")
         log_calendar_action(
             action="cancelled",
             event_id="pending",
             summary=data.get("summary", ""),
-            notes="User cancelled pending event",
+            notes="User cancelled/denied pending event",
         )
         if _mm:
             _mm.post_to_channel_id(channel_id, "Calendar event cancelled.", root_id=root_id)
@@ -561,6 +573,7 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
             end_datetime=end_dt,
             description=description,
             attendees=attendees if attendees else None,
+            _user_approved_external=True,  # User explicitly confirmed via Mattermost
         )
 
         attendee_str = ", ".join(attendees) if attendees else ""
@@ -1421,6 +1434,125 @@ def _try_life_ops(question: str) -> str | None:
     return None
 
 
+def _handle_action_item_command(post: dict, question: str) -> bool:
+    """Handle approve/skip/snooze sched <id_prefix> commands."""
+    q_lower = question.lower().strip()
+    parts = q_lower.split()
+
+    # Match: approve|skip|snooze sched <id_prefix>
+    if len(parts) != 3 or parts[1] != "sched":
+        return False
+    action = parts[0]
+    if action not in ("approve", "skip", "snooze"):
+        return False
+    id_prefix = parts[2]
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    try:
+        from knowledge.db import execute_one, execute_write
+
+        # Find the action item by ID prefix
+        item = execute_one(
+            "SELECT * FROM acos.action_items WHERE CAST(id AS TEXT) LIKE %s AND status = 'pending'",
+            (f"{id_prefix}%",),
+        )
+        if not item:
+            if _mm:
+                _mm.post_to_channel_id(channel_id, f"No pending action item matching `{id_prefix}`.", root_id=root_id)
+            return True
+
+        import json as _json
+        metadata = item["metadata"] if isinstance(item["metadata"], dict) else _json.loads(item["metadata"] or "{}")
+
+        if action == "approve":
+            # Send the draft email
+            sent = False
+            to_addr = metadata.get("to", "")
+            subject = metadata.get("subject", "")
+            body = metadata.get("body", "")
+            thread_id = metadata.get("thread_id") or None
+
+            if _gmail and _gmail.service and to_addr:
+                logger.info("Approval handler: sending email to %s (thread=%s)", to_addr, thread_id)
+                sent = _gmail.send_email(
+                    to=to_addr,
+                    subject=subject,
+                    body=body,
+                    thread_id=thread_id,
+                )
+                logger.info("Approval handler: send result=%s for %s", sent, to_addr)
+            else:
+                logger.warning(
+                    "Approval handler: cannot send — gmail=%s, service=%s, to=%s",
+                    bool(_gmail), bool(_gmail and _gmail.service), to_addr,
+                )
+
+            execute_write(
+                """UPDATE acos.action_items
+                   SET status = 'approved', resolved_at = now(),
+                       resolved_by = 'ryan', updated_at = now()
+                   WHERE id = %s""",
+                (item["id"],),
+            )
+
+            if sent:
+                sender_name = item.get("title", "").replace(f"Schedule {metadata.get('duration_minutes', '')}min with ", "")
+                if _mm:
+                    _mm.post_to_channel_id(
+                        channel_id,
+                        f"\u2705 Reply sent to {to_addr}",
+                        root_id=root_id,
+                    )
+            else:
+                # Fallback: show copy-paste draft so it's not lost
+                fallback = (
+                    f"\u26a0\ufe0f Email send failed — copy-paste draft below:\n\n"
+                    f"**To:** {to_addr}\n"
+                    f"**Subject:** {subject}\n"
+                    f"```\n{body}\n```"
+                )
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, fallback, root_id=root_id)
+
+        elif action == "skip":
+            execute_write(
+                """UPDATE acos.action_items
+                   SET status = 'denied', resolved_at = now(),
+                       resolved_by = 'ryan', updated_at = now()
+                   WHERE id = %s""",
+                (item["id"],),
+            )
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"\u274c **Skipped:** {item['title']} — no email sent",
+                    root_id=root_id,
+                )
+
+        elif action == "snooze":
+            execute_write(
+                """UPDATE acos.action_items
+                   SET snoozed_until = now() + interval '4 hours', updated_at = now()
+                   WHERE id = %s""",
+                (item["id"],),
+            )
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"\U0001f4a4 **Snoozed:** {item['title']} — will remind in 4 hours",
+                    root_id=root_id,
+                )
+
+    except Exception:
+        logger.exception("Action item command failed: %s", q_lower)
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "\u26a0\ufe0f Action item command failed — check logs.", root_id=root_id)
+
+    return True
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -1444,6 +1576,10 @@ def _handle_mention(post: dict, thread: list[dict]):
 
     # Try inbox commands (done, wait, snooze, noise, inbox, waiting, snoozed)
     if _handle_inbox_command(post, question):
+        return
+
+    # Try action item commands (approve/skip/snooze sched)
+    if _handle_action_item_command(post, question):
         return
 
     # Direct commands
@@ -1743,7 +1879,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("Artemis is running. Press Ctrl+C to stop.")
-    app.run(host="0.0.0.0", port=5000, use_reloader=False)
+    app.run(host="0.0.0.0", port=5001, use_reloader=False)
 
 
 if __name__ == "__main__":
