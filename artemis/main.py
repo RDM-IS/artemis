@@ -1624,6 +1624,197 @@ def _handle_action_item_command(post: dict, question: str) -> bool:
     return True
 
 
+def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str | None:
+    """Route message via intent classifier. Returns response string or None to fall through."""
+    from artemis.intent import route_intent
+
+    # Check for file attachments in the Mattermost post
+    file_ids = post.get("file_ids") or []
+    has_attachment = len(file_ids) > 0
+    attachment_mime = None
+
+    # Get file metadata if present
+    file_info = None
+    if has_attachment and _mm:
+        try:
+            resp = _mm._api("GET", f"/files/{file_ids[0]}/info")
+            file_info = resp.json()
+            attachment_mime = file_info.get("mime_type")
+        except Exception:
+            logger.debug("Could not fetch file info for %s", file_ids[0])
+
+    intent = route_intent(question, has_attachment, attachment_mime)
+    logger.info(
+        "Intent: action=%s, confidence=%.2f, entities=%s",
+        intent.action, intent.confidence, intent.entities,
+    )
+
+    # Only act on high-confidence non-general intents
+    if intent.action == "general_reply" or intent.confidence < 0.6:
+        return None
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # ── add_contacts ──
+    if intent.action == "add_contacts":
+        from artemis.parser import parse_document
+        from artemis.crm_writer import write_contacts
+
+        contacts = []
+        if has_attachment and _mm and file_ids:
+            # Download file from Mattermost
+            try:
+                resp = _mm._api("GET", f"/files/{file_ids[0]}")
+                file_bytes = resp.content
+                mime = attachment_mime or "application/octet-stream"
+                contacts = parse_document(file_bytes, mime, user_context=question)
+            except Exception:
+                logger.exception("Failed to download attachment %s", file_ids[0])
+                return "\u26a0\ufe0f Failed to download the attachment. Try uploading again."
+
+        if not contacts and intent.entities:
+            # No attachment but entities mentioned — create minimal contacts
+            from artemis.parser import ExtractedContact
+            for name in intent.entities:
+                contacts.append(ExtractedContact(
+                    name=name,
+                    notes=f"Added via Mattermost: {question[:200]}",
+                    source_description="Mattermost message",
+                ))
+
+        if not contacts:
+            return "\u26a0\ufe0f I couldn't extract any contacts. Try attaching a document or mentioning names."
+
+        result = write_contacts(contacts, ryan_context=question)
+        return f"\U0001f4c7 **Contacts imported**\n{result.summary}"
+
+    # ── query_crm ──
+    if intent.action == "query_crm":
+        from knowledge.db import execute_query
+
+        parts = []
+        for entity_name in intent.entities:
+            # Search contacts
+            rows = execute_query(
+                """SELECT c.name, c.title, c.email, o.name AS org_name
+                   FROM public.contacts c
+                   LEFT JOIN public.organizations o ON c.org_id = o.id
+                   WHERE LOWER(c.name) LIKE '%%' || LOWER(%s) || '%%'
+                      OR LOWER(o.name) LIKE '%%' || LOWER(%s) || '%%'
+                   LIMIT 5""",
+                (entity_name, entity_name),
+            )
+            if rows:
+                for r in rows:
+                    org = f" at {r['org_name']}" if r.get("org_name") else ""
+                    title = f" ({r['title']})" if r.get("title") else ""
+                    parts.append(f"- **{r['name']}**{title}{org}")
+
+            # Search knowledge graph
+            entities = execute_query(
+                """SELECT name, entity_type, content, layer, tags
+                   FROM acos.entities
+                   WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%'
+                   LIMIT 5""",
+                (entity_name,),
+            )
+            for e in entities:
+                tags = ", ".join(e.get("tags") or [])
+                parts.append(
+                    f"- \U0001f9e0 **{e['name']}** ({e['entity_type']}, {e['layer']})"
+                    + (f" — {e['content'][:150]}" if e.get("content") else "")
+                    + (f" [{tags}]" if tags else "")
+                )
+
+            # Search relationships
+            rels = execute_query(
+                """SELECT r.relationship_type, r.relationship_context,
+                          s.name AS source_name, t.name AS target_name
+                   FROM acos.relationships r
+                   JOIN acos.entities s ON r.source_entity_id = s.id
+                   JOIN acos.entities t ON r.target_entity_id = t.id
+                   WHERE LOWER(s.name) LIKE '%%' || LOWER(%s) || '%%'
+                      OR LOWER(t.name) LIKE '%%' || LOWER(%s) || '%%'
+                   LIMIT 10""",
+                (entity_name, entity_name),
+            )
+            for r in rels:
+                parts.append(
+                    f"  \u2192 {r['source_name']} **{r['relationship_type']}** {r['target_name']}"
+                )
+
+        if parts:
+            return "\U0001f50d **CRM lookup**\n" + "\n".join(parts)
+        return f"\U0001f50d No results found for: {', '.join(intent.entities)}"
+
+    # ── add_note ──
+    if intent.action == "add_note":
+        from knowledge.db import execute_write as db_write
+
+        # Find entity to attach the note to
+        entity_id = None
+        entity_name = None
+        if intent.entities:
+            from artemis.crm_writer import _find_entity_by_name, _find_entity_by_name_fuzzy
+            for name in intent.entities:
+                ent = _find_entity_by_name(name) or _find_entity_by_name_fuzzy(name)
+                if ent:
+                    entity_id = str(ent["id"])
+                    entity_name = ent["name"]
+                    break
+
+        if entity_id:
+            db_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, metadata)
+                   VALUES (%s, 'business_context', %s, 'silver', '{}')""",
+                (entity_id, question),
+            )
+            return f"\U0001f4dd Noted on **{entity_name}**: _{question[:200]}_"
+        else:
+            # No entity found — store as a general note on a generic entity
+            db_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, metadata)
+                   VALUES (
+                       (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
+                       'business_context', %s, 'silver', '{}'
+                   )""",
+                (question,),
+            )
+            return f"\U0001f4dd Noted: _{question[:200]}_"
+
+    # ── pipeline_update ──
+    if intent.action == "pipeline_update":
+        from knowledge.db import execute_one as db_one, execute_query as db_query
+
+        for entity_name in intent.entities:
+            deal = db_one(
+                """SELECT d.id, d.name, d.gate, d.stage, o.name AS org_name
+                   FROM public.deals d
+                   JOIN public.organizations o ON d.org_id = o.id
+                   WHERE LOWER(o.name) LIKE '%%' || LOWER(%s) || '%%'
+                      OR LOWER(d.name) LIKE '%%' || LOWER(%s) || '%%'
+                   LIMIT 1""",
+                (entity_name, entity_name),
+            )
+            if deal:
+                return (
+                    f"\U0001f4ca **{deal['org_name']}** — {deal['name']}\n"
+                    f"Gate: {deal['gate']} | Stage: {deal['stage'] or 'N/A'}\n\n"
+                    f"_To update, use the CRM API or tell me specifically what changed._"
+                )
+
+        return "\U0001f4ca No matching deals found. Try mentioning the company name."
+
+    # ── schedule — pass through to existing handlers ──
+    if intent.action == "schedule":
+        return None  # let existing scheduling handlers pick it up
+
+    return None
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -1771,6 +1962,12 @@ def _handle_mention(post: dict, thread: list[dict]):
     life_ops_response = _try_life_ops(question)
     if life_ops_response and _mm:
         _mm.post_to_channel_id(channel_id, life_ops_response, root_id=root_id)
+        return
+
+    # ── Intent router: classify before generic Claude fallback ──
+    intent_response = _handle_intent_routed(post, question, thread)
+    if intent_response:
+        _mm.post_to_channel_id(channel_id, intent_response, root_id=root_id)
         return
 
     thread_lines = []
