@@ -28,31 +28,104 @@ _ROUTER_SYSTEM = (
     "Determine what they want done. Return ONLY valid JSON matching "
     "this schema, no other text:\n"
     "{\n"
-    '  "action": one of ["add_contacts", "query_crm", "add_note", '
+    '  "primary_action": one of ["add_contacts", "query_crm", "add_note", '
     '"schedule", "pipeline_update", "general_reply"],\n'
+    '  "secondary_actions": [...],\n'
     '  "entities": [list of person/org names mentioned],\n'
     '  "context": "one sentence explaining intent",\n'
     '  "attachments_needed": true or false,\n'
     '  "confidence": 0.0 to 1.0\n'
     "}\n\n"
-    "Rules:\n"
-    "- If message mentions adding, saving, importing people or contacts -> add_contacts\n"
-    "- If message asks what you know about someone or company, or asks for status -> query_crm\n"
-    "- If message references a meeting, scheduling, calendar -> schedule\n"
-    "- If message mentions pipeline, gate, deal, prospect -> pipeline_update\n"
-    "- If message asks to remember, note, or log something -> add_note\n"
-    "- Everything else -> general_reply\n"
-    "- If an attachment is present and action is ambiguous, bias toward add_contacts"
+    "CLASSIFICATION RULES (follow these strictly, in priority order):\n\n"
+    "1. ATTACHMENT OVERRIDE: If an attachment is present AND the message mentions "
+    "a person or organization name -> add_contacts as primary_action, regardless "
+    "of other keywords.\n\n"
+    "2. CONTACT / LEAD CREATION:\n"
+    '   Keywords: "create lead", "add lead", "new lead", "add to pipeline", '
+    '"potential POC", "potential contact", "add contact", "save contact", '
+    '"import", "add this person"\n'
+    "   -> primary_action: add_contacts, secondary_actions: [pipeline_update]\n\n"
+    "3. CRM QUERIES:\n"
+    '   Keywords: "what do you know", "tell me about", "find", "look up", '
+    '"who is", "what\'s the status", "any info on"\n'
+    "   -> primary_action: query_crm\n\n"
+    "4. SCHEDULING:\n"
+    '   Keywords: "schedule", "meeting", "calendar", "book", "set up a call"\n'
+    "   -> primary_action: schedule\n\n"
+    "5. PIPELINE MANAGEMENT:\n"
+    '   Keywords: "update pipeline", "move to gate", "deal status", '
+    '"advance deal", "pipeline update", "change stage"\n'
+    "   -> primary_action: pipeline_update (as primary only, no secondary)\n\n"
+    "6. NOTE TAKING:\n"
+    '   Keywords: "remember", "note", "log", "keep track", "jot down"\n'
+    "   -> primary_action: add_note\n\n"
+    "7. Everything else -> primary_action: general_reply\n\n"
+    "SECONDARY ACTIONS: Include secondary_actions when the message implies "
+    "multiple things should happen. Examples:\n"
+    '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '
+    "secondary: [pipeline_update]\n"
+    '  "Note that Brian called and schedule a follow-up" -> primary: add_note, '
+    "secondary: [schedule]\n"
+    "If only one thing is needed, secondary_actions should be [].\n"
 )
 
 
 @dataclass
 class IntentResult:
-    action: str = "general_reply"
+    primary_action: str = "general_reply"
+    secondary_actions: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
     context: str = "fallback"
     attachments_needed: bool = False
     confidence: float = 0.0
+
+    @property
+    def action(self) -> str:
+        """Backward-compatible alias for primary_action."""
+        return self.primary_action
+
+
+def load_intent_examples() -> str:
+    """Load learned intent corrections from acos.data_vault_satellites.
+
+    Returns formatted string of past corrections for inclusion in the
+    Claude routing prompt, or empty string if none exist.
+    """
+    try:
+        from knowledge.db import execute_query
+
+        rows = execute_query(
+            """SELECT content, created_at
+               FROM acos.data_vault_satellites
+               WHERE satellite_type = 'intent_example'
+               ORDER BY created_at DESC
+               LIMIT 20"""
+        )
+        if not rows:
+            return ""
+
+        lines = []
+        for row in rows:
+            try:
+                data = json.loads(row["content"]) if isinstance(row["content"], str) else row["content"]
+                user_said = data.get("user_said", "?")
+                correct = data.get("correct_action", "?")
+                rule = data.get("rule", "")
+                date_str = row["created_at"].strftime("%Y-%m-%d") if row.get("created_at") else "?"
+                lines.append(f'  User said: "{user_said}" -> correct action: {correct} ({date_str})')
+                if rule:
+                    lines.append(f"    Rule: {rule}")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+        if not lines:
+            return ""
+
+        return "Learned corrections from user feedback:\n" + "\n".join(lines) + "\n"
+
+    except Exception:
+        logger.debug("Could not load intent examples", exc_info=True)
+        return ""
 
 
 def route_intent(
@@ -66,20 +139,27 @@ def route_intent(
     general_reply with confidence 0.0.
     """
     client = anthropic.Anthropic(api_key=get_anthropic_key())
+
+    # Build system prompt with learned examples
+    examples = load_intent_examples()
+    system = _ROUTER_SYSTEM
+    if examples:
+        system += "\n" + examples
+
     user_msg = (
         f"Message: {message}\n"
         f"Has attachment: {has_attachment}\n"
         f"Attachment type: {attachment_mime or 'none'}"
     )
     prompt_hash = hashlib.sha256(
-        (_ROUTER_SYSTEM + user_msg).encode()
+        (system + user_msg).encode()
     ).hexdigest()[:16]
 
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
-            system=_ROUTER_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": user_msg}],
         )
         text = response.content[0].text.strip()
@@ -93,12 +173,16 @@ def route_intent(
 
         data = json.loads(text)
 
-        action = data.get("action", "general_reply")
-        if action not in VALID_ACTIONS:
-            action = "general_reply"
+        # Support both old "action" and new "primary_action" keys
+        primary = data.get("primary_action") or data.get("action", "general_reply")
+        if primary not in VALID_ACTIONS:
+            primary = "general_reply"
+
+        secondary = [a for a in data.get("secondary_actions", []) if a in VALID_ACTIONS]
 
         return IntentResult(
-            action=action,
+            primary_action=primary,
+            secondary_actions=secondary,
             entities=data.get("entities", []),
             context=data.get("context", ""),
             attachments_needed=bool(data.get("attachments_needed", False)),
