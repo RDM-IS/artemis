@@ -498,6 +498,123 @@ _BILLING_SCOPES = [
 ]
 
 
+def get_financial_summary() -> str:
+    """Build a plain-text financial summary for the current month.
+
+    Queries:
+      1. v_budget_vs_actual — current month planned vs actual
+      2. v_founder_loan_balance — outstanding Ryan loans
+      3. processed_billing for current month — recent actuals
+      4. monthly_financials for last 3 months — trend
+    """
+    from datetime import datetime
+    from knowledge.db import execute_query
+
+    now = datetime.now()
+    month_label = now.strftime("%B %Y")
+    month_start = now.strftime("%Y-%m-01")
+
+    lines = [f"\U0001f4b0 **RDMIS Financial Position — {month_label}**\n"]
+
+    # 1. Budget vs actual
+    try:
+        rows = execute_query("SELECT * FROM public.v_budget_vs_actual ORDER BY category")
+        if rows:
+            lines.append("**MONTHLY BUDGET vs ACTUAL (MTD):**")
+            total_planned = 0.0
+            total_actual = 0.0
+            for r in rows:
+                planned = float(r.get("planned_monthly") or 0)
+                actual = float(r.get("actual_mtd") or 0)
+                variance = float(r.get("variance") or 0)
+                total_planned += planned
+                total_actual += actual
+                icon = "\u2705" if variance >= 0 else "\u26a0\ufe0f"
+                sign = "-" if variance >= 0 else "+"
+                lines.append(
+                    f"  {r['category']:<20s} Planned ${planned:>8.2f}  "
+                    f"Actual ${actual:>8.2f}  {icon} {sign}${abs(variance):.2f}"
+                )
+            total_var = total_planned - total_actual
+            icon = "\u2705" if total_var >= 0 else "\u26a0\ufe0f"
+            sign = "-" if total_var >= 0 else "+"
+            lines.append(
+                f"  {'TOTAL':<20s} Planned ${total_planned:>8.2f}  "
+                f"Actual ${total_actual:>8.2f}  {icon} {sign}${abs(total_var):.2f}"
+            )
+        else:
+            lines.append("_No budget data for this month._")
+    except Exception:
+        logger.debug("Budget vs actual query failed", exc_info=True)
+        lines.append("_Budget vs actual unavailable._")
+
+    lines.append("")
+
+    # 2. Founder loan balance
+    try:
+        loan = execute_query("SELECT * FROM public.v_founder_loan_balance")
+        if loan and loan[0].get("loan_count"):
+            r = loan[0]
+            lines.append("**FOUNDER LOAN BALANCE:**")
+            lines.append(f"  Total loaned: ${float(r['total_loaned'] or 0):,.2f} across {r['loan_count']} transaction(s)")
+            lines.append(f"  Repaid: ${float(r['total_repaid'] or 0):,.2f}")
+            lines.append(f"  Outstanding: ${float(r['outstanding_balance'] or 0):,.2f}")
+        else:
+            lines.append("**FOUNDER LOAN BALANCE:** _No loans recorded._")
+    except Exception:
+        logger.debug("Founder loan query failed", exc_info=True)
+        lines.append("_Founder loan data unavailable._")
+
+    lines.append("")
+
+    # 3. Recent transactions
+    try:
+        recent = execute_query(
+            """SELECT transaction_date, description, amount, category
+               FROM public.processed_billing
+               WHERE transaction_date >= %s
+               ORDER BY transaction_date DESC
+               LIMIT 5""",
+            (month_start,),
+        )
+        if recent:
+            lines.append("**RECENT TRANSACTIONS (last 5):**")
+            for r in recent:
+                dt = r["transaction_date"].strftime("%m/%d") if r.get("transaction_date") else "?"
+                lines.append(f"  {dt}  {r['description'][:40]:<40s}  ${float(r.get('amount') or 0):>8.2f}  [{r.get('category', '?')}]")
+        else:
+            lines.append("_No transactions recorded this month._")
+    except Exception:
+        logger.debug("Recent transactions query failed", exc_info=True)
+        lines.append("_Recent transactions unavailable._")
+
+    lines.append("")
+
+    # 4. Three-month trend
+    try:
+        trend = execute_query(
+            """SELECT month, revenue_received, expenses_actual, closing_balance
+               FROM public.monthly_financials
+               ORDER BY month DESC
+               LIMIT 3"""
+        )
+        if trend:
+            lines.append("**3-MONTH TREND:**")
+            for r in sorted(trend, key=lambda x: x["month"]):
+                m = r["month"].strftime("%b")
+                rev = float(r.get("revenue_received") or 0)
+                exp = float(r.get("expenses_actual") or 0)
+                net = rev - exp
+                lines.append(f"  {m}: Revenue ${rev:,.2f} | Expenses ${exp:,.2f} | Net ${net:+,.2f}")
+        else:
+            lines.append("_No monthly financial history yet._")
+    except Exception:
+        logger.debug("Monthly financials query failed", exc_info=True)
+        lines.append("_Monthly trend unavailable._")
+
+    return "\n".join(lines)
+
+
 def check_billing_scopes() -> tuple[bool, list[str]]:
     """Check if current OAuth token has Drive and Sheets scopes.
 

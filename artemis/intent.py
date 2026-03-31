@@ -19,6 +19,7 @@ VALID_ACTIONS = {
     "add_note",
     "schedule",
     "pipeline_update",
+    "financial_summary",
     "general_reply",
 }
 
@@ -52,14 +53,19 @@ _ROUTER_SYSTEM = (
     "4. SCHEDULING:\n"
     '   Keywords: "schedule", "meeting", "calendar", "book", "set up a call"\n'
     "   -> primary_action: schedule\n\n"
-    "5. PIPELINE MANAGEMENT:\n"
+    "5. FINANCIAL SUMMARY:\n"
+    '   Keywords: "cash position", "financial summary", "how much have I spent", '
+    '"budget", "what\'s my burn", "burn rate", "expenses", "financials", '
+    '"spending", "runway", "founder loans"\n'
+    "   -> primary_action: financial_summary\n\n"
+    "6. PIPELINE MANAGEMENT:\n"
     '   Keywords: "update pipeline", "move to gate", "deal status", '
     '"advance deal", "pipeline update", "change stage"\n'
     "   -> primary_action: pipeline_update (as primary only, no secondary)\n\n"
-    "6. NOTE TAKING:\n"
+    "7. NOTE TAKING:\n"
     '   Keywords: "remember", "note", "log", "keep track", "jot down"\n'
     "   -> primary_action: add_note\n\n"
-    "7. Everything else -> primary_action: general_reply\n\n"
+    "8. Everything else -> primary_action: general_reply\n\n"
     "SECONDARY ACTIONS: Include secondary_actions when the message implies "
     "multiple things should happen. Examples:\n"
     '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '

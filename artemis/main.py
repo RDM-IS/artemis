@@ -1969,6 +1969,15 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             )
             return f"\U0001f4dd Noted: _{question[:200]}_"
 
+    # ── financial_summary ──
+    if intent.primary_action == "financial_summary":
+        from artemis.billing import get_financial_summary
+        try:
+            return get_financial_summary()
+        except Exception:
+            logger.exception("Financial summary failed")
+            return "\u26a0\ufe0f Financial summary unavailable — check DB connection."
+
     # ── pipeline_update ──
     if intent.primary_action == "pipeline_update":
         from knowledge.db import execute_one as db_one, execute_query as db_query
