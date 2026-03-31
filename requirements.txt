@@ -7,3 +7,5 @@ google-api-python-client>=2.100
 google-auth-httplib2>=0.2
 google-auth-oauthlib>=1.2
 python-dotenv>=1.0
+deepgram-sdk>=3.0.0
+elevenlabs>=1.0.0

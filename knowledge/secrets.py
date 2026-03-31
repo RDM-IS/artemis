@@ -119,3 +119,15 @@ def get_zoho_webhook_secret() -> str:
     Secret name: rdmis/dev/zoho-webhook-secret"""
     secret = get_secret("rdmis/dev/zoho-webhook-secret")
     return secret["webhook_secret"]
+
+
+def get_deepgram_api_key() -> str:
+    """Returns Deepgram API key string.
+    Secret name: rdmis/dev/deepgram-api-key"""
+    return get_secret("rdmis/dev/deepgram-api-key")["api_key"]
+
+
+def get_elevenlabs_api_key() -> str:
+    """Returns ElevenLabs API key string.
+    Secret name: rdmis/dev/elevenlabs-api-key"""
+    return get_secret("rdmis/dev/elevenlabs-api-key")["api_key"]

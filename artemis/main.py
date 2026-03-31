@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 
 from artemis import config
 from artemis.availability import (
@@ -159,6 +159,77 @@ def health_check():
         "last_triage": _last_triage,
         "last_brief": _last_brief,
     })
+
+
+# ---------------------------------------------------------------------------
+# Voice endpoint — Deepgram STT + ElevenLabs TTS
+# ---------------------------------------------------------------------------
+
+_voice_api_key = None
+
+
+def _verify_voice_key():
+    """Verify X-API-Key header. Returns error response or None if OK."""
+    global _voice_api_key
+    if _voice_api_key is None:
+        try:
+            from knowledge.secrets import get_crm_api_key
+            _voice_api_key = get_crm_api_key()
+        except Exception:
+            logger.exception("Failed to load CRM API key for voice auth")
+            return jsonify({"error": "Auth misconfigured"}), 500
+    key = request.headers.get("X-API-Key", "")
+    if key != _voice_api_key:
+        return jsonify({"error": "Invalid API key"}), 403
+    return None
+
+
+@app.route("/voice", methods=["POST"])
+def voice_endpoint():
+    """Accept audio, transcribe, process, and return spoken response."""
+    auth_err = _verify_voice_key()
+    if auth_err:
+        return auth_err
+
+    if "audio" not in request.files:
+        return jsonify({"error": "No 'audio' file in request"}), 400
+
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    mime_type = audio_file.content_type or "audio/webm"
+
+    if len(audio_bytes) == 0:
+        return jsonify({"error": "Empty audio file"}), 400
+
+    logger.info("Voice request: %d bytes, mime=%s", len(audio_bytes), mime_type)
+
+    try:
+        from artemis.voice import process_voice_query
+
+        response_text, audio_out = process_voice_query(
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            mm_client=_mm,
+            gmail_client=_gmail,
+            calendar_client=_calendar,
+        )
+
+        return Response(
+            audio_out,
+            mimetype="audio/mpeg",
+            headers={
+                "X-Transcript": response_text[:500].replace("\n", " "),
+            },
+        )
+    except Exception:
+        logger.exception("Voice processing failed")
+        return jsonify({"error": "Voice processing failed"}), 500
+
+
+@app.route("/voice/health", methods=["GET"])
+def voice_health():
+    """Health check for voice subsystem."""
+    return jsonify({"status": "ok", "stt": "deepgram", "tts": "elevenlabs"})
 
 
 def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient, question: str = "") -> str:
