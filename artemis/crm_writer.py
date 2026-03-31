@@ -135,6 +135,143 @@ def write_contacts(
     return result
 
 
+def write_sales_plan_context(plan, contacts: list) -> WriteResult:
+    """Persist a sales plan to the knowledge graph and CRM.
+
+    1. Find or create org entity for plan.account_name
+    2. Find or create deal record
+    3. Store strategic sections as sales_context satellites
+    4. Write contacts via existing write_contacts()
+    5. Store next actions as next_action satellites
+
+    Args:
+        plan: SalesPlanContext dataclass
+        contacts: list[ExtractedContact] extracted from same document
+    """
+    import json
+    result = WriteResult()
+
+    # 1. Find or create org entity
+    org_entity = _find_entity_by_name(plan.account_name, "Organization")
+    if not org_entity:
+        org_entity_id = upsert_entity(
+            entity_type="Organization",
+            name=plan.account_name,
+            domain="rdmis",
+            confidence=0.9,
+            layer="gold",
+            tags=["sales_plan"],
+        )
+        result.entities_created += 1
+    else:
+        org_entity_id = str(org_entity["id"])
+
+    # 2. Find or create deal
+    org_id = _find_or_create_org(plan.account_name)
+    deal = execute_one(
+        """SELECT id, gate, stage FROM public.deals d
+           JOIN public.organizations o ON d.org_id = o.id
+           WHERE LOWER(o.name) LIKE '%%' || LOWER(%s) || '%%'
+           LIMIT 1""",
+        (plan.account_name,),
+    )
+    if deal:
+        # Update gate if plan provides one
+        if plan.gate is not None:
+            execute_write(
+                "UPDATE public.deals SET gate = %s, updated_at = NOW() WHERE id = %s",
+                (plan.gate, str(deal["id"])),
+            )
+        if plan.tier:
+            # Append tier to notes if not already there
+            execute_write(
+                """UPDATE public.deals
+                   SET notes = COALESCE(notes, '') || %s, updated_at = NOW()
+                   WHERE id = %s AND (notes IS NULL OR notes NOT LIKE '%%' || %s || '%%')""",
+                (f" {plan.tier}.", str(deal["id"]), plan.tier),
+            )
+        result.details.append(
+            f"Deal updated: Gate {plan.gate or deal['gate']} \u00b7 {plan.tier or ''}"
+        )
+    elif org_id:
+        # Create deal
+        execute_write(
+            """INSERT INTO public.deals (org_id, name, gate, stage, notes)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (org_id, f"{plan.account_name} \u2014 Forseti Pilot",
+             plan.gate or 0, "Research",
+             f"{plan.tier or ''}. {plan.warm_path or ''}".strip()),
+        )
+        result.details.append(f"Deal created: {plan.account_name}")
+
+    # 3. Store strategic sections as sales_context satellites
+    sections_stored = 0
+    strategic_sections = [
+        ("pitch_framing", plan.pitch_framing),
+        ("warm_path", plan.warm_path),
+        ("never_say", json.dumps(plan.never_say) if plan.never_say else None),
+        ("always_say", json.dumps(plan.always_say) if plan.always_say else None),
+        ("objections", json.dumps(plan.objections) if plan.objections else None),
+        ("gate_sequence", json.dumps(plan.gate_sequence) if plan.gate_sequence else None),
+        ("entry_point", plan.entry_point),
+    ]
+    for label, content in strategic_sections:
+        if content:
+            execute_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, crm_syncable, metadata)
+                   VALUES (%s, 'sales_context', %s, 'gold', false, '{}')""",
+                (org_entity_id, json.dumps({"label": label, "value": content})),
+            )
+            sections_stored += 1
+
+    # 4. Write contacts via existing path
+    if contacts:
+        contact_result = write_contacts(contacts, pipeline_context=plan.account_name)
+        result.contacts_added += contact_result.contacts_added
+        result.contacts_updated += contact_result.contacts_updated
+        result.entities_created += contact_result.entities_created
+        result.relationships_created += contact_result.relationships_created
+
+    # 5. Store next actions
+    actions_logged = 0
+    for action in plan.next_actions:
+        if action.get("action"):
+            execute_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, metadata)
+                   VALUES (%s, 'next_action', %s, 'gold', '{}')""",
+                (org_entity_id, json.dumps({
+                    "action": action["action"],
+                    "date": action.get("date"),
+                    "owner": action.get("owner"),
+                    "account": plan.account_name,
+                })),
+            )
+            actions_logged += 1
+
+    # Build summary
+    contact_count = result.contacts_added + result.contacts_updated
+    warm_line = ""
+    if plan.warm_path and plan.entry_point:
+        warm_line = f"\n  Warm path: {plan.warm_path} \u2192 {plan.entry_point}"
+
+    result.summary = (
+        f"\U0001f4cb **Sales plan ingested: {plan.account_name}**\n"
+        f"  \u00b7 {sections_stored} strategic sections stored\n"
+        f"  \u00b7 {contact_count} contacts added/updated\n"
+        f"  \u00b7 {actions_logged} next actions logged\n"
+        f"  \u00b7 Deal record updated: Gate {plan.gate or 0} \u00b7 {plan.tier or 'N/A'}"
+        f"{warm_line}"
+    )
+
+    logger.info(
+        "Sales plan write complete: %s — %d sections, %d contacts, %d actions",
+        plan.account_name, sections_stored, contact_count, actions_logged,
+    )
+    return result
+
+
 def _process_one_contact(contact, pipeline_context, ryan_context, result):
     """Process a single ExtractedContact into CRM + knowledge graph."""
 

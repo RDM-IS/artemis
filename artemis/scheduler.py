@@ -198,6 +198,12 @@ class ArtemisScheduler:
             id="action_item_reminders",
         )
 
+        # Follow-up radar — weekdays at 8:00 AM (same TZ as other morning jobs)
+        self.scheduler.add_job(
+            self.job_follow_up_radar, "cron", hour=8, minute=0,
+            day_of_week="mon-fri", id="follow_up_radar",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -1466,6 +1472,122 @@ class ArtemisScheduler:
                 config.CHANNEL_OPS,
                 f"\u2705 All caught up \u2014 nothing missed since last run {gap_str} ago.",
             )
+
+    def job_follow_up_radar(self):
+        """Daily follow-up radar: upcoming actions, stale deals, open commitments."""
+        from knowledge.db import execute_query
+
+        today = date.today()
+        window_start = today - timedelta(days=1)
+        window_end = today + timedelta(days=2)
+        stale_threshold = today - timedelta(days=7)
+
+        lines = [f"\U0001f514 **Follow-up Radar \u2014 {today.strftime('%A %B %d')}**\n"]
+        has_items = False
+
+        # 1. Next actions from data_vault_satellites
+        try:
+            actions = execute_query(
+                """SELECT id, entity_id, content FROM acos.data_vault_satellites
+                   WHERE satellite_type = 'next_action'
+                     AND created_at > NOW() - interval '30 days'
+                   ORDER BY created_at DESC
+                   LIMIT 20"""
+            )
+            due_actions = []
+            for a in actions:
+                try:
+                    import json as _json
+                    data = _json.loads(a["content"]) if isinstance(a["content"], str) else a["content"]
+                    action_date = data.get("date")
+                    notified = data.get("notified")
+                    if notified:
+                        continue
+                    if action_date:
+                        from datetime import datetime as _dt
+                        try:
+                            d = _dt.strptime(action_date, "%Y-%m-%d").date()
+                        except ValueError:
+                            continue
+                        if window_start <= d <= window_end:
+                            label = "TODAY" if d == today else (
+                                "TOMORROW" if d == today + timedelta(days=1) else
+                                "OVERDUE" if d < today else d.strftime("%m/%d")
+                            )
+                            action_text = data.get("action", "?")
+                            account = data.get("account", "")
+                            due_actions.append(f"  \u00b7 [{label}] {action_text}" + (f" ({account})" if account else ""))
+                            # Mark as notified
+                            data["notified"] = "true"
+                            from knowledge.db import execute_write as _db_write
+                            _db_write(
+                                "UPDATE acos.data_vault_satellites SET content = %s WHERE id = %s",
+                                (_json.dumps(data), str(a["id"])),
+                            )
+                except Exception:
+                    continue
+
+            if due_actions:
+                has_items = True
+                lines.append("**DUE TODAY / TOMORROW:**")
+                lines.extend(due_actions)
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: next_action query failed", exc_info=True)
+
+        # 2. Open commitments due soon
+        try:
+            commitments = execute_query(
+                """SELECT c.description, c.due_date, ct.name AS contact_name
+                   FROM public.commitments c
+                   LEFT JOIN public.contacts ct ON c.contact_id = ct.id
+                   WHERE c.status = 'open'
+                     AND c.due_date >= %s AND c.due_date <= %s
+                   ORDER BY c.due_date ASC
+                   LIMIT 10""",
+                (window_start, window_end),
+            )
+            if commitments:
+                has_items = True
+                lines.append("**OPEN COMMITMENTS:**")
+                for cm in commitments:
+                    due = cm["due_date"].strftime("%m/%d") if cm.get("due_date") else "?"
+                    who = cm.get("contact_name", "")
+                    who_str = f" ({who})" if who else ""
+                    lines.append(f"  \u00b7 {cm['description'][:120]}{who_str} \u2014 due {due}")
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: commitments query failed", exc_info=True)
+
+        # 3. Stale deals
+        try:
+            stale = execute_query(
+                """SELECT d.name, d.stage, d.updated_at, o.name AS org_name
+                   FROM public.deals d
+                   JOIN public.organizations o ON d.org_id = o.id
+                   WHERE d.updated_at < %s
+                     AND LOWER(d.stage) NOT IN ('closed', 'lost', 'msa', 'signed')
+                   ORDER BY d.updated_at ASC
+                   LIMIT 10""",
+                (stale_threshold,),
+            )
+            if stale:
+                has_items = True
+                lines.append("**STALE DEALS (no activity 7+ days):**")
+                for d in stale:
+                    last = d["updated_at"].strftime("%b %d") if d.get("updated_at") else "?"
+                    lines.append(f"  \u00b7 {d.get('org_name', d['name'])} \u2014 last updated {last}")
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: stale deals query failed", exc_info=True)
+
+        if has_items:
+            try:
+                self.mm.post_message(config.CHANNEL_OPS, "\n".join(lines))
+            except Exception:
+                logger.exception("Failed to post follow-up radar")
+        else:
+            logger.info("Follow-up radar: nothing due today")
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""

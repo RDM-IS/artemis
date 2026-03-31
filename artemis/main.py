@@ -1843,16 +1843,17 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
     # ── add_contacts ──
     if intent.primary_action == "add_contacts":
         from artemis.parser import parse_document
-        from artemis.crm_writer import write_contacts
+        from artemis.crm_writer import write_contacts, write_sales_plan_context
 
         contacts = []
+        sales_plan = None
         if has_attachment and _mm and file_ids:
             # Download file from Mattermost
             try:
                 resp = _mm._api("GET", f"/files/{file_ids[0]}")
                 file_bytes = resp.content
                 mime = attachment_mime or "application/octet-stream"
-                contacts = parse_document(file_bytes, mime, user_context=question)
+                contacts, sales_plan = parse_document(file_bytes, mime, user_context=question)
             except Exception:
                 logger.exception("Failed to download attachment %s", file_ids[0])
                 return "\u26a0\ufe0f Failed to download the attachment. Try uploading again."
@@ -1867,70 +1868,63 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
                     source_description="Mattermost message",
                 ))
 
-        if not contacts:
+        if not contacts and not sales_plan:
             return "\u26a0\ufe0f I couldn't extract any contacts. Try attaching a document or mentioning names."
 
-        result = write_contacts(contacts, ryan_context=question)
-        return f"\U0001f4c7 **Contacts imported**\n{result.summary}"
+        # Sales plan path vs regular contacts
+        if sales_plan:
+            result = write_sales_plan_context(sales_plan, contacts)
+            return result.summary
+        else:
+            result = write_contacts(contacts, ryan_context=question)
+            return f"\U0001f4c7 **Contacts imported**\n{result.summary}"
 
     # ── query_crm ──
     if intent.primary_action == "query_crm":
-        from knowledge.db import execute_query
+        from artemis.crm_query import query_account, query_contact
+
+        if not intent.entities:
+            return "\U0001f50d Who or what would you like me to look up?"
 
         parts = []
         for entity_name in intent.entities:
-            # Search contacts
-            rows = execute_query(
-                """SELECT c.name, c.title, c.email, o.name AS org_name
-                   FROM public.contacts c
-                   LEFT JOIN public.organizations o ON c.org_id = o.id
-                   WHERE LOWER(c.name) LIKE '%%' || LOWER(%s) || '%%'
-                      OR LOWER(o.name) LIKE '%%' || LOWER(%s) || '%%'
-                   LIMIT 5""",
-                (entity_name, entity_name),
-            )
-            if rows:
-                for r in rows:
-                    org = f" at {r['org_name']}" if r.get("org_name") else ""
-                    title = f" ({r['title']})" if r.get("title") else ""
-                    parts.append(f"- **{r['name']}**{title}{org}")
-
-            # Search knowledge graph
-            entities = execute_query(
-                """SELECT name, entity_type, content, layer, tags
-                   FROM acos.entities
-                   WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%'
-                   LIMIT 5""",
+            # Check if it's an organization or person
+            from knowledge.db import execute_one as db_one
+            is_org = db_one(
+                "SELECT 1 FROM public.organizations WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%' LIMIT 1",
                 (entity_name,),
             )
-            for e in entities:
-                tags = ", ".join(e.get("tags") or [])
-                parts.append(
-                    f"- \U0001f9e0 **{e['name']}** ({e['entity_type']}, {e['layer']})"
-                    + (f" — {e['content'][:150]}" if e.get("content") else "")
-                    + (f" [{tags}]" if tags else "")
-                )
-
-            # Search relationships
-            rels = execute_query(
-                """SELECT r.relationship_type, r.relationship_context,
-                          s.name AS source_name, t.name AS target_name
-                   FROM acos.relationships r
-                   JOIN acos.entities s ON r.source_entity_id = s.id
-                   JOIN acos.entities t ON r.target_entity_id = t.id
-                   WHERE LOWER(s.name) LIKE '%%' || LOWER(%s) || '%%'
-                      OR LOWER(t.name) LIKE '%%' || LOWER(%s) || '%%'
-                   LIMIT 10""",
-                (entity_name, entity_name),
+            is_person = db_one(
+                "SELECT 1 FROM public.contacts WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%' LIMIT 1",
+                (entity_name,),
             )
-            for r in rels:
-                parts.append(
-                    f"  \u2192 {r['source_name']} **{r['relationship_type']}** {r['target_name']}"
-                )
 
-        if parts:
-            return "\U0001f50d **CRM lookup**\n" + "\n".join(parts)
-        return f"\U0001f50d No results found for: {', '.join(intent.entities)}"
+            if is_person:
+                parts.append(query_contact([entity_name]))
+            if is_org:
+                parts.append(query_account(entity_name))
+            if not is_person and not is_org:
+                # Try both — might be an acos entity
+                contact_result = query_contact([entity_name])
+                if "not in the CRM" not in contact_result:
+                    parts.append(contact_result)
+                else:
+                    account_result = query_account(entity_name)
+                    if "No organization found" not in account_result:
+                        parts.append(account_result)
+                    else:
+                        parts.append(contact_result)
+
+        return "\n\n---\n\n".join(parts) if parts else f"\U0001f50d No results for: {', '.join(intent.entities)}"
+
+    # ── log_interaction ──
+    if intent.primary_action == "log_interaction":
+        from artemis.interaction_logger import log_interaction as do_log_interaction
+        try:
+            return do_log_interaction(question, intent.entities)
+        except Exception:
+            logger.exception("Interaction logging failed")
+            return "\u26a0\ufe0f Failed to log interaction \u2014 check DB connection."
 
     # ── add_note ──
     if intent.primary_action == "add_note":

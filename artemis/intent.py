@@ -20,6 +20,7 @@ VALID_ACTIONS = {
     "schedule",
     "pipeline_update",
     "financial_summary",
+    "log_interaction",
     "general_reply",
 }
 
@@ -30,7 +31,8 @@ _ROUTER_SYSTEM = (
     "this schema, no other text:\n"
     "{\n"
     '  "primary_action": one of ["add_contacts", "query_crm", "add_note", '
-    '"schedule", "pipeline_update", "general_reply"],\n'
+    '"schedule", "pipeline_update", "financial_summary", "log_interaction", '
+    '"general_reply"],\n'
     '  "secondary_actions": [...],\n'
     '  "entities": [list of person/org names mentioned],\n'
     '  "context": "one sentence explaining intent",\n'
@@ -62,10 +64,16 @@ _ROUTER_SYSTEM = (
     '   Keywords: "update pipeline", "move to gate", "deal status", '
     '"advance deal", "pipeline update", "change stage"\n'
     "   -> primary_action: pipeline_update (as primary only, no secondary)\n\n"
-    "7. NOTE TAKING:\n"
-    '   Keywords: "remember", "note", "log", "keep track", "jot down"\n'
+    "7. INTERACTION LOGGING (debriefs, call summaries):\n"
+    '   Keywords: "just got off the phone with", "just met with", '
+    '"had a call with", "spoke with", "talked to", "call with", '
+    '"meeting with", "just finished", "debrief", "follow up from", '
+    '"spoke to", "met with"\n'
+    "   -> primary_action: log_interaction\n\n"
+    "8. NOTE TAKING:\n"
+    '   Keywords: "remember", "note", "keep track", "jot down"\n'
     "   -> primary_action: add_note\n\n"
-    "8. Everything else -> primary_action: general_reply\n\n"
+    "9. Everything else -> primary_action: general_reply\n\n"
     "SECONDARY ACTIONS: Include secondary_actions when the message implies "
     "multiple things should happen. Examples:\n"
     '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '
