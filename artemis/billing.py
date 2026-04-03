@@ -1,7 +1,8 @@
 """PB-007: Billing Intake — process billing-labeled emails into expense tracking.
 
 Scans for Gmail messages with the '@artemis/billing' label, extracts expense
-data, uploads attachments to Drive, logs to Sheets, and posts to Mattermost.
+data, logs to Sheets, and posts to Mattermost. Attachments are referenced via
+Gmail deep link (no Drive upload).
 """
 
 import base64
@@ -11,7 +12,6 @@ from datetime import date
 from email.utils import parseaddr
 
 from artemis import config
-from artemis.google_drive import get_or_create_expense_folder, upload_attachment
 from artemis.google_sheets import append_expense_row, get_sheet_url
 from knowledge.db import execute_one, execute_write
 from knowledge.secrets import get_gmail_token
@@ -65,12 +65,16 @@ def parse_amount(raw: str) -> float:
 def best_amount(text: str) -> tuple[str, list[str]]:
     """Extract the best (largest) amount from text.
 
-    Returns (best_amount_str, all_amounts_found).
-    If multiple found, best is the largest.
+    Returns (best_amount_str, all_unique_amounts_found).
+    Deduplicates amounts before processing — repeated identical amounts
+    (common in forwarded emails) are treated as a single amount.
+    If multiple distinct amounts found, best is the largest.
     """
     found = extract_amounts(text)
     if not found:
         return "", []
+    # Deduplicate while preserving order
+    found = list(dict.fromkeys(found))
     if len(found) == 1:
         return found[0], found
     # Pick the largest
@@ -312,13 +316,12 @@ def process_billing_message(
     """Process a single billing email.
 
     Returns a dict with all extracted/logged data for confirmation.
-    If dry_run=True, skips Drive upload, Sheets append, and Mattermost post.
+    If dry_run=True, skips Sheets append and Mattermost post.
     """
     result = {
         "message_id": message_id,
         "success": False,
         "error": None,
-        "drive_link": "",
         "sheet_url": get_sheet_url(),
     }
 
@@ -355,6 +358,21 @@ def process_billing_message(
 
     # Founder Loan detection
     founder_loan_explicit = bool(re.search(r"founder\s+loan", combined_text, re.IGNORECASE))
+
+    # Forwarded founder loan: Ryan forwarding to billing@ with "Founder Loan"
+    # in body — no ambiguity, suppress extra notes flags
+    _fwd_from_ryan = False
+    if founder_loan_explicit:
+        _to = headers.get("to", "").lower()
+        _arrived_at_billing = "billing@rdm.is" in _to
+        # Check envelope sender or forwarded-from for ryan@rdm.is
+        _from_ryan = "ryan@rdm.is" in sender_email.lower()
+        if not _from_ryan:
+            # Also check the forwarded From: line in body
+            fwd_m = _FORWARDED_FROM_RE.search(body_text)
+            if fwd_m and fwd_m.group(2):
+                _from_ryan = "ryan@rdm.is" in fwd_m.group(2).lower()
+        _fwd_from_ryan = _arrived_at_billing and _from_ryan
 
     result.update({
         "amount": amount_str,
@@ -407,34 +425,14 @@ def process_billing_message(
     except Exception:
         logger.exception("CRM write guard failed for billing vendor — continuing")
 
-    # 3. Process attachments
+    # 3. Detect attachments and build Gmail deep link
     attachments = extract_attachments(gmail_client, msg)
-    drive_links = []
-
-    if attachments and not dry_run:
-        folder_id = get_or_create_expense_folder()
-        if folder_id:
-            for att in attachments:
-                file_id, link = upload_attachment(
-                    att["filename"], att["data"], att["mime_type"], folder_id
-                )
-                if link:
-                    drive_links.append(link)
-                else:
-                    logger.warning("Drive upload failed for %s — using Gmail link", att["filename"])
-        else:
-            logger.warning("Could not create expense folder — using Gmail links")
-    elif attachments and dry_run:
-        for att in attachments:
-            drive_links.append(f"[DRY RUN] Would upload: {att['filename']} ({att['mime_type']})")
-
-    # Fallback to Gmail deep link if no attachments or all uploads failed
+    attachment_names = [a["filename"] for a in attachments]
     gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
-    doc_link = drive_links[0] if drive_links else gmail_link
+    doc_link = gmail_link
 
     result.update({
-        "attachments": [a["filename"] for a in attachments],
-        "drive_links": drive_links,
+        "attachments": attachment_names,
         "document_link": doc_link,
         "gmail_link": gmail_link,
     })
@@ -442,13 +440,11 @@ def process_billing_message(
     # 4. Build notes (notes_parts initialized before CRM write guard above)
     if not amount_str:
         notes_parts.append("No amount detected")
-    if len(all_amounts) > 1:
+    if len(all_amounts) > 1 and not _fwd_from_ryan:
         notes_parts.append(f"Multiple amounts found: {', '.join(all_amounts)}")
-    if not attachments:
-        notes_parts.append("No attachment — Gmail link used")
-    if not drive_links and attachments:
-        notes_parts.append("Drive upload failed — Gmail link used")
-    if founder_loan_explicit:
+    if attachment_names:
+        notes_parts.append(f"Attachments: {', '.join(attachment_names)}")
+    if founder_loan_explicit and not _fwd_from_ryan:
         notes_parts.append("Founder Loan flagged in email.")
     if notes_parts:
         notes = "Auto-logged by Artemis. Review required. " + "; ".join(notes_parts)
@@ -488,9 +484,7 @@ def process_billing_message(
     # 7. Post to Mattermost
     if mm_client and not dry_run:
         amount_display = amount_str if amount_str else "\u26a0 None found \u2014 review required"
-        attachment_display = doc_link
-        if drive_links:
-            attachment_display = " | ".join(drive_links)
+        att_display = ", ".join(attachment_names) if attachment_names else "None"
 
         mm_msg = (
             f"\U0001f4c4 **Billing intake logged**\n"
@@ -499,7 +493,8 @@ def process_billing_message(
             f"**Amount detected:** {amount_display}\n"
             f"**Category:** {category}\n"
             f"**Founder Loan:** Yes \u00b7 **Reimbursed:** No\n"
-            f"**Attachment:** {attachment_display}\n"
+            f"**Attachments:** {att_display}\n"
+            f"**Gmail:** {gmail_link}\n"
             f"**Sheet:** {result['sheet_url']}\n\n"
             f"_React with \u2705 if correct or reply to correct any fields._"
         )
@@ -535,7 +530,6 @@ def process_billing_message(
 # ---------------------------------------------------------------------------
 
 _BILLING_SCOPES = [
-    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
@@ -658,7 +652,7 @@ def get_financial_summary() -> str:
 
 
 def check_billing_scopes() -> tuple[bool, list[str]]:
-    """Check if current OAuth token has Drive and Sheets scopes.
+    """Check if current OAuth token has Sheets scope.
 
     Reads the token from Secrets Manager (not a local file).
     Returns (all_present, list_of_missing_scopes).

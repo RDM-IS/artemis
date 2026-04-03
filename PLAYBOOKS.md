@@ -141,41 +141,41 @@ via scheduler job `demo_intake`. Also triggered from triage if matched.
 
 ## PB-007: Billing Intake
 
-**Trigger:** Email has Gmail label "artemis/billing" (applied to emails
+**Trigger:** Email has Gmail label `@artemis/billing` (applied to emails
 arriving at billing@rdm.is)
 
-**OAuth Requirements:** drive.file, spreadsheets scopes (added to
+**OAuth Requirements:** spreadsheets scope (added to
 setup_oauth.py — re-run if missing)
 
 **Actions:**
-1. Fetch full email body and all attachments via Gmail API
+1. Fetch full email body and detect attachments via Gmail API
 2. Extract: sender name, sender domain, subject, date, dollar amounts
    (regex: `\$[\d,]+\.?\d*` or `[\d,]+\.\d{2}`)
+   - Amounts are deduplicated before processing (forwarding artifacts)
 2a. Vendor entity lookup via `crm_write_guard` — see PB-008.
    If flagged, add review note to expense but never drop the billing record.
 3. Classify expense category by keyword matching on subject + sender:
    - Infrastructure (AWS, Azure, etc.)
    - SaaS / Software (GitHub, Notion, Anthropic, etc.)
    - Legal, Insurance, Hardware, Sales & Outreach, or Misc
-4. For each attachment (PDF, PNG, JPG, XLSX):
-   a. Upload to Google Drive (RDMIS/Expenses/2026/)
-   b. Set sharing to "anyone with link can view"
-   c. Collect shareable link
-   If no attachment: generate Gmail deep link
+4. Generate Gmail deep link for the message:
+   `https://mail.google.com/mail/u/0/#inbox/{message_id}`
+   Attachment filenames (if any) are listed in the Notes field.
 5. Append row to expense tracking Google Sheet:
    [Date, Vendor, Description, Category, Amount, Payment Method,
     Founder Loan?, Reimbursed?, Reimbursed Date, Document Link, Notes]
    - Founder Loan = "Yes" by default (pre-MSA)
    - Notes = "Auto-logged by Artemis. Review required." if uncertain
-6. Mark message ID as processed in SQLite (prevents re-processing)
+   - Document Link = Gmail deep link
+6. Mark message ID as processed in Postgres (prevents re-processing)
 7. Post to #artemis-ryan:
-   📄 Billing intake logged — sender, amount, category, attachment link
-   React with ✅ if correct or reply to correct fields
+   Billing intake logged — sender, amount, category, Gmail link
+   React with checkmark if correct or reply to correct fields
 
 **Error Handling:**
-- Drive upload fails → use Gmail link instead, flag in Notes
 - Sheets append fails → post all data to Mattermost for manual entry
-- Multiple amounts found → use largest, note all in Notes field
+- Multiple distinct amounts found → use largest, note all in Notes field
+- Forwarded founder loans from ryan@rdm.is → suppress ambiguity flags
 - Never silently drop an expense
 
 **Testing:** `python -m artemis.test_billing --dry-run` (no writes)
