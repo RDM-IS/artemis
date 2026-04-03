@@ -137,7 +137,7 @@ CREATE INDEX IF NOT EXISTS idx_touch_events_person
     ON public.touch_events (person_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_pending_crm_writes_expires
-    ON acos.pending_crm_writes (expires_at)
+    ON acos.pending_crm_writes (expires_at);
 
 
 CREATE INDEX IF NOT EXISTS idx_funding_events_source
