@@ -1,6 +1,6 @@
 """PB-007: Billing Intake — process billing-labeled emails into expense tracking.
 
-Scans for Gmail messages with the 'artemis/billing' label, extracts expense
+Scans for Gmail messages with the '@artemis/billing' label, extracts expense
 data, uploads attachments to Drive, logs to Sheets, and posts to Mattermost.
 """
 
@@ -115,7 +115,7 @@ def classify_category(subject: str, sender: str) -> str:
 
 
 def ensure_billing_label(gmail_client) -> str | None:
-    """Ensure the 'artemis/billing' Gmail label exists. Creates it if missing.
+    """Ensure the '@artemis/billing' Gmail label exists. Creates it if missing.
 
     Returns the label ID, or None on failure.
     """
@@ -125,28 +125,28 @@ def ensure_billing_label(gmail_client) -> str | None:
     try:
         labels = gmail_client.service.users().labels().list(userId="me").execute()
         for lbl in labels.get("labels", []):
-            if lbl["name"].lower() == "artemis/billing":
+            if lbl["name"].lower() == "@artemis/billing":
                 return lbl["id"]
 
         # Label doesn't exist — create it
         new_label = gmail_client.service.users().labels().create(
             userId="me",
             body={
-                "name": "artemis/billing",
+                "name": "@artemis/billing",
                 "labelListVisibility": "labelShow",
                 "messageListVisibility": "show",
             },
         ).execute()
         label_id = new_label["id"]
-        logger.info("Created Gmail label 'artemis/billing' (id=%s)", label_id)
+        logger.info("Created Gmail label '@artemis/billing' (id=%s)", label_id)
         return label_id
     except Exception:
-        logger.exception("Failed to ensure artemis/billing label")
+        logger.exception("Failed to ensure @artemis/billing label")
         return None
 
 
 def get_billing_messages(gmail_client) -> list[dict]:
-    """Fetch messages with the 'artemis/billing' label that haven't been processed."""
+    """Fetch messages with the '@artemis/billing' label that haven't been processed."""
     if not gmail_client.service:
         return []
 
@@ -154,16 +154,16 @@ def get_billing_messages(gmail_client) -> list[dict]:
         # Refresh credentials to avoid stale SSL connections
         gmail_client.authenticate()
 
-        # Find the label ID for 'artemis/billing'
+        # Find the label ID for '@artemis/billing'
         labels = gmail_client.service.users().labels().list(userId="me").execute()
         label_id = None
         for lbl in labels.get("labels", []):
-            if lbl["name"].lower() == "artemis/billing":
+            if lbl["name"].lower() == "@artemis/billing":
                 label_id = lbl["id"]
                 break
 
         if not label_id:
-            logger.warning("Gmail label 'artemis/billing' not found")
+            logger.warning("Gmail label '@artemis/billing' not found")
             return []
 
         # List messages with that label
