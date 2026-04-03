@@ -364,6 +364,49 @@ def process_billing_message(
         "founder_loan_explicit": founder_loan_explicit,
     })
 
+    # 2a. CRM Write Guard — register vendor as company entity
+    notes_parts = []
+    crm_company_id = None
+    try:
+        from artemis.crm_write_guard import crm_write_guard
+        guard_confidence = "high" if sender_domain else "low"
+        guard_result = crm_write_guard(
+            entity_type="company",
+            data={"name": vendor, "domain": sender_domain, "types": ["Vendor"]},
+            confidence=guard_confidence,
+            source_pb="PB-007",
+            gmail_message_id=message_id,
+            gmail_client=gmail_client,
+            mm_client=mm_client,
+        )
+        crm_company_id = guard_result.get("entity_id")
+        if guard_result.get("status") == "flagged":
+            notes_parts.append(
+                f"Vendor unresolved — see pending CRM review "
+                f"(id={guard_result.get('pending_id', '?')[:8]})"
+            )
+        elif guard_result.get("status") == "written":
+            notes_parts.append(f"CRM: new vendor '{vendor}' added")
+
+        # Log touch event
+        crm_write_guard(
+            entity_type="touch_event",
+            data={
+                "company_id": crm_company_id,
+                "type": "Email",
+                "direction": "Inbound",
+                "subject": subject,
+                "summary": f"Billing email: {amount_str or 'no amount'}",
+                "gmail_message_id": message_id,
+                "playbook": "PB-007",
+            },
+            confidence="high",
+            source_pb="PB-007",
+            gmail_message_id=message_id,
+        )
+    except Exception:
+        logger.exception("CRM write guard failed for billing vendor — continuing")
+
     # 3. Process attachments
     attachments = extract_attachments(gmail_client, msg)
     drive_links = []
@@ -396,8 +439,7 @@ def process_billing_message(
         "gmail_link": gmail_link,
     })
 
-    # 4. Build notes
-    notes_parts = []
+    # 4. Build notes (notes_parts initialized before CRM write guard above)
     if not amount_str:
         notes_parts.append("No amount detected")
     if len(all_amounts) > 1:

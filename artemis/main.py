@@ -2070,6 +2070,64 @@ def _handle_mention(post: dict, thread: list[dict]):
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
 
+    if q_lower.startswith("crm confirm "):
+        pending_id = q_lower.split("crm confirm ", 1)[1].strip()
+        try:
+            from artemis.crm_write_guard import confirm_pending_write
+            cw_result = confirm_pending_write(pending_id)
+            if cw_result.get("status") == "confirmed":
+                reply = (
+                    f"\u2705 Confirmed CRM write: {cw_result.get('entity_type', '?')} "
+                    f"created (id=`{cw_result.get('entity_id', '?')}`)"
+                )
+            else:
+                reply = f"\u26a0\ufe0f Could not confirm: {cw_result.get('error', 'unknown error')}"
+        except Exception:
+            logger.exception("CRM confirm failed")
+            reply = "\u26a0\ufe0f CRM confirm failed \u2014 check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower.startswith("crm reject "):
+        pending_id = q_lower.split("crm reject ", 1)[1].strip()
+        try:
+            from artemis.crm_write_guard import reject_pending_write
+            cw_result = reject_pending_write(pending_id)
+            if cw_result.get("status") == "rejected":
+                reply = f"\u2705 Rejected and removed pending CRM write (`{pending_id[:8]}...`)"
+            else:
+                reply = f"\u26a0\ufe0f Could not reject: {cw_result.get('error', 'unknown error')}"
+        except Exception:
+            logger.exception("CRM reject failed")
+            reply = "\u26a0\ufe0f CRM reject failed \u2014 check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "crm pending":
+        try:
+            from artemis.crm_write_guard import list_pending_writes
+            pending = list_pending_writes()
+            if pending:
+                lines = ["**Pending CRM writes:**"]
+                for p in pending:
+                    p_data = p["data"] if isinstance(p["data"], dict) else {}
+                    lines.append(
+                        f"- `{str(p['id'])[:8]}` {p['entity_type']}: "
+                        f"{p_data.get('name', '?')} (from {p['source_pb']}, "
+                        f"expires {p['expires_at'].strftime('%m/%d')})"
+                    )
+                reply = "\n".join(lines)
+            else:
+                reply = "No pending CRM writes."
+        except Exception:
+            logger.exception("CRM pending list failed")
+            reply = "\u26a0\ufe0f Failed to list pending writes \u2014 check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
     if q_lower in ("list commitments", "commitments", "open commitments"):
         open_items = list_commitments(status="active")
         reply = format_commitments_list(open_items)
@@ -2303,6 +2361,29 @@ def main():
         _calendar.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Calendar authentication failed — calendar features disabled")
+
+    # Pre-create @artemis Gmail label hierarchy
+    if _gmail and _gmail.service:
+        for _label in [
+            "@artemis",
+            "@artemis/billing",
+            "@artemis/billing/paid",
+            "@artemis/billing/disputed",
+            "@artemis/pipeline",
+            "@artemis/pipeline/demo-request",
+            "@artemis/crm",
+            "@artemis/crm/needs-review",
+            "@artemis/needs-review",
+            "@artemis/funding",
+            "@artemis/funding/kiva",
+            "@artemis/funding/aws-activate",
+            "@artemis/funding/microsoft",
+            "@artemis/funding/nsf",
+            "@artemis/calendar",
+            "@artemis/calendar/needs-confirm",
+        ]:
+            _gmail.ensure_gmail_label(_label)
+        logger.info("Gmail label hierarchy initialized")
 
     # Load calendar cache on boot
     if _calendar and _calendar.service:

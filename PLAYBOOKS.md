@@ -2,6 +2,9 @@
 
 ## PB-001: Demo Access Notification
 
+> **Note:** Superseded by PB-008 once built — CRM logic here is legacy.
+> New demo leads flow through the CRM Write Guard for dedup before CRM insert.
+
 **Trigger:** Email from Artemis demo system containing "Demo access confirmed"
 
 **Actions:**
@@ -106,6 +109,8 @@ setup_oauth.py — re-run if missing)
 1. Fetch full email body and all attachments via Gmail API
 2. Extract: sender name, sender domain, subject, date, dollar amounts
    (regex: `\$[\d,]+\.?\d*` or `[\d,]+\.\d{2}`)
+2a. Vendor entity lookup via `crm_write_guard` — see PB-008.
+   If flagged, add review note to expense but never drop the billing record.
 3. Classify expense category by keyword matching on subject + sender:
    - Infrastructure (AWS, Azure, etc.)
    - SaaS / Software (GitHub, Notion, Anthropic, etc.)
@@ -133,3 +138,51 @@ setup_oauth.py — re-run if missing)
 
 **Testing:** `python -m artemis.test_billing --dry-run` (no writes)
 **Unit tests:** `python -m artemis.test_billing --unit`
+
+## PB-008: CRM Write Guard
+
+**Trigger:** Any playbook that creates or references a CRM entity
+(companies, persons, relationships, engagements, touch events).
+
+**Module:** `artemis/crm_write_guard.py`
+
+**Entry point:**
+```python
+crm_write_guard(entity_type, data, confidence, source_pb,
+                gmail_message_id=None, gmail_client=None, mm_client=None)
+# Returns: {"status": "written"|"exists"|"flagged", "entity_id": UUID|None, "flag_reason": str|None}
+```
+
+**Match algorithm:**
+- **Company:** domain exact match → exists. Name Levenshtein ≤ 2 →
+  high confidence = auto-merge, low = flag. No match → create.
+- **Person:** email exact match → exists. Name fuzzy + same company →
+  high = merge, low = flag. Name fuzzy + different company → ALWAYS flag
+  (potential org change). No match → create.
+- **Relationship:** active match + same role → exists. Different role →
+  end old, create new. No match → create.
+- **Engagement:** active match → update gate/status. No match → create.
+- **Touch event:** always write, no dedup.
+
+**Flag routing (ambiguous matches):**
+1. Write proposed data to `acos.pending_crm_writes` (expires after 7 days)
+2. Apply Gmail label `@artemis/needs-review` if gmail_message_id provided
+3. Post to #artemis-ryan with candidate comparison and confirm/reject commands:
+   `@artemis crm confirm [id]` or `@artemis crm reject [id]`
+4. Return `{"status": "flagged"}` — caller must handle gracefully
+
+**Mattermost commands:**
+- `@artemis crm confirm [pending_id]` — execute the pending write, remove from queue
+- `@artemis crm reject [pending_id]` — discard pending write
+- `@artemis crm pending` — list all unresolved pending writes
+
+**Tables (migration 012):**
+- `public.persons`, `public.companies`, `public.relationships`,
+  `public.engagements`, `public.touch_events`
+- `acos.pending_crm_writes`, `acos.funding_events`
+
+**Constraints:**
+- Never drop a billing expense — if CRM write fails, billing continues
+- All successful CRM writes post confirmation to #artemis-ryan
+- API keys never logged or echoed
+- Quiet hours respected for proactive notifications
