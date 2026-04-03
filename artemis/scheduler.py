@@ -48,6 +48,10 @@ from artemis.billing import (
     get_billing_messages,
     process_billing_message,
 )
+from artemis.demo_intake import (
+    get_demo_messages,
+    process_demo_message,
+)
 from artemis.crm_client import CRMClient
 from artemis.scheduling import detect_scheduling_request, draft_scheduling_response
 from artemis.utils import next_business_day
@@ -167,6 +171,12 @@ class ArtemisScheduler:
             logger.info("PB-007 billing intake enabled")
         else:
             logger.warning("PB-007 billing intake disabled — missing scopes: %s", missing)
+
+        # PB-001 v2: Demo intake — every 5 minutes (scan for Lucint demo emails)
+        self.scheduler.add_job(
+            self.job_demo_intake, "interval", minutes=5, id="demo_intake",
+        )
+        logger.info("PB-001 demo intake enabled")
 
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
@@ -836,46 +846,23 @@ class ArtemisScheduler:
             )
 
     def _run_pb001_demo_lead(self, msg: dict, triage_item: dict):
-        """PB-001: Demo Access Notification — create lead + follow-up commitment."""
-        sender_email = msg.get("from_email", "")
-        sender_name = msg.get("from", "").split("<")[0].strip().strip('"') or sender_email
-        # Use sender's domain as company fallback
-        company = sender_email.split("@")[1] if "@" in sender_email else "Prospect"
+        """PB-001: Demo Access Notification (legacy triage path).
 
-        upsert_contact(
-            name=sender_name,
-            email=sender_email,
-            company=company,
-            source="artemis-demo",
-            status="lead",
+        Delegates to demo_intake.process_demo_message for full CRM Write Guard
+        processing.  The primary path is now job_demo_intake (interval scan).
+        """
+        message_id = msg.get("id")
+        if not message_id:
+            logger.warning("PB-001 triage: no message ID — skipping")
+            return
+
+        result = process_demo_message(
+            self.gmail, message_id, mm_client=self.mm,
         )
-
-        nbd = next_business_day()
-
-        # Create commitment via CRM API if available, else SQLite
-        commitment_title = f"Follow up with {sender_name} re: demo access"
-        if self.crm.is_available():
-            try:
-                contact = self.crm.find_contact_by_email(sender_email)
-                contact_id = contact.get("id") if contact else None
-                self.crm.create_commitment({
-                    "description": commitment_title,
-                    "due_date": nbd.isoformat(),
-                    "contact_id": contact_id,
-                    "status": "open",
-                })
-                logger.info("PB-001: Created CRM commitment for %s", sender_name)
-            except Exception:
-                logger.warning("CRM commitment creation failed — falling back to SQLite")
-                add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
-        else:
-            add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
-
-        self.mm.post_message(
-            config.CHANNEL_OPS,
-            f"\U0001f3af New demo lead: {sender_name} ({company}) \u2014 "
-            f"follow-up scheduled for {nbd.isoformat()}",
-        )
+        if not result.get("success"):
+            logger.warning(
+                "PB-001 triage: processing failed — %s", result.get("error", "unknown")
+            )
 
     def _run_pb002_meeting_followup(self, msg: dict, triage_item: dict):
         """PB-002: Meeting Follow-up — create commitments for action items."""
@@ -1116,6 +1103,45 @@ class ArtemisScheduler:
 
         except Exception:
             logger.exception("Commitment reminder chain failed")
+
+    def job_demo_intake(self):
+        """PB-001 v2: Scan for Lucint demo notification emails and process them."""
+        if self._is_quiet():
+            return
+
+        try:
+            message_ids = get_demo_messages(self.gmail)
+            if not message_ids:
+                return
+
+            logger.info("PB-001: Found %d unprocessed demo email(s)", len(message_ids))
+            for msg_id in message_ids:
+                try:
+                    result = process_demo_message(
+                        self.gmail, msg_id, mm_client=self.mm
+                    )
+                    if result.get("success"):
+                        logger.info(
+                            "PB-001: Processed demo lead — %s (%s)",
+                            result.get("name", "?"), result.get("company", "?"),
+                        )
+                    else:
+                        logger.error(
+                            "PB-001: Failed to process %s — %s",
+                            msg_id, result.get("error", "unknown"),
+                        )
+                except Exception:
+                    logger.exception("PB-001: Error processing demo message %s", msg_id)
+                    try:
+                        self.mm.post_message(
+                            config.CHANNEL_OPS,
+                            f"\u26a0\ufe0f PB-001 demo intake failed on message "
+                            f"{msg_id[:12]}\u2026 — check logs. Lead NOT processed.",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("PB-001 demo intake job failed")
 
     _billing_label_checked: bool = False
 

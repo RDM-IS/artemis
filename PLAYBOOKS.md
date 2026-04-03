@@ -1,22 +1,64 @@
 # Artemis Playbooks
 
-## PB-001: Demo Access Notification
+## PB-001: Demo Access Notification (v2)
 
-> **Note:** Superseded by PB-008 once built — CRM logic here is legacy.
-> New demo leads flow through the CRM Write Guard for dedup before CRM insert.
+> **Note:** v2 replaces the legacy flat-contact approach. All CRM writes
+> now flow through the CRM Write Guard (PB-008) for dedup before insert.
 
-**Trigger:** Email from Artemis demo system containing "Demo access confirmed"
+**Module:** `artemis/demo_intake.py`
+
+**Trigger:** Email from `demo@rdm.is` with subject containing
+"Lucint demo accessed" (case-insensitive). Scanned every 5 minutes
+via scheduler job `demo_intake`. Also triggered from triage if matched.
+
+**Extraction from email body:**
+- `Name:` line
+- `Email:` line (domain extracted automatically)
+- `Company:` line (set to None if "not provided", "no company", or empty)
+- `Time:` line
 
 **Actions:**
-1. Extract: visitor name, email, company (if provided)
-2. Create contact in CRM (upsert — don't duplicate if email exists)
-   Fields: name, email, company, source="artemis-demo",
-   first_seen=today, status="lead"
-3. Create commitment: "Follow up with [name] re: demo access"
-   due_date = next business day, effort = 1, client = extracted company or "Prospect"
-4. Post to #artemis-ops: ":dart: New demo lead: [name] ([company]) —
-   follow-up scheduled for [date]"
-5. Mark email as NEEDS_ACTION in inbox zero with due_date = next business day
+1. Apply Gmail labels:
+   - `@artemis`
+   - `@artemis/pipeline`
+   - `@artemis/pipeline/demo-request`
+2. CRM Write Guard — company:
+   - `entity_type="company"`, domain match or fuzzy name
+   - `confidence="high"` if company name extracted, `"low"` if domain-only
+   - `types=["Prospect"]`
+3. CRM Write Guard — person:
+   - `entity_type="person"`, email exact match
+   - `source="lucint-demo"`, `confidence="high"`
+4. CRM Write Guard — relationship:
+   - person + company, `role="Contact"`, `is_primary=True`
+5. CRM Write Guard — engagement:
+   - company, `type="Pilot"`, `gate=0`, `status="Active"`
+6. CRM Write Guard — touch_event:
+   - Inbound email, `playbook="PB-001"`
+7. Create dynamic Gmail label `@artemis/pipeline/[company]`:
+   - Sanitized: lowercase, spaces/special chars replaced with hyphens
+8. Create commitment: "Follow up with [name] re: Lucint demo"
+   - `due_date` = next business day, `effort_days` = 1
+9. Mark message as processed (shared `acos.processed_billing` table)
+10. Post to #artemis-ryan:
+    - Lead name, company, gate, email, CRM status, follow-up date
+
+**Label output state:**
+- `@artemis`
+- `@artemis/pipeline`
+- `@artemis/pipeline/demo-request`
+- `@artemis/pipeline/[company]` (dynamic per-company)
+
+**Error Handling:**
+- Name or email not extractable: apply `@artemis/needs-review`,
+  post to Mattermost, halt (do not write to CRM)
+- Any CRM write guard returns "flagged": continue remaining steps,
+  note flagged entities in Mattermost post
+- Commitment creation fails: log warning, do not halt
+- Fatal error: post raw failure to Mattermost for manual handling
+- Mark as processed ONLY after successful Mattermost post
+
+**Testing:** `python -m artemis.demo_intake --dry-run`
 
 ## PB-002: Meeting Follow-up with Action Items
 
