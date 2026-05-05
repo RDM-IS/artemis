@@ -701,8 +701,16 @@ def insert_inferred_summary() -> bool:
 # ============================================================================
 
 # Static map of session_type → base equipment + location.
-# Bike-based cardio (cardio_intervals, cardio_z2) is computed dynamically
-# from weather + override; this table is for everything else.
+# Cardio sessions (cardio_intervals, cardio_z2) and walk consult weather +
+# override dynamically below; the static base lists below describe the
+# non-bike-decision equipment that's always relevant.
+#
+# Equipment inventory (canonical, from PB-009):
+#   - Road bike with indoor trainer (whatever is set at 04:00 wins)
+#   - Water rower
+#   - Walking pad (lives in home office, movable to gym)
+#   - TRX bands, exercise ball, yoga mat, resistance bands w/ anchors
+#   - PowerBlock dumbbells, curl bar (2x 10# + 2x 25# plates), flat bench
 _EQUIPMENT_MAP: dict[str, dict] = {
     "strength_a": {
         "location": "downstairs gym",
@@ -727,18 +735,24 @@ _EQUIPMENT_MAP: dict[str, dict] = {
         "first_lift": "Goblet squat",
     },
     "cardio_z2": {
-        # Default; bike branch overrides location below.
+        # Z2 = sustained low-intensity. Walking pad is appropriate here
+        # (low-impact, well-suited for Z2 pace). Bike on trainer is the
+        # default; pad is the alternative the user can pick at workout time.
         "location": "downstairs gym",
-        "equipment": ["rower", "bike"],
+        "equipment": ["bike on trainer", "walking pad"],
         "first_lift": None,
     },
     "cardio_intervals": {
-        # Default; bike branch overrides location below.
-        "location": "downstairs gym (treadmill)",
-        "equipment": ["treadmill"],
+        # Intervals require real intensity bursts. Walking pad is NOT
+        # appropriate here. Choices are water rower OR bike on trainer
+        # (intervals); user picks at workout time.
+        "location": "downstairs gym",
+        "equipment": ["water rower", "bike on trainer (intervals)"],
         "first_lift": None,
     },
     "walk": {
+        # Default = outside. Weather branch swaps to indoor walking pad
+        # when cold (<40°F) or rainy.
         "location": "outside",
         "equipment": ["walking shoes"],
         "first_lift": None,
@@ -750,8 +764,17 @@ _EQUIPMENT_MAP: dict[str, dict] = {
     },
 }
 
-# Bike-based sessions — these consult weather/override for location.
+# Sessions whose bike sub-equipment is decided by weather + user_override.
+# (cardio_intervals and cardio_z2 both have a bike option in their list.)
 _BIKE_SESSIONS = {"cardio_z2", "cardio_intervals"}
+
+# Per-session-type "alternative" equipment that's preserved in the final
+# list even after the bike branch decides indoor/outdoor. The user picks
+# bike vs alternative at workout time — both surfaces in the calibrated post.
+_BIKE_ALTERNATIVE = {
+    "cardio_intervals": "water rower",
+    "cardio_z2": "walking pad",
+}
 
 
 def resolve_equipment_and_location(
@@ -762,11 +785,16 @@ def resolve_equipment_and_location(
     """Return {'location': str, 'equipment': list[str], 'notes': str | None,
                 'first_lift': str | None}.
 
-    For bike-based sessions (cardio_z2, cardio_intervals) the location is
-    chosen by:
+    For bike-based sessions (cardio_z2, cardio_intervals) the bike's
+    indoor/outdoor location is chosen by:
         1. user_override='indoor' or 'outdoor' wins outright (with note)
         2. otherwise: temp_f < 40 OR precip_next_90min → indoor
         3. otherwise → outdoor
+    The non-bike alternative (water rower for intervals, walking pad for Z2)
+    is always preserved in the equipment list — user picks at workout time.
+
+    For walk: weather alone drives the indoor (walking pad) vs outdoor
+    decision. user_override does NOT apply to walks.
 
     Pure function. No I/O. Caller passes weather + override in.
     """
@@ -787,20 +815,42 @@ def resolve_equipment_and_location(
         "notes": None,
     }
 
-    # Walk/strength/rest don't need indoor/outdoor reasoning
+    # ── Walk branch: weather-driven indoor swap ────────────────────────
+    if session_type == "walk":
+        w = weather or {}
+        temp_f = w.get("temp_f", 50.0)
+        precip = bool(w.get("precip_next_90min", False))
+        if precip:
+            result["location"] = "downstairs gym (walking pad)"
+            result["equipment"] = ["walking pad"]
+            result["notes"] = "Rain expected — walking pad indoor."
+        elif temp_f < 40:
+            result["location"] = "downstairs gym (walking pad)"
+            result["equipment"] = ["walking pad"]
+            result["notes"] = f"Cold ({temp_f:.0f}°F) — walking pad indoor."
+        return result
+
+    # Strength / rest_mobility — no weather logic
     if session_type not in _BIKE_SESSIONS:
         return result
 
-    # Bike branch: override > weather
+    # ── Bike branch (cardio_intervals, cardio_z2) ──────────────────────
+    # Preserve the non-bike alternative (water rower / walking pad)
+    # alongside whichever bike configuration the override/weather picks.
+    alt = _BIKE_ALTERNATIVE.get(session_type)
+
+    def _with_alt(bike_equip: list[str]) -> list[str]:
+        return ([alt] if alt else []) + bike_equip
+
     if user_override == "indoor":
         result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
         result["notes"] = "Per your override: indoor."
         return result
 
     if user_override == "outdoor":
         result["location"] = "outside (road bike)"
-        result["equipment"] = ["road bike", "helmet", "water bottle"]
+        result["equipment"] = _with_alt(["road bike", "helmet", "water bottle"])
         result["notes"] = "Per your override: outdoor."
         return result
 
@@ -811,15 +861,15 @@ def resolve_equipment_and_location(
 
     if precip:
         result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
         result["notes"] = "Rain expected in next 90 min — indoor."
     elif temp_f < 40:
         result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
         result["notes"] = f"Cold ({temp_f:.0f}°F) — indoor."
     else:
         result["location"] = "outside (road bike)"
-        result["equipment"] = ["road bike", "helmet", "water bottle"]
+        result["equipment"] = _with_alt(["road bike", "helmet", "water bottle"])
         result["notes"] = f"Clear and {temp_f:.0f}°F — outside."
 
     return result

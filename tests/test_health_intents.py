@@ -323,16 +323,25 @@ class TestResolveEquipment(unittest.TestCase):
         self.assertEqual(r["first_lift"], "Goblet squat")
 
     def test_resolve_equipment_cardio_intervals(self):
-        """cardio_intervals returns treadmill (default = no override, mild weather)."""
+        """cardio_intervals → water rower AND bike on trainer (indoor scenario).
+
+        User does NOT own a treadmill. Intervals require real intensity,
+        so the choices are water rower or bike on trainer (intervals).
+        Walking pad is NOT appropriate here.
+
+        Weather chosen to land in the indoor bike branch so both
+        "water rower" and "bike on trainer" substrings appear.
+        """
         from artemis.health import resolve_equipment_and_location
         r = resolve_equipment_and_location(
             "cardio_intervals",
-            weather={"temp_f": 60.0, "precip_next_90min": False},
+            weather={"temp_f": 35.0, "precip_next_90min": False},  # cold → indoor
         )
-        # Mild weather → outside; but cardio_intervals is treadmill-only,
-        # bike branch only triggers for cardio_z2. Spec test: "returns rower or bike"
-        # which matches cardio_z2 — adjusted: confirm equipment list is non-empty
-        self.assertTrue(len(r["equipment"]) > 0)
+        joined = " | ".join(r["equipment"]).lower()
+        self.assertIn("water rower", joined)
+        self.assertIn("bike on trainer", joined)
+        self.assertNotIn("treadmill", joined)
+        self.assertNotIn("walking pad", joined)
 
     def test_resolve_bike_indoor_when_cold(self):
         """temp_f=35 → indoor."""
@@ -405,6 +414,100 @@ class TestResolveEquipment(unittest.TestCase):
         from artemis.health import resolve_equipment_and_location
         r = resolve_equipment_and_location("cardio_z2", weather=None)
         self.assertIn("outside", r["location"].lower())
+
+    # ── T4-fix: walking pad + corrected cardio_intervals ────────────────
+
+    def test_resolve_z2_includes_walking_pad(self):
+        """cardio_z2 → equipment list always includes walking pad alongside bike."""
+        from artemis.health import resolve_equipment_and_location
+        r = resolve_equipment_and_location(
+            "cardio_z2",
+            weather={"temp_f": 60.0, "precip_next_90min": False},
+        )
+        joined = " | ".join(r["equipment"]).lower()
+        self.assertIn("walking pad", joined)
+        # Bike option also present (here: outdoor road bike since 60°F clear)
+        self.assertTrue(
+            "road bike" in joined or "bike on trainer" in joined,
+            f"expected a bike option in {r['equipment']!r}",
+        )
+
+    def test_resolve_walk_outside_when_clear(self):
+        """walk + temp_f=65, no rain → outside, walking shoes."""
+        from artemis.health import resolve_equipment_and_location
+        r = resolve_equipment_and_location(
+            "walk",
+            weather={"temp_f": 65.0, "precip_next_90min": False},
+        )
+        self.assertIn("outside", r["location"].lower())
+        self.assertIn("walking shoes", r["equipment"])
+        self.assertNotIn("walking pad", r["equipment"])
+
+    def test_resolve_walk_uses_pad_when_cold(self):
+        """walk + temp_f=35 → indoor walking pad, cold note."""
+        from artemis.health import resolve_equipment_and_location
+        r = resolve_equipment_and_location(
+            "walk",
+            weather={"temp_f": 35.0, "precip_next_90min": False},
+        )
+        loc = r["location"].lower()
+        self.assertTrue(
+            "downstairs gym" in loc or "indoor" in loc,
+            f"expected indoor walking pad location, got {r['location']!r}",
+        )
+        self.assertIn("walking pad", r["equipment"])
+        self.assertIn("Cold", r["notes"])
+
+    def test_resolve_walk_uses_pad_when_rain(self):
+        """walk + precip_next_90min=True → indoor walking pad, rain note."""
+        from artemis.health import resolve_equipment_and_location
+        r = resolve_equipment_and_location(
+            "walk",
+            weather={"temp_f": 60.0, "precip_next_90min": True},
+        )
+        loc = r["location"].lower()
+        self.assertTrue(
+            "downstairs gym" in loc or "indoor" in loc,
+            f"expected indoor walking pad location, got {r['location']!r}",
+        )
+        self.assertIn("walking pad", r["equipment"])
+        self.assertIn("Rain", r["notes"])
+
+    def test_resolve_intervals_does_not_include_walking_pad(self):
+        """cardio_intervals → walking pad NOT in equipment (intensity check).
+
+        Intervals need real bursts; walking pad can't deliver.
+        """
+        from artemis.health import resolve_equipment_and_location
+        # Test across multiple weather/override combos to catch any path that
+        # accidentally adds walking pad.
+        scenarios = [
+            {"weather": {"temp_f": 30.0, "precip_next_90min": False}, "user_override": None},
+            {"weather": {"temp_f": 75.0, "precip_next_90min": False}, "user_override": None},
+            {"weather": {"temp_f": 60.0, "precip_next_90min": True}, "user_override": None},
+            {"weather": None, "user_override": "indoor"},
+            {"weather": None, "user_override": "outdoor"},
+        ]
+        for sc in scenarios:
+            r = resolve_equipment_and_location("cardio_intervals", **sc)
+            joined = " | ".join(r["equipment"]).lower()
+            self.assertNotIn(
+                "walking pad", joined,
+                f"walking pad should not appear for cardio_intervals; scenario={sc}, equipment={r['equipment']!r}",
+            )
+
+    def test_resolve_z2_user_override_indoor_still_includes_pad(self):
+        """cardio_z2 + user_override='indoor' → equipment includes BOTH bike and pad."""
+        from artemis.health import resolve_equipment_and_location
+        r = resolve_equipment_and_location(
+            "cardio_z2",
+            weather={"temp_f": 75.0, "precip_next_90min": False},
+            user_override="indoor",
+        )
+        joined = " | ".join(r["equipment"]).lower()
+        self.assertIn("bike on trainer", joined)
+        self.assertIn("walking pad", joined)
+        self.assertIn("override", r["notes"].lower())
 
 
 # ============================================================================
