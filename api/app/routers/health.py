@@ -2,20 +2,28 @@
 
 GET /api/health/today  → today's training plan from health.plan
 
-Read-only. No auth (private network). Consumed by gym-display frontend
-(separate repo) on the gym TV at gym.rdm.is.
+Auth: X-API-Key header validated against AWS Secrets Manager
+secret `rdmis/dev/health-api-key`. Returns 401 (per contract) on
+missing/invalid key — distinct from the CRM API which returns 403.
 
-Note on layout: the existing repo convention defines pydantic response
-models inline in the router (see commitments.py). Keeping that pattern
-to avoid restructuring api/app/models.py from flat file → package, which
-would break every existing import.
+CORS: handled by the global CORSMiddleware in api/app/main.py
+(`allow_origins=["*"]` + `allow_methods=["*"]` + `allow_headers=["*"]`),
+which already serves preflight requests from `https://gym.rdm.is`.
+TRUSTED_ORIGINS below is informational — used by the smoke test to
+assert the contract is satisfied.
+
+Note on layout: existing routers (commitments, contacts, deals) define
+pydantic models inline. Following that convention to avoid restructuring
+api/app/models.py from flat file → package, which would break every
+existing import.
 """
 
 from datetime import date, datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Security, status
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -26,6 +34,56 @@ router = APIRouter()
 
 CT = ZoneInfo("America/Chicago")
 
+# Origins explicitly trusted by this endpoint. Currently the global
+# CORSMiddleware allows everything ("*"), so this list is documentation
+# + test fixture only. If the global middleware tightens, this becomes
+# the canonical list for /api/health/*.
+TRUSTED_ORIGINS = {
+    "https://gym.rdm.is",
+}
+
+# ---------------------------------------------------------------------------
+# Auth — health-specific, returns 401 (per contract). Distinct from the CRM
+# API's 403 to make it explicit that the gym-display frontend is a separate
+# consumer with its own key rotation.
+# ---------------------------------------------------------------------------
+
+_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+_HEALTH_API_KEY: Optional[str] = None
+
+
+def _load_health_key() -> str:
+    """Lazy-load the health API key from Secrets Manager, cached per-process."""
+    global _HEALTH_API_KEY
+    if _HEALTH_API_KEY is None:
+        from knowledge.secrets import get_health_api_key
+        _HEALTH_API_KEY = get_health_api_key()
+    return _HEALTH_API_KEY
+
+
+def verify_health_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)):
+    """Validate X-API-Key header. Returns 401 on missing/invalid (per spec).
+
+    Distinct from verify_api_key() in main.py which returns 403 — keeps the
+    health endpoint's contract independent of CRM API behavior.
+    """
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "unauthorized"},
+        )
+    expected = _load_health_key()
+    if api_key != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "unauthorized"},
+        )
+    return api_key
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
 
 class PlanResponse(BaseModel):
     """Response model for GET /api/health/today.
@@ -53,6 +111,10 @@ class NoPlanResponse(BaseModel):
     fallback: str = "rest day or check Mattermost"
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _today_ct() -> date:
     """Return today's date in America/Chicago.
 
@@ -61,12 +123,20 @@ def _today_ct() -> date:
     return datetime.now(CT).date()
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @router.get("/today")
-def get_today(db: Session = Depends(get_db)):
+def get_today(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
     """Return the training plan for today (Central Time).
 
     200 → PlanResponse JSON
     404 → {"error": "no_plan", "fallback": "..."}
+    401 → {"error": "unauthorized"}  (handled by verify_health_api_key)
     """
     today = _today_ct()
 
@@ -82,8 +152,6 @@ def get_today(db: Session = Depends(get_db)):
     ).mappings().first()
 
     if row is None:
-        # Use HTTPException so the response envelope matches FastAPI conventions,
-        # but customize the body to the contract spec.
         raise HTTPException(
             status_code=404,
             detail={
@@ -92,7 +160,6 @@ def get_today(db: Session = Depends(get_db)):
             },
         )
 
-    # blocks comes back as a dict (JSONB native). target_rpe is Decimal → float.
     return PlanResponse(
         plan_id=row["plan_id"],
         plan_date=row["plan_date"],

@@ -114,6 +114,15 @@ def get_crm_api_key() -> str:
     return secret["api_key"]
 
 
+def get_health_api_key() -> str:
+    """Returns Health API key string used by /api/health/* endpoints.
+    Consumed by the gym-display frontend (gym.rdm.is) and any other
+    private-network reader.
+    Secret name: rdmis/dev/health-api-key"""
+    secret = get_secret("rdmis/dev/health-api-key")
+    return secret["api_key"]
+
+
 def get_zoho_webhook_secret() -> str:
     """Returns Zoho webhook secret string.
     Secret name: rdmis/dev/zoho-webhook-secret"""
