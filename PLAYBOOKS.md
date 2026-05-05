@@ -360,6 +360,29 @@ Example debrief confirm-back:
 - Idempotency: `_idempotency_key()` hashes the Mattermost message ID;
   duplicate webhook deliveries are no-ops
 
+### Recovery override
+
+When the calibrated plan is built (`build_calibrated_plan_post`),
+the prompt prepends a recovery override message if **sleep < 5h
+AND energy ≤ 2** on today's `daily_state` row. The override changes
+the Mattermost prompt text only — it does not modify the
+`health.plan` row, does not set `daily_state.is_override`, and does
+NOT update what `/api/health/today` returns. Consequence: the
+gym-display TV at `gym.rdm.is` will show the original scheduled
+workout while the trainer voice prompt on your phone says "drop
+to mobility + walk." Mattermost is authoritative when the two
+disagree.
+
+The 5h / energy 2 thresholds are conservative defaults from sports
+science guidance — protecting against compound-lift injury risk
+when both sleep deprivation and CNS fatigue stack. They are NOT
+configurable in T4; tuning will land with the autoregulator
+ticket which moves the rules into `health.training_rules` config
+reads instead of hardcoded prompt-builder checks.
+
+User can override the override by replying "do it anyway" — the
+debrief intent will fire normally and log against the original plan.
+
 ### Out of scope (deferred to future tickets)
 
 - **Autoregulator** (separate ticket) — adjusts `health.plan` rows
