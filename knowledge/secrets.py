@@ -123,6 +123,14 @@ def get_health_api_key() -> str:
     return secret["api_key"]
 
 
+def get_openweather_api_key() -> str:
+    """Returns OpenWeatherMap API key string.
+    Used by artemis/weather.py for indoor/outdoor cardio decisions.
+    Secret name: rdmis/dev/openweather-api-key"""
+    secret = get_secret("rdmis/dev/openweather-api-key")
+    return secret["api_key"]
+
+
 def get_zoho_webhook_secret() -> str:
     """Returns Zoho webhook secret string.
     Secret name: rdmis/dev/zoho-webhook-secret"""

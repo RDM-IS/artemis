@@ -178,16 +178,43 @@ class ArtemisScheduler:
         )
         logger.info("PB-001 demo intake enabled")
 
-        # Health: workout debrief nag at 23:00 CT
-        # APScheduler honors the system TZ; the job itself re-checks "today" in CT.
+        # Health: workout debrief nag at 21:00 CT (1hr before quiet hours)
+        # Day-of-week suppression handled inside job_health_nag (Tue/Fri off).
         self.scheduler.add_job(
-            self.job_health_nag, "cron", hour=23, minute=0, id="health_nag",
+            self.job_health_nag, "cron", hour=21, minute=0, id="health_nag",
         )
-        # Inferred-summary backstop at 00:05 CT (next day)
+        # Inferred-summary backstop at 21:50 CT (50min after nag, just before
+        # quiet hours start) — operates on TODAY's plan, not yesterday's.
+        # Fires every day regardless of nag suppression — data-quality backstop.
         self.scheduler.add_job(
-            self.job_health_inferred_summary, "cron", hour=0, minute=5, id="health_inferred_summary",
+            self.job_health_inferred_summary, "cron", hour=21, minute=50, id="health_inferred_summary",
         )
-        logger.info("Health nag jobs scheduled")
+        # ── T4: Proactive prompts (PB-009) ────────────────────────────────
+        # Morning workout prompt — Tue/Thu/Fri at 04:01 CT (just after quiet ends)
+        self.scheduler.add_job(
+            self.job_health_morning_prompt, "cron",
+            hour=4, minute=1, day_of_week="tue,thu,fri",
+            id="health_morning_prompt_early",
+        )
+        # Morning workout prompt — Mon/Sun at 07:00 CT
+        self.scheduler.add_job(
+            self.job_health_morning_prompt, "cron",
+            hour=7, minute=0, day_of_week="mon,sun",
+            id="health_morning_prompt_workout",
+        )
+        # Morning logging-only prompt — Wed/Sat at 07:00 CT (workout is later)
+        self.scheduler.add_job(
+            self.job_health_morning_prompt, "cron",
+            hour=7, minute=0, day_of_week="wed,sat",
+            id="health_morning_prompt_logging",
+        )
+        # Evening workout prompt — Wed/Sat at 16:30 CT
+        self.scheduler.add_job(
+            self.job_health_evening_prompt, "cron",
+            hour=16, minute=30, day_of_week="wed,sat",
+            id="health_evening_prompt",
+        )
+        logger.info("Health nag + proactive prompt jobs scheduled")
 
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
@@ -1220,9 +1247,28 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("PB-007 billing intake job failed")
 
+    @staticmethod
+    def _today_ct_date():
+        """Return today's date in America/Chicago. Used by health/training jobs."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Chicago")).date()
+
     def job_health_nag(self):
-        """Health: at 23:00 CT, prompt for workout debrief if missing."""
+        """Health: at 21:00 CT, prompt for workout debrief if missing.
+
+        Day-of-week suppression per PB-009: Tue and Fri have no PM workout
+        and no PM social tolerance — skip the nag entirely on those days.
+        """
+        if self._is_quiet():
+            return
         try:
+            today = self._today_ct_date()
+            dow = today.weekday()  # Mon=0, Tue=1, ..., Fri=4, Sat=5, Sun=6
+            if dow in (1, 4):  # Tue, Fri
+                logger.debug("Health nag suppressed (Tue/Fri schedule)")
+                return
+
             from artemis.health import run_nag_check
             msg = run_nag_check()
             if msg:
@@ -1232,16 +1278,160 @@ class ArtemisScheduler:
             logger.exception("Health nag job failed")
 
     def job_health_inferred_summary(self):
-        """Health: at 00:05 CT, insert a placeholder summary for yesterday if no
+        """Health: at 21:50 CT, insert a placeholder summary for today if no
         debrief was logged. Marked logged_via='inferred' so the autoregulator
-        knows it's not real data."""
+        knows it's not real data.
+
+        Fires every day regardless of nag suppression — data-quality backstop.
+        """
         try:
             from artemis.health import insert_inferred_summary
             inserted = insert_inferred_summary()
             if inserted:
-                logger.info("Inserted inferred session_summary for yesterday")
+                logger.info("Inserted inferred session_summary for today")
         except Exception:
             logger.exception("Health inferred-summary job failed")
+
+    # ── T4: Proactive prompts (PB-009) ────────────────────────────────────
+
+    def job_health_morning_prompt(self):
+        """Post the morning survey prompt to #artemis-ryan.
+
+        Routes by day-of-week:
+            Mon/Sun (07:00) and Tue/Thu/Fri (04:01) → workout_am variant
+                                                       (schedules calibration)
+            Wed/Sat (07:00)                          → logging_only variant
+
+        Idempotent per (slot, today) via system_state KV.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from datetime import datetime, timedelta
+            from zoneinfo import ZoneInfo
+            from artemis.health import (
+                already_prompted_today, build_morning_survey_prompt,
+                get_today_plan, mark_prompted,
+            )
+
+            today = self._today_ct_date()
+            dow = today.weekday()
+
+            if dow in (2, 5):              # Wed, Sat
+                prompt_type = "logging_only"
+            elif dow in (0, 1, 3, 4, 6):   # everyone else
+                prompt_type = "workout_am"
+            else:
+                return
+
+            slot = "morning"
+            if already_prompted_today(slot, today):
+                logger.debug("Morning prompt already fired today — skipping")
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                logger.info("No plan for %s — skipping morning prompt", today)
+                return
+
+            text = build_morning_survey_prompt(plan, prompt_type)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted morning %s prompt (%s)", prompt_type, today)
+
+            # Schedule one-shot calibration follow-up only for workout_am
+            if prompt_type == "workout_am":
+                ct = ZoneInfo("America/Chicago")
+                run_at = datetime.now(ct) + timedelta(minutes=15)
+                job_id = f"health_calibration_{today.isoformat()}"
+                self.scheduler.add_job(
+                    self.job_health_calibration_followup,
+                    "date", run_date=run_at, id=job_id, replace_existing=True,
+                )
+                logger.info("Scheduled calibration follow-up at %s", run_at.isoformat())
+        except Exception:
+            logger.exception("Health morning prompt failed")
+
+    def job_health_calibration_followup(self):
+        """Read morning state + today's plan + override, post the calibrated
+        plan with equipment + location. Fires once, ~15 min after the morning
+        survey prompt on workout days.
+
+        Idempotent per day via system_state KV.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from artemis.health import (
+                already_prompted_today, build_calibrated_plan_post,
+                get_today_plan, get_today_state, mark_prompted,
+                read_bike_override, resolve_equipment_and_location,
+            )
+            from artemis.weather import get_current_conditions
+
+            today = self._today_ct_date()
+            slot = "morning_calibration"
+            if already_prompted_today(slot, today):
+                logger.debug("Calibration follow-up already fired today — skipping")
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                return
+
+            session_type = plan.get("session_type", "")
+            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
+            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+
+            resolved = resolve_equipment_and_location(
+                session_type, weather=weather, user_override=override,
+            )
+
+            state = get_today_state()
+            text = build_calibrated_plan_post(plan, resolved, state)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted calibrated plan for %s", today)
+        except Exception:
+            logger.exception("Health calibration follow-up failed")
+
+    def job_health_evening_prompt(self):
+        """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.
+
+        Idempotent per day. Skips if quiet hours active or no plan row exists.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from artemis.health import (
+                already_prompted_today, build_evening_prompt,
+                get_today_plan, mark_prompted, read_bike_override,
+                resolve_equipment_and_location,
+            )
+            from artemis.weather import get_current_conditions
+
+            today = self._today_ct_date()
+            slot = "evening"
+            if already_prompted_today(slot, today):
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                return
+
+            session_type = plan.get("session_type", "")
+            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
+            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+
+            resolved = resolve_equipment_and_location(
+                session_type, weather=weather, user_override=override,
+            )
+            text = build_evening_prompt(plan, resolved)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted evening prompt for %s", today)
+        except Exception:
+            logger.exception("Health evening prompt failed")
 
     def job_quiet_hours_start(self):
         """Enter quiet hours and announce."""

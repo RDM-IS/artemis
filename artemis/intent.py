@@ -23,6 +23,7 @@ VALID_ACTIONS = {
     "log_interaction",
     "log_morning_state",
     "log_workout_debrief",
+    "trainer_override",
     "general_reply",
 }
 
@@ -86,7 +87,10 @@ _ROUTER_SYSTEM = (
     '   Examples: "done. squats 10 @ 35 RPE 7", '
     '"burpees 15 reps RPE 10 HR peak 159"\n'
     "   -> primary_action: log_workout_debrief\n\n"
-    "11. Everything else -> primary_action: general_reply\n\n"
+    "11. TRAINER OVERRIDE (bike indoor/outdoor for next cardio day):\n"
+    '   Triggers: "trainer set indoor", "trainer set outdoor"\n'
+    "   -> primary_action: trainer_override\n\n"
+    "12. Everything else -> primary_action: general_reply\n\n"
     "SECONDARY ACTIONS: Include secondary_actions when the message implies "
     "multiple things should happen. Examples:\n"
     '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '

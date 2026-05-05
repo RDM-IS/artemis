@@ -558,10 +558,14 @@ _DEBRIEF_TRIGGER = re.compile(
 def detect_health_intent(message: str) -> str | None:
     """Lightweight regex pre-check for health intents.
 
-    Returns 'log_morning_state', 'log_workout_debrief', or None.
-    Cheaper than calling Claude — used as a first pass before the main router.
+    Returns 'log_morning_state', 'log_workout_debrief', 'trainer_override',
+    or None. Cheaper than calling Claude — used as a first pass before
+    the main router.
     """
-    # Debrief checks first because "done" + "RPE X" is more specific than
+    # Trainer override is most specific — match first.
+    if _OVERRIDE_RE.match(message):
+        return INTENT_TRAINER_OVERRIDE
+    # Debrief next because "done" + "RPE X" is more specific than
     # the morning trigger which catches "sleep"/"slept".
     if _DEBRIEF_TRIGGER.search(message):
         return "log_workout_debrief"
@@ -655,20 +659,21 @@ def run_nag_check() -> Optional[str]:
 
 
 def insert_inferred_summary() -> bool:
-    """Insert a placeholder session_summary row for today if still missing.
+    """Insert a placeholder session_summary row for TODAY if still missing.
 
-    Called at 00:00 CT for the previous day. The autoregulator/trends will
-    know it's inferred via logged_via='inferred'.
+    Called at 21:50 CT (50 min after the 21:00 nag, just before quiet hours
+    start at 22:00) and operates on the current calendar day. The
+    autoregulator/trends will know it's inferred via logged_via='inferred'.
 
     Returns True if a row was inserted, False if a real debrief already exists.
     """
     from knowledge.db import execute_one, execute_write
 
-    yesterday = (datetime.now(CT).date() - timedelta(days=1))
+    today = datetime.now(CT).date()
 
     plan = execute_one(
         "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan WHERE plan_date = %s",
-        (yesterday,),
+        (today,),
     )
 
     if not plan or plan["is_skipped"] or plan["session_type"] in ("rest_mobility", "walk"):
@@ -689,3 +694,380 @@ def insert_inferred_summary() -> bool:
         (plan["plan_id"], plan["target_rpe"]),
     )
     return True
+
+
+# ============================================================================
+# T4: Equipment & location resolver (PB-009)
+# ============================================================================
+
+# Static map of session_type → base equipment + location.
+# Bike-based cardio (cardio_intervals, cardio_z2) is computed dynamically
+# from weather + override; this table is for everything else.
+_EQUIPMENT_MAP: dict[str, dict] = {
+    "strength_a": {
+        "location": "downstairs gym",
+        "equipment": [
+            "PowerBlock dumbbells", "flat bench", "TRX",
+            "resistance bands", "exercise mat",
+        ],
+        "first_lift": "Goblet squat",
+    },
+    "strength_b": {
+        "location": "downstairs gym",
+        "equipment": [
+            "PowerBlock dumbbells", "TRX", "resistance bands", "rower",
+        ],
+        "first_lift": "DB deadlift",
+    },
+    "strength_c": {
+        "location": "downstairs gym",
+        "equipment": [
+            "PowerBlock dumbbells", "TRX", "exercise mat", "rower or bike",
+        ],
+        "first_lift": "Goblet squat",
+    },
+    "cardio_z2": {
+        # Default; bike branch overrides location below.
+        "location": "downstairs gym",
+        "equipment": ["rower", "bike"],
+        "first_lift": None,
+    },
+    "cardio_intervals": {
+        # Default; bike branch overrides location below.
+        "location": "downstairs gym (treadmill)",
+        "equipment": ["treadmill"],
+        "first_lift": None,
+    },
+    "walk": {
+        "location": "outside",
+        "equipment": ["walking shoes"],
+        "first_lift": None,
+    },
+    "rest_mobility": {
+        "location": "anywhere — living room is fine",
+        "equipment": ["mat", "resistance bands"],
+        "first_lift": None,
+    },
+}
+
+# Bike-based sessions — these consult weather/override for location.
+_BIKE_SESSIONS = {"cardio_z2", "cardio_intervals"}
+
+
+def resolve_equipment_and_location(
+    session_type: str,
+    weather: dict | None = None,
+    user_override: str | None = None,
+) -> dict:
+    """Return {'location': str, 'equipment': list[str], 'notes': str | None,
+                'first_lift': str | None}.
+
+    For bike-based sessions (cardio_z2, cardio_intervals) the location is
+    chosen by:
+        1. user_override='indoor' or 'outdoor' wins outright (with note)
+        2. otherwise: temp_f < 40 OR precip_next_90min → indoor
+        3. otherwise → outdoor
+
+    Pure function. No I/O. Caller passes weather + override in.
+    """
+    base = _EQUIPMENT_MAP.get(session_type)
+    if not base:
+        # Unknown session type — return safe defaults rather than raise
+        return {
+            "location": "downstairs gym",
+            "equipment": [],
+            "notes": f"Unknown session_type '{session_type}'.",
+            "first_lift": None,
+        }
+
+    result = {
+        "location": base["location"],
+        "equipment": list(base["equipment"]),
+        "first_lift": base.get("first_lift"),
+        "notes": None,
+    }
+
+    # Walk/strength/rest don't need indoor/outdoor reasoning
+    if session_type not in _BIKE_SESSIONS:
+        return result
+
+    # Bike branch: override > weather
+    if user_override == "indoor":
+        result["location"] = "downstairs gym (bike on trainer)"
+        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["notes"] = "Per your override: indoor."
+        return result
+
+    if user_override == "outdoor":
+        result["location"] = "outside (road bike)"
+        result["equipment"] = ["road bike", "helmet", "water bottle"]
+        result["notes"] = "Per your override: outdoor."
+        return result
+
+    # No override — consult weather (or safe default if unavailable)
+    w = weather or {}
+    temp_f = w.get("temp_f", 50.0)
+    precip = bool(w.get("precip_next_90min", False))
+
+    if precip:
+        result["location"] = "downstairs gym (bike on trainer)"
+        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["notes"] = "Rain expected in next 90 min — indoor."
+    elif temp_f < 40:
+        result["location"] = "downstairs gym (bike on trainer)"
+        result["equipment"] = ["bike on trainer", "fan", "towel"]
+        result["notes"] = f"Cold ({temp_f:.0f}°F) — indoor."
+    else:
+        result["location"] = "outside (road bike)"
+        result["equipment"] = ["road bike", "helmet", "water bottle"]
+        result["notes"] = f"Clear and {temp_f:.0f}°F — outside."
+
+    return result
+
+
+# ============================================================================
+# T4: Trainer override capture
+# ============================================================================
+
+INTENT_TRAINER_OVERRIDE = "trainer_override"
+
+_OVERRIDE_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?trainer\s+set\s+(?P<mode>indoor|outdoor)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _next_cardio_date(today: date | None = None) -> date:
+    """Return the date of the next plan row whose session_type is cardio.
+
+    Looks forward up to 14 days from `today` (default = now in CT). If no
+    cardio session is found in that window, returns tomorrow as a fallback.
+    """
+    from knowledge.db import execute_one
+
+    base = today or datetime.now(CT).date()
+    row = execute_one(
+        """SELECT plan_date FROM health.plan
+           WHERE plan_date >= %s
+             AND session_type IN ('cardio_intervals', 'cardio_z2')
+           ORDER BY plan_date
+           LIMIT 1""",
+        (base,),
+    )
+    if row and row.get("plan_date"):
+        return row["plan_date"]
+    # Fallback: tomorrow
+    return base + timedelta(days=1)
+
+
+def detect_trainer_override(text: str) -> str | None:
+    """Returns 'indoor' or 'outdoor' if the text matches; else None."""
+    m = _OVERRIDE_RE.match(text)
+    if not m:
+        return None
+    return m.group("mode").lower()
+
+
+def write_bike_override(target_date: date, mode: str) -> None:
+    """Stash bike_setup_override inside health.plan.blocks JSONB for target_date.
+
+    Uses jsonb_set so we don't clobber the rest of the blocks shape. If no
+    plan row exists for target_date (shouldn't happen for seeded dates), this
+    is a no-op silently.
+    """
+    from knowledge.db import execute_write
+
+    execute_write(
+        """UPDATE health.plan
+           SET blocks = jsonb_set(
+               COALESCE(blocks, '{}'::jsonb),
+               '{bike_setup_override}',
+               to_jsonb(%s::text)
+           )
+           WHERE plan_date = %s""",
+        (mode, target_date),
+    )
+
+
+def read_bike_override(target_date: date) -> str | None:
+    """Read bike_setup_override from health.plan.blocks for target_date.
+
+    Returns 'indoor', 'outdoor', or None.
+    """
+    from knowledge.db import execute_one
+
+    row = execute_one(
+        "SELECT blocks FROM health.plan WHERE plan_date = %s",
+        (target_date,),
+    )
+    if not row:
+        return None
+    blocks = row.get("blocks") or {}
+    val = blocks.get("bike_setup_override")
+    if val in ("indoor", "outdoor"):
+        return val
+    return None
+
+
+def handle_trainer_override(message: str, message_id: str | None = None,
+                             user_id: str | None = None) -> str:
+    """Parse 'trainer set indoor/outdoor' and write to next cardio plan row.
+
+    Always targets the *next* cardio workout from now forward (today included
+    if today is cardio). Per PB-009: morning workout days (Tue/Thu/Fri 04:01)
+    pick up overrides written the prior evening; evening workout days
+    (Wed/Sat 16:30) pick up same-day overrides written before the prompt fires.
+
+    Returns trainer-voice confirm string.
+    """
+    mode = detect_trainer_override(message)
+    if mode is None:
+        # Caller should have pre-checked, but be defensive.
+        return "I couldn't parse that. Try: 'trainer set indoor' or 'trainer set outdoor'."
+
+    target_date = _next_cardio_date()
+    try:
+        write_bike_override(target_date, mode)
+    except Exception:
+        logger.exception("Failed to write bike override")
+        return "⚠️ Couldn't save override — check DB."
+
+    nice_date = target_date.strftime("%a %b %-d") if hasattr(target_date, "strftime") else str(target_date)
+    return f"Got it — bike on trainer set {mode} for {nice_date}."
+
+
+# ============================================================================
+# T4: Prompt builders (trainer voice)
+# ============================================================================
+
+def _session_pretty_name(session_type: str) -> str:
+    return {
+        "strength_a":       "Strength A — Push/Legs",
+        "strength_b":       "Strength B — Pull/Hinge",
+        "strength_c":       "Strength C — Full Body",
+        "cardio_intervals": "Cardio Intervals",
+        "cardio_z2":        "Cardio Zone 2",
+        "walk":             "Walk + mobility",
+        "rest_mobility":    "Rest / Mobility",
+    }.get(session_type, session_type)
+
+
+_SURVEY_QUESTIONS = (
+    "Reply with: sleep hrs, energy 1-5, soreness (region 1-5), weight if you weighed, RHR if you took it.\n"
+    "Example: `slept 6.5 energy 3 legs sore 3 weight 271 RHR 58`"
+)
+
+
+def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
+    """Builds the morning prompt text. prompt_type ∈ {'workout_am', 'logging_only'}.
+
+    workout_am: full survey + heads-up that the calibrated plan arrives in 15 min.
+    logging_only: just the survey; the workout is later in the day.
+    """
+    session = _session_pretty_name(plan.get("session_type", "?"))
+    duration = plan.get("est_duration_min")
+    duration_str = f" — {duration} min" if duration else ""
+
+    if prompt_type == "logging_only":
+        return (
+            f"Morning. Today's workout is later: **{session}**{duration_str}.\n"
+            f"For now: morning check-in.\n\n"
+            f"{_SURVEY_QUESTIONS}"
+        )
+
+    # workout_am
+    return (
+        f"Morning. Today: **{session}**{duration_str}.\n\n"
+        f"{_SURVEY_QUESTIONS}\n\n"
+        f"_Calibrated plan in ~15 min once you reply._"
+    )
+
+
+def build_evening_prompt(plan: dict, resolved: dict) -> str:
+    """Build the evening pre-workout prompt for Wed/Sat 16:30."""
+    session = _session_pretty_name(plan.get("session_type", "?"))
+    duration = plan.get("est_duration_min")
+    duration_str = f" — {duration} min" if duration else ""
+
+    lines = [
+        f"Evening. Tonight: **{session}**{duration_str}.",
+        f"Where: {resolved['location']}",
+    ]
+    if resolved["equipment"]:
+        lines.append(f"Bring: {', '.join(resolved['equipment'])}")
+    if resolved.get("first_lift"):
+        lines.append(f"First lift: {resolved['first_lift']}")
+    if resolved.get("notes"):
+        lines.append(f"_{resolved['notes']}_")
+    lines.append("gym.rdm.is is up — full plan there.")
+    return "\n".join(lines)
+
+
+def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -> str:
+    """Build the trainer-voice calibrated plan post that follows morning survey
+    by ~15 minutes."""
+    session = _session_pretty_name(plan.get("session_type", "?"))
+    duration = plan.get("est_duration_min")
+    duration_str = f" — {duration} min" if duration else ""
+
+    lines = [f"Today: **{session}**{duration_str}.", f"Where: {resolved['location']}"]
+    if resolved["equipment"]:
+        lines.append(f"Bring: {', '.join(resolved['equipment'])}")
+    if resolved.get("first_lift"):
+        lines.append(f"First lift: {resolved['first_lift']}")
+    blocks = plan.get("blocks") or {}
+    if blocks.get("warmup"):
+        lines.append(f"Warmup: {blocks['warmup']}")
+    if resolved.get("notes"):
+        lines.append(f"_{resolved['notes']}_")
+
+    # Recovery-day override notice if morning state suggests it
+    if state:
+        sleep = state.get("sleep_hrs")
+        energy = state.get("energy")
+        if (sleep is not None and sleep < 5) or (energy is not None and energy <= 2):
+            lines.insert(0, "**Recovery override.** Sleep low or energy low. Today drops to mobility + walk.")
+
+    lines.append("gym.rdm.is is up — full plan there.")
+    return "\n".join(lines)
+
+
+# ============================================================================
+# T4: Idempotency for proactive prompts
+# ============================================================================
+
+def already_prompted_today(slot: str, today: date | None = None) -> bool:
+    """Check whether a given prompt slot already fired today.
+
+    slot: 'morning', 'morning_calibration', 'evening' — namespaced per day.
+    Uses the existing system_state KV (artemis.quiet_hours.set_system_value)
+    which is already used for catch-up prevention elsewhere.
+
+    Returns True if the slot has fired today (so caller should skip).
+    """
+    from artemis.quiet_hours import get_system_value
+
+    d = today or datetime.now(CT).date()
+    key = f"health_prompt:{slot}:{d.isoformat()}"
+    return bool(get_system_value(key))
+
+
+def mark_prompted(slot: str, today: date | None = None) -> None:
+    """Record that a given prompt slot has fired today."""
+    from artemis.quiet_hours import set_system_value
+
+    d = today or datetime.now(CT).date()
+    key = f"health_prompt:{slot}:{d.isoformat()}"
+    set_system_value(key, datetime.now(CT).isoformat())
+
+
+def get_today_state() -> dict | None:
+    """Fetch today's morning daily_state row (CT). Returns None if absent."""
+    from knowledge.db import execute_one
+    today = datetime.now(CT).date()
+    return execute_one(
+        """SELECT state_date, weight_lbs, sleep_hrs, energy, soreness,
+                  resting_hr, free_text
+           FROM health.daily_state WHERE state_date = %s""",
+        (today,),
+    )

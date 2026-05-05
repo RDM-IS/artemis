@@ -1948,6 +1948,15 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             logger.exception("Workout debrief handler failed")
             return "\u26a0\ufe0f Couldn\u2019t save debrief \u2014 check DB."
 
+    # ── trainer_override (training, T4) ──
+    if intent.primary_action == "trainer_override":
+        from artemis.health import handle_trainer_override
+        try:
+            return handle_trainer_override(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Trainer override handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save trainer override \u2014 check DB."
+
     # ── add_note ──
     if intent.primary_action == "add_note":
         from knowledge.db import execute_write as db_write
