@@ -1,0 +1,133 @@
+# Baseline 19-week training plan templates.
+# Used by scripts/seed_health_baseline.py to populate health.plan.
+#
+# Phase progression rules baked in:
+#   Phase 1 (Foundation, wks 1-4):  2 rounds, downward-only adjust.
+#   Phase 2 (Build, wks 5-10):       3 rounds.
+#   Phase 3 (Peak, wks 11-16):       3 rounds + heavy top set notation in notes.
+#   Phase 4 (Polish, wks 17-19):     same as Phase 3; week 19 = 50% volume (deload).
+#
+# The autoregulator (later ticket) adjusts these from real session_log + daily_state.
+# Baseline just needs to be sane.
+
+phase_meta:
+  1: { name: Foundation, rounds: 2, target_rpe: 6.5, notes: "Build the habit. Downward-only adjustment." }
+  2: { name: Build,      rounds: 3, target_rpe: 7.5, notes: "Add 3rd lift. True HIIT introduced wks 9-10." }
+  3: { name: Peak,       rounds: 3, target_rpe: 8.5, notes: "Heavy top set on first compound. Real intensity." }
+  4: { name: Polish,     rounds: 3, target_rpe: 8.0, notes: "Hold Phase 3 volume. Wk 19 deload mandatory." }
+
+# Day-of-week → session_type. Constant across phases.
+day_to_session:
+  0: strength_a       # Monday
+  1: cardio_intervals # Tuesday
+  2: strength_b       # Wednesday
+  3: cardio_z2        # Thursday
+  4: rest_mobility    # Friday
+  5: strength_c       # Saturday
+  6: walk             # Sunday
+
+# Session templates. The seed script reads these and substitutes
+# phase-specific rounds / RPE / notes.
+
+strength_a:
+  type: circuit
+  est_duration_min: 40
+  target_hr_zone: 3
+  warmup: "5 min bike easy + band pull-aparts"
+  rest_between_rounds_sec: 120
+  exercises:
+    - { name: "Goblet squat",     format: reps,     target_reps: 10, target_load_lbs: 30, rest_after_sec: 60 }
+    - { name: "Incline push-up",  format: reps,     target_reps: 9,  rest_after_sec: 60 }
+    - { name: "DB RDL",           format: reps,     target_reps: 10, target_load_lbs: 30, rest_after_sec: 60 }
+    - { name: "TRX chest press",  format: reps,     target_reps: 10, rest_after_sec: 60 }
+    - { name: "Glute bridge",     format: reps,     target_reps: 12, rest_after_sec: 60 }
+    - { name: "Plank",            format: duration, duration_sec: 30, rest_after_sec: 60 }
+  cooldown: "8 min bike easy"
+  equipment: ["Powerblocks 25-35lb", "TRX", "Mat"]
+  setup_notes: ["TRX at mid-anchor for press"]
+
+strength_b:
+  type: circuit
+  est_duration_min: 40
+  target_hr_zone: 3
+  warmup: "5 min bike easy + band pull-aparts"
+  rest_between_rounds_sec: 120
+  exercises:
+    - { name: "DB deadlift",        format: reps,     target_reps: 10, target_load_lbs: 35, rest_after_sec: 60 }
+    - { name: "TRX row",            format: reps,     target_reps: 10, rest_after_sec: 60 }
+    - { name: "DB single-arm row",  format: reps,     target_reps: 10, target_load_lbs: 30, rest_after_sec: 60, notes: "10 each side" }
+    - { name: "Banded face pull",   format: reps,     target_reps: 15, rest_after_sec: 60 }
+    - { name: "Dead bug",           format: reps,     target_reps: 10, rest_after_sec: 60, notes: "10 each side" }
+    - { name: "Hollow hold",        format: duration, duration_sec: 20, rest_after_sec: 60 }
+  cooldown: "8 min row easy"
+  equipment: ["Powerblocks 25-35lb", "TRX", "Bands", "Rower"]
+
+strength_c:
+  type: circuit
+  est_duration_min: 45
+  target_hr_zone: 3
+  warmup: "5 min bike easy + band pull-aparts"
+  rest_between_rounds_sec: 120
+  exercises:
+    - { name: "Goblet squat",      format: reps,     target_reps: 10, target_load_lbs: 30, rest_after_sec: 60 }
+    - { name: "Incline push-up",   format: reps,     target_reps: 9,  rest_after_sec: 60 }
+    - { name: "TRX row",           format: reps,     target_reps: 10, rest_after_sec: 60 }
+    - { name: "DB RDL",            format: reps,     target_reps: 10, target_load_lbs: 30, rest_after_sec: 60 }
+    - { name: "Mountain climbers", format: duration, duration_sec: 30, rest_after_sec: 60 }
+    - { name: "Plank",             format: duration, duration_sec: 30, rest_after_sec: 60 }
+  cooldown: "12 min row or bike"
+  equipment: ["Powerblocks 25-35lb", "TRX", "Mat", "Rower"]
+
+cardio_intervals:
+  type: intervals
+  est_duration_min: 30
+  target_hr_zone: 4
+  warmup_sec: 300
+  warmup_settings: "Treadmill 3.0 mph, 0% incline"
+  intervals_template:
+    work_sec: 60
+    work_settings: "3.8 mph, 4% incline"
+    rest_sec: 60
+    rest_settings: "3.0 mph, 0%"
+  rounds: 8
+  cooldown_sec: 300
+  equipment: ["Treadmill"]
+  setup_notes: ["Set treadmill: 3.0 mph / 0% to start"]
+  finisher:
+    type: core_circuit
+    rounds: 2
+    exercises:
+      - { name: "Dead bug",       format: reps,     target_reps: 10, notes: "10 each side" }
+      - { name: "Bird dog",       format: reps,     target_reps: 10, notes: "10 each side" }
+      - { name: "Side plank",     format: duration, duration_sec: 20, notes: "20s each side" }
+      - { name: "Hollow hold",    format: duration, duration_sec: 20 }
+
+cardio_z2:
+  type: intervals
+  est_duration_min: 35
+  target_hr_zone: 2
+  warmup_sec: 300
+  warmup_settings: "Rower easy"
+  intervals_template:
+    work_sec: 90
+    work_settings: "250m moderate-hard"
+    rest_sec: 60
+    rest_settings: "Easy spin"
+  rounds: 6
+  cooldown_sec: 900
+  equipment: ["Rower", "Bike"]
+  setup_notes: ["After rower intervals, finish with 15 min bike Z2"]
+
+rest_mobility:
+  type: mobility
+  duration_min: 20
+  est_duration_min: 20
+  intensity: "gentle"
+  notes: "20 min gentle yoga or full rest"
+
+walk:
+  type: walk
+  duration_min: 45
+  est_duration_min: 45
+  intensity: "conversational"
+  notes: "30-45 min outdoor walk + 10 min mobility cooldown"

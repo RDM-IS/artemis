@@ -178,6 +178,17 @@ class ArtemisScheduler:
         )
         logger.info("PB-001 demo intake enabled")
 
+        # Health: workout debrief nag at 23:00 CT
+        # APScheduler honors the system TZ; the job itself re-checks "today" in CT.
+        self.scheduler.add_job(
+            self.job_health_nag, "cron", hour=23, minute=0, id="health_nag",
+        )
+        # Inferred-summary backstop at 00:05 CT (next day)
+        self.scheduler.add_job(
+            self.job_health_inferred_summary, "cron", hour=0, minute=5, id="health_inferred_summary",
+        )
+        logger.info("Health nag jobs scheduled")
+
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
         qh_end_h, qh_end_m = config.QUIET_HOURS_END.split(":")
@@ -1208,6 +1219,29 @@ class ArtemisScheduler:
                         pass
         except Exception:
             logger.exception("PB-007 billing intake job failed")
+
+    def job_health_nag(self):
+        """Health: at 23:00 CT, prompt for workout debrief if missing."""
+        try:
+            from artemis.health import run_nag_check
+            msg = run_nag_check()
+            if msg:
+                self.mm.post_message(config.CHANNEL_OPS, msg)
+                logger.info("Posted health debrief nag")
+        except Exception:
+            logger.exception("Health nag job failed")
+
+    def job_health_inferred_summary(self):
+        """Health: at 00:05 CT, insert a placeholder summary for yesterday if no
+        debrief was logged. Marked logged_via='inferred' so the autoregulator
+        knows it's not real data."""
+        try:
+            from artemis.health import insert_inferred_summary
+            inserted = insert_inferred_summary()
+            if inserted:
+                logger.info("Inserted inferred session_summary for yesterday")
+        except Exception:
+            logger.exception("Health inferred-summary job failed")
 
     def job_quiet_hours_start(self):
         """Enter quiet hours and announce."""

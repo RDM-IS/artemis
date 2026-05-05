@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "health.plan.blocks",
+  "description": "Schema for the blocks JSONB field on health.plan rows.",
+  "oneOf": [
+    { "$ref": "#/definitions/circuit" },
+    { "$ref": "#/definitions/intervals" },
+    { "$ref": "#/definitions/walk" },
+    { "$ref": "#/definitions/mobility" },
+    { "$ref": "#/definitions/rest" }
+  ],
+  "definitions": {
+    "circuit": {
+      "type": "object",
+      "required": ["type", "rounds", "exercises"],
+      "properties": {
+        "type": { "const": "circuit" },
+        "warmup": { "type": "string" },
+        "rounds": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "rest_between_rounds_sec": { "type": "integer", "minimum": 0 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/exercise" }
+        },
+        "cooldown": { "type": "string" },
+        "equipment": { "type": "array", "items": { "type": "string" } },
+        "setup_notes": { "type": "array", "items": { "type": "string" } },
+        "finisher": { "type": "object" }
+      }
+    },
+    "exercise": {
+      "type": "object",
+      "required": ["name", "format"],
+      "properties": {
+        "name": { "type": "string" },
+        "format": { "enum": ["reps", "duration", "distance"] },
+        "target_reps": { "type": "integer", "minimum": 1 },
+        "target_load_lbs": { "type": "number", "minimum": 0 },
+        "duration_sec": { "type": "integer", "minimum": 1 },
+        "distance_m": { "type": "number", "minimum": 1 },
+        "rest_after_sec": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "string" }
+      }
+    },
+    "intervals": {
+      "type": "object",
+      "required": ["type", "warmup_sec", "intervals_template", "rounds", "cooldown_sec"],
+      "properties": {
+        "type": { "const": "intervals" },
+        "warmup_sec": { "type": "integer", "minimum": 0 },
+        "warmup_settings": { "type": "string" },
+        "intervals_template": {
+          "type": "object",
+          "required": ["work_sec", "rest_sec"],
+          "properties": {
+            "work_sec": { "type": "integer", "minimum": 1 },
+            "work_settings": { "type": "string" },
+            "rest_sec": { "type": "integer", "minimum": 0 },
+            "rest_settings": { "type": "string" }
+          }
+        },
+        "rounds": { "type": "integer", "minimum": 1 },
+        "cooldown_sec": { "type": "integer", "minimum": 0 },
+        "equipment": { "type": "array", "items": { "type": "string" } },
+        "setup_notes": { "type": "array", "items": { "type": "string" } },
+        "finisher": { "type": "object" }
+      }
+    },
+    "walk": {
+      "type": "object",
+      "required": ["type", "duration_min"],
+      "properties": {
+        "type": { "const": "walk" },
+        "duration_min": { "type": "integer", "minimum": 1 },
+        "intensity": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "mobility": {
+      "type": "object",
+      "required": ["type", "duration_min"],
+      "properties": {
+        "type": { "const": "mobility" },
+        "duration_min": { "type": "integer", "minimum": 1 },
+        "intensity": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "rest": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "rest" },
+        "duration_min": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}

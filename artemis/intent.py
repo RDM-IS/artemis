@@ -21,6 +21,8 @@ VALID_ACTIONS = {
     "pipeline_update",
     "financial_summary",
     "log_interaction",
+    "log_morning_state",
+    "log_workout_debrief",
     "general_reply",
 }
 
@@ -73,7 +75,18 @@ _ROUTER_SYSTEM = (
     "8. NOTE TAKING:\n"
     '   Keywords: "remember", "note", "keep track", "jot down"\n'
     "   -> primary_action: add_note\n\n"
-    "9. Everything else -> primary_action: general_reply\n\n"
+    "9. MORNING CHECK-IN (training):\n"
+    '   Triggers: message starts with "morning", "checkin", '
+    '"@artemis morning", or contains "slept" / "sleep"\n'
+    '   Examples: "slept 6.5 energy 3", "morning. RHR 58, legs sore"\n'
+    "   -> primary_action: log_morning_state\n\n"
+    "10. WORKOUT DEBRIEF (training):\n"
+    '   Triggers: "done", "debrief", "workout done", "@artemis done", '
+    'or contains "RPE" + exercise names\n'
+    '   Examples: "done. squats 10 @ 35 RPE 7", '
+    '"burpees 15 reps RPE 10 HR peak 159"\n'
+    "   -> primary_action: log_workout_debrief\n\n"
+    "11. Everything else -> primary_action: general_reply\n\n"
     "SECONDARY ACTIONS: Include secondary_actions when the message implies "
     "multiple things should happen. Examples:\n"
     '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '

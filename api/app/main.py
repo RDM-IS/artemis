@@ -17,7 +17,7 @@ from .database import get_db
 from .routers import (
     organizations, contacts, deals, interactions,
     commitments, invoices, founder_loans, webhooks,
-    dashboard,
+    dashboard, health as health_router,
 )
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
@@ -51,6 +51,8 @@ app.include_router(invoices.router, prefix="/invoices", tags=["invoices"], depen
 app.include_router(founder_loans.router, prefix="/founder-loans", tags=["founder-loans"], dependencies=[Depends(verify_api_key)])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"], dependencies=[Depends(verify_api_key)])
+# Health/training plan — no auth (private network, gym-display frontend).
+app.include_router(health_router.router, prefix="/api/health", tags=["health"])
 
 @app.get("/health")
 @app.get("/default/rdmis-crm-api/health")

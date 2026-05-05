@@ -1926,6 +1926,28 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             logger.exception("Interaction logging failed")
             return "\u26a0\ufe0f Failed to log interaction \u2014 check DB connection."
 
+    # ── log_morning_state (training) ──
+    if intent.primary_action == "log_morning_state":
+        from artemis.health import handle_morning_intent
+        try:
+            return handle_morning_intent(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Morning check-in handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save morning check-in \u2014 check DB."
+
+    # ── log_workout_debrief (training) ──
+    if intent.primary_action == "log_workout_debrief":
+        from artemis.health import handle_debrief_intent, handle_fix_intent
+        # First check if this is a "fix <exercise> rpe <N>" edit
+        fix_result = handle_fix_intent(question)
+        if fix_result is not None:
+            return fix_result
+        try:
+            return handle_debrief_intent(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Workout debrief handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save debrief \u2014 check DB."
+
     # ── add_note ──
     if intent.primary_action == "add_note":
         from knowledge.db import execute_write as db_write
