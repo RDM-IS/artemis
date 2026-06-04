@@ -6,11 +6,12 @@ import re
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Event
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 
 from artemis import config
 from artemis.availability import (
@@ -159,6 +160,77 @@ def health_check():
         "last_triage": _last_triage,
         "last_brief": _last_brief,
     })
+
+
+# ---------------------------------------------------------------------------
+# Voice endpoint — Deepgram STT + ElevenLabs TTS
+# ---------------------------------------------------------------------------
+
+_voice_api_key = None
+
+
+def _verify_voice_key():
+    """Verify X-API-Key header. Returns error response or None if OK."""
+    global _voice_api_key
+    if _voice_api_key is None:
+        try:
+            from knowledge.secrets import get_crm_api_key
+            _voice_api_key = get_crm_api_key()
+        except Exception:
+            logger.exception("Failed to load CRM API key for voice auth")
+            return jsonify({"error": "Auth misconfigured"}), 500
+    key = request.headers.get("X-API-Key", "")
+    if key != _voice_api_key:
+        return jsonify({"error": "Invalid API key"}), 403
+    return None
+
+
+@app.route("/voice", methods=["POST"])
+def voice_endpoint():
+    """Accept audio, transcribe, process, and return spoken response."""
+    auth_err = _verify_voice_key()
+    if auth_err:
+        return auth_err
+
+    if "audio" not in request.files:
+        return jsonify({"error": "No 'audio' file in request"}), 400
+
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    mime_type = audio_file.content_type or "audio/webm"
+
+    if len(audio_bytes) == 0:
+        return jsonify({"error": "Empty audio file"}), 400
+
+    logger.info("Voice request: %d bytes, mime=%s", len(audio_bytes), mime_type)
+
+    try:
+        from artemis.voice import process_voice_query
+
+        response_text, audio_out = process_voice_query(
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            mm_client=_mm,
+            gmail_client=_gmail,
+            calendar_client=_calendar,
+        )
+
+        return Response(
+            audio_out,
+            mimetype="audio/mpeg",
+            headers={
+                "X-Transcript": response_text[:500].replace("\n", " "),
+            },
+        )
+    except Exception:
+        logger.exception("Voice processing failed")
+        return jsonify({"error": "Voice processing failed"}), 500
+
+
+@app.route("/voice/health", methods=["GET"])
+def voice_health():
+    """Health check for voice subsystem."""
+    return jsonify({"status": "ok", "stt": "deepgram", "tts": "elevenlabs"})
 
 
 def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarClient, question: str = "") -> str:
@@ -1553,6 +1625,414 @@ def _handle_action_item_command(post: dict, question: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Correction / feedback learning
+# ---------------------------------------------------------------------------
+
+_CORRECTION_PHRASES = [
+    "no,", "no ", "wrong", "actually", "i meant", "that's not right",
+    "you should have", "next time", "correct action is", "not what i",
+    "that was wrong", "try again", "redo", "should have been",
+]
+
+# Track last N Artemis responses for correction context: {post_id: {message, action_taken}}
+_artemis_responses: dict[str, dict] = {}
+_MAX_TRACKED_RESPONSES = 50
+
+
+def _track_artemis_response(original_post: dict, response_text: str, intent: bool = False):
+    """Store an Artemis response so corrections can reference it."""
+    post_id = original_post.get("root_id") or original_post.get("id", "")
+    if not post_id:
+        return
+    _artemis_responses[post_id] = {
+        "original_message": original_post.get("message", "").replace("@artemis", "").strip(),
+        "response": response_text[:500],
+        "intent_routed": intent,
+    }
+    # Evict old entries
+    if len(_artemis_responses) > _MAX_TRACKED_RESPONSES:
+        oldest = list(_artemis_responses.keys())[0]
+        del _artemis_responses[oldest]
+
+
+@dataclass
+class CorrectionResult:
+    original_intent: str = ""
+    correct_intent: str = ""
+    learned_rule: str = ""
+    confidence: float = 0.0
+
+
+def classify_correction(
+    original_message: str,
+    artemis_response: str,
+    correction_message: str,
+) -> CorrectionResult:
+    """Use Claude to understand what the user is correcting and what the right action was."""
+    from knowledge.secrets import get_anthropic_key as _get_key
+    import anthropic as _anthropic
+
+    client = _anthropic.Anthropic(api_key=_get_key())
+    system = (
+        "The user is correcting an AI assistant called Artemis. "
+        "Given the original message, Artemis's response, and the user's correction, determine:\n"
+        "1. What action Artemis incorrectly took (original_intent)\n"
+        "2. What action it should have taken (correct_intent, must be one of: "
+        "add_contacts, query_crm, add_note, schedule, pipeline_update, general_reply)\n"
+        "3. A short rule to remember for next time (under 100 chars)\n"
+        "Return ONLY JSON: {\"original_intent\": \"...\", \"correct_intent\": \"...\", "
+        "\"learned_rule\": \"...\", \"confidence\": 0.0-1.0}"
+    )
+    user = (
+        f"Original message: {original_message}\n"
+        f"Artemis response: {artemis_response}\n"
+        f"User correction: {correction_message}"
+    )
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = resp.content[0].text.strip()
+        text = re.sub(r"^```json\s*", "", text)
+        text = re.sub(r"^```\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        data = json.loads(text.strip())
+
+        return CorrectionResult(
+            original_intent=data.get("original_intent", ""),
+            correct_intent=data.get("correct_intent", "general_reply"),
+            learned_rule=data.get("learned_rule", "")[:100],
+            confidence=float(data.get("confidence", 0.5)),
+        )
+    except Exception:
+        logger.debug("Correction classification failed", exc_info=True)
+        return CorrectionResult()
+
+
+def _handle_correction(post: dict, question: str, thread: list[dict]) -> str | None:
+    """Detect and handle correction messages in thread replies.
+
+    Returns a response string if a correction was handled, None otherwise.
+    """
+    # Must be a thread reply
+    root_id = post.get("root_id")
+    if not root_id:
+        return None
+
+    # Check if message looks like a correction
+    q_lower = question.lower()
+    is_correction = any(phrase in q_lower for phrase in _CORRECTION_PHRASES)
+    if not is_correction:
+        return None
+
+    # Find the original Artemis response in tracked history
+    tracked = _artemis_responses.get(root_id)
+    if not tracked:
+        # Try to get context from thread
+        if len(thread) < 2:
+            return None
+        # Find the last Artemis message in thread
+        bot_msgs = [
+            p for p in thread
+            if p.get("user_id") == (_mm._bot_user_id if _mm else "")
+        ]
+        if not bot_msgs:
+            return None
+        tracked = {
+            "original_message": thread[0].get("message", "").replace("@artemis", "").strip(),
+            "response": bot_msgs[-1].get("message", "")[:500],
+        }
+
+    # Classify the correction
+    correction = classify_correction(
+        original_message=tracked["original_message"],
+        artemis_response=tracked["response"],
+        correction_message=question,
+    )
+
+    if not correction.learned_rule or correction.confidence < 0.4:
+        return None
+
+    # Store the learned rule
+    try:
+        from knowledge.db import execute_write as _db_write
+        _db_write(
+            """INSERT INTO acos.data_vault_satellites
+               (entity_id, satellite_type, content, layer, crm_syncable, metadata)
+               VALUES (
+                   (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
+                   'intent_example',
+                   %s,
+                   'gold',
+                   false,
+                   '{}'
+               )""",
+            (json.dumps({
+                "user_said": tracked["original_message"][:200],
+                "correct_action": correction.correct_intent,
+                "rule": correction.learned_rule,
+                "learned_at": datetime.now(timezone.utc).isoformat(),
+            }),),
+        )
+    except Exception:
+        logger.exception("Failed to store learned intent rule")
+
+    # Re-process the original message with the correction
+    reprocess_result = None
+    try:
+        from artemis.intent import route_intent
+        new_intent = route_intent(tracked["original_message"])
+        logger.info(
+            "Correction re-route: %s -> %s (was %s)",
+            tracked["original_message"][:50],
+            new_intent.primary_action,
+            correction.original_intent,
+        )
+        # Execute the corrected action if it matches
+        if new_intent.primary_action == correction.correct_intent or new_intent.confidence >= 0.6:
+            reprocess_result = _handle_intent_routed(
+                post, tracked["original_message"], thread
+            )
+    except Exception:
+        logger.debug("Re-processing after correction failed", exc_info=True)
+
+    response = f"\U0001f4a1 Got it \u2014 I've learned that \"{correction.learned_rule}\"."
+    if reprocess_result:
+        response += f"\n\nLet me try that again:\n\n{reprocess_result}"
+
+    return response
+
+
+def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str | None:
+    """Route message via intent classifier. Returns response string or None to fall through."""
+    from artemis.intent import route_intent
+
+    # Check for file attachments in the Mattermost post
+    file_ids = post.get("file_ids") or []
+    has_attachment = len(file_ids) > 0
+    attachment_mime = None
+
+    # Get file metadata if present
+    file_info = None
+    if has_attachment and _mm:
+        try:
+            resp = _mm._api("GET", f"/files/{file_ids[0]}/info")
+            file_info = resp.json()
+            attachment_mime = file_info.get("mime_type")
+        except Exception:
+            logger.debug("Could not fetch file info for %s", file_ids[0])
+
+    intent = route_intent(question, has_attachment, attachment_mime)
+    logger.info(
+        "Intent: primary=%s, secondary=%s, confidence=%.2f, entities=%s",
+        intent.primary_action, intent.secondary_actions, intent.confidence, intent.entities,
+    )
+
+    # Only act on high-confidence non-general intents
+    if intent.primary_action == "general_reply" or intent.confidence < 0.6:
+        return None
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    # ── add_contacts ──
+    if intent.primary_action == "add_contacts":
+        from artemis.parser import parse_document
+        from artemis.crm_writer import write_contacts, write_sales_plan_context
+
+        contacts = []
+        sales_plan = None
+        if has_attachment and _mm and file_ids:
+            # Download file from Mattermost
+            try:
+                resp = _mm._api("GET", f"/files/{file_ids[0]}")
+                file_bytes = resp.content
+                mime = attachment_mime or "application/octet-stream"
+                contacts, sales_plan = parse_document(file_bytes, mime, user_context=question)
+            except Exception:
+                logger.exception("Failed to download attachment %s", file_ids[0])
+                return "\u26a0\ufe0f Failed to download the attachment. Try uploading again."
+
+        if not contacts and intent.entities:
+            # No attachment but entities mentioned — create minimal contacts
+            from artemis.parser import ExtractedContact
+            for name in intent.entities:
+                contacts.append(ExtractedContact(
+                    name=name,
+                    notes=f"Added via Mattermost: {question[:200]}",
+                    source_description="Mattermost message",
+                ))
+
+        if not contacts and not sales_plan:
+            return "\u26a0\ufe0f I couldn't extract any contacts. Try attaching a document or mentioning names."
+
+        # Sales plan path vs regular contacts
+        if sales_plan:
+            result = write_sales_plan_context(sales_plan, contacts)
+            return result.summary
+        else:
+            result = write_contacts(contacts, ryan_context=question)
+            return f"\U0001f4c7 **Contacts imported**\n{result.summary}"
+
+    # ── query_crm ──
+    if intent.primary_action == "query_crm":
+        from artemis.crm_query import query_account, query_contact
+
+        if not intent.entities:
+            return "\U0001f50d Who or what would you like me to look up?"
+
+        parts = []
+        for entity_name in intent.entities:
+            # Check if it's an organization or person
+            from knowledge.db import execute_one as db_one
+            is_org = db_one(
+                "SELECT 1 FROM public.organizations WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%' LIMIT 1",
+                (entity_name,),
+            )
+            is_person = db_one(
+                "SELECT 1 FROM public.contacts WHERE LOWER(name) LIKE '%%' || LOWER(%s) || '%%' LIMIT 1",
+                (entity_name,),
+            )
+
+            if is_person:
+                parts.append(query_contact([entity_name]))
+            if is_org:
+                parts.append(query_account(entity_name))
+            if not is_person and not is_org:
+                # Try both — might be an acos entity
+                contact_result = query_contact([entity_name])
+                if "not in the CRM" not in contact_result:
+                    parts.append(contact_result)
+                else:
+                    account_result = query_account(entity_name)
+                    if "No organization found" not in account_result:
+                        parts.append(account_result)
+                    else:
+                        parts.append(contact_result)
+
+        return "\n\n---\n\n".join(parts) if parts else f"\U0001f50d No results for: {', '.join(intent.entities)}"
+
+    # ── log_interaction ──
+    if intent.primary_action == "log_interaction":
+        from artemis.interaction_logger import log_interaction as do_log_interaction
+        try:
+            return do_log_interaction(question, intent.entities)
+        except Exception:
+            logger.exception("Interaction logging failed")
+            return "\u26a0\ufe0f Failed to log interaction \u2014 check DB connection."
+
+    # ── log_morning_state (training) ──
+    if intent.primary_action == "log_morning_state":
+        from artemis.health import handle_morning_intent
+        try:
+            return handle_morning_intent(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Morning check-in handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save morning check-in \u2014 check DB."
+
+    # ── log_workout_debrief (training) ──
+    if intent.primary_action == "log_workout_debrief":
+        from artemis.health import handle_debrief_intent, handle_fix_intent
+        # First check if this is a "fix <exercise> rpe <N>" edit
+        fix_result = handle_fix_intent(question)
+        if fix_result is not None:
+            return fix_result
+        try:
+            return handle_debrief_intent(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Workout debrief handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save debrief \u2014 check DB."
+
+    # ── trainer_override (training, T4) ──
+    if intent.primary_action == "trainer_override":
+        from artemis.health import handle_trainer_override
+        try:
+            return handle_trainer_override(question, message_id=post.get("id"))
+        except Exception:
+            logger.exception("Trainer override handler failed")
+            return "\u26a0\ufe0f Couldn\u2019t save trainer override \u2014 check DB."
+
+    # ── add_note ──
+    if intent.primary_action == "add_note":
+        from knowledge.db import execute_write as db_write
+
+        # Find entity to attach the note to
+        entity_id = None
+        entity_name = None
+        if intent.entities:
+            from artemis.crm_writer import _find_entity_by_name, _find_entity_by_name_fuzzy
+            for name in intent.entities:
+                ent = _find_entity_by_name(name) or _find_entity_by_name_fuzzy(name)
+                if ent:
+                    entity_id = str(ent["id"])
+                    entity_name = ent["name"]
+                    break
+
+        if entity_id:
+            db_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, metadata)
+                   VALUES (%s, 'business_context', %s, 'silver', '{}')""",
+                (entity_id, question),
+            )
+            return f"\U0001f4dd Noted on **{entity_name}**: _{question[:200]}_"
+        else:
+            # No entity found — store as a general note on a generic entity
+            db_write(
+                """INSERT INTO acos.data_vault_satellites
+                   (entity_id, satellite_type, content, layer, metadata)
+                   VALUES (
+                       (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
+                       'business_context', %s, 'silver', '{}'
+                   )""",
+                (question,),
+            )
+            return f"\U0001f4dd Noted: _{question[:200]}_"
+
+    # ── financial_summary ──
+    if intent.primary_action == "financial_summary":
+        from artemis.billing import get_financial_summary
+        try:
+            return get_financial_summary()
+        except Exception:
+            logger.exception("Financial summary failed")
+            return "\u26a0\ufe0f Financial summary unavailable — check DB connection."
+
+    # ── pipeline_update ──
+    if intent.primary_action == "pipeline_update":
+        from knowledge.db import execute_one as db_one, execute_query as db_query
+
+        for entity_name in intent.entities:
+            deal = db_one(
+                """SELECT d.id, d.name, d.gate, d.stage, o.name AS org_name
+                   FROM public.deals d
+                   JOIN public.organizations o ON d.org_id = o.id
+                   WHERE LOWER(o.name) LIKE '%%' || LOWER(%s) || '%%'
+                      OR LOWER(d.name) LIKE '%%' || LOWER(%s) || '%%'
+                   LIMIT 1""",
+                (entity_name, entity_name),
+            )
+            if deal:
+                return (
+                    f"\U0001f4ca **{deal['org_name']}** — {deal['name']}\n"
+                    f"Gate: {deal['gate']} | Stage: {deal['stage'] or 'N/A'}\n\n"
+                    f"_To update, use the CRM API or tell me specifically what changed._"
+                )
+
+        return "\U0001f4ca No matching deals found. Try mentioning the company name."
+
+    # ── schedule — pass through to existing handlers ──
+    if intent.primary_action == "schedule":
+        return None  # let existing scheduling handlers pick it up
+
+    return None
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = post.get("message", "").replace("@artemis", "").strip()
@@ -1617,6 +2097,64 @@ def _handle_mention(post: dict, thread: list[dict]):
                 reply = "\u26a0\ufe0f CRM API error — check logs."
         else:
             reply = "CRM API not configured (CRM_API_URL / CRM_API_KEY not set)."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower.startswith("crm confirm "):
+        pending_id = q_lower.split("crm confirm ", 1)[1].strip()
+        try:
+            from artemis.crm_write_guard import confirm_pending_write
+            cw_result = confirm_pending_write(pending_id)
+            if cw_result.get("status") == "confirmed":
+                reply = (
+                    f"\u2705 Confirmed CRM write: {cw_result.get('entity_type', '?')} "
+                    f"created (id=`{cw_result.get('entity_id', '?')}`)"
+                )
+            else:
+                reply = f"\u26a0\ufe0f Could not confirm: {cw_result.get('error', 'unknown error')}"
+        except Exception:
+            logger.exception("CRM confirm failed")
+            reply = "\u26a0\ufe0f CRM confirm failed \u2014 check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower.startswith("crm reject "):
+        pending_id = q_lower.split("crm reject ", 1)[1].strip()
+        try:
+            from artemis.crm_write_guard import reject_pending_write
+            cw_result = reject_pending_write(pending_id)
+            if cw_result.get("status") == "rejected":
+                reply = f"\u2705 Rejected and removed pending CRM write (`{pending_id[:8]}...`)"
+            else:
+                reply = f"\u26a0\ufe0f Could not reject: {cw_result.get('error', 'unknown error')}"
+        except Exception:
+            logger.exception("CRM reject failed")
+            reply = "\u26a0\ufe0f CRM reject failed \u2014 check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
+    if q_lower == "crm pending":
+        try:
+            from artemis.crm_write_guard import list_pending_writes
+            pending = list_pending_writes()
+            if pending:
+                lines = ["**Pending CRM writes:**"]
+                for p in pending:
+                    p_data = p["data"] if isinstance(p["data"], dict) else {}
+                    lines.append(
+                        f"- `{str(p['id'])[:8]}` {p['entity_type']}: "
+                        f"{p_data.get('name', '?')} (from {p['source_pb']}, "
+                        f"expires {p['expires_at'].strftime('%m/%d')})"
+                    )
+                reply = "\n".join(lines)
+            else:
+                reply = "No pending CRM writes."
+        except Exception:
+            logger.exception("CRM pending list failed")
+            reply = "\u26a0\ufe0f Failed to list pending writes \u2014 check logs."
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
@@ -1702,6 +2240,20 @@ def _handle_mention(post: dict, thread: list[dict]):
         _mm.post_to_channel_id(channel_id, life_ops_response, root_id=root_id)
         return
 
+    # ── Correction / feedback detection ──
+    correction_response = _handle_correction(post, question, thread)
+    if correction_response:
+        _mm.post_to_channel_id(channel_id, correction_response, root_id=root_id)
+        return
+
+    # ── Intent router: classify before generic Claude fallback ──
+    intent_response = _handle_intent_routed(post, question, thread)
+    if intent_response:
+        _mm.post_to_channel_id(channel_id, intent_response, root_id=root_id)
+        # Track this response for potential correction later
+        _track_artemis_response(post, intent_response, intent=True)
+        return
+
     thread_lines = []
     for p in thread[-10:]:
         thread_lines.append(f"{p.get('message', '')}")
@@ -1728,6 +2280,7 @@ def _handle_mention(post: dict, thread: list[dict]):
             response += "\n\n\U0001f319 _Quiet hours active. Say `@artemis override` to start a working session._"
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
+        _track_artemis_response(post, response)
 
 
 def _connect_mattermost_with_retry(mm: MattermostClient) -> bool:
@@ -1839,6 +2392,29 @@ def main():
         _calendar.authenticate(mm_client=_mm)
     except Exception:
         logger.warning("Calendar authentication failed — calendar features disabled")
+
+    # Pre-create @artemis Gmail label hierarchy
+    if _gmail and _gmail.service:
+        for _label in [
+            "@artemis",
+            "@artemis/billing",
+            "@artemis/billing/paid",
+            "@artemis/billing/disputed",
+            "@artemis/pipeline",
+            "@artemis/pipeline/demo-request",
+            "@artemis/crm",
+            "@artemis/crm/needs-review",
+            "@artemis/needs-review",
+            "@artemis/funding",
+            "@artemis/funding/kiva",
+            "@artemis/funding/aws-activate",
+            "@artemis/funding/microsoft",
+            "@artemis/funding/nsf",
+            "@artemis/calendar",
+            "@artemis/calendar/needs-confirm",
+        ]:
+            _gmail.ensure_gmail_label(_label)
+        logger.info("Gmail label hierarchy initialized")
 
     # Load calendar cache on boot
     if _calendar and _calendar.service:

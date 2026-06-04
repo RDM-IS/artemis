@@ -34,6 +34,7 @@ class GmailClient:
         self.service = None
         self._last_history_id: str | None = None
         self.scope_mismatch: bool = False
+        self._label_cache: dict[str, str] = {}
 
     def authenticate(self, mm_client=None):
         """Authenticate with Gmail API.
@@ -551,3 +552,65 @@ class GmailClient:
                 f"Preview: {msg.get('full_body', msg.get('snippet', ''))[:500]}\n"
             )
         return UNTRUSTED_PREFIX + "\n---\n".join(parts)
+
+    def ensure_gmail_label(self, label_name: str) -> str | None:
+        """Find or create a Gmail label by full path name. Returns label_id.
+
+        Creates parent labels if needed (Gmail API handles hierarchy via '/'
+        separators automatically). Results are cached for the session.
+        """
+        if label_name in self._label_cache:
+            return self._label_cache[label_name]
+
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot ensure label")
+            return None
+
+        try:
+            labels = self.service.users().labels().list(userId="me").execute()
+            for lbl in labels.get("labels", []):
+                if lbl["name"].lower() == label_name.lower():
+                    self._label_cache[label_name] = lbl["id"]
+                    return lbl["id"]
+
+            # Label doesn't exist — create it
+            new_label = self.service.users().labels().create(
+                userId="me",
+                body={
+                    "name": label_name,
+                    "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show",
+                },
+            ).execute()
+            label_id = new_label["id"]
+            self._label_cache[label_name] = label_id
+            logger.info("Created Gmail label '%s' (id=%s)", label_name, label_id)
+            return label_id
+        except Exception:
+            logger.exception("Failed to ensure Gmail label '%s'", label_name)
+            return None
+
+    def apply_gmail_label(self, message_id: str, label_name: str) -> bool:
+        """Apply a label to a Gmail message by label path name.
+
+        Calls ensure_gmail_label internally. Returns True on success.
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot apply label")
+            return False
+
+        label_id = self.ensure_gmail_label(label_name)
+        if not label_id:
+            return False
+
+        try:
+            self.service.users().messages().modify(
+                userId="me",
+                id=message_id,
+                body={"addLabelIds": [label_id]},
+            ).execute()
+            logger.info("Applied label '%s' to message %s", label_name, message_id)
+            return True
+        except Exception:
+            logger.exception("Failed to apply label '%s' to message %s", label_name, message_id)
+            return False

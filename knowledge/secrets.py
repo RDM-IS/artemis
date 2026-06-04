@@ -114,8 +114,37 @@ def get_crm_api_key() -> str:
     return secret["api_key"]
 
 
+def get_health_api_key() -> str:
+    """Returns Health API key string used by /api/health/* endpoints.
+    Consumed by the gym-display frontend (gym.rdm.is) and any other
+    private-network reader.
+    Secret name: rdmis/dev/health-api-key"""
+    secret = get_secret("rdmis/dev/health-api-key")
+    return secret["api_key"]
+
+
+def get_openweather_api_key() -> str:
+    """Returns OpenWeatherMap API key string.
+    Used by artemis/weather.py for indoor/outdoor cardio decisions.
+    Secret name: rdmis/dev/openweather-api-key"""
+    secret = get_secret("rdmis/dev/openweather-api-key")
+    return secret["api_key"]
+
+
 def get_zoho_webhook_secret() -> str:
     """Returns Zoho webhook secret string.
     Secret name: rdmis/dev/zoho-webhook-secret"""
     secret = get_secret("rdmis/dev/zoho-webhook-secret")
     return secret["webhook_secret"]
+
+
+def get_deepgram_api_key() -> str:
+    """Returns Deepgram API key string.
+    Secret name: rdmis/dev/deepgram-api-key"""
+    return get_secret("rdmis/dev/deepgram-api-key")["api_key"]
+
+
+def get_elevenlabs_api_key() -> str:
+    """Returns ElevenLabs API key string.
+    Secret name: rdmis/dev/elevenlabs-api-key"""
+    return get_secret("rdmis/dev/elevenlabs-api-key")["api_key"]

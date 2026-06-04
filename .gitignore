@@ -11,3 +11,5 @@ build/
 venv/
 api/package/
 api/function.zip
+calendar_token.json
+lambda.zip

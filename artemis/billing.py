@@ -1,7 +1,8 @@
 """PB-007: Billing Intake — process billing-labeled emails into expense tracking.
 
-Scans for Gmail messages with the 'artemis/billing' label, extracts expense
-data, uploads attachments to Drive, logs to Sheets, and posts to Mattermost.
+Scans for Gmail messages with the '@artemis/billing' label, extracts expense
+data, logs to Sheets, and posts to Mattermost. Attachments are referenced via
+Gmail deep link (no Drive upload).
 """
 
 import base64
@@ -11,7 +12,6 @@ from datetime import date
 from email.utils import parseaddr
 
 from artemis import config
-from artemis.google_drive import get_or_create_expense_folder, upload_attachment
 from artemis.google_sheets import append_expense_row, get_sheet_url
 from knowledge.db import execute_one, execute_write
 from knowledge.secrets import get_gmail_token
@@ -65,12 +65,16 @@ def parse_amount(raw: str) -> float:
 def best_amount(text: str) -> tuple[str, list[str]]:
     """Extract the best (largest) amount from text.
 
-    Returns (best_amount_str, all_amounts_found).
-    If multiple found, best is the largest.
+    Returns (best_amount_str, all_unique_amounts_found).
+    Deduplicates amounts before processing — repeated identical amounts
+    (common in forwarded emails) are treated as a single amount.
+    If multiple distinct amounts found, best is the largest.
     """
     found = extract_amounts(text)
     if not found:
         return "", []
+    # Deduplicate while preserving order
+    found = list(dict.fromkeys(found))
     if len(found) == 1:
         return found[0], found
     # Pick the largest
@@ -115,7 +119,7 @@ def classify_category(subject: str, sender: str) -> str:
 
 
 def ensure_billing_label(gmail_client) -> str | None:
-    """Ensure the 'artemis/billing' Gmail label exists. Creates it if missing.
+    """Ensure the '@artemis/billing' Gmail label exists. Creates it if missing.
 
     Returns the label ID, or None on failure.
     """
@@ -125,28 +129,28 @@ def ensure_billing_label(gmail_client) -> str | None:
     try:
         labels = gmail_client.service.users().labels().list(userId="me").execute()
         for lbl in labels.get("labels", []):
-            if lbl["name"].lower() == "artemis/billing":
+            if lbl["name"].lower() == "@artemis/billing":
                 return lbl["id"]
 
         # Label doesn't exist — create it
         new_label = gmail_client.service.users().labels().create(
             userId="me",
             body={
-                "name": "artemis/billing",
+                "name": "@artemis/billing",
                 "labelListVisibility": "labelShow",
                 "messageListVisibility": "show",
             },
         ).execute()
         label_id = new_label["id"]
-        logger.info("Created Gmail label 'artemis/billing' (id=%s)", label_id)
+        logger.info("Created Gmail label '@artemis/billing' (id=%s)", label_id)
         return label_id
     except Exception:
-        logger.exception("Failed to ensure artemis/billing label")
+        logger.exception("Failed to ensure @artemis/billing label")
         return None
 
 
 def get_billing_messages(gmail_client) -> list[dict]:
-    """Fetch messages with the 'artemis/billing' label that haven't been processed."""
+    """Fetch messages with the '@artemis/billing' label that haven't been processed."""
     if not gmail_client.service:
         return []
 
@@ -154,16 +158,16 @@ def get_billing_messages(gmail_client) -> list[dict]:
         # Refresh credentials to avoid stale SSL connections
         gmail_client.authenticate()
 
-        # Find the label ID for 'artemis/billing'
+        # Find the label ID for '@artemis/billing'
         labels = gmail_client.service.users().labels().list(userId="me").execute()
         label_id = None
         for lbl in labels.get("labels", []):
-            if lbl["name"].lower() == "artemis/billing":
+            if lbl["name"].lower() == "@artemis/billing":
                 label_id = lbl["id"]
                 break
 
         if not label_id:
-            logger.warning("Gmail label 'artemis/billing' not found")
+            logger.warning("Gmail label '@artemis/billing' not found")
             return []
 
         # List messages with that label
@@ -312,13 +316,12 @@ def process_billing_message(
     """Process a single billing email.
 
     Returns a dict with all extracted/logged data for confirmation.
-    If dry_run=True, skips Drive upload, Sheets append, and Mattermost post.
+    If dry_run=True, skips Sheets append and Mattermost post.
     """
     result = {
         "message_id": message_id,
         "success": False,
         "error": None,
-        "drive_link": "",
         "sheet_url": get_sheet_url(),
     }
 
@@ -356,6 +359,21 @@ def process_billing_message(
     # Founder Loan detection
     founder_loan_explicit = bool(re.search(r"founder\s+loan", combined_text, re.IGNORECASE))
 
+    # Forwarded founder loan: Ryan forwarding to billing@ with "Founder Loan"
+    # in body — no ambiguity, suppress extra notes flags
+    _fwd_from_ryan = False
+    if founder_loan_explicit:
+        _to = headers.get("to", "").lower()
+        _arrived_at_billing = "billing@rdm.is" in _to
+        # Check envelope sender or forwarded-from for ryan@rdm.is
+        _from_ryan = "ryan@rdm.is" in sender_email.lower()
+        if not _from_ryan:
+            # Also check the forwarded From: line in body
+            fwd_m = _FORWARDED_FROM_RE.search(body_text)
+            if fwd_m and fwd_m.group(2):
+                _from_ryan = "ryan@rdm.is" in fwd_m.group(2).lower()
+        _fwd_from_ryan = _arrived_at_billing and _from_ryan
+
     result.update({
         "amount": amount_str,
         "all_amounts": all_amounts,
@@ -364,49 +382,69 @@ def process_billing_message(
         "founder_loan_explicit": founder_loan_explicit,
     })
 
-    # 3. Process attachments
+    # 2a. CRM Write Guard — register vendor as company entity
+    notes_parts = []
+    crm_company_id = None
+    try:
+        from artemis.crm_write_guard import crm_write_guard
+        guard_confidence = "high" if sender_domain else "low"
+        guard_result = crm_write_guard(
+            entity_type="company",
+            data={"name": vendor, "domain": sender_domain, "types": ["Vendor"]},
+            confidence=guard_confidence,
+            source_pb="PB-007",
+            gmail_message_id=message_id,
+            gmail_client=gmail_client,
+            mm_client=mm_client,
+        )
+        crm_company_id = guard_result.get("entity_id")
+        if guard_result.get("status") == "flagged":
+            notes_parts.append(
+                f"Vendor unresolved — see pending CRM review "
+                f"(id={guard_result.get('pending_id', '?')[:8]})"
+            )
+        elif guard_result.get("status") == "written":
+            notes_parts.append(f"CRM: new vendor '{vendor}' added")
+
+        # Log touch event
+        crm_write_guard(
+            entity_type="touch_event",
+            data={
+                "company_id": crm_company_id,
+                "type": "Email",
+                "direction": "Inbound",
+                "subject": subject,
+                "summary": f"Billing email: {amount_str or 'no amount'}",
+                "gmail_message_id": message_id,
+                "playbook": "PB-007",
+            },
+            confidence="high",
+            source_pb="PB-007",
+            gmail_message_id=message_id,
+        )
+    except Exception:
+        logger.exception("CRM write guard failed for billing vendor — continuing")
+
+    # 3. Detect attachments and build Gmail deep link
     attachments = extract_attachments(gmail_client, msg)
-    drive_links = []
-
-    if attachments and not dry_run:
-        folder_id = get_or_create_expense_folder()
-        if folder_id:
-            for att in attachments:
-                file_id, link = upload_attachment(
-                    att["filename"], att["data"], att["mime_type"], folder_id
-                )
-                if link:
-                    drive_links.append(link)
-                else:
-                    logger.warning("Drive upload failed for %s — using Gmail link", att["filename"])
-        else:
-            logger.warning("Could not create expense folder — using Gmail links")
-    elif attachments and dry_run:
-        for att in attachments:
-            drive_links.append(f"[DRY RUN] Would upload: {att['filename']} ({att['mime_type']})")
-
-    # Fallback to Gmail deep link if no attachments or all uploads failed
+    attachment_names = [a["filename"] for a in attachments]
     gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
-    doc_link = drive_links[0] if drive_links else gmail_link
+    doc_link = gmail_link
 
     result.update({
-        "attachments": [a["filename"] for a in attachments],
-        "drive_links": drive_links,
+        "attachments": attachment_names,
         "document_link": doc_link,
         "gmail_link": gmail_link,
     })
 
-    # 4. Build notes
-    notes_parts = []
+    # 4. Build notes (notes_parts initialized before CRM write guard above)
     if not amount_str:
         notes_parts.append("No amount detected")
-    if len(all_amounts) > 1:
+    if len(all_amounts) > 1 and not _fwd_from_ryan:
         notes_parts.append(f"Multiple amounts found: {', '.join(all_amounts)}")
-    if not attachments:
-        notes_parts.append("No attachment — Gmail link used")
-    if not drive_links and attachments:
-        notes_parts.append("Drive upload failed — Gmail link used")
-    if founder_loan_explicit:
+    if attachment_names:
+        notes_parts.append(f"Attachments: {', '.join(attachment_names)}")
+    if founder_loan_explicit and not _fwd_from_ryan:
         notes_parts.append("Founder Loan flagged in email.")
     if notes_parts:
         notes = "Auto-logged by Artemis. Review required. " + "; ".join(notes_parts)
@@ -446,9 +484,7 @@ def process_billing_message(
     # 7. Post to Mattermost
     if mm_client and not dry_run:
         amount_display = amount_str if amount_str else "\u26a0 None found \u2014 review required"
-        attachment_display = doc_link
-        if drive_links:
-            attachment_display = " | ".join(drive_links)
+        att_display = ", ".join(attachment_names) if attachment_names else "None"
 
         mm_msg = (
             f"\U0001f4c4 **Billing intake logged**\n"
@@ -457,7 +493,8 @@ def process_billing_message(
             f"**Amount detected:** {amount_display}\n"
             f"**Category:** {category}\n"
             f"**Founder Loan:** Yes \u00b7 **Reimbursed:** No\n"
-            f"**Attachment:** {attachment_display}\n"
+            f"**Attachments:** {att_display}\n"
+            f"**Gmail:** {gmail_link}\n"
             f"**Sheet:** {result['sheet_url']}\n\n"
             f"_React with \u2705 if correct or reply to correct any fields._"
         )
@@ -493,13 +530,129 @@ def process_billing_message(
 # ---------------------------------------------------------------------------
 
 _BILLING_SCOPES = [
-    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 
+def get_financial_summary() -> str:
+    """Build a plain-text financial summary for the current month.
+
+    Queries:
+      1. v_budget_vs_actual — current month planned vs actual
+      2. v_founder_loan_balance — outstanding Ryan loans
+      3. processed_billing for current month — recent actuals
+      4. monthly_financials for last 3 months — trend
+    """
+    from datetime import datetime
+    from knowledge.db import execute_query
+
+    now = datetime.now()
+    month_label = now.strftime("%B %Y")
+    month_start = now.strftime("%Y-%m-01")
+
+    lines = [f"\U0001f4b0 **RDMIS Financial Position — {month_label}**\n"]
+
+    # 1. Budget vs actual
+    try:
+        rows = execute_query("SELECT * FROM public.v_budget_vs_actual ORDER BY category")
+        if rows:
+            lines.append("**MONTHLY BUDGET vs ACTUAL (MTD):**")
+            total_planned = 0.0
+            total_actual = 0.0
+            for r in rows:
+                planned = float(r.get("planned_monthly") or 0)
+                actual = float(r.get("actual_mtd") or 0)
+                variance = float(r.get("variance") or 0)
+                total_planned += planned
+                total_actual += actual
+                icon = "\u2705" if variance >= 0 else "\u26a0\ufe0f"
+                sign = "-" if variance >= 0 else "+"
+                lines.append(
+                    f"  {r['category']:<20s} Planned ${planned:>8.2f}  "
+                    f"Actual ${actual:>8.2f}  {icon} {sign}${abs(variance):.2f}"
+                )
+            total_var = total_planned - total_actual
+            icon = "\u2705" if total_var >= 0 else "\u26a0\ufe0f"
+            sign = "-" if total_var >= 0 else "+"
+            lines.append(
+                f"  {'TOTAL':<20s} Planned ${total_planned:>8.2f}  "
+                f"Actual ${total_actual:>8.2f}  {icon} {sign}${abs(total_var):.2f}"
+            )
+        else:
+            lines.append("_No budget data for this month._")
+    except Exception:
+        logger.debug("Budget vs actual query failed", exc_info=True)
+        lines.append("_Budget vs actual unavailable._")
+
+    lines.append("")
+
+    # 2. Founder loan balance
+    try:
+        loan = execute_query("SELECT * FROM public.v_founder_loan_balance")
+        if loan and loan[0].get("loan_count"):
+            r = loan[0]
+            lines.append("**FOUNDER LOAN BALANCE:**")
+            lines.append(f"  Total loaned: ${float(r['total_loaned'] or 0):,.2f} across {r['loan_count']} transaction(s)")
+            lines.append(f"  Repaid: ${float(r['total_repaid'] or 0):,.2f}")
+            lines.append(f"  Outstanding: ${float(r['outstanding_balance'] or 0):,.2f}")
+        else:
+            lines.append("**FOUNDER LOAN BALANCE:** _No loans recorded._")
+    except Exception:
+        logger.debug("Founder loan query failed", exc_info=True)
+        lines.append("_Founder loan data unavailable._")
+
+    lines.append("")
+
+    # 3. Recent transactions
+    try:
+        recent = execute_query(
+            """SELECT transaction_date, description, amount, category
+               FROM public.processed_billing
+               WHERE transaction_date >= %s
+               ORDER BY transaction_date DESC
+               LIMIT 5""",
+            (month_start,),
+        )
+        if recent:
+            lines.append("**RECENT TRANSACTIONS (last 5):**")
+            for r in recent:
+                dt = r["transaction_date"].strftime("%m/%d") if r.get("transaction_date") else "?"
+                lines.append(f"  {dt}  {r['description'][:40]:<40s}  ${float(r.get('amount') or 0):>8.2f}  [{r.get('category', '?')}]")
+        else:
+            lines.append("_No transactions recorded this month._")
+    except Exception:
+        logger.debug("Recent transactions query failed", exc_info=True)
+        lines.append("_Recent transactions unavailable._")
+
+    lines.append("")
+
+    # 4. Three-month trend
+    try:
+        trend = execute_query(
+            """SELECT month, revenue_received, expenses_actual, closing_balance
+               FROM public.monthly_financials
+               ORDER BY month DESC
+               LIMIT 3"""
+        )
+        if trend:
+            lines.append("**3-MONTH TREND:**")
+            for r in sorted(trend, key=lambda x: x["month"]):
+                m = r["month"].strftime("%b")
+                rev = float(r.get("revenue_received") or 0)
+                exp = float(r.get("expenses_actual") or 0)
+                net = rev - exp
+                lines.append(f"  {m}: Revenue ${rev:,.2f} | Expenses ${exp:,.2f} | Net ${net:+,.2f}")
+        else:
+            lines.append("_No monthly financial history yet._")
+    except Exception:
+        logger.debug("Monthly financials query failed", exc_info=True)
+        lines.append("_Monthly trend unavailable._")
+
+    return "\n".join(lines)
+
+
 def check_billing_scopes() -> tuple[bool, list[str]]:
-    """Check if current OAuth token has Drive and Sheets scopes.
+    """Check if current OAuth token has Sheets scope.
 
     Reads the token from Secrets Manager (not a local file).
     Returns (all_present, list_of_missing_scopes).

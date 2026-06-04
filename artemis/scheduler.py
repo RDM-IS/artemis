@@ -48,6 +48,10 @@ from artemis.billing import (
     get_billing_messages,
     process_billing_message,
 )
+from artemis.demo_intake import (
+    get_demo_messages,
+    process_demo_message,
+)
 from artemis.crm_client import CRMClient
 from artemis.scheduling import detect_scheduling_request, draft_scheduling_response
 from artemis.utils import next_business_day
@@ -168,6 +172,38 @@ class ArtemisScheduler:
         else:
             logger.warning("PB-007 billing intake disabled — missing scopes: %s", missing)
 
+        # PB-001 v2: Demo intake — every 5 minutes (scan for Lucint demo emails)
+        self.scheduler.add_job(
+            self.job_demo_intake, "interval", minutes=5, id="demo_intake",
+        )
+        logger.info("PB-001 demo intake enabled")
+
+        # Health: workout debrief nag at 21:00 CT (1hr before quiet hours)
+        # Day-of-week suppression handled inside job_health_nag (Tue/Fri off).
+        self.scheduler.add_job(
+            self.job_health_nag, "cron", hour=21, minute=0, id="health_nag",
+        )
+        # Inferred-summary backstop at 21:50 CT (50min after nag, just before
+        # quiet hours start) — operates on TODAY's plan, not yesterday's.
+        # Fires every day regardless of nag suppression — data-quality backstop.
+        self.scheduler.add_job(
+            self.job_health_inferred_summary, "cron", hour=21, minute=50, id="health_inferred_summary",
+        )
+        # ── T4: Proactive prompts (PB-009) ────────────────────────────────
+        # Morning workout prompt — Tue/Thu/Fri at 04:01 CT (just after quiet ends)
+        self.scheduler.add_job(
+            self.job_health_morning_prompt, "cron",
+            hour=7, minute=0, day_of_week="mon-sun",
+            id="health_morning_prompt",
+        )
+        # Recalibrated schedule (2026-05-05): no more evening workouts —
+        # all sessions are morning-prompted. job_health_morning_prompt
+        # internally dispatches workout_am vs logging_only based on dow.
+        # Old Tue/Thu/Fri 04:01 early cron and Wed/Sat 16:30 evening
+        # cron jobs have been retired. job_health_evening_prompt method
+        # is preserved for future use but no longer cron-registered.
+        logger.info("Health nag + morning prompt jobs scheduled")
+
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
         qh_end_h, qh_end_m = config.QUIET_HOURS_END.split(":")
@@ -196,6 +232,12 @@ class ArtemisScheduler:
         self.scheduler.add_job(
             self.job_action_item_reminders, "interval", minutes=30,
             id="action_item_reminders",
+        )
+
+        # Follow-up radar — weekdays at 8:00 AM (same TZ as other morning jobs)
+        self.scheduler.add_job(
+            self.job_follow_up_radar, "cron", hour=8, minute=0,
+            day_of_week="mon-fri", id="follow_up_radar",
         )
 
         # Load playbooks at startup
@@ -830,46 +872,23 @@ class ArtemisScheduler:
             )
 
     def _run_pb001_demo_lead(self, msg: dict, triage_item: dict):
-        """PB-001: Demo Access Notification — create lead + follow-up commitment."""
-        sender_email = msg.get("from_email", "")
-        sender_name = msg.get("from", "").split("<")[0].strip().strip('"') or sender_email
-        # Use sender's domain as company fallback
-        company = sender_email.split("@")[1] if "@" in sender_email else "Prospect"
+        """PB-001: Demo Access Notification (legacy triage path).
 
-        upsert_contact(
-            name=sender_name,
-            email=sender_email,
-            company=company,
-            source="artemis-demo",
-            status="lead",
+        Delegates to demo_intake.process_demo_message for full CRM Write Guard
+        processing.  The primary path is now job_demo_intake (interval scan).
+        """
+        message_id = msg.get("id")
+        if not message_id:
+            logger.warning("PB-001 triage: no message ID — skipping")
+            return
+
+        result = process_demo_message(
+            self.gmail, message_id, mm_client=self.mm,
         )
-
-        nbd = next_business_day()
-
-        # Create commitment via CRM API if available, else SQLite
-        commitment_title = f"Follow up with {sender_name} re: demo access"
-        if self.crm.is_available():
-            try:
-                contact = self.crm.find_contact_by_email(sender_email)
-                contact_id = contact.get("id") if contact else None
-                self.crm.create_commitment({
-                    "description": commitment_title,
-                    "due_date": nbd.isoformat(),
-                    "contact_id": contact_id,
-                    "status": "open",
-                })
-                logger.info("PB-001: Created CRM commitment for %s", sender_name)
-            except Exception:
-                logger.warning("CRM commitment creation failed — falling back to SQLite")
-                add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
-        else:
-            add_commitment(title=commitment_title, due_date=nbd.isoformat(), effort_days=1, client=company)
-
-        self.mm.post_message(
-            config.CHANNEL_OPS,
-            f"\U0001f3af New demo lead: {sender_name} ({company}) \u2014 "
-            f"follow-up scheduled for {nbd.isoformat()}",
-        )
+        if not result.get("success"):
+            logger.warning(
+                "PB-001 triage: processing failed — %s", result.get("error", "unknown")
+            )
 
     def _run_pb002_meeting_followup(self, msg: dict, triage_item: dict):
         """PB-002: Meeting Follow-up — create commitments for action items."""
@@ -1111,6 +1130,45 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("Commitment reminder chain failed")
 
+    def job_demo_intake(self):
+        """PB-001 v2: Scan for Lucint demo notification emails and process them."""
+        if self._is_quiet():
+            return
+
+        try:
+            message_ids = get_demo_messages(self.gmail)
+            if not message_ids:
+                return
+
+            logger.info("PB-001: Found %d unprocessed demo email(s)", len(message_ids))
+            for msg_id in message_ids:
+                try:
+                    result = process_demo_message(
+                        self.gmail, msg_id, mm_client=self.mm
+                    )
+                    if result.get("success"):
+                        logger.info(
+                            "PB-001: Processed demo lead — %s (%s)",
+                            result.get("name", "?"), result.get("company", "?"),
+                        )
+                    else:
+                        logger.error(
+                            "PB-001: Failed to process %s — %s",
+                            msg_id, result.get("error", "unknown"),
+                        )
+                except Exception:
+                    logger.exception("PB-001: Error processing demo message %s", msg_id)
+                    try:
+                        self.mm.post_message(
+                            config.CHANNEL_OPS,
+                            f"\u26a0\ufe0f PB-001 demo intake failed on message "
+                            f"{msg_id[:12]}\u2026 — check logs. Lead NOT processed.",
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("PB-001 demo intake job failed")
+
     _billing_label_checked: bool = False
 
     def job_billing_intake(self):
@@ -1176,6 +1234,198 @@ class ArtemisScheduler:
                         pass
         except Exception:
             logger.exception("PB-007 billing intake job failed")
+
+    @staticmethod
+    def _today_ct_date():
+        """Return today's date in America/Chicago. Used by health/training jobs."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Chicago")).date()
+
+    def job_health_nag(self):
+        """Health: at 21:00 CT, prompt for workout debrief if missing.
+
+        Day-of-week suppression per PB-009: Tue and Fri have no PM workout
+        and no PM social tolerance — skip the nag entirely on those days.
+        """
+        if self._is_quiet():
+            return
+        try:
+            today = self._today_ct_date()
+            dow = today.weekday()  # Mon=0, Tue=1, ..., Fri=4, Sat=5, Sun=6
+            if dow in (1, 4):  # Tue, Fri
+                logger.debug("Health nag suppressed (Tue/Fri schedule)")
+                return
+
+            from artemis.health import run_nag_check
+            msg = run_nag_check()
+            if msg:
+                self.mm.post_message(config.CHANNEL_OPS, msg)
+                logger.info("Posted health debrief nag")
+        except Exception:
+            logger.exception("Health nag job failed")
+
+    def job_health_inferred_summary(self):
+        """Health: at 21:50 CT, insert a placeholder summary for today if no
+        debrief was logged. Marked logged_via='inferred' so the autoregulator
+        knows it's not real data.
+
+        Fires every day regardless of nag suppression — data-quality backstop.
+        """
+        try:
+            from artemis.health import insert_inferred_summary
+            inserted = insert_inferred_summary()
+            if inserted:
+                logger.info("Inserted inferred session_summary for today")
+        except Exception:
+            logger.exception("Health inferred-summary job failed")
+
+    # ── T4: Proactive prompts (PB-009) ────────────────────────────────────
+
+    def job_health_morning_prompt(self):
+        """Post the morning survey prompt to #artemis-ryan.
+
+        Routes by day-of-week:
+            Mon/Sun (07:00) and Tue/Thu/Fri (04:01) → workout_am variant
+                                                       (schedules calibration)
+            Wed/Sat (07:00)                          → logging_only variant
+
+        Idempotent per (slot, today) via system_state KV.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from datetime import datetime, timedelta
+            from zoneinfo import ZoneInfo
+            from artemis.health import (
+                already_prompted_today, build_morning_survey_prompt,
+                get_today_plan, mark_prompted,
+            )
+
+            today = self._today_ct_date()
+            dow = today.weekday()
+
+            # Recalibrated schedule (2026-05-05):
+            #   Mon (0) cardio_intervals  → workout_am
+            #   Tue (1) OFF/rest_mobility → logging_only
+            #   Wed (2) strength_c        → workout_am
+            #   Thu (3) cardio_intervals  → workout_am
+            #   Fri (4) OFF/rest_mobility → logging_only
+            #   Sat (5) strength_a/MetCon → workout_am
+            #   Sun (6) strength_c        → workout_am
+            if dow in (1, 4):              # Tue, Fri = OFF days
+                prompt_type = "logging_only"
+            else:                          # Sun, Mon, Wed, Thu, Sat = workout days
+                prompt_type = "workout_am"
+
+            slot = "morning"
+            if already_prompted_today(slot, today):
+                logger.debug("Morning prompt already fired today — skipping")
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                logger.info("No plan for %s — skipping morning prompt", today)
+                return
+
+            text = build_morning_survey_prompt(plan, prompt_type)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted morning %s prompt (%s)", prompt_type, today)
+
+            # Schedule one-shot calibration follow-up only for workout_am
+            if prompt_type == "workout_am":
+                ct = ZoneInfo("America/Chicago")
+                run_at = datetime.now(ct) + timedelta(minutes=15)
+                job_id = f"health_calibration_{today.isoformat()}"
+                self.scheduler.add_job(
+                    self.job_health_calibration_followup,
+                    "date", run_date=run_at, id=job_id, replace_existing=True,
+                )
+                logger.info("Scheduled calibration follow-up at %s", run_at.isoformat())
+        except Exception:
+            logger.exception("Health morning prompt failed")
+
+    def job_health_calibration_followup(self):
+        """Read morning state + today's plan + override, post the calibrated
+        plan with equipment + location. Fires once, ~15 min after the morning
+        survey prompt on workout days.
+
+        Idempotent per day via system_state KV.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from artemis.health import (
+                already_prompted_today, build_calibrated_plan_post,
+                get_today_plan, get_today_state, mark_prompted,
+                read_bike_override, resolve_equipment_and_location,
+            )
+            from artemis.weather import get_current_conditions
+
+            today = self._today_ct_date()
+            slot = "morning_calibration"
+            if already_prompted_today(slot, today):
+                logger.debug("Calibration follow-up already fired today — skipping")
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                return
+
+            session_type = plan.get("session_type", "")
+            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
+            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+
+            resolved = resolve_equipment_and_location(
+                session_type, weather=weather, user_override=override,
+            )
+
+            state = get_today_state()
+            text = build_calibrated_plan_post(plan, resolved, state)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted calibrated plan for %s", today)
+        except Exception:
+            logger.exception("Health calibration follow-up failed")
+
+    def job_health_evening_prompt(self):
+        """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.
+
+        Idempotent per day. Skips if quiet hours active or no plan row exists.
+        """
+        if self._is_quiet():
+            return
+        try:
+            from artemis.health import (
+                already_prompted_today, build_evening_prompt,
+                get_today_plan, mark_prompted, read_bike_override,
+                resolve_equipment_and_location,
+            )
+            from artemis.weather import get_current_conditions
+
+            today = self._today_ct_date()
+            slot = "evening"
+            if already_prompted_today(slot, today):
+                return
+
+            plan = get_today_plan()
+            if not plan:
+                return
+
+            session_type = plan.get("session_type", "")
+            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
+            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+
+            resolved = resolve_equipment_and_location(
+                session_type, weather=weather, user_override=override,
+            )
+            text = build_evening_prompt(plan, resolved)
+            self.mm.post_message(config.CHANNEL_OPS, text)
+            mark_prompted(slot, today)
+            logger.info("Posted evening prompt for %s", today)
+        except Exception:
+            logger.exception("Health evening prompt failed")
 
     def job_quiet_hours_start(self):
         """Enter quiet hours and announce."""
@@ -1466,6 +1716,122 @@ class ArtemisScheduler:
                 config.CHANNEL_OPS,
                 f"\u2705 All caught up \u2014 nothing missed since last run {gap_str} ago.",
             )
+
+    def job_follow_up_radar(self):
+        """Daily follow-up radar: upcoming actions, stale deals, open commitments."""
+        from knowledge.db import execute_query
+
+        today = date.today()
+        window_start = today - timedelta(days=1)
+        window_end = today + timedelta(days=2)
+        stale_threshold = today - timedelta(days=7)
+
+        lines = [f"\U0001f514 **Follow-up Radar \u2014 {today.strftime('%A %B %d')}**\n"]
+        has_items = False
+
+        # 1. Next actions from data_vault_satellites
+        try:
+            actions = execute_query(
+                """SELECT id, entity_id, content FROM acos.data_vault_satellites
+                   WHERE satellite_type = 'next_action'
+                     AND created_at > NOW() - interval '30 days'
+                   ORDER BY created_at DESC
+                   LIMIT 20"""
+            )
+            due_actions = []
+            for a in actions:
+                try:
+                    import json as _json
+                    data = _json.loads(a["content"]) if isinstance(a["content"], str) else a["content"]
+                    action_date = data.get("date")
+                    notified = data.get("notified")
+                    if notified:
+                        continue
+                    if action_date:
+                        from datetime import datetime as _dt
+                        try:
+                            d = _dt.strptime(action_date, "%Y-%m-%d").date()
+                        except ValueError:
+                            continue
+                        if window_start <= d <= window_end:
+                            label = "TODAY" if d == today else (
+                                "TOMORROW" if d == today + timedelta(days=1) else
+                                "OVERDUE" if d < today else d.strftime("%m/%d")
+                            )
+                            action_text = data.get("action", "?")
+                            account = data.get("account", "")
+                            due_actions.append(f"  \u00b7 [{label}] {action_text}" + (f" ({account})" if account else ""))
+                            # Mark as notified
+                            data["notified"] = "true"
+                            from knowledge.db import execute_write as _db_write
+                            _db_write(
+                                "UPDATE acos.data_vault_satellites SET content = %s WHERE id = %s",
+                                (_json.dumps(data), str(a["id"])),
+                            )
+                except Exception:
+                    continue
+
+            if due_actions:
+                has_items = True
+                lines.append("**DUE TODAY / TOMORROW:**")
+                lines.extend(due_actions)
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: next_action query failed", exc_info=True)
+
+        # 2. Open commitments due soon
+        try:
+            commitments = execute_query(
+                """SELECT c.description, c.due_date, ct.name AS contact_name
+                   FROM public.commitments c
+                   LEFT JOIN public.contacts ct ON c.contact_id = ct.id
+                   WHERE c.status = 'open'
+                     AND c.due_date >= %s AND c.due_date <= %s
+                   ORDER BY c.due_date ASC
+                   LIMIT 10""",
+                (window_start, window_end),
+            )
+            if commitments:
+                has_items = True
+                lines.append("**OPEN COMMITMENTS:**")
+                for cm in commitments:
+                    due = cm["due_date"].strftime("%m/%d") if cm.get("due_date") else "?"
+                    who = cm.get("contact_name", "")
+                    who_str = f" ({who})" if who else ""
+                    lines.append(f"  \u00b7 {cm['description'][:120]}{who_str} \u2014 due {due}")
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: commitments query failed", exc_info=True)
+
+        # 3. Stale deals
+        try:
+            stale = execute_query(
+                """SELECT d.name, d.stage, d.updated_at, o.name AS org_name
+                   FROM public.deals d
+                   JOIN public.organizations o ON d.org_id = o.id
+                   WHERE d.updated_at < %s
+                     AND LOWER(d.stage) NOT IN ('closed', 'lost', 'msa', 'signed')
+                   ORDER BY d.updated_at ASC
+                   LIMIT 10""",
+                (stale_threshold,),
+            )
+            if stale:
+                has_items = True
+                lines.append("**STALE DEALS (no activity 7+ days):**")
+                for d in stale:
+                    last = d["updated_at"].strftime("%b %d") if d.get("updated_at") else "?"
+                    lines.append(f"  \u00b7 {d.get('org_name', d['name'])} \u2014 last updated {last}")
+                lines.append("")
+        except Exception:
+            logger.debug("Follow-up radar: stale deals query failed", exc_info=True)
+
+        if has_items:
+            try:
+                self.mm.post_message(config.CHANNEL_OPS, "\n".join(lines))
+            except Exception:
+                logger.exception("Failed to post follow-up radar")
+        else:
+            logger.info("Follow-up radar: nothing due today")
 
     def _record_gmail_success(self):
         """Reset Gmail failure counter on success."""
