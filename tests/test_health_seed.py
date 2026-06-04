@@ -89,10 +89,10 @@ class TestSeedGeneration(unittest.TestCase):
     def test_phase_window_boundaries(self):
         """The phase windows in PHASE_WINDOWS must align with the spec."""
         expected = [
-            (1, date(2026, 5, 6),  date(2026, 6, 2)),
-            (2, date(2026, 6, 3),  date(2026, 7, 14)),
-            (3, date(2026, 7, 15), date(2026, 8, 25)),
-            (4, date(2026, 8, 26), date(2026, 9, 19)),
+            (1, date(2026, 6, 6),  date(2026, 7, 3)),
+            (2, date(2026, 7, 4),  date(2026, 8, 14)),
+            (3, date(2026, 8, 15), date(2026, 9, 25)),
+            (4, date(2026, 9, 26), date(2026, 10, 20)),
         ]
         for window, (p_exp, s_exp, e_exp) in zip(PHASE_WINDOWS, expected):
             phase, start, end = window[0], window[1], window[2]
@@ -108,15 +108,15 @@ class TestSeedGeneration(unittest.TestCase):
     def test_phase_for_date_lookup(self):
         """phase_for_date returns the correct phase + week."""
         # Day 1 of Phase 1 → week 1
-        self.assertEqual(phase_for_date(date(2026, 5, 6)), (1, 1))
+        self.assertEqual(phase_for_date(date(2026, 6, 6)), (1, 1))
         # Day 1 of Phase 2 → week 5
-        self.assertEqual(phase_for_date(date(2026, 6, 3)), (2, 5))
+        self.assertEqual(phase_for_date(date(2026, 7, 4)), (2, 5))
         # Day 1 of Phase 3 → week 11
-        self.assertEqual(phase_for_date(date(2026, 7, 15)), (3, 11))
+        self.assertEqual(phase_for_date(date(2026, 8, 15)), (3, 11))
         # Day 1 of Phase 4 → week 17
-        self.assertEqual(phase_for_date(date(2026, 8, 26)), (4, 17))
+        self.assertEqual(phase_for_date(date(2026, 9, 26)), (4, 17))
         # Last day → week 19
-        last_phase, last_week = phase_for_date(date(2026, 9, 19))
+        last_phase, last_week = phase_for_date(date(2026, 10, 20))
         self.assertEqual(last_phase, 4)
         self.assertEqual(last_week, 19)
 

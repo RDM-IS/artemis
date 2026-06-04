@@ -17,14 +17,22 @@ phase_meta:
   4: { name: Polish,     rounds: 3, target_rpe: 8.0, notes: "Hold Phase 3 volume. Wk 19 deload mandatory." }
 
 # Day-of-week → session_type. Constant across phases.
+# Recalibrated 2026-05-05 — see PB-009 for canonical schedule:
+#   Sun: Full Body Strength  → strength_c
+#   Mon: HIIT Cardio (Z3/4)  → cardio_intervals
+#   Tue: OFF                  → rest_mobility
+#   Wed: Full Body Strength  → strength_c
+#   Thu: HIIT Cardio + Core  → cardio_intervals (template already has core finisher)
+#   Fri: OFF                  → rest_mobility
+#   Sat: Hybrid/MetCon       → strength_a (circuit template fits MetCon shape)
 day_to_session:
-  0: strength_a       # Monday
-  1: cardio_intervals # Tuesday
-  2: strength_b       # Wednesday
-  3: cardio_z2        # Thursday
-  4: rest_mobility    # Friday
-  5: strength_c       # Saturday
-  6: walk             # Sunday
+  0: cardio_intervals # Monday    — HIIT
+  1: rest_mobility    # Tuesday   — OFF
+  2: strength_c       # Wednesday — Full Body Strength
+  3: cardio_intervals # Thursday  — HIIT + Core (cardio_intervals template has core finisher)
+  4: rest_mobility    # Friday    — OFF
+  5: strength_a       # Saturday  — Hybrid/MetCon (circuit template)
+  6: strength_c       # Sunday    — Full Body Strength
 
 # Session templates. The seed script reads these and substitutes
 # phase-specific rounds / RPE / notes.

@@ -36,15 +36,18 @@ FIXTURE_PATH = _REPO_ROOT / "scripts" / "data" / "baseline_plan.yaml"
 # Week numbers are 1-indexed and continuous across phases (1..19).
 # Phase 4 runs 25 days but only spans weeks 17-19 — the trailing 4 days
 # are absorbed into week 19 (the deload week).
+#
+# Recalibrated 2026-05-05: start shifted from 2026-05-06 → 2026-06-06 (Saturday).
+# Day-of-week mapping also changed; see scripts/data/baseline_plan.yaml.
 PHASE_WINDOWS = [
-    (1, date(2026, 5, 6),  date(2026, 6, 2),  1,  4),    # 28 days, wks 1-4
-    (2, date(2026, 6, 3),  date(2026, 7, 14), 5,  10),   # 42 days, wks 5-10
-    (3, date(2026, 7, 15), date(2026, 8, 25), 11, 16),   # 42 days, wks 11-16
-    (4, date(2026, 8, 26), date(2026, 9, 19), 17, 19),   # 25 days, wks 17-19 (deload tail)
+    (1, date(2026, 6, 6),  date(2026, 7, 3),   1,  4),    # 28 days, wks 1-4
+    (2, date(2026, 7, 4),  date(2026, 8, 14),  5,  10),   # 42 days, wks 5-10
+    (3, date(2026, 8, 15), date(2026, 9, 25),  11, 16),   # 42 days, wks 11-16
+    (4, date(2026, 9, 26), date(2026, 10, 20), 17, 19),   # 25 days, wks 17-19 (deload tail)
 ]
 
-START_DATE = date(2026, 5, 6)
-END_DATE = date(2026, 9, 19)
+START_DATE = date(2026, 6, 6)
+END_DATE = date(2026, 10, 20)
 
 
 def get_connection():

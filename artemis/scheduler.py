@@ -193,28 +193,16 @@ class ArtemisScheduler:
         # Morning workout prompt — Tue/Thu/Fri at 04:01 CT (just after quiet ends)
         self.scheduler.add_job(
             self.job_health_morning_prompt, "cron",
-            hour=4, minute=1, day_of_week="tue,thu,fri",
-            id="health_morning_prompt_early",
+            hour=7, minute=0, day_of_week="mon-sun",
+            id="health_morning_prompt",
         )
-        # Morning workout prompt — Mon/Sun at 07:00 CT
-        self.scheduler.add_job(
-            self.job_health_morning_prompt, "cron",
-            hour=7, minute=0, day_of_week="mon,sun",
-            id="health_morning_prompt_workout",
-        )
-        # Morning logging-only prompt — Wed/Sat at 07:00 CT (workout is later)
-        self.scheduler.add_job(
-            self.job_health_morning_prompt, "cron",
-            hour=7, minute=0, day_of_week="wed,sat",
-            id="health_morning_prompt_logging",
-        )
-        # Evening workout prompt — Wed/Sat at 16:30 CT
-        self.scheduler.add_job(
-            self.job_health_evening_prompt, "cron",
-            hour=16, minute=30, day_of_week="wed,sat",
-            id="health_evening_prompt",
-        )
-        logger.info("Health nag + proactive prompt jobs scheduled")
+        # Recalibrated schedule (2026-05-05): no more evening workouts —
+        # all sessions are morning-prompted. job_health_morning_prompt
+        # internally dispatches workout_am vs logging_only based on dow.
+        # Old Tue/Thu/Fri 04:01 early cron and Wed/Sat 16:30 evening
+        # cron jobs have been retired. job_health_evening_prompt method
+        # is preserved for future use but no longer cron-registered.
+        logger.info("Health nag + morning prompt jobs scheduled")
 
         # Quiet hours entry/exit announcements
         qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
@@ -1317,12 +1305,18 @@ class ArtemisScheduler:
             today = self._today_ct_date()
             dow = today.weekday()
 
-            if dow in (2, 5):              # Wed, Sat
+            # Recalibrated schedule (2026-05-05):
+            #   Mon (0) cardio_intervals  → workout_am
+            #   Tue (1) OFF/rest_mobility → logging_only
+            #   Wed (2) strength_c        → workout_am
+            #   Thu (3) cardio_intervals  → workout_am
+            #   Fri (4) OFF/rest_mobility → logging_only
+            #   Sat (5) strength_a/MetCon → workout_am
+            #   Sun (6) strength_c        → workout_am
+            if dow in (1, 4):              # Tue, Fri = OFF days
                 prompt_type = "logging_only"
-            elif dow in (0, 1, 3, 4, 6):   # everyone else
+            else:                          # Sun, Mon, Wed, Thu, Sat = workout days
                 prompt_type = "workout_am"
-            else:
-                return
 
             slot = "morning"
             if already_prompted_today(slot, today):
