@@ -266,5 +266,151 @@ class TestHealthAuthDependency(unittest.TestCase):
         self.assertEqual(result, "expected-key")
 
 
+# ---------------------------------------------------------------------------
+# /status endpoint — windowed payload for gym-display /status page
+# ---------------------------------------------------------------------------
+
+class _QueryAwareSession:
+    """DB shim that returns different rows based on SQL content.
+
+    Routes by substring match — sufficient for /status's distinct queries.
+    """
+
+    def __init__(self, fixtures: dict[str, list[dict]]):
+        # fixtures keys: 'plan_window', 'most_recent', 'history',
+        # 'rpe_trend', 'weight_trend', 'phase_config', 'prev_plan'
+        self._f = fixtures
+
+    def execute(self, stmt, *_args, **_kwargs):
+        sql = str(stmt).lower()
+        if "phase_config" in sql:
+            rows = self._f.get("phase_config", [])
+        elif "from health.plan" in sql and "between" in sql:
+            rows = self._f.get("plan_window", [])
+        elif "from health.plan" in sql and "order by plan_date desc" in sql:
+            rows = self._f.get("prev_plan", [])
+        elif "from health.session_log" in sql and "limit 1" in sql and ":exclude" not in sql and "<>" not in sql:
+            rows = self._f.get("most_recent", [])
+        elif "from health.session_log" in sql and "limit :n" in sql:
+            rows = self._f.get("history", [])
+        elif "from health.session_log" in sql and "log_type in" in sql:
+            # exercises join for a plan_id
+            pid = _args[0].get("pid") if _args else None
+            rows = self._f.get("exercises", {}).get(pid, [])
+        elif "from health.session_log" in sql and "rpe_actual" in sql and "between" in sql:
+            rows = self._f.get("rpe_trend", [])
+        elif "from health.daily_state" in sql:
+            rows = self._f.get("weight_trend", [])
+        else:
+            rows = []
+        first = rows[0] if rows else None
+        return _MockExecuteResult(first) if len(rows) <= 1 else _MockMultiResult(rows)
+
+
+class _MockMultiResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return _MockMultiMapping(self._rows)
+
+
+class _MockMultiMapping:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+
+def _build_status_client(fixtures: dict):
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        raise unittest.SkipTest("fastapi not installed")
+    from api.app.database import get_db
+    from api.app.main import app
+    from api.app.routers import health as health_router
+
+    def _override_db():
+        yield _QueryAwareSession(fixtures)
+
+    app.dependency_overrides[get_db] = _override_db
+    health_router._HEALTH_API_KEY = VALID_KEY
+    return TestClient(app), app
+
+
+class TestStatusEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.app = None
+
+    def tearDown(self):
+        if self.app is not None:
+            self.app.dependency_overrides.clear()
+        from api.app.routers import health as health_router
+        health_router._HEALTH_API_KEY = None
+
+    def test_401_without_key(self):
+        client, self.app = _build_status_client({})
+        resp = client.get("/api/health/status")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_empty_db_returns_well_formed_payload(self):
+        client, self.app = _build_status_client({})
+        resp = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        # Shape contract
+        self.assertIn("today", body)
+        self.assertIn("window_start", body)
+        self.assertIn("window_end", body)
+        self.assertEqual(len(body["day_strip"]), 11)  # today ±5
+        self.assertEqual(body["rpe_trend"], [])
+        self.assertEqual(body["weight_trend"], [])
+        self.assertEqual(body["same_type_history"], [])
+        self.assertIsNone(body["most_recent_session"])
+        self.assertIsNone(body["banner"])
+        # today_summary present even with no data
+        self.assertIn("today_summary", body)
+        self.assertFalse(body["today_summary"]["exists"])
+
+    def test_day_strip_marks_today(self):
+        client, self.app = _build_status_client({})
+        resp = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        today_entries = [d for d in body["day_strip"] if d["is_today"]]
+        self.assertEqual(len(today_entries), 1)
+        self.assertEqual(today_entries[0]["plan_date"], body["today"])
+
+    def test_with_today_plan_and_summary_populates_today_summary(self):
+        today = date.today()
+        fixtures = {
+            "plan_window": [{
+                "plan_id": 42,
+                "plan_date": today,
+                "session_type": "strength_a",
+                "is_skipped": False,
+                "is_logged": True,
+                "phase": 1,
+                "week_num": 3,
+            }],
+            "phase_config": [{"phase_name": "Foundation"}],
+        }
+        client, self.app = _build_status_client(fixtures)
+        resp = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        self.assertEqual(body["today_summary"]["plan_id"], 42)
+        self.assertEqual(body["today_summary"]["session_type"], "strength_a")
+        self.assertTrue(body["today_summary"]["exists"])
+        self.assertTrue(body["today_summary"]["is_logged"])
+        self.assertIsNotNone(body["banner"])
+        self.assertEqual(body["banner"]["phase"], 1)
+        self.assertEqual(body["banner"]["week_num"], 3)
+        self.assertEqual(body["banner"]["phase_name"], "Foundation")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
