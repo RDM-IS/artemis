@@ -10,6 +10,7 @@ short, direct, no fluff, no shame, no fake hype.
 The autoregulator is downstream — these handlers ONLY write data.
 """
 
+import difflib
 import hashlib
 import json
 import logging
@@ -1121,3 +1122,939 @@ def get_today_state() -> dict | None:
            FROM health.daily_state WHERE state_date = %s""",
         (today,),
     )
+
+
+# ============================================================================
+# PB-009 — Conversational workout session loop
+#
+# Build 2: session-state cursor (no new table)
+# Build 3: conversational loop (log a set → confirm → next exercise → suggestion)
+# Build 4: dictation-tolerant single-set parser
+# Build 5: history Q&A (handle_plan_query)
+#
+# Hard constraints honored: only existing health.plan / health.session_log
+# columns, no migrations, no schema changes. The legacy life_ops SQLite path
+# is never touched — main.py routes these handlers ahead of _try_life_ops.
+# ============================================================================
+
+# Session-types that are NOT loggable lifting sessions (no conversational loop).
+_NON_WORKOUT_SESSIONS = ("rest_mobility", "walk")
+
+
+# ----------------------------------------------------------------------------
+# Build 2a — session-state marker
+#
+# "Active" = today's plan is a real workout AND "let's workout" was said AND
+# "done" not yet said. We persist that fact in the existing system_state KV
+# (artemis.quiet_hours.get/set_system_value) rather than an in-memory dict.
+#
+# Justification: the deploy procedure runs `sudo systemctl restart acos`, which
+# would wipe any in-process state mid-session. system_state is a durable SQLite
+# KV already used for per-day prompt idempotency (already_prompted_today), so it
+# survives restarts, needs no migration, and is naturally namespaced per day.
+# ----------------------------------------------------------------------------
+
+def _session_state_key(d: date | None = None) -> str:
+    d = d or datetime.now(CT).date()
+    return f"health_session:{d.isoformat()}"
+
+
+def _get_session_marker(d: date | None = None) -> str | None:
+    """Return 'active', 'ended', or None for the given day (default today CT)."""
+    from artemis.quiet_hours import get_system_value
+    return get_system_value(_session_state_key(d))
+
+
+def _set_session_marker(value: str, d: date | None = None) -> None:
+    from artemis.quiet_hours import set_system_value
+    set_system_value(_session_state_key(d), value)
+
+
+def get_active_session() -> dict | None:
+    """Return today's plan row IFF a workout session is currently active.
+
+    Active requires all of:
+      - today's plan exists, is not skipped, and is a real workout
+        (session_type not in rest_mobility / walk), AND
+      - the session marker for today is 'active' (set by "let's workout",
+        cleared to 'ended' by "done").
+
+    Returns the plan dict (so callers get plan_id + blocks) or None.
+    """
+    plan = get_today_plan()
+    if not plan:
+        return None
+    if plan.get("is_skipped") or plan.get("session_type") in _NON_WORKOUT_SESSIONS:
+        return None
+    if _get_session_marker() == "active":
+        return plan
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Build 2b — reading the plan's ordered exercise list (real blocks shape)
+# ----------------------------------------------------------------------------
+
+def _plan_exercises(plan: dict) -> list[dict]:
+    """Return the ordered exercise dicts from plan.blocks.
+
+    Strength/circuit days carry blocks['exercises']. cardio_intervals has no
+    top-level list — its only per-exercise list is blocks['finisher']['exercises'].
+    We read the real shape rather than assume one.
+    """
+    blocks = plan.get("blocks")
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except (ValueError, TypeError):
+            blocks = {}
+    blocks = blocks or {}
+    exercises = blocks.get("exercises")
+    if isinstance(exercises, list) and exercises:
+        return [e for e in exercises if isinstance(e, dict)]
+    finisher = blocks.get("finisher")
+    if isinstance(finisher, dict) and isinstance(finisher.get("exercises"), list):
+        return [e for e in finisher["exercises"] if isinstance(e, dict)]
+    return []
+
+
+def _plan_exercise_names(plan: dict) -> list[str]:
+    return [str(e.get("name")) for e in _plan_exercises(plan) if e.get("name")]
+
+
+def _is_plan_exercise(name: str | None, plan: dict) -> bool:
+    """True if `name` is one of today's plan exercises (not an off-plan literal)."""
+    if not name:
+        return False
+    return name.lower() in {n.lower() for n in _plan_exercise_names(plan)}
+
+
+def _exercise_target(ex: dict) -> dict:
+    """Normalize a plan exercise dict to the fields the loop needs."""
+    return {
+        "name": str(ex.get("name", "")).strip(),
+        "format": ex.get("format"),
+        "target_reps": ex.get("target_reps"),
+        "target_load_lbs": ex.get("target_load_lbs"),
+        "duration_sec": ex.get("duration_sec"),
+    }
+
+
+def _logged_exercise_names_today(plan_id: int) -> set[str]:
+    """Lowercased exercise names that already have >=1 logged set today."""
+    from knowledge.db import execute_query
+    rows = execute_query(
+        """SELECT DISTINCT LOWER(exercise) AS ex
+           FROM health.session_log
+           WHERE plan_id = %s AND log_type IN ('strength_set', 'cardio_block')""",
+        (plan_id,),
+    )
+    return {r["ex"] for r in rows if r.get("ex")}
+
+
+def _name_is_logged(name: str, logged: set[str]) -> bool:
+    ln = name.lower().strip()
+    for g in logged:
+        if g == ln or g in ln or ln in g:
+            return True
+    return False
+
+
+def next_exercise(plan: dict) -> dict | None:
+    """First exercise in plan.blocks (in order) with zero session_log rows today.
+
+    Returns {name, format, target_reps, target_load_lbs, duration_sec} or None
+    when every exercise on the card has at least one logged set.
+    """
+    exercises = _plan_exercises(plan)
+    if not exercises:
+        return None
+    logged = _logged_exercise_names_today(plan["plan_id"])
+    for ex in exercises:
+        name = str(ex.get("name", "")).strip()
+        if name and not _name_is_logged(name, logged):
+            return _exercise_target(ex)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Build 2c — last_time(): prior history for an exercise
+# ----------------------------------------------------------------------------
+
+def last_time(exercise: str, session_type: str | None = None) -> dict | None:
+    """Most recent PRIOR (before today) session_log rows for an exercise.
+
+    Returns {'plan_date': date, 'sets': [rows]} for the latest day that
+    exercise was logged, or None if never logged before today.
+
+    session_type is accepted for context and used as a *soft* filter: we try
+    to scope to the same session_type first, then fall back to any session_type.
+    The same lift (e.g. Goblet squat) appears in multiple session_types, and the
+    genuinely useful answer to "what did I do last time" is the true last time —
+    so we don't hard-restrict to one session_type.
+    """
+    from knowledge.db import execute_query
+    today = datetime.now(CT).date()
+
+    base_sql = """
+        SELECT p.plan_date, p.session_type, sl.set_num, sl.reps_done,
+               sl.weight_lbs, sl.rpe_actual, sl.duration_sec
+        FROM health.session_log sl
+        JOIN health.plan p ON sl.plan_id = p.plan_id
+        WHERE LOWER(sl.exercise) LIKE LOWER(%s)
+          AND p.plan_date < %s
+          AND sl.is_skipped = FALSE
+          AND sl.log_type IN ('strength_set', 'cardio_block')
+        {extra}
+        ORDER BY p.plan_date DESC, sl.set_num ASC NULLS LAST
+    """
+    like = f"%{exercise.strip()}%"
+
+    rows = []
+    if session_type:
+        rows = execute_query(
+            base_sql.format(extra="AND p.session_type = %s"),
+            (like, today, session_type),
+        )
+    if not rows:
+        rows = execute_query(base_sql.format(extra=""), (like, today))
+    if not rows:
+        return None
+
+    recent_date = rows[0]["plan_date"]
+    sets = [r for r in rows if r["plan_date"] == recent_date]
+    return {"plan_date": recent_date, "sets": sets}
+
+
+# ----------------------------------------------------------------------------
+# Build 4 — dictation-tolerant single-set parser
+# ----------------------------------------------------------------------------
+
+_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+}
+_TENS_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+# Homophones speech-to-text commonly emits for RPE values.
+_RPE_VALUE_WORDS = dict(_NUM_WORDS)
+_RPE_VALUE_WORDS.update({"for": 4, "to": 2, "too": 2, "tu": 2, "ate": 8, "won": 1})
+
+# Words that are never part of an exercise name once numbers/units are stripped.
+_SET_STOPWORDS = {
+    "at", "for", "the", "a", "an", "did", "i", "and", "with", "of", "got", "do",
+    "done", "just", "reps", "rep", "lbs", "lb", "pounds", "pound", "rpe", "set",
+    "sets", "x", "to", "on", "was", "were", "felt", "feeling", "that", "then",
+    "round", "rounds",
+}
+
+
+def _words_to_numbers(text: str) -> str:
+    """Convert spelled cardinal numbers (incl. compounds like 'twenty five') to
+    digits. Leaves non-number words untouched."""
+    words = text.split()
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        bare = words[i].strip(",.!?;:")
+        if bare in _TENS_WORDS:
+            val = _TENS_WORDS[bare]
+            if i + 1 < len(words):
+                nxt = words[i + 1].strip(",.!?;:")
+                if nxt in _NUM_WORDS and 1 <= _NUM_WORDS[nxt] <= 9:
+                    val += _NUM_WORDS[nxt]
+                    out.append(str(val))
+                    i += 2
+                    continue
+            out.append(str(val))
+            i += 1
+            continue
+        if bare in _NUM_WORDS:
+            out.append(str(_NUM_WORDS[bare]))
+            i += 1
+            continue
+        out.append(words[i])
+        i += 1
+    return " ".join(out)
+
+
+def _pop_rpe(text: str) -> tuple[float | None, str]:
+    """Extract RPE, absorbing dictation noise ('rpe four', 'RP4', 'are pee 4',
+    'r p e 4'). Returns (rpe_or_None, text_with_rpe_removed)."""
+    t = text
+    # Normalize spelled-out RPE markers to the token 'rpe'.
+    t = re.sub(r"\bare\s+pee\b", "rpe", t)
+    t = re.sub(r"\br\s*\.?\s*p\s*\.?\s*e\b", "rpe", t)   # 'r p e' / 'r.p.e'
+    t = re.sub(r"\barpe\b", "rpe", t)
+    t = re.sub(r"\brp(?=\s*\d)", "rpe ", t)              # 'RP4' / 'rp 4'
+
+    m = re.search(r"\brpe\b\s*(?:of|is|at|was|=|:)?\s*([0-9]+(?:\.[0-9]+)?|[a-z]+)", t)
+    if not m:
+        return None, text
+
+    tok = m.group(1)
+    val: float | None = None
+    if tok[0].isdigit():
+        try:
+            val = float(tok)
+        except ValueError:
+            val = None
+    elif tok in _RPE_VALUE_WORDS:
+        val = float(_RPE_VALUE_WORDS[tok])
+
+    if val is None or not (1 <= val <= 10):
+        # Couldn't resolve a sane RPE — strip the marker but report no value.
+        cleaned = (t[:m.start()] + " " + t[m.end():]).strip()
+        return None, cleaned
+
+    cleaned = (t[:m.start()] + " " + t[m.end():]).strip()
+    return val, cleaned
+
+
+def _pop_weight(text: str, allow_bare: bool = True) -> tuple[float | None, str]:
+    """Extract weight: '12 lbs' / '12lb' / '12 pounds' / '12#' always; '@ 30' /
+    'at 30' (no unit) only when allow_bare is True — i.e. the line already looks
+    like a set — so chatter like 'remind me at 5' isn't read as a weight."""
+    m = re.search(r"\b([0-9]+(?:\.[0-9]+)?)\s*(?:lbs?|pounds?|#)\b", text)
+    if not m and allow_bare:
+        m = re.search(r"(?:@|\bat)\s*([0-9]+(?:\.[0-9]+)?)\b", text)
+    if not m:
+        return None, text
+    val = float(m.group(1))
+    cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+    return val, cleaned
+
+
+def _pop_duration(text: str) -> tuple[int | None, str]:
+    """Extract a held-duration: '30s' / '30 sec' / '2 min' (→ seconds)."""
+    m = re.search(r"\b([0-9]+)\s*(?:s|sec|secs|seconds?)\b", text)
+    if m:
+        cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+        return int(m.group(1)), cleaned
+    m = re.search(r"\b([0-9]+)\s*(?:m|min|mins|minutes?)\b", text)
+    if m:
+        cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+        return int(m.group(1)) * 60, cleaned
+    return None, text
+
+
+def _pop_reps(text: str) -> tuple[int | None, str]:
+    """Extract reps: '13 reps' / 'x13' / '13x' / '3x10' (sets x reps → reps)."""
+    # 'SETSxREPS' — take the second number as reps.
+    m = re.search(r"\b([0-9]+)\s*x\s*([0-9]+)\b", text)
+    if m:
+        cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+        return int(m.group(2)), cleaned
+    for pat in (r"\b([0-9]+)\s*(?:reps?)\b", r"\bx\s*([0-9]+)\b", r"\b([0-9]+)\s*x\b"):
+        m = re.search(pat, text)
+        if m:
+            cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+            return int(m.group(1)), cleaned
+    return None, text
+
+
+def _pop_set_num(text: str) -> tuple[int | None, str]:
+    m = re.search(r"\bset\s*([0-9]+)\b", text)
+    if not m:
+        return None, text
+    cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+    return int(m.group(1)), cleaned
+
+
+def _match_exercise(leftover: str, plan: dict) -> str | None:
+    """Fuzzy-match the residual words against today's plan exercises.
+
+    A plan exercise is matched when the candidate shares a meaningful token
+    with it (len >= 3, e.g. 'rdl' ~ 'DB RDL', 'squat' ~ 'Goblet squat') or the
+    full strings are highly similar. Otherwise, if the words still look like a
+    (short) exercise name, they're returned title-cased so off-script exercises
+    (e.g. 'bicep curl' on an ad-hoc day) still get logged. Returns None when
+    nothing name-like remains — the caller then attributes the set to the
+    cursor's next exercise.
+    """
+    tokens = [t for t in re.findall(r"[a-z]+", leftover.lower()) if t not in _SET_STOPWORDS]
+    if not tokens:
+        return None
+    cand = " ".join(tokens)
+    cand_set = set(tokens)
+
+    best_name, best_score = None, 0.0
+    for name in _plan_exercise_names(plan):
+        nlow = name.lower()
+        nset = set(re.findall(r"[a-z]+", nlow))
+        shared = [w for w in (cand_set & nset) if len(w) >= 3]
+        if shared:
+            score = 0.6 + 0.1 * len(shared)
+        else:
+            seq = difflib.SequenceMatcher(None, cand, nlow).ratio()
+            score = seq if seq >= 0.62 else 0.0
+        if score > best_score:
+            best_name, best_score = name, score
+
+    if best_name and best_score >= 0.6:
+        return best_name
+    if 1 <= len(tokens) <= 3:
+        return " ".join(t.capitalize() for t in tokens)
+    return None
+
+
+def parse_set_line(text: str, plan: dict) -> dict | None:
+    """Parse one dictated set into {exercise, reps, weight, duration, rpe, set_num}.
+
+    Tolerates speech-to-text noise and flexible word order. Returns None when
+    the line has no set signal (so the caller falls through to other handlers).
+    A set with numbers but no recognizable exercise returns exercise=None — the
+    session handler then attributes it to the current cursor exercise.
+    """
+    work = text.lower().strip()
+    if not work:
+        return None
+
+    rpe, work = _pop_rpe(work)
+    work = _words_to_numbers(work)
+    reps, work = _pop_reps(work)
+    duration, work = _pop_duration(work)
+    # Bare 'at N'/'@N' only counts as weight once the line already looks like a set.
+    allow_bare = any(v is not None for v in (reps, duration, rpe))
+    weight, work = _pop_weight(work, allow_bare=allow_bare)
+    set_num, work = _pop_set_num(work)
+
+    exercise = _match_exercise(work, plan)
+
+    # Bare-number reps fallback: a lone integer (e.g. "goblet squat 10 @ 30",
+    # where 10 has no "reps"/"x" marker) only counts as reps when the line is
+    # clearly a set — a weight/RPE is present, or a real plan exercise matched.
+    if reps is None and duration is None:
+        bare_nums = re.findall(r"\b([0-9]+)\b", work)
+        if bare_nums and (weight is not None or rpe is not None or _is_plan_exercise(exercise, plan)):
+            reps = int(bare_nums[0])
+
+    has_signal = any(v is not None for v in (reps, weight, duration, rpe))
+
+    # No numbers at all → not a set to log (a bare name or chatter falls through).
+    if not has_signal:
+        return None
+
+    return {
+        "exercise": exercise,
+        "reps": reps,
+        "weight": weight,
+        "duration": duration,
+        "rpe": rpe,
+        "set_num": set_num,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Build 3 — conversational loop (formatters + writers)
+# ----------------------------------------------------------------------------
+
+_START_RE = re.compile(
+    r"^\s*(?:let'?s|lets|time\s+to|start(?:ing)?|begin(?:ning)?|gonna|about\s+to)"
+    r"\s+(?:work\s?out|lift(?:ing)?|train(?:ing)?)\b"
+    r"|^\s*(?:work\s?out|lifting)\s+time\b",
+    re.IGNORECASE,
+)
+# Anchored to a bare end phrase (optional trailing punctuation only), so an
+# inbox command like "done <thread_id>" or a stray "done squats" is NOT treated
+# as a session-end and falls through to its real handler.
+_END_RE = re.compile(
+    r"^\s*(?:done|i'?m\s+done|im\s+done|i\s+am\s+done|all\s+done|that'?s\s+it|"
+    r"thats\s+it|finished|i'?m\s+finished|im\s+finished|we'?re\s+done|were\s+done|"
+    r"workout\s+done|session\s+done|that'?s\s+a\s+wrap|thats\s+a\s+wrap)\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _fmt_num(x) -> str:
+    """Drop a trailing .0 from numeric values for clean display."""
+    if x is None:
+        return ""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    return str(int(f)) if f == int(f) else str(f)
+
+
+def _top_set(sets: list[dict]) -> dict:
+    """Pick the representative set — heaviest, else first."""
+    def weight_key(s):
+        w = s.get("weight_lbs")
+        return float(w) if w is not None else -1.0
+    return max(sets, key=weight_key) if sets else {}
+
+
+def _format_set_detail(s: dict) -> str:
+    reps, wt = s.get("reps_done"), s.get("weight_lbs")
+    rpe, dur = s.get("rpe_actual"), s.get("duration_sec")
+    if reps is not None and wt is not None:
+        base = f"{reps}×{_fmt_num(wt)}lb"
+    elif wt is not None:
+        base = f"{_fmt_num(wt)}lb"
+    elif reps is not None:
+        base = f"{reps} reps"
+    elif dur is not None:
+        base = f"{dur}s"
+    else:
+        base = "logged"
+    if rpe is not None:
+        base += f" RPE {_fmt_num(rpe)}"
+    return base
+
+
+def _format_last(last: dict) -> str:
+    return _format_set_detail(_top_set(last.get("sets", [])))
+
+
+def _format_target_only(nxt: dict) -> str:
+    reps, load = nxt.get("target_reps"), nxt.get("target_load_lbs")
+    dur = nxt.get("duration_sec")
+    if reps is not None and load is not None:
+        return f"{reps}×{_fmt_num(load)}lb"
+    if reps is not None:
+        return f"{reps} reps"
+    if dur is not None:
+        return f"{dur}s"
+    return ""
+
+
+def _suggestion_from_last(last: dict) -> str:
+    """Trainer suggestion driven by last time's RPE on the top set."""
+    top = _top_set(last.get("sets", []))
+    rpe = top.get("rpe_actual")
+    wt = top.get("weight_lbs")
+    if rpe is None:
+        return f"Match or beat {_fmt_num(wt)}lb." if wt is not None else "Match or beat it."
+    rpe = float(rpe)
+    if rpe <= 5:
+        # Low RPE → add load.
+        return f"Try {_fmt_num(float(wt) + 5)}." if wt is not None else "Add load."
+    if rpe >= 9:
+        # High RPE → hold or back off.
+        return f"Hold {_fmt_num(wt)}lb or drop a touch." if wt is not None else "Hold or reduce."
+    return f"Match or beat {_fmt_num(wt)}lb." if wt is not None else "Match or beat it."
+
+
+def _format_next_line(nxt: dict, session_type: str, prefix: str = "Next") -> str:
+    """'Next: tricep extension — last time 20lb RPE 6. Try 25. Waiting.'"""
+    last = last_time(nxt["name"], session_type)
+    seg = f"{prefix}: {nxt['name']}"
+    if last and last.get("sets"):
+        seg += f" — last time {_format_last(last)}."
+        sug = _suggestion_from_last(last)
+        if sug:
+            seg += f" {sug}"
+    else:
+        tgt = _format_target_only(nxt)
+        seg += " — no prior data."
+        if tgt:
+            seg += f" Target {tgt}."
+    return seg + " Waiting."
+
+
+def _format_logged_line(parsed: dict) -> str:
+    ex = parsed["exercise"]
+    reps, wt = parsed.get("reps"), parsed.get("weight")
+    rpe, dur = parsed.get("rpe"), parsed.get("duration")
+    if reps is not None and wt is not None:
+        body = f"{ex} {reps}×{_fmt_num(wt)}lb"
+    elif reps is not None:
+        body = f"{ex} {reps} reps"
+    elif dur is not None:
+        body = f"{ex} {dur}s"
+    elif wt is not None:
+        body = f"{ex} {_fmt_num(wt)}lb"
+    else:
+        body = str(ex)
+    if rpe is not None:
+        body += f", RPE {_fmt_num(rpe)}"
+    return f"💪 Logged: {body}."
+
+
+def _next_set_num(plan_id: int, exercise: str) -> int:
+    from knowledge.db import execute_one
+    row = execute_one(
+        """SELECT COALESCE(MAX(set_num), 0) AS m
+           FROM health.session_log
+           WHERE plan_id = %s AND LOWER(exercise) = LOWER(%s)""",
+        (plan_id, exercise),
+    )
+    return int((row or {}).get("m") or 0) + 1
+
+
+def _insert_set_row(plan_id: int, log_type: str, p: dict) -> None:
+    from knowledge.db import execute_write
+    execute_write(
+        """INSERT INTO health.session_log (
+               plan_id, log_type, exercise, set_num, reps_done,
+               weight_lbs, duration_sec, rpe_actual, logged_via
+           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'mattermost')""",
+        (
+            plan_id, log_type, p["exercise"], p.get("set_num"),
+            p.get("reps"), p.get("weight"), p.get("duration"), p.get("rpe"),
+        ),
+    )
+
+
+def _start_session() -> str:
+    """Begin (or re-surface) today's session and announce the first exercise."""
+    plan = get_today_plan()
+    if not plan:
+        return "No plan on the calendar for today. Nothing to start."
+    if plan.get("is_skipped") or plan.get("session_type") in _NON_WORKOUT_SESSIONS:
+        pretty = _session_pretty_name(plan.get("session_type", "?"))
+        return f"Today isn't a lifting day — {pretty}. Nothing to start."
+
+    _set_session_marker("active")
+    nxt = next_exercise(plan)
+    if not nxt:
+        # Either no readable exercise list, or everything already logged.
+        return (
+            f"Session on — {_session_pretty_name(plan['session_type'])}. "
+            "Call out your sets as you go (e.g. `goblet squat 10 @ 30 rpe 7`)."
+        )
+    return "Session on. " + _format_next_line(nxt, plan["session_type"], prefix="First")
+
+
+def _today_logged_sets(plan_id: int) -> list[dict]:
+    from knowledge.db import execute_query
+    return execute_query(
+        """SELECT exercise, set_num, reps_done, weight_lbs, duration_sec, rpe_actual
+           FROM health.session_log
+           WHERE plan_id = %s AND log_type IN ('strength_set', 'cardio_block')
+           ORDER BY log_id""",
+        (plan_id,),
+    )
+
+
+def _ensure_session_summary(plan_id: int, rows: list[dict]) -> None:
+    """Write a session_summary row if none exists yet, so the 21:50 inferred
+    placeholder / 23:00 nag don't fire for a session the user already closed."""
+    from knowledge.db import execute_one, execute_write
+    existing = execute_one(
+        "SELECT 1 AS x FROM health.session_log WHERE plan_id = %s AND log_type = 'session_summary' LIMIT 1",
+        (plan_id,),
+    )
+    if existing:
+        return
+    rpes = [float(r["rpe_actual"]) for r in rows if r.get("rpe_actual") is not None]
+    avg = round(sum(rpes) / len(rpes), 1) if rpes else None
+    execute_write(
+        """INSERT INTO health.session_log (
+               plan_id, log_type, exercise, rpe_actual, notes, logged_via
+           ) VALUES (%s, 'session_summary', 'session_summary', %s,
+                     'conversational session closed', 'mattermost')""",
+        (plan_id, avg),
+    )
+
+
+def _format_session_summary(plan: dict, rows: list[dict]) -> str:
+    by: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in rows:
+        k = r["exercise"]
+        if k not in by:
+            by[k] = []
+            order.append(k)
+        by[k].append(r)
+
+    lines = [f"Session done — {_session_pretty_name(plan['session_type'])}."]
+    all_rpe: list[float] = []
+    for k in order:
+        sets = by[k]
+        n = len(sets)
+        detail = _format_last({"sets": sets})
+        lines.append(f"• {k}: {n} set{'s' if n != 1 else ''} ({detail})")
+        all_rpe += [float(s["rpe_actual"]) for s in sets if s.get("rpe_actual") is not None]
+    if all_rpe:
+        lines.append(f"Overall ~RPE {_fmt_num(round(sum(all_rpe) / len(all_rpe), 1))}.")
+    lines.append("Logged. Get some protein.")
+    return "\n".join(lines)
+
+
+def _end_session(plan: dict) -> str:
+    plan_id = plan["plan_id"]
+    rows = _today_logged_sets(plan_id)
+    _set_session_marker("ended")
+    try:
+        _ensure_session_summary(plan_id, rows)
+    except Exception:
+        logger.exception("Failed to write session_summary on done")
+    if not rows:
+        return "Session closed. Nothing logged — next time call out your sets as you go."
+    return _format_session_summary(plan, rows)
+
+
+def _log_set_and_advance(plan: dict, parsed: dict) -> str | None:
+    plan_id = plan["plan_id"]
+    session_type = plan["session_type"]
+
+    # Attribute a name-less set to the cursor's current exercise.
+    if not parsed.get("exercise"):
+        nxt = next_exercise(plan)
+        if not nxt:
+            return None  # nothing to attribute to → fall through
+        parsed["exercise"] = nxt["name"]
+
+    if parsed.get("set_num") is None:
+        parsed["set_num"] = _next_set_num(plan_id, parsed["exercise"])
+
+    log_type = "cardio_block" if session_type.startswith("cardio") else "strength_set"
+    try:
+        _insert_set_row(plan_id, log_type, parsed)
+    except Exception:
+        logger.exception("Failed to log set")
+        return "⚠️ Couldn't save that set — check DB."
+
+    conf = _format_logged_line(parsed)
+    nxt = next_exercise(plan)
+    if nxt:
+        return conf + " " + _format_next_line(nxt, session_type)
+    return conf + " That's the whole card. Say `done` to close it out."
+
+
+def handle_workout_session(message: str) -> str | None:
+    """Conversational workout dispatcher (Build 3).
+
+    Returns a reply string when this message belongs to the session loop
+    (start / log-a-set / done), or None to fall through to other handlers.
+
+    Set-logging and 'done' only act while a session is active, so when no
+    session is running this only ever claims an explicit start trigger.
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    # Start a session (wins over the legacy life_ops "let's work out" handler).
+    if _START_RE.search(msg):
+        return _start_session()
+
+    plan = get_active_session()
+    if not plan:
+        return None
+
+    if _END_RE.match(msg):
+        return _end_session(plan)
+
+    parsed = parse_set_line(msg, plan)
+    if parsed is None:
+        return None  # not a set line — let other handlers try
+
+    return _log_set_and_advance(plan, parsed)
+
+
+# ----------------------------------------------------------------------------
+# Build 5 — history Q&A (handle_plan_query)
+# ----------------------------------------------------------------------------
+
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+# Aliases for the struggle query → canonical session_type.
+_SESSION_TYPE_ALIASES = {
+    "strength_a": "strength_a", "strength a": "strength_a",
+    "strength_b": "strength_b", "strength b": "strength_b",
+    "strength_c": "strength_c", "strength c": "strength_c",
+    "cardio_intervals": "cardio_intervals", "cardio intervals": "cardio_intervals",
+    "intervals": "cardio_intervals", "hiit": "cardio_intervals",
+    "cardio_z2": "cardio_z2", "cardio z2": "cardio_z2", "zone 2": "cardio_z2",
+    "z2": "cardio_z2",
+}
+
+
+def _detect_weekday(q: str) -> int | None:
+    for name, idx in _WEEKDAYS.items():
+        if re.search(rf"\b{name}(?:'s|s)?\b", q):  # matches saturday / saturdays / saturday's
+            return idx
+    return None
+
+
+def _detect_session_type(q: str) -> str | None:
+    for alias, canonical in _SESSION_TYPE_ALIASES.items():
+        if alias in q:
+            return canonical
+    return None
+
+
+def _relative_day_label(d: date, today: date) -> str:
+    if d == today:
+        return "Today"
+    if d == today + timedelta(days=1):
+        return "Tomorrow"
+    return d.strftime("%A %b %-d")
+
+
+def _format_plan_overview(plan: dict, today: date) -> str:
+    when = _relative_day_label(plan["plan_date"], today)
+    lines = [f"{when}: {_session_pretty_name(plan['session_type'])}."]
+    if plan.get("is_skipped"):
+        lines.append("_(marked skipped)_")
+    for ex in _plan_exercises(plan):
+        name = str(ex.get("name", "")).strip()
+        if not name:
+            continue
+        tgt = _format_target_only(_exercise_target(ex))
+        lines.append(f"• {name}" + (f" — {tgt}" if tgt else ""))
+    return "\n".join(lines)
+
+
+def _query_next_workout() -> str:
+    from knowledge.db import execute_one
+    today = datetime.now(CT).date()
+    row = execute_one(
+        """SELECT * FROM health.plan
+           WHERE plan_date >= %s AND is_skipped = FALSE
+             AND session_type NOT IN ('rest_mobility', 'walk')
+           ORDER BY plan_date LIMIT 1""",
+        (today,),
+    )
+    if not row:
+        return "No upcoming workout on the calendar."
+    return _format_plan_overview(row, today)
+
+
+def _query_day(target: date) -> str:
+    from knowledge.db import execute_one
+    today = datetime.now(CT).date()
+    row = execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (target,))
+    if not row:
+        return f"No plan for {target.strftime('%A %b %-d')}."
+    return _format_plan_overview(row, today)
+
+
+def _query_weekday_workout(weekday_idx: int) -> str:
+    today = datetime.now(CT).date()
+    delta = (weekday_idx - today.weekday()) % 7  # next occurrence (today counts)
+    return _query_day(today + timedelta(days=delta))
+
+
+def _query_last_workout() -> str:
+    from knowledge.db import execute_one, execute_query
+    today = datetime.now(CT).date()
+    plan = execute_one(
+        """SELECT p.plan_id, p.plan_date, p.session_type
+           FROM health.plan p
+           WHERE p.plan_date <= %s
+             AND EXISTS (
+                 SELECT 1 FROM health.session_log sl
+                 WHERE sl.plan_id = p.plan_id
+                   AND sl.log_type IN ('strength_set', 'cardio_block')
+                   AND sl.logged_via <> 'inferred')
+           ORDER BY p.plan_date DESC LIMIT 1""",
+        (today,),
+    )
+    if not plan:
+        return "No logged workouts yet."
+
+    rows = execute_query(
+        """SELECT exercise, set_num, reps_done, weight_lbs, duration_sec, rpe_actual
+           FROM health.session_log
+           WHERE plan_id = %s AND log_type IN ('strength_set', 'cardio_block')
+           ORDER BY log_id""",
+        (plan["plan_id"],),
+    )
+    summary = execute_one(
+        """SELECT rpe_actual FROM health.session_log
+           WHERE plan_id = %s AND log_type = 'session_summary'
+           ORDER BY log_id DESC LIMIT 1""",
+        (plan["plan_id"],),
+    )
+
+    when = _relative_day_label(plan["plan_date"], today)
+    lines = [f"Last workout — {when}, {_session_pretty_name(plan['session_type'])}:"]
+
+    by: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in rows:
+        k = r["exercise"]
+        if k not in by:
+            by[k] = []
+            order.append(k)
+        by[k].append(r)
+    for k in order:
+        lines.append(f"• {k}: {_format_last({'sets': by[k]})}")
+
+    if summary and summary.get("rpe_actual") is not None:
+        lines.append(f"Overall RPE {_fmt_num(summary['rpe_actual'])}.")
+    return "\n".join(lines)
+
+
+def _query_struggle(session_type: str) -> str:
+    from knowledge.db import execute_query
+    pretty = _session_pretty_name(session_type)
+    rows = execute_query(
+        """SELECT sl.exercise,
+                  AVG(sl.rpe_actual) AS avg_rpe,
+                  MAX(sl.rpe_actual) AS max_rpe,
+                  COUNT(*) AS n
+           FROM health.session_log sl
+           JOIN health.plan p ON sl.plan_id = p.plan_id
+           WHERE p.session_type = %s
+             AND sl.log_type = 'strength_set'
+             AND sl.rpe_actual IS NOT NULL
+           GROUP BY sl.exercise
+           ORDER BY avg_rpe DESC
+           LIMIT 5""",
+        (session_type,),
+    )
+    if not rows:
+        return f"No logged sets for {pretty} yet."
+    lines = [f"Toughest in {pretty} (by RPE):"]
+    for r in rows:
+        lines.append(
+            f"• {r['exercise']}: avg RPE {_fmt_num(round(float(r['avg_rpe']), 1))} "
+            f"(peak {_fmt_num(r['max_rpe'])}, {r['n']} set{'s' if r['n'] != 1 else ''})"
+        )
+    return "\n".join(lines)
+
+
+def handle_plan_query(message: str) -> str | None:
+    """History / plan read-intent Q&A (Build 5).
+
+    Routed in main.py BEFORE _try_life_ops so RDS reads always win over the
+    legacy SQLite path. Returns a reply string, or None to fall through.
+    Conservative: only fires on clear plan/workout phrasing.
+    """
+    q = (message or "").lower().strip()
+    if not q:
+        return None
+
+    # 1. "where did I struggle in strength_c" — most specific.
+    if re.search(r"\b(struggl\w*|hardest|toughest|worst|where\s+did\s+i)\b", q):
+        st = _detect_session_type(q)
+        if st:
+            return _query_struggle(st)
+
+    workout_noun = re.search(r"\b(workout|session|plan|training|lift\w*)\b", q)
+
+    # 2. "what's Saturday's workout" — weekday → next occurrence.
+    wd = _detect_weekday(q)
+    if wd is not None and workout_noun:
+        return _query_weekday_workout(wd)
+
+    # 3. "how was my last workout".
+    if re.search(r"\b(last|previous|yesterday'?s|recent)\b", q) and (
+        workout_noun or re.search(r"\b(how\s+(was|did|'?d)|recap)\b", q)
+    ):
+        return _query_last_workout()
+
+    # 4. "what's my next workout" / "today's workout" / "tomorrow's workout".
+    if workout_noun and re.search(
+        r"\b(next|today'?s|todays|tomorrow'?s|tomorrows|upcoming|what'?s|whats|what\s+is|my)\b", q
+    ):
+        today = datetime.now(CT).date()
+        if re.search(r"\btomorrow", q):
+            return _query_day(today + timedelta(days=1))
+        if re.search(r"\btoday", q):
+            return _query_day(today)
+        return _query_next_workout()
+
+    return None

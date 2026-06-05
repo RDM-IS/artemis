@@ -95,15 +95,39 @@ class MattermostClient:
         ws_url = get_mattermost_ws_url().rstrip("/") + "/api/v4/websocket"
         bot_id = self.get_bot_user_id()
 
+        # PB-009: Artemis always-listens in the configured DM channel
+        # (#artemis-ryan). Every message there is routed to the mention handler
+        # even without an @artemis mention. Resolve the channel ID once here
+        # (cached) rather than hardcoding a literal; if it can't resolve we fall
+        # back to mention-gating only.
+        try:
+            always_listen_channel_id = self.get_channel_id(config.CHANNEL_OPS)
+            logger.info(
+                "Always-listen enabled for channel '%s' (%s)",
+                config.CHANNEL_OPS, always_listen_channel_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not resolve always-listen channel '%s'; mention-gating only",
+                config.CHANNEL_OPS,
+            )
+            always_listen_channel_id = None
+
         def on_message(ws, raw):
             try:
                 event = json.loads(raw)
                 if event.get("event") != "posted":
                     return
                 post = json.loads(event["data"]["post"])
-                # Ignore own messages
+                # Hard guard: never respond to our own messages (no self-reply loops).
                 if post["user_id"] == bot_id:
                     return
+                # Always-listen channel: route everything (no mention required).
+                channel_id = post.get("channel_id", "")
+                always_listen = (
+                    always_listen_channel_id is not None
+                    and channel_id == always_listen_channel_id
+                )
                 # Check for @mention or active thread participation
                 message = post.get("message", "")
                 has_mention = (
@@ -111,9 +135,9 @@ class MattermostClient:
                     or bot_id in post.get("props", {}).get("mentioned_user_ids", [])
                 )
                 in_active_thread = bool(post.get("root_id"))
-                if not has_mention and not in_active_thread:
+                if not always_listen and not has_mention and not in_active_thread:
                     return
-                if not has_mention and in_active_thread:
+                if not always_listen and not has_mention and in_active_thread:
                     thread_id = post["root_id"]
                     try:
                         thread_posts = self.get_thread_posts(thread_id, limit=50)

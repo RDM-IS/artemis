@@ -2033,9 +2033,54 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
     return None
 
 
+_WAKE_WORD_RE = re.compile(
+    r"^\s*(?:hey\s+)?@?artemis\b[\s,:.\-]*|^\s*(?:hey\s+)?at\s+artemis\b[\s,:.\-]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_wake_word(message: str) -> str:
+    """Strip a leading wake word before parsing.
+
+    The always-listen channel (PB-009) means dictation often prefixes a message
+    with '@artemis' / 'at artemis' / 'artemis' even though no mention is needed.
+    Remove a single leading occurrence, then drop any remaining inline @artemis
+    tokens (preserving prior behavior).
+    """
+    stripped = _WAKE_WORD_RE.sub("", message or "", count=1)
+    return stripped.replace("@artemis", "").strip()
+
+
+def _handle_health_conversation(post: dict, question: str) -> bool:
+    """PB-009 — conversational workout session + training history Q&A.
+
+    Runs BEFORE _try_life_ops (and before the inbox handler, so an active
+    session's bare 'done' isn't shadowed by `done <thread_id>`). RDS-backed
+    plan/session reads and writes always win over the legacy life_ops SQLite
+    path. Returns True if a reply was posted.
+    """
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        from artemis.health import handle_plan_query, handle_workout_session
+        # Read-intent (history Q&A) first, then the session loop.
+        reply = handle_plan_query(question)
+        if reply is None:
+            reply = handle_workout_session(question)
+    except Exception:
+        logger.exception("Health conversation handler failed")
+        return False
+
+    if reply:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+    return False
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
-    question = post.get("message", "").replace("@artemis", "").strip()
+    question = _strip_wake_word(post.get("message", ""))
     if not question:
         return
 
@@ -2048,6 +2093,12 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_calendar_confirm(post, question):
         return
     if _handle_delete_confirm(post, question):
+        return
+
+    # ── PB-009: conversational workout session + training history ──
+    # Must run before inbox ('done' shadowing) and before _try_life_ops so the
+    # RDS health path always wins over the legacy life_ops SQLite handlers.
+    if _handle_health_conversation(post, question):
         return
 
     # Try quiet hours session commands (goodnight, morning, override, extend)
