@@ -309,6 +309,40 @@ def log_guardrail_violation(
 
 
 # ---------------------------------------------------------------------------
+# Calendar write audit (Brad Spaits incident — guard #3)
+# ---------------------------------------------------------------------------
+
+def log_calendar_audit(
+    action: str,
+    event_id: str = None,
+    title: str = None,
+    start_ts=None,
+    attendees: list[str] = None,
+    has_external: bool = False,
+    approved_by: str = None,
+    dup_override: bool = False,
+    actor: str = "artemis",
+) -> str:
+    """Record a calendar write (create/update/delete) to acos.calendar_audit.
+
+    Called AFTER the write succeeds, with the real event_id. Returns the row id.
+    """
+    import json
+    row = execute_write(
+        """
+        INSERT INTO acos.calendar_audit (
+            action, event_id, title, start_ts, attendees,
+            has_external, approved_by, dup_override, actor
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (action, event_id, title, start_ts, json.dumps(attendees or []),
+         has_external, approved_by, dup_override, actor),
+    )
+    return str(row["id"]) if row else ""
+
+
+# ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
 

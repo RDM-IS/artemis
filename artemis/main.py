@@ -113,6 +113,11 @@ _CONFIRM_WORDS = frozenset({"confirm", "approved", "approve", "yes", "send", "se
 _CANCEL_WORDS = frozenset({"cancel", "no", "deny", "discard"})
 _CONTROL_WORDS = _CONFIRM_WORDS | _CANCEL_WORDS
 
+# Duplicate-block override. DELIBERATELY DISTINCT from the confirm words: a
+# confirm/approved/yes must NEVER bypass a duplicate block (Brad Spaits guard #2).
+# The only phrase that creates past a block is exactly this one.
+_DUP_OVERRIDE_PHRASE = "override duplicate"
+
 # Pending availability reply flow keyed by channel_id
 # Stores slots and email context for send/confirm/edit flow
 _pending_availability: dict[str, dict] = {}
@@ -487,60 +492,26 @@ def _process_calendar_events(response: str, channel_id: str = "") -> str:
                 response = response[:match.start()] + replacement + response[match.end():]
                 continue
 
-            # ── Rule 2: Duplicate / conflict detection ──
-            nearby = _calendar.get_events_around(start_dt, window_hours=2)
-            conflict = None
-            for existing in nearby:
-                # Same attendee overlap or similar name on same day
-                if summary.lower() in existing["summary"].lower() or existing["summary"].lower() in summary.lower():
-                    conflict = existing
-                    break
-                # Check time overlap
-                try:
-                    ex_start = datetime.fromisoformat(existing["start"])
-                    if abs((ex_start - start_dt).total_seconds()) < 3600:  # within 1 hour
-                        conflict = existing
-                        break
-                except (ValueError, TypeError):
-                    pass
-
-            if conflict:
-                _pending_confirms[channel_id] = {
-                    "type": "calendar_create_conflict",
-                    "data": data,
-                    "conflict": conflict,
-                    "timestamp": time.time(),
-                }
-                replacement = (
-                    f"\n> :warning: You already have **{conflict['summary']}** at {conflict['start']} on that day.\n"
-                    f"> Create **{summary}** at {start_time} anyway? Reply `yes` to confirm.\n"
+            # ── Rule 2: Duplicate detection (Brad guard #2) ──
+            # Confident duplicate (time overlap + title/attendee match) → BLOCK
+            # by default; only `override duplicate` proceeds. A bare overlap with
+            # an unrelated event is a soft note, not a block.
+            verdict = _detect_calendar_duplicate(data)
+            if verdict.get("duplicate"):
+                block_msg = _register_duplicate_block(
+                    channel_id, data, user_approved_external=False, match=verdict["match"],
                 )
+                replacement = "\n> " + block_msg.replace("\n", "\n> ") + "\n"
                 response = response[:match.start()] + replacement + response[match.end():]
                 continue
 
-            # ── No blockers — create directly ──
-            event_id = _calendar.create_event(
-                summary=summary,
-                start_datetime=start_dt,
-                end_datetime=end_dt,
-                description=description,
+            # ── No blockers — create directly (audited) ──
+            reply = _create_calendar_from_data(
+                channel_id, data, user_approved_external=False, dup_override=False,
             )
-
-            if event_id:
-                log_calendar_action(
-                    action="create",
-                    event_id=event_id,
-                    summary=summary,
-                    attendees="",
-                    auto_created=True,
-                    notes="Internal event, no attendees",
-                )
-                replacement = (
-                    f"\n> :white_check_mark: Event created: **{summary}** on "
-                    f"{date_str} {start_time}–{end_time} (ID: `{event_id}`)\n"
-                )
-            else:
-                replacement = f"\n> :red_circle: Failed to create event: **{summary}** — check logs.\n"
+            replacement = "\n> " + reply.replace("\n", "\n> ") + "\n"
+            if verdict.get("soft_note"):
+                replacement += f"> _Note: {verdict['soft_note']}_\n"
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.warning("Failed to parse calendar_event block: %s", e)
@@ -598,6 +569,209 @@ def _process_commitments(response: str, channel_id: str = "") -> str:
     return response
 
 
+def _audit_calendar_write(
+    action: str,
+    event_id: str,
+    *,
+    title: str = "",
+    start_ts: str = None,
+    attendees: list[str] | None = None,
+    has_external: bool = False,
+    approved_by: str | None = None,
+    dup_override: bool = False,
+) -> None:
+    """Record a calendar write to acos.calendar_audit (queryable). Never raises —
+    an audit failure (e.g. RDS unavailable) must not fail the calendar action."""
+    try:
+        from knowledge.db import log_calendar_audit
+        log_calendar_audit(
+            action=action, event_id=event_id, title=title, start_ts=start_ts,
+            attendees=attendees or [], has_external=has_external,
+            approved_by=approved_by, dup_override=dup_override, actor="artemis",
+        )
+    except Exception:
+        logger.exception("calendar_audit write failed (%s %s)", action, event_id)
+
+
+def _detect_calendar_duplicate(event_data: dict) -> dict:
+    """Fetch nearby events and classify the proposed event as a duplicate or not.
+
+    Returns the guardrails.check_duplicate_event verdict; on any error or with no
+    calendar, returns a non-duplicate verdict (fail-open for detection, never
+    blocking a legitimate create on infra failure)."""
+    from artemis.guardrails import check_duplicate_event
+    if not _calendar or not getattr(_calendar, "service", None):
+        return {"duplicate": False, "match": None, "soft_note": None}
+    try:
+        local_tz = ZoneInfo(config.TIMEZONE)
+        start_dt = datetime.strptime(
+            f"{event_data['date']} {event_data['start_time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=local_tz)
+    except (KeyError, ValueError):
+        return {"duplicate": False, "match": None, "soft_note": None}
+    try:
+        existing = _calendar.get_events_around(start_dt, window_hours=2)
+        return check_duplicate_event(
+            event_data.get("summary", ""), start_dt,
+            event_data.get("attendees") or [], existing,
+        )
+    except Exception:
+        # Detection must never block a legitimate create on an infra/parse error.
+        logger.exception("Duplicate detection failed — proceeding without block")
+        return {"duplicate": False, "match": None, "soft_note": None}
+
+
+def _format_dup_block(match: dict) -> str:
+    """Format the duplicate-block message. `override duplicate` is the ONLY way past."""
+    title = match.get("summary", "(event)")
+    eid = match.get("id", "?")
+    when = match.get("start", "") or ""
+    date_part, time_part = when, ""
+    if "T" in when:
+        date_part, _, rest = when.partition("T")
+        time_part = rest[:5]
+    return (
+        f":warning: Blocked — this looks like a duplicate of '{title}' already on your "
+        f"calendar {date_part} {time_part} (id {eid}). I did NOT create a new event.\n"
+        f"To create it anyway, reply exactly: `override duplicate`"
+    )
+
+
+def _register_duplicate_block(
+    channel_id: str, event_data: dict, *, user_approved_external: bool, match: dict
+) -> str:
+    """Store a duplicate_override pending and return the block message.
+
+    user_approved_external is carried so a later override preserves (but does NOT
+    grant) external-attendee approval — the hard guardrail still applies at create."""
+    _pending_confirms[channel_id] = {
+        "type": "duplicate_override",
+        "data": event_data,
+        "user_approved_external": user_approved_external,
+        "match": match,
+        "timestamp": time.time(),
+    }
+    return _format_dup_block(match)
+
+
+def _create_calendar_from_data(
+    channel_id: str, data: dict, *, user_approved_external: bool, dup_override: bool
+) -> str:
+    """Create the event, audit the write, and return the reply message.
+
+    Nothing is narrated as "sent" before create_event returns a real id. The
+    external-attendee hard guardrail lives inside create_event and is NOT
+    bypassed here — a dup_override does not grant attendee approval."""
+    from artemis.guardrails import get_external_attendees
+    summary = data["summary"]
+    date_str = data["date"]
+    start_time_str = data["start_time"]
+    end_time_str = data["end_time"]
+    description = data.get("description")
+    attendees = data.get("attendees") or []
+    local_tz = ZoneInfo(config.TIMEZONE)
+    start_dt = datetime.strptime(f"{date_str} {start_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    end_dt = datetime.strptime(f"{date_str} {end_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+    attendee_str = ", ".join(attendees) if attendees else ""
+
+    try:
+        event_id = _calendar.create_event(
+            summary=summary,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            description=description,
+            attendees=attendees if attendees else None,
+            _user_approved_external=user_approved_external,
+            add_conference=bool(attendees),  # Google Meet for real invites
+        )
+    except Exception:
+        logger.exception("create_event raised for '%s'", summary)
+        event_id = None
+
+    if not event_id:
+        return (
+            f":red_circle: Couldn't create the event **{summary}** — nothing was sent. "
+            f"Check logs and try again."
+        )
+
+    has_external = bool(get_external_attendees(attendees))
+    approved_by = "ryan" if (user_approved_external or dup_override) else None
+    _audit_calendar_write(
+        "create", event_id, title=summary, start_ts=start_dt.isoformat(),
+        attendees=attendees, has_external=has_external,
+        approved_by=approved_by, dup_override=dup_override,
+    )
+    log_calendar_action(
+        action="create", event_id=event_id, summary=summary, attendees=attendee_str,
+        user_approved=user_approved_external,
+        notes="dup_override create" if dup_override else "confirmed create",
+    )
+
+    meet_link = ""
+    try:
+        meet_link = _calendar.get_meet_link(event_id) or ""
+    except Exception:
+        logger.exception("Failed to fetch Meet link for %s", event_id)
+
+    reply = (
+        f":white_check_mark: Event created: **{summary}** on "
+        f"{date_str} {start_time_str}–{end_time_str} (ID: `{event_id}`)"
+    )
+    if attendee_str:
+        reply += f"\nInvite sent to {attendee_str}."
+    if meet_link:
+        reply += f"\nGoogle Meet: {meet_link}"
+    return reply
+
+
+def _handle_duplicate_override(post: dict, question: str) -> bool:
+    """Consume a pending duplicate_override. Only `override duplicate` creates;
+    confirm words explicitly do NOT bypass the block. Returns True if handled."""
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    if channel_id not in _pending_confirms:
+        return False
+    pending = _pending_confirms[channel_id]
+    if pending.get("type") != "duplicate_override":
+        return False
+    if time.time() - pending["timestamp"] > 600:
+        del _pending_confirms[channel_id]
+        return False
+
+    q_lower = question.lower().strip()
+
+    if q_lower == _DUP_OVERRIDE_PHRASE:
+        data = pending["data"]
+        approved_ext = bool(pending.get("user_approved_external", False))
+        del _pending_confirms[channel_id]
+        reply = _create_calendar_from_data(
+            channel_id, data, user_approved_external=approved_ext, dup_override=True,
+        )
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    if q_lower in _CANCEL_WORDS:
+        del _pending_confirms[channel_id]
+        if _mm:
+            _mm.post_to_channel_id(channel_id, "Discarded — no event created.", root_id=root_id)
+        return True
+
+    if q_lower in _CONFIRM_WORDS:
+        # A confirm word must NOT bypass a duplicate block — consume it (so it
+        # never reaches the classifier) and restate the override instruction.
+        if _mm:
+            _mm.post_to_channel_id(
+                channel_id,
+                ":warning: That's a duplicate — `confirm`/`yes` won't override it. "
+                "Reply exactly `override duplicate` to create it anyway, or `cancel` to discard.",
+                root_id=root_id,
+            )
+        return True
+
+    return False
+
+
 def _handle_calendar_confirm(post: dict, question: str) -> bool:
     """Handle confirmation replies for pending calendar actions. Returns True if handled."""
     q_lower = question.lower().strip()
@@ -648,65 +822,24 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
     # confirm — actually create the event. NOTHING is narrated as "sent" before
     # create_event returns a real id; an exception or None is reported as failure.
     if decision == "confirm":
-        summary = data["summary"]
-        date_str = data["date"]
-        start_time_str = data["start_time"]
-        end_time_str = data["end_time"]
-        description = data.get("description")
-        attendees = data.get("attendees") or []
-
-        start_dt = datetime.strptime(f"{date_str} {start_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-        end_dt = datetime.strptime(f"{date_str} {end_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
-
-        attendee_str = ", ".join(attendees) if attendees else ""
-        try:
-            event_id = _calendar.create_event(
-                summary=summary,
-                start_datetime=start_dt,
-                end_datetime=end_dt,
-                description=description,
-                attendees=attendees if attendees else None,
-                # External-attendee approval can ONLY be set here, by a real
-                # confirm that consumed a pending row. The hard guardrail lives
-                # inside create_event so this can never be bypassed.
-                _user_approved_external=True,
-                add_conference=bool(attendees),  # generate a Google Meet link for real invites
+        # Brad guard #2: duplicate detection runs BEFORE create and INDEPENDENTLY
+        # of the external-approval gate — the user may have already accepted this
+        # event and would not remember it, so approval alone can't prevent a dup.
+        verdict = _detect_calendar_duplicate(data)
+        if verdict.get("duplicate"):
+            # Replace the confirm pending with a duplicate_override pending,
+            # carrying the external approval already given in this confirm.
+            msg = _register_duplicate_block(
+                channel_id, data, user_approved_external=True, match=verdict["match"],
             )
-        except Exception:
-            logger.exception("create_event raised during confirm for '%s'", summary)
-            event_id = None
+            if _mm:
+                _mm.post_to_channel_id(channel_id, msg, root_id=root_id)
+            return True
 
-        # Terminal either way — drop the pending so a retry re-proposes cleanly.
         del _pending_confirms[channel_id]
-
-        if event_id:
-            meet_link = ""
-            try:
-                meet_link = _calendar.get_meet_link(event_id) or ""
-            except Exception:
-                logger.exception("Failed to fetch Meet link for %s", event_id)
-            log_calendar_action(
-                action="create",
-                event_id=event_id,
-                summary=summary,
-                attendees=attendee_str,
-                user_approved=True,
-                notes=f"Confirmed by user (type: {pending['type']})",
-            )
-            reply = (
-                f":white_check_mark: Event created: **{summary}** on "
-                f"{date_str} {start_time_str}–{end_time_str} (ID: `{event_id}`)"
-            )
-            if attendee_str:
-                reply += f"\nInvite sent to {attendee_str}."
-            if meet_link:
-                reply += f"\nGoogle Meet: {meet_link}"
-        else:
-            reply = (
-                f":red_circle: Couldn't create the event **{summary}** — nothing was sent. "
-                f"Check logs and try again."
-            )
-
+        reply = _create_calendar_from_data(
+            channel_id, data, user_approved_external=True, dup_override=False,
+        )
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return True
@@ -802,6 +935,10 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
                 user_approved=True,
                 notes="Deleted by user via @mention",
             )
+            _audit_calendar_write(
+                "delete", data["event_id"], title=data.get("summary", ""),
+                start_ts=data.get("start"), approved_by="ryan",
+            )
             reply = f":white_check_mark: Deleted **{data['summary']}**."
         else:
             reply = f":red_circle: Failed to delete **{data['summary']}** — check logs."
@@ -849,6 +986,10 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
                             summary=ev["summary"],
                             user_approved=True,
                             notes="Bulk convert to task",
+                        )
+                        _audit_calendar_write(
+                            "delete", ev["event_id"], title=ev.get("summary", ""),
+                            approved_by="ryan",
                         )
                         deleted += 1
                     else:
@@ -2153,6 +2294,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     # Try confirmation flows first (yes/confirm/cancel for pending actions)
     if _handle_availability_command(post, question):
         return
+    # Duplicate-override MUST run before the calendar confirm handler so a
+    # `confirm`/`yes` can never bypass a duplicate block.
+    if _handle_duplicate_override(post, question):
+        return
     if _handle_calendar_confirm(post, question):
         return
     if _handle_delete_confirm(post, question):
@@ -2366,7 +2511,11 @@ def _handle_mention(post: dict, thread: list[dict]):
     # general_reply and confabulates a "sent" reply). The typed confirm handlers
     # above normally consume it; this is the last-resort guarantee for any
     # pending type/word they didn't match. Re-run them, then consume safely.
-    if channel_id in _pending_confirms and q_lower in _CONTROL_WORDS:
+    if channel_id in _pending_confirms and (
+        q_lower in _CONTROL_WORDS or q_lower == _DUP_OVERRIDE_PHRASE
+    ):
+        if _handle_duplicate_override(post, question):
+            return
         if _handle_calendar_confirm(post, question):
             return
         if _handle_delete_confirm(post, question):
