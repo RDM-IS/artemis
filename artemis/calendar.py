@@ -364,10 +364,15 @@ class CalendarClient:
         attendees: list[str] | None = None,
         reminder_minutes: int = 15,
         _user_approved_external: bool = False,
+        add_conference: bool = False,
     ) -> str | None:
         """Create a calendar event.
 
         Returns the event ID on success, or None on failure.
+
+        When add_conference is True, a Google Meet link is requested for the
+        event (retrievable afterward via get_meet_link). Non-breaking: the
+        return value is still the event id.
 
         HARD GUARDRAIL: If attendees contains any external email (not @rdm.is
         or @gmail.com), creation is BLOCKED unless _user_approved_external=True.
@@ -416,10 +421,21 @@ class CalendarClient:
         if attendees:
             body["attendees"] = [{"email": email} for email in attendees]
 
+        insert_kwargs: dict = {"calendarId": "primary", "body": body}
+        if add_conference:
+            import uuid
+            body["conferenceData"] = {
+                "createRequest": {
+                    "requestId": uuid.uuid4().hex,
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            }
+            insert_kwargs["conferenceDataVersion"] = 1
+
         try:
             event = (
                 self.service.events()
-                .insert(calendarId="primary", body=body)
+                .insert(**insert_kwargs)
                 .execute()
             )
             event_id = event.get("id", "")
@@ -428,6 +444,31 @@ class CalendarClient:
         except Exception:
             logger.exception("Failed to create calendar event: %s", summary)
             return None
+
+    def get_meet_link(self, event_id: str) -> str:
+        """Return the Google Meet (hangout) link for an event, or "" if none.
+
+        Best-effort: reads hangoutLink, falling back to a conferenceData video
+        entry point. Never raises on a missing link — returns "".
+        """
+        if not self.service or not event_id:
+            return ""
+        try:
+            event = (
+                self.service.events()
+                .get(calendarId="primary", eventId=event_id)
+                .execute()
+            )
+        except Exception:
+            logger.exception("Failed to fetch event %s for Meet link", event_id)
+            return ""
+        link = event.get("hangoutLink", "")
+        if link:
+            return link
+        for ep in (event.get("conferenceData", {}) or {}).get("entryPoints", []) or []:
+            if ep.get("entryPointType") == "video" and ep.get("uri"):
+                return ep["uri"]
+        return ""
 
     def format_events_for_brief(self, events: list[dict]) -> str:
         """Format events for inclusion in a morning brief."""
