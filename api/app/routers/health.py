@@ -100,6 +100,7 @@ class PlanResponse(BaseModel):
     phase: int
     week_num: int
     session_type: str
+    display_name: Optional[str] = None
     target_rpe: Optional[float] = None
     target_hr_zone: Optional[int] = None
     est_duration_min: Optional[int] = None
@@ -124,6 +125,31 @@ def _today_ct() -> date:
     Ryan is in West Bend, WI (Central Time). DST handled by zoneinfo.
     """
     return datetime.now(CT).date()
+
+
+# Legacy fallback labels (kept local — this FastAPI app doesn't import artemis.*).
+# Used only when a row predates the v2 reseed and lacks blocks.display_name.
+_LEGACY_PRETTY = {
+    "strength_a": "Strength A — Push/Legs",
+    "strength_b": "Strength B — Pull/Hinge",
+    "strength_c": "Strength C — Full Body",
+    "cardio_intervals": "Cardio Intervals",
+    "cardio_z2": "Cardio Zone 2",
+    "walk": "Walk + mobility",
+    "rest_mobility": "Rest / Mobility",
+}
+
+
+def _display_name(blocks: Any, session_type: Optional[str]) -> Optional[str]:
+    """Canonical human program name. Prefer blocks['display_name'] (written by
+    reseed_health_plan_v2); fall back to the legacy session_type label."""
+    if isinstance(blocks, dict):
+        dn = blocks.get("display_name")
+        if dn:
+            return dn
+    if session_type is None:
+        return None
+    return _LEGACY_PRETTY.get(session_type, session_type)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +195,7 @@ def get_today(
         phase=row["phase"],
         week_num=row["week_num"],
         session_type=row["session_type"],
+        display_name=_display_name(row["blocks"], row["session_type"]),
         target_rpe=float(row["target_rpe"]) if row["target_rpe"] is not None else None,
         target_hr_zone=row["target_hr_zone"],
         est_duration_min=row["est_duration_min"],
@@ -194,6 +221,7 @@ class TrendPoint(BaseModel):
 class DayStripEntry(BaseModel):
     plan_date: date
     session_type: Optional[str] = None
+    display_name: Optional[str] = None
     is_skipped: bool = False
     is_logged: bool = False
     is_today: bool = False
@@ -219,6 +247,7 @@ class LoggedSession(BaseModel):
     plan_id: int
     plan_date: date
     session_type: str
+    display_name: Optional[str] = None
     phase: int
     week_num: int
     rpe_actual: Optional[float] = None
@@ -237,6 +266,7 @@ class Banner(BaseModel):
 class TodaySummary(BaseModel):
     plan_id: Optional[int] = None
     session_type: Optional[str] = None
+    display_name: Optional[str] = None
     is_skipped: bool = False
     is_logged: bool = False
     exists: bool = False
@@ -287,6 +317,7 @@ def _build_logged_session(db: Session, summary_row: dict[str, Any]) -> LoggedSes
         plan_id=summary_row["plan_id"],
         plan_date=summary_row["plan_date"],
         session_type=summary_row["session_type"],
+        display_name=_display_name(summary_row.get("blocks"), summary_row["session_type"]),
         phase=summary_row["phase"],
         week_num=summary_row["week_num"],
         rpe_actual=float(summary_row["rpe_actual"]) if summary_row["rpe_actual"] is not None else None,
@@ -323,7 +354,7 @@ def get_status(
     strip_rows = db.execute(
         text("""
             SELECT p.plan_id, p.plan_date, p.session_type, p.is_skipped,
-                   p.phase, p.week_num,
+                   p.phase, p.week_num, p.blocks,
                    EXISTS (
                      SELECT 1 FROM health.session_log sl
                      WHERE sl.plan_id = p.plan_id
@@ -347,6 +378,7 @@ def get_status(
             day_strip.append(DayStripEntry(
                 plan_date=r["plan_date"],
                 session_type=r["session_type"],
+                display_name=_display_name(r.get("blocks"), r["session_type"]),
                 is_skipped=bool(r["is_skipped"]),
                 is_logged=bool(r["is_logged"]),
                 is_today=(r["plan_date"] == today),
@@ -359,6 +391,7 @@ def get_status(
     today_summary = TodaySummary(
         plan_id=today_row["plan_id"] if today_row else None,
         session_type=today_row["session_type"] if today_row else None,
+        display_name=_display_name(today_row.get("blocks"), today_row["session_type"]) if today_row else None,
         is_skipped=bool(today_row["is_skipped"]) if today_row else False,
         is_logged=bool(today_row["is_logged"]) if today_row else False,
         exists=today_row is not None,
@@ -393,7 +426,7 @@ def get_status(
     most_recent_row = db.execute(
         text("""
             SELECT sl.plan_id, sl.logged_at, sl.rpe_actual, sl.notes,
-                   p.plan_date, p.session_type, p.phase, p.week_num
+                   p.plan_date, p.session_type, p.phase, p.week_num, p.blocks
             FROM health.session_log sl
             JOIN health.plan p ON p.plan_id = sl.plan_id
             WHERE sl.log_type = 'session_summary'
@@ -410,7 +443,7 @@ def get_status(
         history_rows = db.execute(
             text("""
                 SELECT sl.plan_id, sl.logged_at, sl.rpe_actual, sl.notes,
-                       p.plan_date, p.session_type, p.phase, p.week_num
+                       p.plan_date, p.session_type, p.phase, p.week_num, p.blocks
                 FROM health.session_log sl
                 JOIN health.plan p ON p.plan_id = sl.plan_id
                 WHERE sl.log_type = 'session_summary'

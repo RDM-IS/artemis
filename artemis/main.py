@@ -2062,11 +2062,23 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
     try:
-        from artemis.health import handle_plan_query, handle_workout_session
-        # Read-intent (history Q&A) first, then the session loop.
-        reply = handle_plan_query(question)
-        if reply is None:
-            reply = handle_workout_session(question)
+        from artemis.health import (
+            INTENT_PLAN_LOOKUP,
+            detect_health_intent,
+            get_plan_lookup,
+            handle_plan_query,
+            handle_workout_session,
+        )
+        # plan_lookup (RDS read-intent) wins outright and NEVER falls through to
+        # general_reply: get_plan_lookup() always returns a string (real plan or
+        # the exact "No plan seeded for <date>." guard), which we post here.
+        if detect_health_intent(question) == INTENT_PLAN_LOOKUP:
+            reply = get_plan_lookup(question)
+        else:
+            # Read-intent (history Q&A) first, then the session loop.
+            reply = handle_plan_query(question)
+            if reply is None:
+                reply = handle_workout_session(question)
     except Exception:
         logger.exception("Health conversation handler failed")
         return False
