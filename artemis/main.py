@@ -103,6 +103,16 @@ _last_brief: str = "never"
 # Each value is a dict with "type", "data", and "timestamp"
 _pending_confirms: dict[str, dict] = {}
 
+# Control words for pending-action confirm/cancel. These are matched
+# case-insensitively and trimmed. CRITICAL: when a pending action is open for a
+# channel, a control-word reply MUST be consumed by a confirm handler and must
+# never reach the LLM intent classifier — the classifier mislabels them
+# general_reply and confabulates "sending now…" while create_event is never
+# called. See _handle_calendar_confirm / the _handle_mention backstop.
+_CONFIRM_WORDS = frozenset({"confirm", "approved", "approve", "yes", "send", "send it", "go"})
+_CANCEL_WORDS = frozenset({"cancel", "no", "deny", "discard"})
+_CONTROL_WORDS = _CONFIRM_WORDS | _CANCEL_WORDS
+
 # Pending availability reply flow keyed by channel_id
 # Stores slots and email context for send/confirm/edit flow
 _pending_availability: dict[str, dict] = {}
@@ -603,14 +613,12 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
         del _pending_confirms[channel_id]
         return False
 
-    if q_lower not in ("confirm", "yes", "cancel", "no", "approve", "deny"):
+    if q_lower in _CANCEL_WORDS:
+        decision = "cancel"
+    elif q_lower in _CONFIRM_WORDS:
+        decision = "confirm"
+    else:
         return False
-
-    # Map approve/deny to yes/cancel for unified handling
-    if q_lower == "approve":
-        q_lower = "yes"
-    elif q_lower == "deny":
-        q_lower = "cancel"
 
     # Only handle calendar create types here; other types handled by their own handlers
     if pending.get("type") not in (None, "calendar_create", "calendar_create_external", "calendar_create_conflict"):
@@ -619,7 +627,7 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
     local_tz = ZoneInfo(config.TIMEZONE)
     data = pending["data"]
 
-    if q_lower in ("cancel", "no"):
+    if decision == "cancel":
         del _pending_confirms[channel_id]
         # Log guardrail denial if this was an external attendee block
         if pending.get("type") == "calendar_create_external":
@@ -637,8 +645,9 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, "Calendar event cancelled.", root_id=root_id)
         return True
 
-    # confirm / yes
-    if q_lower in ("confirm", "yes"):
+    # confirm — actually create the event. NOTHING is narrated as "sent" before
+    # create_event returns a real id; an exception or None is reported as failure.
+    if decision == "confirm":
         summary = data["summary"]
         date_str = data["date"]
         start_time_str = data["start_time"]
@@ -649,17 +658,33 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
         start_dt = datetime.strptime(f"{date_str} {start_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
         end_dt = datetime.strptime(f"{date_str} {end_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
 
-        event_id = _calendar.create_event(
-            summary=summary,
-            start_datetime=start_dt,
-            end_datetime=end_dt,
-            description=description,
-            attendees=attendees if attendees else None,
-            _user_approved_external=True,  # User explicitly confirmed via Mattermost
-        )
-
         attendee_str = ", ".join(attendees) if attendees else ""
+        try:
+            event_id = _calendar.create_event(
+                summary=summary,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                description=description,
+                attendees=attendees if attendees else None,
+                # External-attendee approval can ONLY be set here, by a real
+                # confirm that consumed a pending row. The hard guardrail lives
+                # inside create_event so this can never be bypassed.
+                _user_approved_external=True,
+                add_conference=bool(attendees),  # generate a Google Meet link for real invites
+            )
+        except Exception:
+            logger.exception("create_event raised during confirm for '%s'", summary)
+            event_id = None
+
+        # Terminal either way — drop the pending so a retry re-proposes cleanly.
+        del _pending_confirms[channel_id]
+
         if event_id:
+            meet_link = ""
+            try:
+                meet_link = _calendar.get_meet_link(event_id) or ""
+            except Exception:
+                logger.exception("Failed to fetch Meet link for %s", event_id)
             log_calendar_action(
                 action="create",
                 event_id=event_id,
@@ -672,10 +697,16 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
                 f":white_check_mark: Event created: **{summary}** on "
                 f"{date_str} {start_time_str}–{end_time_str} (ID: `{event_id}`)"
             )
+            if attendee_str:
+                reply += f"\nInvite sent to {attendee_str}."
+            if meet_link:
+                reply += f"\nGoogle Meet: {meet_link}"
         else:
-            reply = f":red_circle: Failed to create event: **{summary}** — check logs."
+            reply = (
+                f":red_circle: Couldn't create the event **{summary}** — nothing was sent. "
+                f"Check logs and try again."
+            )
 
-        del _pending_confirms[channel_id]
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return True
@@ -746,18 +777,22 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
         del _pending_confirms[channel_id]
         return False
 
-    if q_lower not in ("yes", "no", "cancel"):
+    if q_lower in _CANCEL_WORDS:
+        decision = "cancel"
+    elif q_lower in _CONFIRM_WORDS:
+        decision = "confirm"
+    else:
         return False
 
     data = pending["data"]
     del _pending_confirms[channel_id]
 
-    if q_lower in ("no", "cancel"):
+    if decision == "cancel":
         if _mm:
             _mm.post_to_channel_id(channel_id, "Deletion cancelled.", root_id=root_id)
         return True
 
-    if q_lower == "yes":
+    if decision == "confirm":
         success = _calendar.delete_event(data["event_id"])
         if success:
             log_calendar_action(
@@ -800,7 +835,7 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
             if time.time() - pending["timestamp"] > 600:
                 del _pending_confirms[channel_id]
                 return False
-            if q_lower in ("yes", "confirm", "execute"):
+            if q_lower in _CONFIRM_WORDS or q_lower == "execute":
                 events = pending["events"]
                 deleted = 0
                 added = 0
@@ -836,12 +871,12 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
                 if _mm:
                     _mm.post_to_channel_id(channel_id, "\n".join(parts), root_id=root_id)
                 return True
-            if q_lower in ("no", "cancel"):
+            if q_lower in _CANCEL_WORDS:
                 del _pending_confirms[channel_id]
                 if _mm:
                     _mm.post_to_channel_id(channel_id, "Bulk convert cancelled.", root_id=root_id)
                 return True
-            # Not a yes/no — fall through so other handlers can try
+            # Not a control word — fall through so other handlers can try
             return False
 
     # ---- Phase 1: detect convert intent ----
@@ -2323,6 +2358,33 @@ def _handle_mention(post: dict, thread: list[dict]):
     correction_response = _handle_correction(post, question, thread)
     if correction_response:
         _mm.post_to_channel_id(channel_id, correction_response, root_id=root_id)
+        return
+
+    # ── Confirm backstop ──
+    # If a pending action is still open for this channel and the user sent a
+    # control word, it MUST NOT reach the intent classifier (which mislabels it
+    # general_reply and confabulates a "sent" reply). The typed confirm handlers
+    # above normally consume it; this is the last-resort guarantee for any
+    # pending type/word they didn't match. Re-run them, then consume safely.
+    if channel_id in _pending_confirms and q_lower in _CONTROL_WORDS:
+        if _handle_calendar_confirm(post, question):
+            return
+        if _handle_delete_confirm(post, question):
+            return
+        if _handle_convert_to_tasks(post, question):
+            return
+        logger.warning(
+            "Open pending + control word '%s' unmatched by typed handlers — "
+            "consuming to prevent a confabulated classifier reply", q_lower,
+        )
+        _pending_confirms.pop(channel_id, None)
+        if _mm:
+            _mm.post_to_channel_id(
+                channel_id,
+                ":warning: I couldn't match that confirmation to the pending action "
+                "(it may have expired or already been handled). Please re-issue the request.",
+                root_id=root_id,
+            )
         return
 
     # ── Intent router: classify before generic Claude fallback ──
