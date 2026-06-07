@@ -555,17 +555,41 @@ _DEBRIEF_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 
+# PB-009 plan-lookup intent — READ-intent for "what's the plan" style questions.
+# Deliberately requires a plan/workout/schedule noun so it never swallows a
+# debrief ("done", "RPE 7"), a morning check-in, or unrelated chatter.
+INTENT_PLAN_LOOKUP = "plan_lookup"
+
+_PLAN_NOUN = r"(?:workouts?|sessions?|plan|schedule|training|lift(?:s|ing)?)"
+_WEEKDAY_WORD = r"(?:mon|tues?|wednes|thurs?|fri|satur|sun)day"
+_PLAN_LOOKUP_RE = re.compile(
+    # "show my plan", "what's tomorrow's workout", "what's my workout monday"
+    rf"\b(?:show|see|what'?s|what\s+is|whats)\b.*\b{_PLAN_NOUN}\b"
+    # "<plan-noun> tomorrow/today/this week/next N days/<weekday>"
+    rf"|\b{_PLAN_NOUN}\b.*\b(?:tomorrow|today|tonight|this\s+week|next\s+\d+\s+days?|{_WEEKDAY_WORD})\b"
+    # "tomorrow's/this week's <plan-noun>"
+    rf"|\b(?:tomorrow|today|tonight|this\s+week|next\s+\d+\s+days?|{_WEEKDAY_WORD})('?s)?\b.*\b{_PLAN_NOUN}\b"
+    # bare ranges that only make sense as a plan lookup here
+    rf"|\bnext\s+\d+\s+days?\b"
+    rf"|\bthis\s+week'?s?\s+{_PLAN_NOUN}\b",
+    re.IGNORECASE,
+)
+
 
 def detect_health_intent(message: str) -> str | None:
     """Lightweight regex pre-check for health intents.
 
-    Returns 'log_morning_state', 'log_workout_debrief', 'trainer_override',
-    or None. Cheaper than calling Claude — used as a first pass before
-    the main router.
+    Returns 'plan_lookup', 'log_morning_state', 'log_workout_debrief',
+    'trainer_override', or None. Cheaper than calling Claude — used as a first
+    pass before the main router.
     """
     # Trainer override is most specific — match first.
     if _OVERRIDE_RE.match(message):
         return INTENT_TRAINER_OVERRIDE
+    # Plan-lookup (read-intent) before debrief/morning: it requires a plan noun
+    # plus a temporal/show cue, so it can't collide with "done"/"RPE"/"slept".
+    if _PLAN_LOOKUP_RE.search(message):
+        return INTENT_PLAN_LOOKUP
     # Debrief next because "done" + "RPE X" is more specific than
     # the morning trigger which catches "sleep"/"slept".
     if _DEBRIEF_TRIGGER.search(message):
@@ -778,10 +802,39 @@ _BIKE_ALTERNATIVE = {
 }
 
 
+def _blocks_use_bike(blocks) -> bool:
+    """True if a blocks payload describes an actual bike session.
+
+    Discriminator: equipment mentions a bike. Empty equipment with a run/walk
+    display_name is explicitly NOT a bike session (Sunday run-walk)."""
+    b = _coerce_blocks(blocks)
+    equip = b.get("equipment") or []
+    if any("bike" in str(e).lower() for e in equip):
+        return True
+    if not equip:
+        dn = str(b.get("display_name") or "").lower()
+        return not ("run" in dn or "walk" in dn)
+    return False
+
+
+def is_bike_session(plan: dict) -> bool:
+    """True only for cardio sessions that actually use a bike.
+
+    Sat (long Z2 ride) and Sun (run-walk) both map to session_type='cardio_z2',
+    so weather / indoor-outdoor resolution must key on the blocks payload, not
+    session_type alone — otherwise Sunday's run-walk would wrongly get
+    bike-weather handling. Used by the scheduler to gate override + weather.
+    """
+    if (plan.get("session_type") or "") not in _BIKE_SESSIONS:
+        return False
+    return _blocks_use_bike(plan.get("blocks"))
+
+
 def resolve_equipment_and_location(
     session_type: str,
     weather: dict | None = None,
     user_override: str | None = None,
+    blocks: dict | None = None,
 ) -> dict:
     """Return {'location': str, 'equipment': list[str], 'notes': str | None,
                 'first_lift': str | None}.
@@ -834,6 +887,20 @@ def resolve_equipment_and_location(
     # Strength / rest_mobility — no weather logic
     if session_type not in _BIKE_SESSIONS:
         return result
+
+    # ── Non-bike cardio guard (PB-009) ─────────────────────────────────
+    # A cardio_z2/cardio_intervals row whose blocks don't use a bike (e.g.
+    # Sunday run-walk, now mapped to cardio_z2) must NOT get bike/weather
+    # handling. Only applies when blocks are provided (legacy callers that pass
+    # no blocks keep the original bike behavior).
+    if blocks is not None and not _blocks_use_bike(blocks):
+        b = _coerce_blocks(blocks)
+        return {
+            "location": "outside (run-walk)",
+            "equipment": list(b.get("equipment") or []),
+            "first_lift": None,
+            "notes": "Run-walk session — outdoor; weather/bike setup not applicable.",
+        }
 
     # ── Bike branch (cardio_intervals, cardio_z2) ──────────────────────
     # Preserve the non-bike alternative (water rower / walking pad)
@@ -2058,3 +2125,130 @@ def handle_plan_query(message: str) -> str | None:
         return _query_next_workout()
 
     return None
+
+
+# ----------------------------------------------------------------------------
+# PB-009 plan_lookup — the routing-bug fix.
+#
+# get_plan_lookup() is the dedicated handler for the 'plan_lookup' intent. It:
+#   * anchors ALL date math to America/Chicago (CT) — never naive date.today()
+#     / UTC, which is what mislabeled Saturday as Jun 7 and shifted the week;
+#   * reads health.plan for the requested range and returns session_type + the
+#     REAL exercise names from blocks.exercises (and the finisher if present);
+#   * HARD GUARD: a requested date with no DB row yields exactly
+#     "No plan seeded for <date>." It never fabricates exercises and (via the
+#     main.py wiring) never falls through to the LLM general_reply path.
+# ----------------------------------------------------------------------------
+
+def _coerce_blocks(blocks) -> dict:
+    if isinstance(blocks, str):
+        try:
+            return json.loads(blocks)
+        except (ValueError, TypeError):
+            return {}
+    return blocks or {}
+
+
+def _exercise_names_from_blocks(blocks) -> tuple[list[str], list[str]]:
+    """Return (main_exercise_names, finisher_exercise_names) from a blocks dict.
+
+    Reads the real contract shape: blocks['exercises'] for the main circuit and
+    blocks['finisher']['exercises'] for the core finisher. Either may be absent
+    (e.g. cardio intervals have no per-exercise list)."""
+    b = _coerce_blocks(blocks)
+    main = [str(e.get("name")) for e in (b.get("exercises") or []) if isinstance(e, dict) and e.get("name")]
+    fin: list[str] = []
+    finisher = b.get("finisher")
+    if isinstance(finisher, dict):
+        fin = [str(e.get("name")) for e in (finisher.get("exercises") or []) if isinstance(e, dict) and e.get("name")]
+    return main, fin
+
+
+def _fetch_plan_row(d: date) -> dict | None:
+    from knowledge.db import execute_one
+    return execute_one(
+        """SELECT plan_date, session_type, target_rpe, est_duration_min,
+                  is_skipped, blocks
+           FROM health.plan WHERE plan_date = %s""",
+        (d,),
+    )
+
+
+def _format_plan_lookup_day(d: date, row: dict, today: date) -> str:
+    # Weekday label is derived from the plan_date itself → it can never be
+    # mislabeled the way the UTC/naive bug did.
+    label = d.strftime("%A %b %-d")
+    if d == today:
+        label += " (today)"
+    elif d == today + timedelta(days=1):
+        label += " (tomorrow)"
+
+    # Prefer the canonical program name from blocks.display_name; fall back to
+    # the legacy session_type pretty label only when it's absent.
+    blocks = _coerce_blocks(row.get("blocks"))
+    session = blocks.get("display_name") or _session_pretty_name(row.get("session_type", "?"))
+    line = f"**{label}** — {session}"
+    if row.get("is_skipped"):
+        line += " _(skipped)_"
+
+    main, fin = _exercise_names_from_blocks(row.get("blocks"))
+    if main:
+        line += "\n   " + ", ".join(main)
+    if fin:
+        line += "\n   finisher: " + ", ".join(fin)
+    if not main and not fin:
+        # Cardio/rest days legitimately have no exercise list — show the type.
+        b = _coerce_blocks(row.get("blocks"))
+        btype = b.get("type")
+        if btype:
+            line += f"\n   ({btype})"
+    return line
+
+
+def get_plan_lookup(message: str) -> str:
+    """Handle the 'plan_lookup' intent (PB-009 routing-bug fix).
+
+    Always returns a non-empty string (so the caller posts it and returns,
+    never reaching general_reply). Missing dates yield exactly
+    "No plan seeded for <date>.".
+    """
+    q = (message or "").lower()
+    today = datetime.now(CT).date()  # CT-anchored — the bug fix
+
+    header: str | None = None
+    m = re.search(r"next\s+(\d+)\s+days?", q)
+    if m:
+        n = max(1, min(int(m.group(1)), 31))
+        dates = [today + timedelta(days=i) for i in range(n)]
+        header = f"Next {n} days"
+    elif "this week" in q:
+        monday = today - timedelta(days=today.weekday())  # CT week start
+        dates = [monday + timedelta(days=i) for i in range(7)]
+        header = "This week"
+    elif "tomorrow" in q:
+        dates = [today + timedelta(days=1)]
+    elif "today" in q or "tonight" in q:
+        dates = [today]
+    else:
+        wd = _detect_weekday(q)
+        if wd is not None:
+            delta = (wd - today.weekday()) % 7  # next occurrence (today counts)
+            dates = [today + timedelta(days=delta)]
+        elif re.search(r"\b(plan|week|workouts|schedule)\b", q) or "show" in q:
+            # "show my plan" with no temporal cue → the upcoming 7 days.
+            dates = [today + timedelta(days=i) for i in range(7)]
+            header = "Next 7 days"
+        else:
+            dates = [today]
+
+    lines: list[str] = []
+    if header:
+        lines.append(f"**{header}:**")
+    for d in dates:
+        row = _fetch_plan_row(d)
+        if row is None:
+            # HARD GUARD — exact string, no fabrication, no LLM.
+            lines.append(f"No plan seeded for {d.isoformat()}.")
+        else:
+            lines.append(_format_plan_lookup_day(d, row, today))
+    return "\n".join(lines)

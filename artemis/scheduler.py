@@ -1358,7 +1358,7 @@ class ArtemisScheduler:
         try:
             from artemis.health import (
                 already_prompted_today, build_calibrated_plan_post,
-                get_today_plan, get_today_state, mark_prompted,
+                get_today_plan, get_today_state, is_bike_session, mark_prompted,
                 read_bike_override, resolve_equipment_and_location,
             )
             from artemis.weather import get_current_conditions
@@ -1374,11 +1374,16 @@ class ArtemisScheduler:
                 return
 
             session_type = plan.get("session_type", "")
-            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
-            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+            # Gate bike override + weather on the ACTUAL session (blocks), not just
+            # session_type: Sat & Sun both map to cardio_z2 but only Sat is a bike
+            # ride; Sunday run-walk must not pull weather/indoor-outdoor handling.
+            is_bike = is_bike_session(plan)
+            override = read_bike_override(today) if is_bike else None
+            weather = get_current_conditions() if is_bike and not override else None
 
             resolved = resolve_equipment_and_location(
                 session_type, weather=weather, user_override=override,
+                blocks=plan.get("blocks"),
             )
 
             state = get_today_state()
@@ -1399,7 +1404,7 @@ class ArtemisScheduler:
         try:
             from artemis.health import (
                 already_prompted_today, build_evening_prompt,
-                get_today_plan, mark_prompted, read_bike_override,
+                get_today_plan, is_bike_session, mark_prompted, read_bike_override,
                 resolve_equipment_and_location,
             )
             from artemis.weather import get_current_conditions
@@ -1414,11 +1419,15 @@ class ArtemisScheduler:
                 return
 
             session_type = plan.get("session_type", "")
-            override = read_bike_override(today) if session_type in ("cardio_z2", "cardio_intervals") else None
-            weather = get_current_conditions() if session_type in ("cardio_z2", "cardio_intervals") and not override else None
+            # Gate bike override + weather on the ACTUAL session (blocks): only a
+            # real bike ride gets indoor/outdoor weather handling (run-walk won't).
+            is_bike = is_bike_session(plan)
+            override = read_bike_override(today) if is_bike else None
+            weather = get_current_conditions() if is_bike and not override else None
 
             resolved = resolve_equipment_and_location(
                 session_type, weather=weather, user_override=override,
+                blocks=plan.get("blocks"),
             )
             text = build_evening_prompt(plan, resolved)
             self.mm.post_message(config.CHANNEL_OPS, text)
