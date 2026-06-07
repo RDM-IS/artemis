@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -256,20 +257,28 @@ def _load_dotenv():
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def _load_rows_live(start: date, end: date) -> dict[date, dict]:
-    """READ-ONLY SELECT of health.plan over [start, end]. Returns {plan_date: row}."""
+@contextmanager
+def _connect():
+    """Yield a psycopg2 connection. Prefer DATABASE_URL; otherwise use the
+    knowledge.db pool via its own context manager (no manual __enter__)."""
     import psycopg2
-    _load_dotenv()
     url = os.environ.get("DATABASE_URL")
     if url:
         conn = psycopg2.connect(url, connect_timeout=10)
-        close = conn.close
+        try:
+            yield conn
+        finally:
+            conn.close()
     else:
         from knowledge.db import get_connection
-        cm = get_connection()
-        conn = cm.__enter__()
-        close = lambda: cm.__exit__(None, None, None)
-    try:
+        with get_connection() as conn:
+            yield conn
+
+
+def _load_rows_live(start: date, end: date) -> dict[date, dict]:
+    """READ-ONLY SELECT of health.plan over [start, end]. Returns {plan_date: row}."""
+    _load_dotenv()
+    with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT plan_date, session_type, blocks FROM health.plan "
@@ -279,9 +288,10 @@ def _load_rows_live(start: date, end: date) -> dict[date, dict]:
         rows = {}
         for plan_date, session_type, blocks in cur.fetchall():
             rows[plan_date] = {"session_type": session_type, "blocks": _coerce_blocks(blocks)}
+        # Read-only: roll back the read transaction so the pool path doesn't
+        # auto-commit anything on exit.
+        conn.rollback()
         return rows
-    finally:
-        close()
 
 
 def _load_rows_selftest(start: date, end: date, fault: bool) -> dict[date, dict]:

@@ -56,6 +56,7 @@ import copy
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -304,28 +305,27 @@ def _load_dotenv() -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+@contextmanager
 def _connect():
-    """Yield-like: return a psycopg2 connection. Prefer DATABASE_URL, else the
-    knowledge.db pool (EC2 path)."""
+    """Yield a psycopg2 connection. Prefer DATABASE_URL; otherwise use the
+    knowledge.db pool (EC2 path) via its own context manager.
+
+    The caller controls the transaction explicitly (commit on write, rollback on
+    dry-run). For the pool path we delegate to `with get_connection()` rather
+    than manually entering the CM, so cleanup/return-to-pool always happens.
+    """
     import psycopg2
     url = os.environ.get("DATABASE_URL")
     if url:
-        return psycopg2.connect(url, connect_timeout=10)
-    # EC2 path: reuse the app's pool helper.
-    from knowledge.db import get_connection
-    cm = get_connection()
-    conn = cm.__enter__()
-    # stash the context manager so caller can close it cleanly
-    conn._cm = cm  # type: ignore[attr-defined]
-    return conn
-
-
-def _close(conn) -> None:
-    cm = getattr(conn, "_cm", None)
-    if cm is not None:
-        cm.__exit__(None, None, None)
+        conn = psycopg2.connect(url, connect_timeout=10)
+        try:
+            yield conn
+        finally:
+            conn.close()
     else:
-        conn.close()
+        from knowledge.db import get_connection
+        with get_connection() as conn:
+            yield conn
 
 
 _UPSERT_SQL = """
@@ -450,42 +450,44 @@ def _validate(rows: list[dict]) -> None:
 
 def reseed(dry_run: bool) -> int:
     _load_dotenv()
-    conn = _connect()
-    try:
+    with _connect() as conn:
         cur = conn.cursor()
 
         ok, msg = _preflight(cur)
         print(f"[preflight] {msg}")
         if not ok and not dry_run:
+            conn.rollback()
             raise SystemExit(f"[ABORT] {msg}")
 
         existing = _read_existing(cur)
         if not existing:
             print("No existing rows in health.plan — nothing to reseed.")
+            conn.rollback()
             return 0
         rows = [build_row(e["plan_date"], e["phase"], e["week_num"]) for e in existing]
         _validate(rows)
         _print_summary(existing, rows)
 
         if dry_run:
+            # Read-only: roll back the (read) transaction, write nothing.
+            conn.rollback()
             print("[DRY-RUN] (default) No rows written. Re-run with --commit to write.")
             return 0
 
-        for r in rows:
-            cur.execute(_UPSERT_SQL, (
-                r["plan_date"], r["phase"], r["week_num"], r["session_type"],
-                json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
-                r["est_duration_min"], r["generated_by"], r["notes"],
-            ))
-        conn.commit()
+        try:
+            for r in rows:
+                cur.execute(_UPSERT_SQL, (
+                    r["plan_date"], r["phase"], r["week_num"], r["session_type"],
+                    json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
+                    r["est_duration_min"], r["generated_by"], r["notes"],
+                ))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         print(f"[OK] Rewrote {len(rows)} rows in health.plan "
               f"(generated_by='{GENERATED_BY_DB}').")
         return len(rows)
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _close(conn)
 
 
 def main() -> None:
