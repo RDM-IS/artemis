@@ -31,9 +31,10 @@ from artemis.inbox import (
     mark_needs_action,
     record_nudge,
     set_mattermost_post_id,
+    should_keep_in_inbox,
+    state_from_triage,
     upsert_thread,
     NEEDS_ACTION,
-    NOISE,
 )
 from artemis.monitors import (
     check_all_ssl,
@@ -269,6 +270,24 @@ class ArtemisScheduler:
             logger.exception("Gmail poll failed")
             return []
 
+    _state_from_triage = staticmethod(state_from_triage)
+
+    def _archive_for_state(self, message_id: str, state: str, subject: str = "") -> None:
+        """State-conditional archive gate (spec §2).
+
+        NEEDS_ACTION stays in INBOX; everything else is filed (archived).
+        Under FILING_DRY_RUN the decision is only logged — no mutation — so the
+        rubric can be verified against live mail before touching anything.
+        """
+        if should_keep_in_inbox(state):
+            logger.info("Filing gate: KEEP inbox [%s] state=%s", subject, state)
+            return
+        if config.FILING_DRY_RUN:
+            logger.info("Filing gate: DRY-RUN would ARCHIVE [%s] state=%s", subject, state)
+            return
+        self.gmail.archive_message(message_id)
+        logger.info("Filing gate: ARCHIVED [%s] state=%s", subject, state)
+
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
         if self._is_quiet():
@@ -315,9 +334,9 @@ class ArtemisScheduler:
                     )
                     if post.get("id"):
                         set_mattermost_post_id(msg["thread_id"], post["id"])
-                    # Archive after successful tracking
-                    self.gmail.archive_message(msg["id"])
-                    logger.info("Archived [%s] from %s", msg["subject"], msg["from_email"])
+                    # Priority sender is tracked NEEDS_ACTION → the gate keeps it
+                    # in INBOX (a human decision is required).
+                    self._archive_for_state(msg["id"], NEEDS_ACTION, msg.get("subject", ""))
                 except Exception:
                     logger.exception(
                         "Failed to track priority email — NOT archiving %s", msg["id"]
@@ -344,24 +363,15 @@ class ArtemisScheduler:
 
                 for i, item in enumerate(triaged):
                     urgency = item.get("urgency", "low")
-                    sender_type = item.get("sender_type", "")
                     playbook_match = item.get("playbook_match")
                     orig = non_priority[i] if i < len(non_priority) else None
 
-                    if urgency in ("high", "medium") and orig:
+                    # Rubric-assigned state drives both tracking and the archive gate.
+                    state = self._state_from_triage(item)
+                    if orig:
                         upsert_thread(
                             orig["thread_id"], orig["subject"], orig["from_email"],
-                            state=NEEDS_ACTION,
-                        )
-                    elif sender_type == "noise" and orig:
-                        upsert_thread(
-                            orig["thread_id"], orig["subject"], orig["from_email"],
-                            state=NOISE,
-                        )
-                    elif orig:
-                        upsert_thread(
-                            orig["thread_id"], orig["subject"], orig["from_email"],
-                            state=NEEDS_ACTION,
+                            state=state,
                         )
 
                     if urgency == "high":
@@ -415,10 +425,9 @@ class ArtemisScheduler:
                         if email_text:
                             self._check_scheduling_request(orig, email_text)
 
-                    # Archive every processed email
+                    # State-conditional archive gate (NEEDS_ACTION stays in INBOX)
                     if orig:
-                        self.gmail.archive_message(orig["id"])
-                        logger.info("Archived [%s] from %s", orig.get("subject", ""), orig.get("from_email", ""))
+                        self._archive_for_state(orig["id"], state, orig.get("subject", ""))
 
             # Record successful triage timestamp for catch-up on restart
             try:
@@ -1670,12 +1679,9 @@ class ArtemisScheduler:
                 for i, item in enumerate(triaged):
                     orig = new_messages[i] if i < len(new_messages) else None
                     if orig:
-                        from artemis.inbox import upsert_thread, NEEDS_ACTION, NOISE
-                        sender_type = item.get("sender_type", "")
-                        if sender_type == "noise":
-                            upsert_thread(orig["thread_id"], orig["subject"], orig.get("from_email", ""), state=NOISE)
-                        else:
-                            upsert_thread(orig["thread_id"], orig["subject"], orig.get("from_email", ""), state=NEEDS_ACTION)
+                        # Rubric-assigned state drives tracking and the archive gate.
+                        state = self._state_from_triage(item)
+                        upsert_thread(orig["thread_id"], orig["subject"], orig.get("from_email", ""), state=state)
                         emails_processed += 1
 
                         # Execute playbooks
@@ -1687,8 +1693,8 @@ class ArtemisScheduler:
                             self._execute_playbook(playbook_match, orig, item)
                             playbooks_fired += 1
 
-                        # Archive
-                        self.gmail.archive_message(orig["id"])
+                        # State-conditional archive gate (NEEDS_ACTION stays in INBOX)
+                        self._archive_for_state(orig["id"], state, orig.get("subject", ""))
         except Exception:
             logger.exception("Catch-up email processing failed")
 

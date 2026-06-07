@@ -19,6 +19,25 @@ For each email, provide:
 - one_line_summary: a single sentence summary
 - needs_action: true or false
 - playbook_match: the playbook ID that matches (e.g. "PB-001"), or null if none match
+- state: NEEDS_ACTION, DONE, or NOISE — assigned by the rubric below
+
+STATE RUBRIC (the importance judgment — the core of the job).
+Apply these tests in priority order and assign the FIRST that matches:
+- NEEDS_ACTION — a specific person is waiting on your reply or decision; OR money
+  needs verification or payment; OR a security / access / legal decision; OR a
+  deadline with a real consequence if missed.
+- DONE — notification of a COMPLETED automated action (PR deployed, build green);
+  OR a receipt / confirmation already reconciled. (file, leaves the inbox)
+- NOISE — newsletter or vendor update with no ask; OR marketing with no
+  relationship. (file, leaves the inbox)
+
+Judge by BODY CONTEXT, not keywords. The defining example: a "deploy succeeded"
+notification is DONE (file); a "deploy failed" notification from the same sender
+with the same subject is NEEDS_ACTION (inbox). Same sender, same subject, opposite
+handling — decided purely by what the body says.
+
+UNCERTAINTY RULE: when the rubric is genuinely ambiguous, default to NEEDS_ACTION.
+A false inbox costs a glance; a false file drops a ball.
 
 You have access to standing playbooks that define automatic handling procedures.
 When an email matches a playbook trigger, include the playbook ID so it can be

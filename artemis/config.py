@@ -150,6 +150,19 @@ OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 # Database
 SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
 
+
+def _bool(val: str, default: bool = False) -> bool:
+    if val is None or val == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Filing engine (state→INBOX gate)
+# When TRUE (default), the archive gate only LOGS its keep/archive decision and
+# never removes a message from INBOX — observe-mode so the rubric can be verified
+# against live mail before any mutation. Set FILING_DRY_RUN=false to act for real.
+FILING_DRY_RUN = _bool(os.environ.get("FILING_DRY_RUN", "true"), default=True)
+
 # Weekly staples (grocery)
 WEEKLY_STAPLES = os.environ.get("WEEKLY_STAPLES", "")
 
