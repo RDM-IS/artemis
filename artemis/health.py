@@ -122,6 +122,21 @@ def _call_claude_json(system: str, user_msg: str, max_tokens: int = 600) -> dict
     return json.loads(text.strip())
 
 
+def _call_claude_text(system: str, user_msg: str, max_tokens: int = 200) -> str:
+    """Call Claude with a system prompt that emits plain text. Returns the text.
+
+    Same trainer-voice LLM path used elsewhere; raises on any API/auth failure so
+    callers can degrade gracefully (e.g. return the structured render alone)."""
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    return response.content[0].text.strip()
+
+
 # ============================================================================
 # Morning check-in parser
 # ============================================================================
@@ -575,19 +590,58 @@ _PLAN_LOOKUP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# PB-009 plan-DETAIL intent — single-day DEPTH ("explain the whole session"),
+# as opposed to plan_lookup which is multi-day BREADTH ("list the next 7 days").
+INTENT_PLAN_DETAIL = "plan_detail"
+
+# Depth cues → user wants the full session broken down.
+_DETAIL_CUE = (
+    r"(?:detail(?:ed|s)?|full|complete|whole|entire|break[\s-]*down|"
+    r"explain(?:ed)?|explanation|walk\s+me\s+through|in[\s-]?depth|"
+    r"deep\s+dive|elaborate|everything)"
+)
+# Breadth cues → a multi-day list; these stay plan_lookup (depth never applies).
+_MULTIDAY_RE = re.compile(
+    r"\b(?:next\s+\d+\s+days?|this\s+week|the\s+week|coming\s+days?|"
+    r"rest\s+of\s+the\s+week|\d+\s+days)\b",
+    re.IGNORECASE,
+)
+_SINGLE_DAY_REF = rf"(?:today|tonight|tomorrow|{_WEEKDAY_WORD})"
+# Explicit depth request tied to a session / day / plan noun.
+_PLAN_DETAIL_RE = re.compile(
+    rf"\b{_DETAIL_CUE}\b.*\b(?:{_PLAN_NOUN}|session|{_SINGLE_DAY_REF})\b"
+    rf"|\b(?:{_PLAN_NOUN}|session|{_SINGLE_DAY_REF})\b.*\b{_DETAIL_CUE}\b",
+    re.IGNORECASE,
+)
+# A single-day plan request with no breadth cue → defaults to DEPTH (per spec:
+# a bare "today's workout" should return the full session, not a one-liner).
+_SINGLE_DAY_PLAN_RE = re.compile(
+    rf"\b{_SINGLE_DAY_REF}\b.*\b(?:{_PLAN_NOUN}|session)\b"
+    rf"|\b(?:{_PLAN_NOUN}|session)\b.*\b{_SINGLE_DAY_REF}\b",
+    re.IGNORECASE,
+)
+
 
 def detect_health_intent(message: str) -> str | None:
     """Lightweight regex pre-check for health intents.
 
-    Returns 'plan_lookup', 'log_morning_state', 'log_workout_debrief',
-    'trainer_override', or None. Cheaper than calling Claude — used as a first
-    pass before the main router.
+    Returns 'plan_detail', 'plan_lookup', 'log_morning_state',
+    'log_workout_debrief', 'trainer_override', or None. Cheaper than calling
+    Claude — used as a first pass before the main router.
     """
     # Trainer override is most specific — match first.
     if _OVERRIDE_RE.match(message):
         return INTENT_TRAINER_OVERRIDE
-    # Plan-lookup (read-intent) before debrief/morning: it requires a plan noun
-    # plus a temporal/show cue, so it can't collide with "done"/"RPE"/"slept".
+
+    # Depth vs breadth: a multi-day request is always breadth (plan_lookup). A
+    # single-day request — explicit detail OR a bare "today's workout" — is
+    # depth (plan_detail). Depth is checked first so single-day wins.
+    if not _MULTIDAY_RE.search(message):
+        if _PLAN_DETAIL_RE.search(message) or _SINGLE_DAY_PLAN_RE.search(message):
+            return INTENT_PLAN_DETAIL
+
+    # Plan-lookup (breadth read-intent): requires a plan noun plus a temporal/
+    # show cue, so it can't collide with "done"/"RPE"/"slept".
     if _PLAN_LOOKUP_RE.search(message):
         return INTENT_PLAN_LOOKUP
     # Debrief next because "done" + "RPE X" is more specific than
@@ -2192,17 +2246,18 @@ def _format_plan_lookup_day(d: date, row: dict, today: date) -> str:
         line += " _(skipped)_"
 
     main, fin = _exercise_names_from_blocks(row.get("blocks"))
+    parts = [line]
     if main:
-        line += "\n   " + ", ".join(main)
+        parts.append("• " + ", ".join(main))
     if fin:
-        line += "\n   finisher: " + ", ".join(fin)
+        parts.append("• finisher: " + ", ".join(fin))
     if not main and not fin:
         # Cardio/rest days legitimately have no exercise list — show the type.
-        b = _coerce_blocks(row.get("blocks"))
-        btype = b.get("type")
+        btype = blocks.get("type")
         if btype:
-            line += f"\n   ({btype})"
-    return line
+            parts.append(f"• ({btype})")
+    # One item per line so Mattermost doesn't run the day together.
+    return "\n".join(parts)
 
 
 def get_plan_lookup(message: str) -> str:
@@ -2241,14 +2296,264 @@ def get_plan_lookup(message: str) -> str:
         else:
             dates = [today]
 
-    lines: list[str] = []
+    blocks_out: list[str] = []
     if header:
-        lines.append(f"**{header}:**")
+        blocks_out.append(f"**{header}:**")
     for d in dates:
         row = _fetch_plan_row(d)
         if row is None:
             # HARD GUARD — exact string, no fabrication, no LLM.
-            lines.append(f"No plan seeded for {d.isoformat()}.")
+            blocks_out.append(f"No plan seeded for {d.isoformat()}.")
         else:
-            lines.append(_format_plan_lookup_day(d, row, today))
-    return "\n".join(lines)
+            blocks_out.append(_format_plan_lookup_day(d, row, today))
+    # Blank line between days so the multi-day view isn't a run-on.
+    return "\n\n".join(blocks_out)
+
+
+# ----------------------------------------------------------------------------
+# PB-009 plan_detail — single-day DEPTH: render the FULL block + coaching note.
+#
+# get_plan_detail() expands everything health.plan.blocks already carries that
+# the breadth view discards: duration, RPE, HR zone, warmup/cooldown, every
+# exercise with sets/reps/load/rest, and the finisher's rep schemes. A short
+# trainer-voice coaching note is appended via the LLM — constrained to THIS
+# block only (no invention, no history). Missing dates use the same exact
+# "No plan seeded for <date>." guard and never reach the LLM.
+# ----------------------------------------------------------------------------
+
+_HR_ZONE_LABEL = {
+    1: "Zone 1 — very easy, recovery",
+    2: "Zone 2 — conversational pace",
+    3: "Zone 3 — steady, controlled effort",
+    4: "Zone 4 — hard, near threshold",
+    5: "Zone 5 — max effort",
+}
+
+
+def _hr_zone_label(zone) -> str:
+    try:
+        return _HR_ZONE_LABEL.get(int(zone), f"HR zone {zone}")
+    except (TypeError, ValueError):
+        return f"HR zone {zone}"
+
+
+def _format_exercise_detail(ex: dict) -> str:
+    """Format-aware one-line detail: reps (× load) or held duration, + side
+    note and rest."""
+    name = str(ex.get("name", "")).strip() or "exercise"
+    fmt = ex.get("format")
+    dur = ex.get("duration_sec")
+    reps = ex.get("target_reps")
+    if fmt == "duration" or (dur is not None and reps is None):
+        core = f"{dur}s" if dur is not None else "hold"
+    elif reps is not None:
+        core = f"{reps} reps"
+        load = ex.get("target_load_lbs")
+        if load is not None:
+            core += f" @ {_fmt_num(load)} lb"
+    else:
+        core = "as prescribed"
+    seg = f"{name} — {core}"
+    note = ex.get("notes")
+    if note:
+        seg += f" ({note})"
+    rest = ex.get("rest_after_sec")
+    if rest is not None:
+        seg += f" · rest {rest}s"
+    return seg
+
+
+def _render_finisher(fin: dict) -> str:
+    rounds = fin.get("rounds")
+    head = f"**Core finisher** — {rounds} rounds:" if rounds else "**Core finisher:**"
+    out = [head]
+    for ex in fin.get("exercises") or []:
+        if isinstance(ex, dict) and ex.get("name"):
+            out.append(f"• {_format_exercise_detail(ex)}")
+    return "\n".join(out)
+
+
+def _render_circuit(blocks: dict) -> list[str]:
+    sections: list[str] = []
+    if blocks.get("warmup"):
+        sections.append(f"**Warmup:** {blocks['warmup']}")
+
+    rounds = blocks.get("rounds")
+    rbr = blocks.get("rest_between_rounds_sec")
+    head = f"**Circuit** — {rounds} rounds" if rounds else "**Circuit**"
+    if rbr:
+        head += f" ({rbr}s rest between rounds)"
+    head += ":"
+    lines = [head]
+    for i, ex in enumerate(blocks.get("exercises") or [], 1):
+        if isinstance(ex, dict) and ex.get("name"):
+            lines.append(f"{i}. {_format_exercise_detail(ex)}")
+    sections.append("\n".join(lines))
+
+    fin = blocks.get("finisher")
+    if isinstance(fin, dict):
+        sections.append(_render_finisher(fin))
+    if blocks.get("cooldown"):
+        sections.append(f"**Cooldown:** {blocks['cooldown']}")
+    return sections
+
+
+def _render_cardio(blocks: dict) -> list[str]:
+    sections: list[str] = []
+    it = blocks.get("intervals_template") if isinstance(blocks.get("intervals_template"), dict) else None
+    if it:
+        rounds = blocks.get("rounds")
+        work, wset = it.get("work_sec"), it.get("work_settings")
+        rest, rset = it.get("rest_sec"), it.get("rest_settings")
+        seg = f"**Intervals** — {rounds} rounds: " if rounds else "**Intervals:** "
+        seg += f"{work}s work" + (f" ({wset})" if wset else "")
+        seg += f" / {rest}s easy" + (f" ({rset})" if rset else "")
+        sections.append(seg)
+    else:
+        dur = blocks.get("duration_min")
+        rng = blocks.get("target_range_min")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            dstr = f"{rng[0]}–{rng[1]} min"
+        elif dur:
+            dstr = f"{dur} min"
+        else:
+            dstr = ""
+        inten = blocks.get("intensity")
+        seg = "**Steady**"
+        if dstr:
+            seg += f": {dstr}"
+        if inten:
+            seg += f" at {inten}"
+        sections.append(seg)
+
+    wc = []
+    wu, cd = blocks.get("warmup_sec"), blocks.get("cooldown_sec")
+    if wu:
+        wc.append(f"Warmup {wu // 60} min" + (f" ({blocks.get('warmup_settings')})" if blocks.get("warmup_settings") else ""))
+    if cd:
+        wc.append(f"Cooldown {cd // 60} min" + (f" ({blocks.get('cooldown_settings')})" if blocks.get("cooldown_settings") else ""))
+    if wc:
+        sections.append(" · ".join(wc))
+
+    equip = blocks.get("equipment")
+    if equip:
+        sections.append("Equipment: " + ", ".join(str(e) for e in equip))
+
+    fin = blocks.get("finisher")
+    if isinstance(fin, dict):
+        sections.append(_render_finisher(fin))
+
+    notes = blocks.get("setup_notes")
+    if notes:
+        sections.append("Notes: " + "; ".join(str(n) for n in notes))
+    return sections
+
+
+def _render_mobility(blocks: dict) -> list[str]:
+    sections: list[str] = []
+    if blocks.get("notes"):
+        sections.append(str(blocks["notes"]))
+    dur = blocks.get("duration_min")
+    if dur:
+        sections.append(f"Duration: {dur} min")
+    return sections
+
+
+def _render_full_block(d: date, row: dict, today: date) -> str:
+    """Render the full session from a plan row's blocks + columns."""
+    blocks = _coerce_blocks(row.get("blocks"))
+    display = blocks.get("display_name") or _session_pretty_name(row.get("session_type", "?"))
+
+    header = f"**{_relative_day_label(d, today)} — {display}**"
+    if row.get("is_skipped"):
+        header += " _(skipped)_"
+
+    meta = []
+    est = row.get("est_duration_min")
+    if est:
+        meta.append(f"~{est} min")
+    rpe = row.get("target_rpe")
+    if rpe is not None:
+        meta.append(f"target RPE {_fmt_num(rpe)}")
+    zone = row.get("target_hr_zone")
+    if zone is not None:
+        meta.append(_hr_zone_label(zone))
+    elif blocks.get("intensity"):
+        meta.append(str(blocks["intensity"]))
+
+    btype = blocks.get("type")
+    if btype == "circuit":
+        body = _render_circuit(blocks)
+    elif btype in ("intervals", "steady"):
+        body = _render_cardio(blocks)
+    elif btype == "mobility":
+        body = _render_mobility(blocks)
+    else:
+        body = []
+
+    sections = [header]
+    if meta:
+        sections.append(" · ".join(meta))
+    sections.extend(body)
+    # Blank line between sections → readable in Mattermost.
+    return "\n\n".join(s for s in sections if s)
+
+
+def _coach_note(structured_text: str, display_name: str) -> str | None:
+    """1-2 sentences of trainer guidance for THIS session, via the trainer-voice
+    LLM. Constrained to the given block; returns None if the LLM is unavailable
+    so the caller falls back to the structured render alone."""
+    system = TRAINER_VOICE_PROMPT + (
+        "\n\nYou are given the EXACT prescription for ONE workout session below. "
+        "Add 1-2 short sentences of practical coaching for THIS session only. "
+        "Explain only what is in the block — do NOT invent exercises, do NOT change "
+        "any loads, reps, sets, or timings, and do NOT reference past sessions or "
+        "any conversation. No emojis, no hype, no lists."
+    )
+    user = (
+        f"Session: {display_name}\n\n"
+        f"{structured_text}\n\n"
+        "Give 1-2 sentences of coaching for this exact session."
+    )
+    try:
+        note = _call_claude_text(system, user, max_tokens=140).strip()
+        return note or None
+    except Exception:
+        logger.debug("Coaching note unavailable — returning structured render only", exc_info=True)
+        return None
+
+
+def _fetch_plan_full(d: date) -> dict | None:
+    from knowledge.db import execute_one
+    return execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (d,))
+
+
+def get_plan_detail(message: str) -> str:
+    """Handle the 'plan_detail' intent — full single-day session breakdown.
+
+    Resolves the target date (CT-anchored; today / tomorrow / weekday), renders
+    the FULL block, then appends a constrained trainer-voice coaching note.
+    Missing dates yield exactly "No plan seeded for <date>." and never reach the
+    LLM. Always returns a non-empty string.
+    """
+    q = (message or "").lower()
+    today = datetime.now(CT).date()
+
+    if "tomorrow" in q:
+        target = today + timedelta(days=1)
+    elif "today" in q or "tonight" in q:
+        target = today
+    else:
+        wd = _detect_weekday(q)
+        target = today + timedelta(days=(wd - today.weekday()) % 7) if wd is not None else today
+
+    row = _fetch_plan_full(target)
+    if row is None:
+        # HARD GUARD — exact string, no fabrication, no LLM coaching.
+        return f"No plan seeded for {target.isoformat()}."
+
+    structured = _render_full_block(target, row, today)
+    blocks = _coerce_blocks(row.get("blocks"))
+    display = blocks.get("display_name") or _session_pretty_name(row.get("session_type", "?"))
+    coach = _coach_note(structured, display)
+    return f"{structured}\n\n{coach}" if coach else structured
