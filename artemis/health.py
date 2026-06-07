@@ -634,16 +634,37 @@ _PLAN_META_RE = re.compile(
     r"|\bwhat'?s\s+in\s+the\s+(?:plan|workout|training)\b",
     re.IGNORECASE,
 )
-# Anti-confabulation fallback: a clearly WORKOUT-flavoured message that matched no
-# specific intent above. Strong fitness terms only (deliberately excludes bare
-# "plan/session/sets/reps/lift" so it can't hijack calendar / CRM / "set up a
-# meeting"). The general_reply scrubber (scrub_db_denial) is the backstop for the
-# long tail.
-_HEALTH_TOPIC_RE = re.compile(
-    r"\b(?:work\s?outs?|exercises?|cardio|rpe|routines?|training|"
+# Plan/exercise terms used by the (tightened) data-retrieval fallback. Strong
+# fitness terms only — no bare "plan/session/sets/reps/lift" that would hijack
+# calendar / CRM / "set up a meeting".
+_PLAN_TERM_BODY = (
+    r"work\s?outs?|exercises?|cardio|routines?|training|program|"
     r"warm\s?ups?|cool\s?downs?|circuits?|intervals?|finishers?|"
-    r"deadlift|goblet|kettlebell|dumbbell|powerblock|rower|treadmill|"
-    r"run[\s-]?walk|rest\s+day|zone\s+\d|z2)\b",
+    r"deadlift|goblet|squat|lunge|rdl|kettlebell|dumbbell|powerblock|rower|treadmill|"
+    r"run[\s-]?walk|rest\s+day|zone\s+\d|z2|workout\s+plan|training\s+plan"
+)
+# Retrieval signals: possessive/demonstrative or a retrieval verb adjacent to a
+# plan/exercise term — i.e. the user wants the DATA, not a discussion.
+_PLAN_POSSESS = r"my|the|today'?s|tonight'?s|tomorrow'?s|this"
+_PLAN_RETRIEVAL_VERB = (
+    r"show|pull(?:\s+up)?|give\s+me|tell\s+me(?:\s+about)?|what'?s\s+the|"
+    r"what\s+is\s+the|list|bring\s+up|look\s+up|break\s*down|run\s+down|breakdown\s+of"
+)
+_PLAN_RETRIEVAL_RE = re.compile(
+    rf"\b(?:{_PLAN_POSSESS})\s+(?:\w+\s+){{0,2}}(?:{_PLAN_TERM_BODY})\b"        # "my cardio", "the deadlift weight", "today's session"
+    rf"|\b(?:{_PLAN_RETRIEVAL_VERB})\b.*\b(?:{_PLAN_TERM_BODY})\b"             # "tell me about my cardio", "what's the deadlift weight"
+    rf"|\b(?:{_PLAN_RETRIEVAL_VERB})\s+(?:me\s+|us\s+|up\s+)?(?:today|tonight|tomorrow)(?:'s)?\s*[.!?]*$",  # "show me today" (day at end, not "today's calendar")
+    re.IGNORECASE,
+)
+# Conceptual / progress / state markers. When present, the message is a question
+# or opinion (not a data pull), so it must reach the (now plan-aware)
+# general_reply trainer-voice path — NOT plan_detail.
+_CONCEPTUAL_RE = re.compile(
+    r"\b(?:why|how'?s|how\s+is|how\s+are|how\s+am|how\s+many|how\s+much|"
+    r"better\s+than|worse\s+than|should\s+i|vs\.?|versus|feels?\s+like|feeling\s+like|"
+    r"going|on\s+track|worth\s+it|matters?|important|explain|difference|over\s?train\w*|"
+    r"sore|wrecked|hurts?|tired|exhausted|"
+    r"is\s+it\s+(?:ok|okay|normal|good|bad|fine))\b",
     re.IGNORECASE,
 )
 
@@ -681,11 +702,13 @@ def detect_health_intent(message: str) -> str | None:
     if _MORNING_TRIGGER.search(message):
         return "log_morning_state"
 
-    # ANTI-CONFABULATION FALLBACK: any clearly workout-flavoured message that
-    # matched nothing specific still routes to the plan handler (default today),
-    # so it can NEVER fall through to general_reply and have the LLM deny that a
-    # workout database exists.
-    if _HEALTH_TOPIC_RE.search(message):
+    # DATA-RETRIEVAL fallback (tightened — Option C): only a message that wants
+    # the plan DATA (possessive/retrieval signal + a plan term, and NOT a
+    # conceptual/progress/state question) routes to plan_detail. Conceptual asks
+    # ("why is zone 2 important", "how's my training going", "is the rower better
+    # than running") fall through to the now plan-aware general_reply path. The
+    # scrub_db_denial output guard remains the anti-denial backstop.
+    if not _CONCEPTUAL_RE.search(message) and _PLAN_RETRIEVAL_RE.search(message):
         return INTENT_PLAN_DETAIL
     return None
 
@@ -2669,3 +2692,97 @@ def scrub_db_denial(response: str | None, message: str) -> str:
         )
         return get_plan_detail(message or "today's workout")
     return response or ""
+
+
+# ----------------------------------------------------------------------------
+# Compact health slice for the general_reply (trainer-voice) context.
+#
+# general_reply was historically BLIND to health.plan (its context held only
+# email/calendar/commitments/inbox), which is the root cause of the "I don't have
+# a workout database" confabulation AND of uninformed answers to conceptual /
+# progress questions. This slice gives the trainer voice just enough real data —
+# today + next few days, and the last few logged sessions — to answer
+# conversational workout questions truthfully. It is a SUMMARY (token-bounded),
+# never full blocks; full detail still comes from get_plan_detail.
+# ----------------------------------------------------------------------------
+
+def _one_line_block_summary(blocks) -> str:
+    b = _coerce_blocks(blocks)
+    t = b.get("type")
+    if t == "circuit":
+        n = len([e for e in (b.get("exercises") or []) if isinstance(e, dict)])
+        rounds = b.get("rounds")
+        s = f"{n}-exercise circuit"
+        return s + (f", {rounds} rounds" if rounds else "")
+    if t in ("intervals", "steady"):
+        dur = b.get("duration_min")
+        rng = b.get("target_range_min")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            dstr = f"~{rng[0]}–{rng[1]} min"
+        elif dur:
+            dstr = f"~{dur} min"
+        else:
+            dstr = ""
+        label = "intervals" if t == "intervals" else "steady"
+        return (f"{label}, {dstr}".rstrip(", ")) if dstr else label
+    if t == "mobility":
+        return "mobility / rest"
+    return t or ""
+
+
+def build_context_slice(days_ahead: int = 3, recent: int = 3) -> str:
+    """Return a compact, token-bounded training summary for the general_reply
+    LLM context: today + next `days_ahead` days (session + one-liner) and the
+    last `recent` logged sessions (date, type, how it went). Empty string on any
+    error — never raises into the mention path."""
+    try:
+        from knowledge.db import execute_query
+        today = datetime.now(CT).date()
+
+        plan_rows = execute_query(
+            "SELECT plan_date, session_type, blocks FROM health.plan "
+            "WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date",
+            (today, today + timedelta(days=days_ahead)),
+        )
+        logged = execute_query(
+            """SELECT p.plan_date, p.session_type, sl.rpe_actual, sl.notes
+               FROM health.session_log sl
+               JOIN health.plan p ON p.plan_id = sl.plan_id
+               WHERE sl.log_type = 'session_summary'
+               ORDER BY sl.logged_at DESC
+               LIMIT %s""",
+            (recent,),
+        )
+
+        lines: list[str] = []
+        if plan_rows:
+            lines.append("Upcoming (you DO have this from health.plan):")
+            for r in plan_rows:
+                b = _coerce_blocks(r.get("blocks"))
+                disp = b.get("display_name") or _session_pretty_name(r["session_type"])
+                summ = _one_line_block_summary(b)
+                label = _relative_day_label(r["plan_date"], today)
+                lines.append(f"  - {label}: {disp}" + (f" — {summ}" if summ else "")
+                             + f"  [session_type={r['session_type']}]")
+        if logged:
+            lines.append("Recent logged sessions (health.session_log):")
+            for r in logged:
+                rpe = r.get("rpe_actual")
+                note = (r.get("notes") or "").strip()
+                bits = []
+                if rpe is not None:
+                    bits.append(f"RPE {_fmt_num(rpe)}")
+                if note:
+                    bits.append(note[:60])
+                d = r["plan_date"]
+                lines.append(
+                    f"  - {d.isoformat()} {_session_pretty_name(r['session_type'])}"
+                    + (f" ({'; '.join(bits)})" if bits else "")
+                )
+
+        if not lines:
+            return ""
+        return "**Training plan & recent sessions (health.plan / health.session_log):**\n" + "\n".join(lines)
+    except Exception:
+        logger.debug("build_context_slice failed", exc_info=True)
+        return ""

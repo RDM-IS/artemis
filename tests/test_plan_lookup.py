@@ -82,10 +82,34 @@ class TestIntentClassification(unittest.TestCase):
             self.assertEqual(detect_health_intent(msg), INTENT_PLAN_LOOKUP, msg)
 
     def test_does_not_hijack_non_workout_topics(self):
-        # Strong-fitness fallback must not grab calendar / CRM / scheduling.
+        # Tightened fallback must not grab calendar / CRM / scheduling.
         self.assertIsNone(detect_health_intent("set up a meeting with greg"))
         self.assertIsNone(detect_health_intent("query the crm database"))
         self.assertIsNone(detect_health_intent("what's on my calendar"))
+        self.assertIsNone(detect_health_intent("show me today's calendar"))
+
+    def test_conceptual_progress_state_reach_general_reply(self):
+        # Option C: conceptual/progress/state questions must NOT hit plan_detail —
+        # they fall through (None) to the now plan-aware general_reply path.
+        for msg in [
+            "why is zone 2 important",
+            "how's my training going",
+            "is the rower better than running",
+            "my legs are wrecked from cardio",
+            "should I add a finisher",
+            "what's a good warmup",
+        ]:
+            self.assertIsNone(detect_health_intent(msg), msg)
+
+    def test_data_retrieval_routes_to_plan_detail(self):
+        # Data-retrieval intent (retrieval signal + plan term) still → plan_detail.
+        for msg in [
+            "tell me about my cardio",
+            "what's the deadlift weight",
+            "show me today",
+            "pull up my workout plan",
+        ]:
+            self.assertEqual(detect_health_intent(msg), INTENT_PLAN_DETAIL, msg)
 
     def test_does_not_swallow_debrief_or_morning(self):
         self.assertEqual(detect_health_intent("done"), "log_workout_debrief")
@@ -353,6 +377,44 @@ class TestAntiConfabulation(unittest.TestCase):
         self.assertIn(f"your plan runs {first.isoformat()} to {last.isoformat()}", reply)
         llm.assert_not_called()
         self._assert_no_denial(reply)
+
+
+# ---------------------------------------------------------------------------
+# general_reply now SEES the plan (Option C) — build_context_slice
+# ---------------------------------------------------------------------------
+
+class TestContextSlice(unittest.TestCase):
+    def test_slice_contains_today_session_and_recent_logs(self):
+        today = datetime.now(CT).date()
+
+        def fake_query(sql, params=()):
+            s = " ".join(sql.split())
+            if "FROM health.plan WHERE plan_date BETWEEN" in s:
+                return [{
+                    "plan_date": today, "session_type": "cardio_z2",
+                    "blocks": {"type": "steady", "display_name": "Long Z2 Bike",
+                               "duration_min": 55, "target_range_min": [45, 55]},
+                }]
+            if "log_type = 'session_summary'" in s:
+                return [{"plan_date": today - timedelta(days=2),
+                         "session_type": "strength_a", "rpe_actual": 7.5,
+                         "notes": "felt strong"}]
+            return []
+
+        with mock.patch("knowledge.db.execute_query", side_effect=fake_query):
+            sliced = health.build_context_slice()
+
+        # The trainer voice can now SEE today's session + recent training.
+        self.assertIn("session_type=cardio_z2", sliced)
+        self.assertIn("Long Z2 Bike", sliced)
+        self.assertIn("Recent logged sessions", sliced)
+        self.assertIn("felt strong", sliced)
+        # And it explicitly affirms the data exists (anti-confabulation framing).
+        self.assertIn("you DO have this", sliced)
+
+    def test_slice_empty_on_no_data(self):
+        with mock.patch("knowledge.db.execute_query", return_value=[]):
+            self.assertEqual(health.build_context_slice(), "")
 
 
 if __name__ == "__main__":

@@ -309,6 +309,16 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     except Exception:
         logger.exception("Failed to get inbox status for mention context")
 
+    # Training plan slice — so general_reply (trainer voice) can answer workout
+    # questions from REAL data and never claim the plan/database doesn't exist.
+    try:
+        from artemis.health import build_context_slice
+        health_slice = build_context_slice()
+        if health_slice:
+            parts.append("\n" + health_slice)
+    except Exception:
+        logger.exception("Failed to add training slice to mention context")
+
     return UNTRUSTED_PREFIX + "\n".join(parts) if parts else "No context available."
 
 
