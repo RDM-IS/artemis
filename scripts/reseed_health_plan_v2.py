@@ -25,9 +25,10 @@ migration touching these columns):
     and the blocks payload, neither of which changes the documented JSON shape.
   * health.plan.generated_by CHECK allows ONLY:
       baseline, autoreg_morning, autoreg_evening, manual
-    'reseed_v2' would violate it, so generated_by is written as 'manual' and the
-    'reseed_v2' provenance tag is recorded in notes. Flip GENERATED_BY_DB to
-    'reseed_v2' only after expanding that CHECK.
+    A human-run reseed is a MANUAL change, so generated_by is written as 'manual'
+    (the correct semantic, not a workaround). The CHECK is NOT expanded. Provenance
+    is preserved by appending a 'reseed_v2 <ISO-date>' tag to each row's notes
+    (existing notes kept; see _compose_notes).
 
 blocks JSON shape is held EXACTLY to the live contract (read by the scheduler,
 the conversational logger, and api/app/routers/health.py):
@@ -55,6 +56,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -63,12 +65,33 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-# Per the latest instruction, generated_by is written literally as 'reseed_v2'.
-# NOTE: migration 013_health_schema.sql DOES define a CHECK on generated_by
-# (baseline/autoreg_morning/autoreg_evening/manual). If the LIVE schema still
-# carries that CHECK, this value is rejected — _preflight() detects that and
-# aborts a --commit run with a clear message before any write.
-GENERATED_BY_DB = "reseed_v2"
+# health.plan.generated_by is CHECK-constrained to
+# (baseline | autoreg_morning | autoreg_evening | manual). A human-run reseed is
+# a MANUAL change, so 'manual' is the correct semantic value (not a workaround).
+# We do NOT expand the CHECK (same policy as session_type). Provenance that we'd
+# otherwise have lost from generated_by is preserved as a tag in notes instead
+# (see _compose_notes / RESEED_TAG).
+GENERATED_BY_DB = "manual"
+
+# Provenance marker appended to each row's notes (since generated_by can't carry it).
+RESEED_TAG = "reseed_v2"
+_RESEED_TAG_RE = re.compile(r"\s*\|?\s*reseed_v2\b[^|]*", re.IGNORECASE)
+
+
+def _compose_notes(existing_notes: str | None, program_label: str, run_iso: str) -> str:
+    """Append a 'reseed_v2 <ISO-date>' provenance tag to a row's notes.
+
+    Keeps any existing notes content (append, don't overwrite); falls back to the
+    program label when the row had no notes, so we still record which program was
+    applied. Any prior reseed_v2 tag is stripped first so re-running stays
+    idempotent rather than accumulating tags.
+    """
+    base = (existing_notes or "").strip()
+    base = _RESEED_TAG_RE.sub("", base).strip().strip("|").strip()
+    if not base:
+        base = program_label
+    tag = f"{RESEED_TAG} {run_iso}"
+    return f"{base} | {tag}" if base else tag
 
 # Canonical equipment inventory (PB-009). NO treadmill, no unprogrammed filler.
 _EQ_POWERBLOCKS = "PowerBlocks 25-35lb"
@@ -260,11 +283,13 @@ _BUILDERS = {
 }
 
 
-def build_row(plan_date: date, phase: int, week_num: int) -> dict:
+def build_row(plan_date: date, phase: int, week_num: int,
+              existing_notes: str | None = None, run_date: date | None = None) -> dict:
     """Build the full reseed payload for one existing plan row.
 
     phase and week_num come from the EXISTING row and are passed through
-    unchanged (week_num also drives finisher rotation).
+    unchanged (week_num also drives finisher rotation). existing_notes is the
+    row's current notes (preserved + tagged); run_date stamps the provenance tag.
     """
     program_label, session_type = _DAY_MAP[plan_date.weekday()]
     blocks, target_rpe, hr_zone, est = _BUILDERS[program_label](week_num)
@@ -273,6 +298,7 @@ def build_row(plan_date: date, phase: int, week_num: int) -> dict:
     # plan-lookup handler and the gym read API both render (falling back to the
     # legacy pretty label only when absent).
     blocks["display_name"] = _DISPLAY_NAME[program_label]
+    run_iso = (run_date or date.today()).isoformat()
     return {
         "plan_date": plan_date,
         "phase": phase,
@@ -284,7 +310,7 @@ def build_row(plan_date: date, phase: int, week_num: int) -> dict:
         "target_hr_zone": hr_zone,
         "est_duration_min": est,
         "generated_by": GENERATED_BY_DB,
-        "notes": program_label,
+        "notes": _compose_notes(existing_notes, program_label, run_iso),
     }
 
 
@@ -346,9 +372,9 @@ ON CONFLICT (plan_date) DO UPDATE SET
 
 
 def _preflight(cur) -> tuple[bool, str]:
-    """Check whether the LIVE health.plan CHECK constraints permit what we write
-    (generated_by='reseed_v2' and the mapped session_type values). Returns
-    (ok, message). Never raises — the caller decides whether to abort."""
+    """Check whether the LIVE health.plan generated_by CHECK permits the value we
+    write (GENERATED_BY_DB). Returns (ok, message). Never raises — the caller
+    decides whether to abort."""
     cur.execute(
         """SELECT pg_get_constraintdef(c.oid)
            FROM pg_constraint c
@@ -358,20 +384,19 @@ def _preflight(cur) -> tuple[bool, str]:
     )
     defs = [r[0] for r in cur.fetchall()]
     gb_checks = [d for d in defs if "generated_by" in d]
-    if gb_checks and not any("reseed_v2" in d for d in gb_checks):
+    if gb_checks and not any(f"'{GENERATED_BY_DB}'" in d for d in gb_checks):
         return False, (
-            "LIVE health.plan.generated_by CHECK rejects 'reseed_v2': "
+            f"LIVE health.plan.generated_by CHECK rejects '{GENERATED_BY_DB}': "
             f"{gb_checks[0]}\n"
-            "    Per instruction the CHECK must NOT be expanded. Either drop the "
-            "generated_by CHECK out-of-band, or set GENERATED_BY_DB to an allowed "
-            "value (e.g. 'manual') and re-run."
+            "    Per policy the CHECK must NOT be expanded. Set GENERATED_BY_DB to "
+            "an allowed value and re-run."
         )
-    return True, "generated_by 'reseed_v2' permitted by live schema."
+    return True, f"generated_by '{GENERATED_BY_DB}' permitted by live schema."
 
 
 def _read_existing(cur) -> list[dict]:
     cur.execute(
-        "SELECT plan_date, phase, week_num, session_type AS old_session_type "
+        "SELECT plan_date, phase, week_num, session_type AS old_session_type, notes "
         "FROM health.plan ORDER BY plan_date"
     )
     cols = [d[0] for d in cur.description]
@@ -464,7 +489,12 @@ def reseed(dry_run: bool) -> int:
             print("No existing rows in health.plan — nothing to reseed.")
             conn.rollback()
             return 0
-        rows = [build_row(e["plan_date"], e["phase"], e["week_num"]) for e in existing]
+        run_date = date.today()
+        rows = [
+            build_row(e["plan_date"], e["phase"], e["week_num"],
+                      existing_notes=e.get("notes"), run_date=run_date)
+            for e in existing
+        ]
         _validate(rows)
         _print_summary(existing, rows)
 
