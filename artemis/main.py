@@ -309,6 +309,16 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     except Exception:
         logger.exception("Failed to get inbox status for mention context")
 
+    # Training plan slice — so general_reply (trainer voice) can answer workout
+    # questions from REAL data and never claim the plan/database doesn't exist.
+    try:
+        from artemis.health import build_context_slice
+        health_slice = build_context_slice()
+        if health_slice:
+            parts.append("\n" + health_slice)
+    except Exception:
+        logger.exception("Failed to add training slice to mention context")
+
     return UNTRUSTED_PREFIX + "\n".join(parts) if parts else "No context available."
 
 
@@ -2331,6 +2341,16 @@ def _handle_mention(post: dict, thread: list[dict]):
     data_context = _build_mention_context(post, _gmail, _calendar, question=question)
 
     response = handle_mention(question, thread_context, data_context)
+
+    # Anti-confabulation guard: Artemis must NEVER deny it has a workout database
+    # or claim training data "came from the chat". If the LLM draft does, discard
+    # it and return the real plan detail instead.
+    try:
+        from artemis.health import scrub_db_denial
+        response = scrub_db_denial(response, question)
+    except Exception:
+        logger.exception("scrub_db_denial failed")
+
     if response and _mm:
         channel_id = post.get("channel_id", "")
         root_id = post.get("root_id") or post["id"]

@@ -57,11 +57,59 @@ class TestIntentClassification(unittest.TestCase):
         ]:
             self.assertEqual(detect_health_intent(msg), INTENT_PLAN_DETAIL, msg)
 
+    def test_plan_detail_meta_and_database_phrasings(self):
+        # Detail follow-ups + meta/database asks must route to plan_detail,
+        # NEVER fall through to general_reply (the confabulation source).
+        for msg in [
+            "tell me more about tomorrow's workout",
+            "more detail on today's session",
+            "expand on monday's workout",
+            "full breakdown of today's workout",
+            "what exactly is the cardio session",
+            # meta / database flavoured
+            "query the workout database",
+            "deep query the workout database",
+            "what's in the plan table",
+            "pull from the database",
+            "what data do you have on my training",
+        ]:
+            self.assertEqual(detect_health_intent(msg), INTENT_PLAN_DETAIL, msg)
+
     def test_plan_lookup_phrasings(self):
         # Multi-day BREADTH stays plan_lookup.
         for msg in ["next 7 days", "this week's workouts", "show my plan",
                     "what's my plan for the next 5 days"]:
             self.assertEqual(detect_health_intent(msg), INTENT_PLAN_LOOKUP, msg)
+
+    def test_does_not_hijack_non_workout_topics(self):
+        # Tightened fallback must not grab calendar / CRM / scheduling.
+        self.assertIsNone(detect_health_intent("set up a meeting with greg"))
+        self.assertIsNone(detect_health_intent("query the crm database"))
+        self.assertIsNone(detect_health_intent("what's on my calendar"))
+        self.assertIsNone(detect_health_intent("show me today's calendar"))
+
+    def test_conceptual_progress_state_reach_general_reply(self):
+        # Option C: conceptual/progress/state questions must NOT hit plan_detail —
+        # they fall through (None) to the now plan-aware general_reply path.
+        for msg in [
+            "why is zone 2 important",
+            "how's my training going",
+            "is the rower better than running",
+            "my legs are wrecked from cardio",
+            "should I add a finisher",
+            "what's a good warmup",
+        ]:
+            self.assertIsNone(detect_health_intent(msg), msg)
+
+    def test_data_retrieval_routes_to_plan_detail(self):
+        # Data-retrieval intent (retrieval signal + plan term) still → plan_detail.
+        for msg in [
+            "tell me about my cardio",
+            "what's the deadlift weight",
+            "show me today",
+            "pull up my workout plan",
+        ]:
+            self.assertEqual(detect_health_intent(msg), INTENT_PLAN_DETAIL, msg)
 
     def test_does_not_swallow_debrief_or_morning(self):
         self.assertEqual(detect_health_intent("done"), "log_workout_debrief")
@@ -147,6 +195,21 @@ _CARDIO_ROW = {
 }
 
 
+_RUNWALK_ROW = {
+    "plan_date": None, "session_type": "cardio_z2",
+    "target_rpe": 5.5, "target_hr_zone": 2, "est_duration_min": 35, "is_skipped": False,
+    "blocks": {
+        "type": "steady", "display_name": "Run-Walk Progression", "rounds": 6,
+        "intervals_template": {"work_sec": 120, "work_settings": "easy jog",
+                               "rest_sec": 120, "rest_settings": "walk"},
+        "warmup_sec": 300, "warmup_settings": "walk",
+        "cooldown_sec": 300, "cooldown_settings": "walk",
+        "intensity": "moderate", "equipment": [],
+        "setup_notes": ["Run-walk: 6 rounds of 2 min easy jog / 2 min walk"],
+    },
+}
+
+
 class TestGetPlanDetailRender(unittest.TestCase):
     def test_strength_full_block(self):
         with mock.patch("knowledge.db.execute_one", return_value=_STRENGTH_ROW), \
@@ -178,6 +241,22 @@ class TestGetPlanDetailRender(unittest.TestCase):
         self.assertIn("Equipment: road bike + indoor trainer", reply)
         self.assertIn("Core finisher", reply)
         self.assertIn("Dead bug — 10 reps (10 each side)", reply)
+
+    def test_runwalk_steady_full_block_with_zone2_cue(self):
+        with mock.patch("knowledge.db.execute_one", return_value=_RUNWALK_ROW), \
+             mock.patch.object(health, "_call_claude_text", return_value="Coach: keep the jogs honest."):
+            reply = get_plan_detail("tell me more about tomorrow's workout")
+        self.assertIn("Run-Walk Progression", reply)
+        self.assertNotIn("Walk + mobility", reply)        # legacy label not used
+        self.assertIn("Zone 2 — conversational pace", reply)
+        # run/walk structure rendered from intervals_template
+        self.assertIn("6 rounds", reply)
+        self.assertIn("easy jog", reply)
+        self.assertIn("walk", reply.lower())
+        # Zone 2 talk-test reminder appended
+        self.assertIn("Zone 2 cue", reply)
+        self.assertIn("120", reply)  # ~120-140 HR cue
+        self.assertNotIn("No plan seeded", reply)
 
     def test_coaching_path_receives_the_block(self):
         """The LLM coaching call must be passed the structured block (so it can
@@ -234,6 +313,108 @@ class TestGetPlanLookupFormatting(unittest.TestCase):
         self.assertIn("DB floor press", reply)
         self.assertIn("finisher: Dead bug", reply)
         self.assertNotIn("No plan seeded", reply)
+
+
+# ---------------------------------------------------------------------------
+# Anti-confabulation — Artemis must NEVER deny it has a workout database
+# ---------------------------------------------------------------------------
+
+_DENIAL_MARKERS = [
+    "don't have a workout database", "dont have a workout database",
+    "no workout database", "no connected database",
+    "shared directly in the chat", "from the chat thread",
+    "don't have access to your workout", "i don't have a workout",
+]
+
+
+class TestAntiConfabulation(unittest.TestCase):
+    def _assert_no_denial(self, text):
+        low = (text or "").lower()
+        for marker in _DENIAL_MARKERS:
+            self.assertNotIn(marker, low, f"response contains a DB denial: {marker!r}")
+        self.assertIsNone(health._DB_DENIAL_RE.search(text or ""),
+                          "response matched the DB-denial regex")
+
+    def test_deep_query_does_not_reach_general_reply_and_no_denial(self):
+        """'deep query the workout database' must hit the plan handler, never
+        general_reply, and the response must not deny DB access."""
+        general_reply = mock.MagicMock(return_value="I don't have a workout database.")
+        with mock.patch("knowledge.db.execute_one", return_value=_STRENGTH_ROW), \
+             mock.patch.object(health, "_coach_note", return_value=None):
+            reply = _route("deep query the workout database", general_reply)
+        general_reply.assert_not_called()
+        self.assertIn("Strength — Push/Quad", reply)  # real plan data, not a denial
+        self._assert_no_denial(reply)
+
+    def test_scrubber_fires_on_planted_denial(self):
+        """If general_reply drafts a denial, scrub_db_denial replaces it with the
+        real plan detail."""
+        denial = ("I don't have a workout database — that information was shared "
+                  "directly in the chat thread.")
+        with mock.patch("knowledge.db.execute_one", return_value=_STRENGTH_ROW), \
+             mock.patch.object(health, "_coach_note", return_value=None):
+            out = health.scrub_db_denial(denial, "deep query the workout database")
+        self.assertIn("Strength — Push/Quad", out)  # routed to plan_detail
+        self._assert_no_denial(out)
+
+    def test_scrubber_passes_through_clean_replies(self):
+        clean = "Here are your meetings today: 10am with Greg."
+        self.assertEqual(health.scrub_db_denial(clean, "what's on my calendar"), clean)
+
+    def test_empty_result_states_range_not_denial(self):
+        """Missing date → a concrete 'No plan seeded … your plan runs X to Y',
+        never a claim that the database doesn't exist."""
+        today = datetime.now(CT).date()
+        first, last = today - timedelta(days=2), today + timedelta(days=130)
+
+        def fake(sql, p=()):
+            return {"first": first, "last": last} if "MIN(plan_date)" in " ".join(sql.split()) else None
+
+        with mock.patch("knowledge.db.execute_one", side_effect=fake), \
+             mock.patch.object(health, "_call_claude_text") as llm:
+            reply = get_plan_detail("explain today's workout")
+        self.assertIn(f"No plan seeded for {today.isoformat()}", reply)
+        self.assertIn(f"your plan runs {first.isoformat()} to {last.isoformat()}", reply)
+        llm.assert_not_called()
+        self._assert_no_denial(reply)
+
+
+# ---------------------------------------------------------------------------
+# general_reply now SEES the plan (Option C) — build_context_slice
+# ---------------------------------------------------------------------------
+
+class TestContextSlice(unittest.TestCase):
+    def test_slice_contains_today_session_and_recent_logs(self):
+        today = datetime.now(CT).date()
+
+        def fake_query(sql, params=()):
+            s = " ".join(sql.split())
+            if "FROM health.plan WHERE plan_date BETWEEN" in s:
+                return [{
+                    "plan_date": today, "session_type": "cardio_z2",
+                    "blocks": {"type": "steady", "display_name": "Long Z2 Bike",
+                               "duration_min": 55, "target_range_min": [45, 55]},
+                }]
+            if "log_type = 'session_summary'" in s:
+                return [{"plan_date": today - timedelta(days=2),
+                         "session_type": "strength_a", "rpe_actual": 7.5,
+                         "notes": "felt strong"}]
+            return []
+
+        with mock.patch("knowledge.db.execute_query", side_effect=fake_query):
+            sliced = health.build_context_slice()
+
+        # The trainer voice can now SEE today's session + recent training.
+        self.assertIn("session_type=cardio_z2", sliced)
+        self.assertIn("Long Z2 Bike", sliced)
+        self.assertIn("Recent logged sessions", sliced)
+        self.assertIn("felt strong", sliced)
+        # And it explicitly affirms the data exists (anti-confabulation framing).
+        self.assertIn("you DO have this", sliced)
+
+    def test_slice_empty_on_no_data(self):
+        with mock.patch("knowledge.db.execute_query", return_value=[]):
+            self.assertEqual(health.build_context_slice(), "")
 
 
 if __name__ == "__main__":
