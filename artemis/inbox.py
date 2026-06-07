@@ -19,6 +19,32 @@ NOISE = "NOISE"
 
 VALID_STATES = {NEEDS_ACTION, WAITING, SNOOZED, DONE, NOISE}
 
+
+def should_keep_in_inbox(state: str) -> bool:
+    """Return True only for states that must remain in the Gmail INBOX.
+
+    The one rule: INBOX = a human decision is required. So NEEDS_ACTION keeps;
+    WAITING / DONE / NOISE are filed (archived). SNOOZED is keep-on-wake, handled
+    by the snooze-resurfacing job — at triage time it archives like the rest, so
+    it is NOT kept here.
+    """
+    return state == NEEDS_ACTION
+
+
+def state_from_triage(item: dict) -> str:
+    """Resolve a triaged email (a triage_emails() result item) to an inbox state.
+
+    Prefers the rubric-assigned `state`; falls back to the legacy sender_type
+    mapping when the classifier omits it. Biases to NEEDS_ACTION (INBOX) on
+    uncertainty — a false file drops a ball, a false inbox costs a glance.
+    """
+    state = (item.get("state") or "").strip().upper()
+    if state in (NEEDS_ACTION, DONE, NOISE):
+        return state
+    if item.get("sender_type") == "noise":
+        return NOISE
+    return NEEDS_ACTION
+
 # Snooze periods: label → timedelta
 SNOOZE_PERIODS = {
     "1d": timedelta(days=1),

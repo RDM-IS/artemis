@@ -107,7 +107,7 @@ ENVIRONMENT       — dev / prod
 
 ```
 /home/ec2-user/
-  artemis/              ← this repo (aws-build branch)
+  artemis/              ← this repo (main branch)
     artemis/            ← orchestrator code
     api/                ← CRM Lambda code
     knowledge/          ← shared secrets + DB modules
