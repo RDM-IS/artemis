@@ -594,11 +594,13 @@ _PLAN_LOOKUP_RE = re.compile(
 # as opposed to plan_lookup which is multi-day BREADTH ("list the next 7 days").
 INTENT_PLAN_DETAIL = "plan_detail"
 
-# Depth cues → user wants the full session broken down.
+# Depth cues → user wants the full session broken down. Includes "tell me more /
+# more about / expand / what exactly" so follow-up depth asks are caught.
 _DETAIL_CUE = (
     r"(?:detail(?:ed|s)?|full|complete|whole|entire|break[\s-]*down|"
     r"explain(?:ed)?|explanation|walk\s+me\s+through|in[\s-]?depth|"
-    r"deep\s+dive|elaborate|everything)"
+    r"deep\s+dive|elaborate|everything|expand|more\s+detail|tell\s+me\s+more|"
+    r"more\s+about|what\s+exactly|spell\s+out)"
 )
 # Breadth cues → a multi-day list; these stay plan_lookup (depth never applies).
 _MULTIDAY_RE = re.compile(
@@ -618,6 +620,30 @@ _PLAN_DETAIL_RE = re.compile(
 _SINGLE_DAY_PLAN_RE = re.compile(
     rf"\b{_SINGLE_DAY_REF}\b.*\b(?:{_PLAN_NOUN}|session)\b"
     rf"|\b(?:{_PLAN_NOUN}|session)\b.*\b{_SINGLE_DAY_REF}\b",
+    re.IGNORECASE,
+)
+# META / DATABASE asks about the training data store. These must read health.plan
+# — NEVER fall through to general_reply (which confabulates "I have no workout DB").
+_PLAN_META_RE = re.compile(
+    r"\bdeep\s+quer(?:y|ies)\b"
+    r"|\bquer(?:y|ies)\b.*\b(?:workout|training|plan|session|routine)\b"
+    r"|\b(?:workout|training|plan|session|routine)s?\s+(?:database|table|data)\b"
+    r"|\b(?:pull|read|look|get)\b.*\b(?:workout|training|plan)\b.*\b(?:database|table|data|db)\b"
+    r"|\bpull\s+from\s+the\s+database\b"
+    r"|\bwhat\s+data\s+do\s+you\s+have\b.*\b(?:training|workout|plan|exercise|fitness)\b"
+    r"|\bwhat'?s\s+in\s+the\s+(?:plan|workout|training)\b",
+    re.IGNORECASE,
+)
+# Anti-confabulation fallback: a clearly WORKOUT-flavoured message that matched no
+# specific intent above. Strong fitness terms only (deliberately excludes bare
+# "plan/session/sets/reps/lift" so it can't hijack calendar / CRM / "set up a
+# meeting"). The general_reply scrubber (scrub_db_denial) is the backstop for the
+# long tail.
+_HEALTH_TOPIC_RE = re.compile(
+    r"\b(?:work\s?outs?|exercises?|cardio|rpe|routines?|training|"
+    r"warm\s?ups?|cool\s?downs?|circuits?|intervals?|finishers?|"
+    r"deadlift|goblet|kettlebell|dumbbell|powerblock|rower|treadmill|"
+    r"run[\s-]?walk|rest\s+day|zone\s+\d|z2)\b",
     re.IGNORECASE,
 )
 
@@ -640,6 +666,10 @@ def detect_health_intent(message: str) -> str | None:
         if _PLAN_DETAIL_RE.search(message) or _SINGLE_DAY_PLAN_RE.search(message):
             return INTENT_PLAN_DETAIL
 
+    # Meta / database asks ("deep query the workout database") → read health.plan.
+    if _PLAN_META_RE.search(message):
+        return INTENT_PLAN_DETAIL
+
     # Plan-lookup (breadth read-intent): requires a plan noun plus a temporal/
     # show cue, so it can't collide with "done"/"RPE"/"slept".
     if _PLAN_LOOKUP_RE.search(message):
@@ -650,6 +680,13 @@ def detect_health_intent(message: str) -> str | None:
         return "log_workout_debrief"
     if _MORNING_TRIGGER.search(message):
         return "log_morning_state"
+
+    # ANTI-CONFABULATION FALLBACK: any clearly workout-flavoured message that
+    # matched nothing specific still routes to the plan handler (default today),
+    # so it can NEVER fall through to general_reply and have the LLM deny that a
+    # workout database exists.
+    if _HEALTH_TOPIC_RE.search(message):
+        return INTENT_PLAN_DETAIL
     return None
 
 
@@ -2495,6 +2532,17 @@ def _render_full_block(d: date, row: dict, today: date) -> str:
     if meta:
         sections.append(" · ".join(meta))
     sections.extend(body)
+
+    # Zone 2 sessions get an explicit HR + talk-test cue.
+    try:
+        if int(zone) == 2:
+            sections.append(
+                "**Zone 2 cue:** keep HR ~120–140 — full-sentence conversational "
+                "pace (if you can't talk in full sentences, ease off)."
+            )
+    except (TypeError, ValueError):
+        pass
+
     # Blank line between sections → readable in Mattermost.
     return "\n\n".join(s for s in sections if s)
 
@@ -2528,13 +2576,39 @@ def _fetch_plan_full(d: date) -> dict | None:
     return execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (d,))
 
 
+def _plan_date_range() -> tuple[date, date] | None:
+    """Return (first_plan_date, last_plan_date) from health.plan, or None if the
+    table has no rows. Used to make 'no plan for this date' answers concrete —
+    never a denial that the database exists."""
+    from knowledge.db import execute_one
+    try:
+        row = execute_one("SELECT MIN(plan_date) AS first, MAX(plan_date) AS last FROM health.plan")
+    except Exception:
+        logger.debug("Could not read plan date range", exc_info=True)
+        return None
+    if row and row.get("first") and row.get("last"):
+        return row["first"], row["last"]
+    return None
+
+
+def _no_plan_message(target: date) -> str:
+    """The ONLY 'missing data' answer. States the seeded window when known.
+    NEVER claims the database doesn't exist or that data came from chat."""
+    rng = _plan_date_range()
+    if rng:
+        return (f"No plan seeded for {target.isoformat()} — "
+                f"your plan runs {rng[0].isoformat()} to {rng[1].isoformat()}.")
+    return f"No plan seeded for {target.isoformat()}."
+
+
 def get_plan_detail(message: str) -> str:
     """Handle the 'plan_detail' intent — full single-day session breakdown.
 
     Resolves the target date (CT-anchored; today / tomorrow / weekday), renders
     the FULL block, then appends a constrained trainer-voice coaching note.
-    Missing dates yield exactly "No plan seeded for <date>." and never reach the
-    LLM. Always returns a non-empty string.
+    Missing dates yield a concrete "No plan seeded for <date> — your plan runs
+    <first> to <last>." (never a DB denial) and never reach the LLM. Always
+    returns a non-empty string.
     """
     q = (message or "").lower()
     today = datetime.now(CT).date()
@@ -2549,11 +2623,49 @@ def get_plan_detail(message: str) -> str:
 
     row = _fetch_plan_full(target)
     if row is None:
-        # HARD GUARD — exact string, no fabrication, no LLM coaching.
-        return f"No plan seeded for {target.isoformat()}."
+        # HARD GUARD — concrete missing-data message, no fabrication, no LLM,
+        # and NEVER a denial that the workout database exists.
+        return _no_plan_message(target)
 
     structured = _render_full_block(target, row, today)
     blocks = _coerce_blocks(row.get("blocks"))
     display = blocks.get("display_name") or _session_pretty_name(row.get("session_type", "?"))
     coach = _coach_note(structured, display)
     return f"{structured}\n\n{coach}" if coach else structured
+
+
+# ----------------------------------------------------------------------------
+# Anti-confabulation scrubber for the general_reply (free-text LLM) path.
+# Artemis must NEVER deny that it has a workout database / training data, or
+# claim that workout info "came from the chat thread". If a drafted general
+# reply contains such a denial, discard it and return the real plan detail.
+# ----------------------------------------------------------------------------
+
+_DB_DENIAL_RE = re.compile(
+    r"don'?t\s+have\s+(?:a\s+|any\s+|access\s+to\s+a\s+)?(?:\w+\s+){0,3}"
+    r"(?:workout|training|fitness|exercise|plan)\s+(?:database|data|table|plan)"
+    r"|no\s+(?:connected\s+|access\s+to\s+a\s+)?(?:workout|training|fitness)?\s*database"
+    r"|(?:shared|came|provided|posted)\s+(?:directly\s+)?in\s+(?:the\s+|this\s+)?chat"
+    r"|from\s+(?:the\s+|this\s+)?chat\s+(?:thread|history|conversation)"
+    r"|don'?t\s+have\s+access\s+to\s+(?:your\s+)?(?:workout|training|fitness)"
+    r"|no\s+(?:workout|training)\s+(?:database|data|plan)\b"
+    r"|i\s+don'?t\s+(?:have|keep|store)\s+(?:a\s+)?(?:workout|training|fitness)",
+    re.IGNORECASE,
+)
+
+
+def scrub_db_denial(response: str | None, message: str) -> str:
+    """Belt-and-suspenders guard on the general_reply path.
+
+    If the drafted reply denies that a workout/training database exists, or
+    claims the data came from chat, discard it and return the real plan detail
+    for the requested day (default today). Logs when it fires so leaks are
+    visible. Otherwise returns the response unchanged.
+    """
+    if response and _DB_DENIAL_RE.search(response):
+        logger.warning(
+            "general_reply produced a workout-DB denial — scrubbing and routing "
+            "to plan_detail. message=%r draft=%r", message, response[:200],
+        )
+        return get_plan_detail(message or "today's workout")
+    return response or ""
