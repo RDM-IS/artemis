@@ -2,9 +2,12 @@
 
 GET  /api/health/today          → today's training plan from health.plan
 GET  /api/health/today/logged   → which exercises today already have logs
+GET  /api/health/last_logged    → batch: most-recent prior set per exercise
+                                  (used by gym-display to pre-fill steppers)
 GET  /api/health/status         → windowed status payload for /status page
-POST /api/health/log            → insert N session_log rows for one exercise
-                                  (or one cardio block, or a session_summary)
+POST /api/health/log            → insert N session_log rows for one exercise.
+                                  Optional session_rpe → also writes one
+                                  session_summary row in the same txn.
 
 Auth: X-API-Key header validated against AWS Secrets Manager
 secret `rdmis/dev/health-api-key`. Returns 401 (per contract) on
@@ -542,12 +545,17 @@ class LogExerciseIn(BaseModel):
     log_type chooses the column shape: strength_set / cardio_block /
     session_summary.  For session_summary, `exercise` should be null and
     `sets` should be a single entry carrying rpe_actual + notes.
+
+    session_rpe (optional) — when present, an additional session_summary
+    row is INSERTed in the same transaction. Lets the "Finish workout"
+    action be a single POST instead of two round trips.
     """
     plan_id: Optional[int] = None
     exercise: Optional[str] = None
     log_type: str = Field(default="strength_set")
     sets: list[LogSetIn] = Field(default_factory=list)
     notes: Optional[str] = None
+    session_rpe: Optional[float] = Field(default=None, ge=1, le=10)
 
 
 class LogRowOut(BaseModel):
@@ -617,29 +625,31 @@ def post_log(
     plan_id = _resolve_plan_id(db, body.plan_id)
     inserted_rows: list[dict[str, Any]] = []
 
+    insert_sql = text("""
+        INSERT INTO health.session_log (
+            plan_id, log_type, exercise,
+            set_num, reps_done, weight_lbs,
+            duration_sec, distance_m,
+            hr_avg, hr_peak, rpe_actual,
+            notes, is_skipped, logged_via
+        ) VALUES (
+            :plan_id, :log_type, :exercise,
+            :set_num, :reps_done, :weight_lbs,
+            :duration_sec, :distance_m,
+            :hr_avg, :hr_peak, :rpe_actual,
+            :notes, :is_skipped, :logged_via
+        )
+        RETURNING log_id, plan_id, log_type, exercise,
+                  set_num, reps_done, weight_lbs,
+                  duration_sec, distance_m,
+                  hr_avg, hr_peak, rpe_actual,
+                  notes, is_skipped, logged_at, logged_via
+    """)
+
     try:
         for s in body.sets:
             row = db.execute(
-                text("""
-                    INSERT INTO health.session_log (
-                        plan_id, log_type, exercise,
-                        set_num, reps_done, weight_lbs,
-                        duration_sec, distance_m,
-                        hr_avg, hr_peak, rpe_actual,
-                        notes, is_skipped, logged_via
-                    ) VALUES (
-                        :plan_id, :log_type, :exercise,
-                        :set_num, :reps_done, :weight_lbs,
-                        :duration_sec, :distance_m,
-                        :hr_avg, :hr_peak, :rpe_actual,
-                        :notes, :is_skipped, :logged_via
-                    )
-                    RETURNING log_id, plan_id, log_type, exercise,
-                              set_num, reps_done, weight_lbs,
-                              duration_sec, distance_m,
-                              hr_avg, hr_peak, rpe_actual,
-                              notes, is_skipped, logged_at, logged_via
-                """),
+                insert_sql,
                 {
                     "plan_id": plan_id,
                     "log_type": body.log_type,
@@ -654,6 +664,29 @@ def post_log(
                     "rpe_actual": s.rpe_actual,
                     "notes": s.notes if s.notes is not None else body.notes,
                     "is_skipped": s.is_skipped,
+                    "logged_via": LOGGED_VIA_GYM_DISPLAY,
+                },
+            ).mappings().first()
+            if row is not None:
+                inserted_rows.append(dict(row))
+        # Optional in-band session_summary write — same transaction.
+        if body.session_rpe is not None and body.log_type != "session_summary":
+            row = db.execute(
+                insert_sql,
+                {
+                    "plan_id": plan_id,
+                    "log_type": "session_summary",
+                    "exercise": None,
+                    "set_num": None,
+                    "reps_done": None,
+                    "weight_lbs": None,
+                    "duration_sec": None,
+                    "distance_m": None,
+                    "hr_avg": None,
+                    "hr_peak": None,
+                    "rpe_actual": body.session_rpe,
+                    "notes": body.notes,
+                    "is_skipped": False,
                     "logged_via": LOGGED_VIA_GYM_DISPLAY,
                 },
             ).mappings().first()
@@ -764,3 +797,73 @@ def get_today_logged(
         ],
         has_session_summary=summary_row is not None,
     )
+
+
+# ---------------------------------------------------------------------------
+# /last_logged — pre-fill source for gym-display stepper UI
+# ---------------------------------------------------------------------------
+
+class LastLoggedEntry(BaseModel):
+    exercise: str
+    plan_date: Optional[date] = None
+    weight_lbs: Optional[float] = None
+    reps_done: Optional[int] = None
+    rpe_actual: Optional[float] = None
+    duration_sec: Optional[int] = None
+    distance_m: Optional[float] = None
+    hr_avg: Optional[int] = None
+    hr_peak: Optional[int] = None
+
+
+class LastLoggedResponse(BaseModel):
+    by_exercise: dict[str, LastLoggedEntry]
+
+
+@router.get("/last_logged", response_model=LastLoggedResponse)
+def get_last_logged(
+    exercises: str = "",
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """Batch lookup: the most-recent prior strength_set / cardio_block per
+    exercise name. Used by gym-display to pre-fill stepper defaults so
+    the common case is zero edits.
+
+    Query: /last_logged?exercises=Goblet+squat,Plank,Hollow+hold
+    Response keys: exact exercise names from the query (unknowns are
+    silently absent from the result).
+    """
+    names = [n.strip() for n in exercises.split(",") if n.strip()]
+    if not names:
+        return LastLoggedResponse(by_exercise={})
+
+    rows = db.execute(
+        text("""
+            SELECT DISTINCT ON (sl.exercise)
+                sl.exercise,
+                sl.weight_lbs, sl.reps_done, sl.rpe_actual,
+                sl.duration_sec, sl.distance_m, sl.hr_avg, sl.hr_peak,
+                p.plan_date
+            FROM health.session_log sl
+            JOIN health.plan p ON p.plan_id = sl.plan_id
+            WHERE sl.exercise = ANY(:names)
+              AND sl.log_type IN ('strength_set', 'cardio_block')
+            ORDER BY sl.exercise, sl.logged_at DESC
+        """),
+        {"names": names},
+    ).mappings().all()
+
+    out: dict[str, LastLoggedEntry] = {}
+    for r in rows:
+        out[r["exercise"]] = LastLoggedEntry(
+            exercise=r["exercise"],
+            plan_date=r["plan_date"],
+            weight_lbs=float(r["weight_lbs"]) if r["weight_lbs"] is not None else None,
+            reps_done=r["reps_done"],
+            rpe_actual=float(r["rpe_actual"]) if r["rpe_actual"] is not None else None,
+            duration_sec=r["duration_sec"],
+            distance_m=float(r["distance_m"]) if r["distance_m"] is not None else None,
+            hr_avg=r["hr_avg"],
+            hr_peak=r["hr_peak"],
+        )
+    return LastLoggedResponse(by_exercise=out)
