@@ -1,9 +1,10 @@
 """Health/training plan endpoints.
 
-GET /api/health/today   → today's training plan from health.plan
-GET /api/health/status  → windowed status payload for the /status page
-                          (11-day strip, most-recent logged session,
-                           same-type history, RPE + body-weight trends)
+GET  /api/health/today          → today's training plan from health.plan
+GET  /api/health/today/logged   → which exercises today already have logs
+GET  /api/health/status         → windowed status payload for /status page
+POST /api/health/log            → insert N session_log rows for one exercise
+                                  (or one cardio block, or a session_summary)
 
 Auth: X-API-Key header validated against AWS Secrets Manager
 secret `rdmis/dev/health-api-key`. Returns 401 (per contract) on
@@ -27,8 +28,9 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Security, status
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -500,4 +502,265 @@ def get_status(
         same_type_history=same_type_history,
         rpe_trend=rpe_trend,
         weight_trend=weight_trend,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /log — POST: insert N session_log rows for one exercise (or session_summary)
+# ---------------------------------------------------------------------------
+#
+# Schema notes (see migrations/013_health_schema.sql):
+#   - log_type     IN ('strength_set', 'cardio_block', 'session_summary')
+#   - logged_via   IN ('mattermost', 'voice', 'manual', 'inferred')
+#
+# `gym-display` writes use logged_via='manual'. The CHECK constraint does NOT
+# accept 'gym_display' today; widening it is a future migration if a separate
+# value is wanted.
+
+ALLOWED_LOG_TYPES = ("strength_set", "cardio_block", "session_summary")
+LOGGED_VIA_GYM_DISPLAY = "manual"  # closest existing CHECK value
+
+
+class LogSetIn(BaseModel):
+    """One set of a strength exercise OR one cardio block (single set)."""
+    set_num: Optional[int] = Field(default=None, ge=1, le=99)
+    reps_done: Optional[int] = Field(default=None, ge=0, le=999)
+    weight_lbs: Optional[float] = Field(default=None, ge=0, le=9999)
+    rpe_actual: Optional[float] = Field(default=None, ge=1, le=10)
+    duration_sec: Optional[int] = Field(default=None, ge=0, le=86_400)
+    distance_m: Optional[float] = Field(default=None, ge=0, le=999_999)
+    hr_avg: Optional[int] = Field(default=None, ge=0, le=300)
+    hr_peak: Optional[int] = Field(default=None, ge=0, le=300)
+    is_skipped: bool = False
+    notes: Optional[str] = None
+
+
+class LogExerciseIn(BaseModel):
+    """Payload posted by gym-display for one exercise's sets.
+
+    plan_id is optional — resolved to today's plan when omitted.
+    log_type chooses the column shape: strength_set / cardio_block /
+    session_summary.  For session_summary, `exercise` should be null and
+    `sets` should be a single entry carrying rpe_actual + notes.
+    """
+    plan_id: Optional[int] = None
+    exercise: Optional[str] = None
+    log_type: str = Field(default="strength_set")
+    sets: list[LogSetIn] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class LogRowOut(BaseModel):
+    log_id: int
+    plan_id: Optional[int] = None
+    log_type: str
+    exercise: Optional[str] = None
+    set_num: Optional[int] = None
+    reps_done: Optional[int] = None
+    weight_lbs: Optional[float] = None
+    duration_sec: Optional[int] = None
+    distance_m: Optional[float] = None
+    hr_avg: Optional[int] = None
+    hr_peak: Optional[int] = None
+    rpe_actual: Optional[float] = None
+    notes: Optional[str] = None
+    is_skipped: bool = False
+    logged_at: datetime
+    logged_via: str
+
+
+class LogResponse(BaseModel):
+    plan_id: Optional[int] = None
+    inserted: int
+    rows: list[LogRowOut]
+
+
+def _resolve_plan_id(db: Session, supplied: Optional[int]) -> Optional[int]:
+    if supplied is not None:
+        return supplied
+    today = _today_ct()
+    row = db.execute(
+        text("SELECT plan_id FROM health.plan WHERE plan_date = :d"),
+        {"d": today},
+    ).mappings().first()
+    return row["plan_id"] if row else None
+
+
+@router.post("/log", response_model=LogResponse)
+def post_log(
+    body: LogExerciseIn,
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """Insert N session_log rows for one exercise (or a session_summary).
+
+    All rows are inserted in a single transaction. Returns the inserted
+    rows (with server-assigned log_id + logged_at) so the UI can mark the
+    exercise as logged without a follow-up GET.
+
+    400 on invalid log_type or empty sets list.
+    """
+    if body.log_type not in ALLOWED_LOG_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_log_type",
+                "allowed": list(ALLOWED_LOG_TYPES),
+            },
+        )
+    if not body.sets:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "empty_sets"},
+        )
+
+    plan_id = _resolve_plan_id(db, body.plan_id)
+    inserted_rows: list[dict[str, Any]] = []
+
+    try:
+        for s in body.sets:
+            row = db.execute(
+                text("""
+                    INSERT INTO health.session_log (
+                        plan_id, log_type, exercise,
+                        set_num, reps_done, weight_lbs,
+                        duration_sec, distance_m,
+                        hr_avg, hr_peak, rpe_actual,
+                        notes, is_skipped, logged_via
+                    ) VALUES (
+                        :plan_id, :log_type, :exercise,
+                        :set_num, :reps_done, :weight_lbs,
+                        :duration_sec, :distance_m,
+                        :hr_avg, :hr_peak, :rpe_actual,
+                        :notes, :is_skipped, :logged_via
+                    )
+                    RETURNING log_id, plan_id, log_type, exercise,
+                              set_num, reps_done, weight_lbs,
+                              duration_sec, distance_m,
+                              hr_avg, hr_peak, rpe_actual,
+                              notes, is_skipped, logged_at, logged_via
+                """),
+                {
+                    "plan_id": plan_id,
+                    "log_type": body.log_type,
+                    "exercise": body.exercise,
+                    "set_num": s.set_num,
+                    "reps_done": s.reps_done,
+                    "weight_lbs": s.weight_lbs,
+                    "duration_sec": s.duration_sec,
+                    "distance_m": s.distance_m,
+                    "hr_avg": s.hr_avg,
+                    "hr_peak": s.hr_peak,
+                    "rpe_actual": s.rpe_actual,
+                    "notes": s.notes if s.notes is not None else body.notes,
+                    "is_skipped": s.is_skipped,
+                    "logged_via": LOGGED_VIA_GYM_DISPLAY,
+                },
+            ).mappings().first()
+            if row is not None:
+                inserted_rows.append(dict(row))
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "insert_failed", "message": str(e)},
+        )
+
+    return LogResponse(
+        plan_id=plan_id,
+        inserted=len(inserted_rows),
+        rows=[
+            LogRowOut(
+                log_id=r["log_id"],
+                plan_id=r["plan_id"],
+                log_type=r["log_type"],
+                exercise=r["exercise"],
+                set_num=r["set_num"],
+                reps_done=r["reps_done"],
+                weight_lbs=float(r["weight_lbs"]) if r["weight_lbs"] is not None else None,
+                duration_sec=r["duration_sec"],
+                distance_m=float(r["distance_m"]) if r["distance_m"] is not None else None,
+                hr_avg=r["hr_avg"],
+                hr_peak=r["hr_peak"],
+                rpe_actual=float(r["rpe_actual"]) if r["rpe_actual"] is not None else None,
+                notes=r["notes"],
+                is_skipped=bool(r["is_skipped"]),
+                logged_at=r["logged_at"],
+                logged_via=r["logged_via"],
+            )
+            for r in inserted_rows
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# /today/logged — which exercises today already have logs (UI completion state)
+# ---------------------------------------------------------------------------
+
+class LoggedExerciseEntry(BaseModel):
+    exercise: str
+    log_type: str
+    set_count: int
+
+
+class LoggedTodayResponse(BaseModel):
+    plan_id: Optional[int] = None
+    exercises: list[LoggedExerciseEntry]
+    has_session_summary: bool
+
+
+@router.get("/today/logged", response_model=LoggedTodayResponse)
+def get_today_logged(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """List the exercises already logged for today's plan.
+
+    Returned in distinct (exercise, log_type) groups with the set count.
+    Exercises with no rows are simply absent from the list.
+    The UI uses this to mark exercises as ✓ done on first load.
+    """
+    today = _today_ct()
+    plan_row = db.execute(
+        text("SELECT plan_id FROM health.plan WHERE plan_date = :d"),
+        {"d": today},
+    ).mappings().first()
+    if plan_row is None:
+        return LoggedTodayResponse(plan_id=None, exercises=[], has_session_summary=False)
+
+    plan_id = plan_row["plan_id"]
+    rows = db.execute(
+        text("""
+            SELECT exercise, log_type, COUNT(*) AS n
+            FROM health.session_log
+            WHERE plan_id = :pid
+              AND exercise IS NOT NULL
+              AND log_type IN ('strength_set', 'cardio_block')
+            GROUP BY exercise, log_type
+            ORDER BY exercise
+        """),
+        {"pid": plan_id},
+    ).mappings().all()
+
+    summary_row = db.execute(
+        text("""
+            SELECT 1 FROM health.session_log
+            WHERE plan_id = :pid AND log_type = 'session_summary'
+            LIMIT 1
+        """),
+        {"pid": plan_id},
+    ).mappings().first()
+
+    return LoggedTodayResponse(
+        plan_id=plan_id,
+        exercises=[
+            LoggedExerciseEntry(
+                exercise=r["exercise"],
+                log_type=r["log_type"],
+                set_count=int(r["n"]),
+            )
+            for r in rows
+        ],
+        has_session_summary=summary_row is not None,
     )

@@ -21,7 +21,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -410,6 +410,278 @@ class TestStatusEndpoint(unittest.TestCase):
         self.assertEqual(body["banner"]["phase"], 1)
         self.assertEqual(body["banner"]["week_num"], 3)
         self.assertEqual(body["banner"]["phase_name"], "Foundation")
+
+
+# ---------------------------------------------------------------------------
+# /log + /today/logged — write path
+# ---------------------------------------------------------------------------
+
+class _LogCaptureSession:
+    """DB shim that captures INSERTs (executemany-style) and answers SELECTs
+    from a small fixtures dict. Single transaction, no real DB."""
+
+    def __init__(self, fixtures: dict | None = None):
+        self.inserted: list[dict] = []
+        self.committed = False
+        self.rolled_back = False
+        self._fixtures = fixtures or {}
+        self._log_counter = 100
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt).strip().lower()
+        if sql.startswith("insert"):
+            assert params is not None
+            self._log_counter += 1
+            row = {
+                "log_id": self._log_counter,
+                "plan_id": params["plan_id"],
+                "log_type": params["log_type"],
+                "exercise": params["exercise"],
+                "set_num": params["set_num"],
+                "reps_done": params["reps_done"],
+                "weight_lbs": params["weight_lbs"],
+                "duration_sec": params["duration_sec"],
+                "distance_m": params["distance_m"],
+                "hr_avg": params["hr_avg"],
+                "hr_peak": params["hr_peak"],
+                "rpe_actual": params["rpe_actual"],
+                "notes": params["notes"],
+                "is_skipped": params["is_skipped"],
+                "logged_at": datetime(2026, 6, 8, 18, 30, 0),
+                "logged_via": params["logged_via"],
+            }
+            self.inserted.append(row)
+            return _MockExecuteResult(row)
+        # SELECT plan_id for today
+        if "from health.plan" in sql:
+            return _MockExecuteResult(self._fixtures.get("today_plan"))
+        # GET /today/logged group-by
+        if "group by exercise" in sql:
+            rows = self._fixtures.get("logged_groups", [])
+            return _MockMultiResult(rows)
+        # GET /today/logged session_summary check
+        if "log_type = 'session_summary'" in sql:
+            return _MockExecuteResult(self._fixtures.get("summary_row"))
+        return _MockExecuteResult(None)
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def _build_log_client(fixtures: dict | None = None) -> tuple:
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        raise unittest.SkipTest("fastapi not installed")
+    from api.app.database import get_db
+    from api.app.main import app
+    from api.app.routers import health as health_router
+
+    sess = _LogCaptureSession(fixtures)
+
+    def _override_db():
+        yield sess
+
+    app.dependency_overrides[get_db] = _override_db
+    health_router._HEALTH_API_KEY = VALID_KEY
+    return TestClient(app), app, sess
+
+
+class TestLogEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.app = None
+
+    def tearDown(self):
+        if self.app is not None:
+            self.app.dependency_overrides.clear()
+        from api.app.routers import health as health_router
+        health_router._HEALTH_API_KEY = None
+
+    def test_401_without_key(self):
+        client, self.app, _ = _build_log_client()
+        resp = client.post("/api/health/log", json={
+            "exercise": "Goblet squat", "sets": [{"set_num": 1, "reps_done": 10, "weight_lbs": 35, "rpe_actual": 7}],
+        })
+        self.assertEqual(resp.status_code, 401)
+
+    def test_strength_three_sets_inserts_three_rows(self):
+        client, self.app, sess = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={
+                "plan_id": 42,
+                "exercise": "Goblet squat",
+                "log_type": "strength_set",
+                "sets": [
+                    {"set_num": 1, "reps_done": 10, "weight_lbs": 35, "rpe_actual": 7},
+                    {"set_num": 2, "reps_done": 10, "weight_lbs": 35, "rpe_actual": 7.5},
+                    {"set_num": 3, "reps_done": 8,  "weight_lbs": 35, "rpe_actual": 8},
+                ],
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["inserted"], 3)
+        self.assertEqual(len(body["rows"]), 3)
+        # logged_via='manual' (CHECK constraint forbids 'gym_display')
+        self.assertEqual(body["rows"][0]["logged_via"], "manual")
+        self.assertEqual(body["rows"][0]["plan_id"], 42)
+        # Transaction committed
+        self.assertTrue(sess.committed)
+        self.assertFalse(sess.rolled_back)
+        # All three INSERTs captured
+        self.assertEqual(len(sess.inserted), 3)
+        self.assertEqual(sess.inserted[2]["reps_done"], 8)
+
+    def test_resolves_plan_id_from_today_when_omitted(self):
+        client, self.app, sess = _build_log_client(fixtures={
+            "today_plan": {"plan_id": 99},
+        })
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={
+                "exercise": "Plank",
+                "log_type": "strength_set",
+                "sets": [{"set_num": 1, "duration_sec": 30, "rpe_actual": 7}],
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["plan_id"], 99)
+        self.assertEqual(sess.inserted[0]["plan_id"], 99)
+
+    def test_cardio_block_single_row(self):
+        client, self.app, sess = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={
+                "plan_id": 51,
+                "exercise": "Long Z2 Bike",
+                "log_type": "cardio_block",
+                "sets": [{
+                    "duration_sec": 2700, "distance_m": 18000,
+                    "hr_avg": 132, "hr_peak": 148, "rpe_actual": 5.5,
+                }],
+                "notes": "Felt easy",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["inserted"], 1)
+        self.assertEqual(body["rows"][0]["log_type"], "cardio_block")
+        self.assertEqual(body["rows"][0]["duration_sec"], 2700)
+        self.assertEqual(body["rows"][0]["hr_avg"], 132)
+        # notes fall-through from body when set-level is null
+        self.assertEqual(body["rows"][0]["notes"], "Felt easy")
+
+    def test_400_on_empty_sets(self):
+        client, self.app, _ = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={"exercise": "Plank", "log_type": "strength_set", "sets": []},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["detail"]["error"], "empty_sets")
+
+    def test_400_on_invalid_log_type(self):
+        client, self.app, _ = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={"log_type": "garbage", "sets": [{"set_num": 1}]},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["detail"]["error"], "invalid_log_type")
+
+    def test_pydantic_clamps_rpe_above_10(self):
+        client, self.app, _ = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={
+                "exercise": "Plank",
+                "log_type": "strength_set",
+                "sets": [{"set_num": 1, "reps_done": 10, "rpe_actual": 11}],
+            },
+        )
+        # Field constraint ge=1, le=10 → 422 validation error
+        self.assertEqual(resp.status_code, 422)
+
+    def test_session_summary_single_row(self):
+        client, self.app, sess = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={
+                "plan_id": 42,
+                "log_type": "session_summary",
+                "sets": [{"rpe_actual": 7.5}],
+                "notes": "Solid session.",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["inserted"], 1)
+        self.assertEqual(sess.inserted[0]["log_type"], "session_summary")
+        self.assertEqual(sess.inserted[0]["notes"], "Solid session.")
+
+
+class TestTodayLoggedEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.app = None
+
+    def tearDown(self):
+        if self.app is not None:
+            self.app.dependency_overrides.clear()
+        from api.app.routers import health as health_router
+        health_router._HEALTH_API_KEY = None
+
+    def test_401_without_key(self):
+        client, self.app, _ = _build_log_client()
+        resp = client.get("/api/health/today/logged")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_no_plan_returns_empty_payload(self):
+        client, self.app, _ = _build_log_client(fixtures={"today_plan": None})
+        resp = client.get("/api/health/today/logged", headers={"X-API-Key": VALID_KEY})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIsNone(body["plan_id"])
+        self.assertEqual(body["exercises"], [])
+        self.assertFalse(body["has_session_summary"])
+
+    def test_logged_exercises_are_grouped(self):
+        client, self.app, _ = _build_log_client(fixtures={
+            "today_plan": {"plan_id": 42},
+            "logged_groups": [
+                {"exercise": "Goblet squat", "log_type": "strength_set", "n": 3},
+                {"exercise": "Plank",        "log_type": "strength_set", "n": 1},
+            ],
+            "summary_row": None,
+        })
+        resp = client.get("/api/health/today/logged", headers={"X-API-Key": VALID_KEY})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["plan_id"], 42)
+        self.assertEqual(len(body["exercises"]), 2)
+        self.assertEqual(body["exercises"][0]["exercise"], "Goblet squat")
+        self.assertEqual(body["exercises"][0]["set_count"], 3)
+        self.assertFalse(body["has_session_summary"])
+
+    def test_session_summary_present_flag(self):
+        client, self.app, _ = _build_log_client(fixtures={
+            "today_plan": {"plan_id": 42},
+            "logged_groups": [],
+            "summary_row": {"col": 1},
+        })
+        resp = client.get("/api/health/today/logged", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        self.assertTrue(body["has_session_summary"])
 
 
 if __name__ == "__main__":
