@@ -5,6 +5,10 @@ GET  /api/health/today/logged   → which exercises today already have logs
 GET  /api/health/last_logged    → batch: most-recent prior set per exercise
                                   (used by gym-display to pre-fill steppers)
 GET  /api/health/status         → windowed status payload for /status page
+GET  /api/health/sessions       → per-day plan + per-set rows + computed
+                                  aggregates + outlier flags for the
+                                  Status page facts read-back (no
+                                  generated coaching prose)
 POST /api/health/log            → insert N session_log rows for one exercise.
                                   Optional session_rpe → also writes one
                                   session_summary row in the same txn.
@@ -867,3 +871,289 @@ def get_last_logged(
             hr_peak=r["hr_peak"],
         )
     return LastLoggedResponse(by_exercise=out)
+
+
+# ---------------------------------------------------------------------------
+# /sessions — per-day plan + per-set rows + aggregates + outliers
+# ---------------------------------------------------------------------------
+#
+# Facts read-back for the Status page. No generated prose; no trainer-voice
+# synthesis — just the rows + computed comparisons. The user gets to validate
+# their writes by reading exactly what landed in session_log.
+#
+# Window: today-(days-1) .. today in America/Chicago. Default 7 days.
+
+DEFAULT_SESSIONS_DAYS = 7
+MAX_SESSIONS_DAYS = 30
+HIGH_RPE_THRESHOLD = 9.0
+PAIN_KEYWORDS = ("pain", "injury", "hurt", "tweak")
+
+
+class SessionSetRow(BaseModel):
+    log_id: int
+    log_type: str
+    exercise: Optional[str] = None
+    set_num: Optional[int] = None
+    reps_done: Optional[int] = None
+    weight_lbs: Optional[float] = None
+    duration_sec: Optional[int] = None
+    distance_m: Optional[float] = None
+    hr_avg: Optional[int] = None
+    hr_peak: Optional[int] = None
+    rpe_actual: Optional[float] = None
+    notes: Optional[str] = None
+    is_skipped: bool = False
+    logged_at: datetime
+    logged_via: str
+
+
+class SessionSummaryRow(BaseModel):
+    rpe_actual: Optional[float] = None
+    notes: Optional[str] = None
+    logged_at: datetime
+
+
+class OutlierFlags(BaseModel):
+    """Pure data flags — outliers that EXIST in the rows. No interpretation."""
+    high_rpe_sets: list[dict[str, Any]] = Field(default_factory=list)
+    incomplete: bool = False
+    incomplete_logged: int = 0
+    incomplete_planned: int = 0
+    pain_notes: list[str] = Field(default_factory=list)
+
+
+class SessionDayRow(BaseModel):
+    plan_date: date
+    plan_id: Optional[int] = None
+    session_type: Optional[str] = None
+    display_name: Optional[str] = None
+    phase: Optional[int] = None
+    week_num: Optional[int] = None
+    target_rpe: Optional[float] = None
+    target_hr_zone: Optional[int] = None
+    is_skipped: bool = False
+    is_today: bool = False
+    planned_set_count: int = 0
+    logged_set_count: int = 0
+    sets: list[SessionSetRow] = Field(default_factory=list)
+    session_summary: Optional[SessionSummaryRow] = None
+    avg_set_rpe: Optional[float] = None
+    hr_avg: Optional[int] = None      # avg across cardio_block rows
+    hr_peak: Optional[int] = None     # max across cardio_block rows
+    total_work_sec: int = 0
+    outliers: OutlierFlags = Field(default_factory=OutlierFlags)
+
+
+class SessionsResponse(BaseModel):
+    today: date
+    window_start: date
+    window_end: date
+    days: list[SessionDayRow]
+
+
+def _planned_set_count(blocks: Any) -> int:
+    """Walk a plan.blocks JSONB and return the total expected set count.
+
+    Mirrors src/lib/log-state.ts totalSetsFor: circuit rounds × occurrences
+    summed across main + finisher; intervals/steady/walk/mobility = 1.
+    """
+    if not isinstance(blocks, dict):
+        return 0
+    t = blocks.get("type")
+    total = 0
+    if t == "circuit":
+        rounds = max(1, int(blocks.get("rounds") or 1))
+        exs = blocks.get("exercises")
+        n = len(exs) if isinstance(exs, list) else 0
+        total += rounds * n
+    elif t in ("intervals", "steady", "walk", "mobility"):
+        total += 1
+    fin = blocks.get("finisher")
+    if isinstance(fin, dict):
+        f_rounds = max(1, int(fin.get("rounds") or 1))
+        f_exs = fin.get("exercises")
+        f_n = len(f_exs) if isinstance(f_exs, list) else 0
+        total += f_rounds * f_n
+    return total
+
+
+def _contains_pain_keyword(s: Optional[str]) -> bool:
+    if not s:
+        return False
+    lo = s.lower()
+    return any(k in lo for k in PAIN_KEYWORDS)
+
+
+@router.get("/sessions", response_model=SessionsResponse)
+def get_sessions(
+    days: int = DEFAULT_SESSIONS_DAYS,
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """Per-day plan + per-set rows + computed aggregates for the Status page.
+
+    Returns one row per calendar day in [today-(days-1), today] (America/
+    Chicago). Per-day fields cover:
+
+      * plan metadata + planned_set_count derived from blocks JSONB
+      * sets[] — every session_log row of log_type strength_set / cardio_block
+      * session_summary if present
+      * avg_set_rpe — avg of non-null rpe_actual across the day's sets
+      * hr_avg, hr_peak — aggregated from cardio_block rows only
+      * total_work_sec — sum of duration_sec across the day's sets
+      * outliers — {high_rpe_sets, incomplete, pain_notes}: pure data flags
+
+    No generated coaching prose. The page renders facts + computed
+    comparisons; trainer-voice synthesis is the future autoregulator.
+    """
+    days = max(1, min(MAX_SESSIONS_DAYS, days))
+    today = _today_ct()
+    window_start = today - timedelta(days=days - 1)
+    window_end = today
+
+    # Plans in the window.
+    plan_rows = db.execute(
+        text("""
+            SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
+                   target_rpe, target_hr_zone, is_skipped
+            FROM health.plan
+            WHERE plan_date BETWEEN :s AND :e
+            ORDER BY plan_date
+        """),
+        {"s": window_start, "e": window_end},
+    ).mappings().all()
+
+    plans_by_date: dict[date, dict[str, Any]] = {r["plan_date"]: dict(r) for r in plan_rows}
+    plan_ids = [p["plan_id"] for p in plan_rows]
+
+    # All session_log rows tied to these plan_ids in one query.
+    log_rows: list[dict[str, Any]] = []
+    if plan_ids:
+        log_rows = [
+            dict(r)
+            for r in db.execute(
+                text("""
+                    SELECT log_id, plan_id, log_type, exercise, set_num,
+                           reps_done, weight_lbs, duration_sec, distance_m,
+                           hr_avg, hr_peak, rpe_actual, notes, is_skipped,
+                           logged_at, logged_via
+                    FROM health.session_log
+                    WHERE plan_id = ANY(:pids)
+                    ORDER BY plan_id, log_id
+                """),
+                {"pids": plan_ids},
+            ).mappings().all()
+        ]
+
+    logs_by_plan: dict[int, list[dict[str, Any]]] = {}
+    for r in log_rows:
+        logs_by_plan.setdefault(r["plan_id"], []).append(r)
+
+    out_days: list[SessionDayRow] = []
+    for i in range(days):
+        d = window_start + timedelta(days=i)
+        plan = plans_by_date.get(d)
+        sets: list[SessionSetRow] = []
+        summary: Optional[SessionSummaryRow] = None
+        avg_rpe: Optional[float] = None
+        agg_hr_avg: Optional[int] = None
+        agg_hr_peak: Optional[int] = None
+        total_work_sec = 0
+        high_rpe: list[dict[str, Any]] = []
+        pain_notes: list[str] = []
+        logged_set_count = 0
+
+        if plan is not None:
+            for r in logs_by_plan.get(plan["plan_id"], []):
+                if r["log_type"] == "session_summary":
+                    summary = SessionSummaryRow(
+                        rpe_actual=float(r["rpe_actual"]) if r["rpe_actual"] is not None else None,
+                        notes=r["notes"],
+                        logged_at=r["logged_at"],
+                    )
+                    if _contains_pain_keyword(r["notes"]):
+                        pain_notes.append(r["notes"])
+                    continue
+                if r["log_type"] not in ("strength_set", "cardio_block"):
+                    continue
+                row = SessionSetRow(
+                    log_id=r["log_id"],
+                    log_type=r["log_type"],
+                    exercise=r["exercise"],
+                    set_num=r["set_num"],
+                    reps_done=r["reps_done"],
+                    weight_lbs=float(r["weight_lbs"]) if r["weight_lbs"] is not None else None,
+                    duration_sec=r["duration_sec"],
+                    distance_m=float(r["distance_m"]) if r["distance_m"] is not None else None,
+                    hr_avg=r["hr_avg"],
+                    hr_peak=r["hr_peak"],
+                    rpe_actual=float(r["rpe_actual"]) if r["rpe_actual"] is not None else None,
+                    notes=r["notes"],
+                    is_skipped=bool(r["is_skipped"]),
+                    logged_at=r["logged_at"],
+                    logged_via=r["logged_via"],
+                )
+                sets.append(row)
+                logged_set_count += 1
+                if row.duration_sec:
+                    total_work_sec += row.duration_sec
+                if row.rpe_actual is not None and row.rpe_actual >= HIGH_RPE_THRESHOLD:
+                    high_rpe.append({
+                        "exercise": row.exercise,
+                        "set_num": row.set_num,
+                        "rpe_actual": row.rpe_actual,
+                    })
+                if _contains_pain_keyword(row.notes):
+                    pain_notes.append(row.notes or "")
+
+            # Aggregates: avg of non-null RPE; HR from cardio rows only.
+            rpes = [s.rpe_actual for s in sets if s.rpe_actual is not None]
+            if rpes:
+                avg_rpe = sum(rpes) / len(rpes)
+            cardio = [s for s in sets if s.log_type == "cardio_block"]
+            avgs = [s.hr_avg for s in cardio if s.hr_avg is not None]
+            peaks = [s.hr_peak for s in cardio if s.hr_peak is not None]
+            if avgs:
+                agg_hr_avg = round(sum(avgs) / len(avgs))
+            if peaks:
+                agg_hr_peak = max(peaks)
+
+        planned = _planned_set_count(plan.get("blocks") if plan else None)
+        # Incomplete = at least one set logged but fewer than planned.
+        incomplete = logged_set_count > 0 and planned > 0 and logged_set_count < planned
+
+        out_days.append(SessionDayRow(
+            plan_date=d,
+            plan_id=plan["plan_id"] if plan else None,
+            session_type=plan["session_type"] if plan else None,
+            display_name=_display_name(plan.get("blocks") if plan else None,
+                                       plan["session_type"] if plan else None),
+            phase=plan["phase"] if plan else None,
+            week_num=plan["week_num"] if plan else None,
+            target_rpe=float(plan["target_rpe"]) if plan and plan["target_rpe"] is not None else None,
+            target_hr_zone=plan["target_hr_zone"] if plan else None,
+            is_skipped=bool(plan["is_skipped"]) if plan else False,
+            is_today=(d == today),
+            planned_set_count=planned,
+            logged_set_count=logged_set_count,
+            sets=sets,
+            session_summary=summary,
+            avg_set_rpe=round(avg_rpe, 2) if avg_rpe is not None else None,
+            hr_avg=agg_hr_avg,
+            hr_peak=agg_hr_peak,
+            total_work_sec=total_work_sec,
+            outliers=OutlierFlags(
+                high_rpe_sets=high_rpe,
+                incomplete=incomplete,
+                incomplete_logged=logged_set_count,
+                incomplete_planned=planned,
+                pain_notes=pain_notes,
+            ),
+        ))
+
+    return SessionsResponse(
+        today=today,
+        window_start=window_start,
+        window_end=window_end,
+        days=out_days,
+    )

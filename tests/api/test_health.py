@@ -733,6 +733,188 @@ class TestTodayLoggedEndpoint(unittest.TestCase):
         self.assertTrue(body["has_session_summary"])
 
 
+class _SessionsAwareSession:
+    """DB shim for /sessions tests. Returns plan rows then log rows."""
+
+    def __init__(self, plan_rows=None, log_rows=None):
+        self._plan_rows = plan_rows or []
+        self._log_rows = log_rows or []
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt).lower()
+        if "from health.plan" in sql and "between" in sql:
+            return _MockMultiResult(self._plan_rows)
+        if "from health.session_log" in sql and "any(:pids)" in sql:
+            return _MockMultiResult(self._log_rows)
+        return _MockExecuteResult(None)
+
+
+def _build_sessions_client(plan_rows=None, log_rows=None):
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        raise unittest.SkipTest("fastapi not installed")
+    from api.app.database import get_db
+    from api.app.main import app
+    from api.app.routers import health as health_router
+
+    def _override_db():
+        yield _SessionsAwareSession(plan_rows, log_rows)
+    app.dependency_overrides[get_db] = _override_db
+    health_router._HEALTH_API_KEY = VALID_KEY
+    return TestClient(app), app
+
+
+class TestSessionsEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.app = None
+
+    def tearDown(self):
+        if self.app is not None:
+            self.app.dependency_overrides.clear()
+        from api.app.routers import health as health_router
+        health_router._HEALTH_API_KEY = None
+
+    def test_401_without_key(self):
+        client, self.app = _build_sessions_client()
+        resp = client.get("/api/health/sessions")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_empty_window_returns_days_rows(self):
+        client, self.app = _build_sessions_client()
+        resp = client.get("/api/health/sessions?days=7", headers={"X-API-Key": VALID_KEY})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(len(body["days"]), 7)
+        for d in body["days"]:
+            self.assertEqual(d["planned_set_count"], 0)
+            self.assertEqual(d["logged_set_count"], 0)
+            self.assertEqual(d["sets"], [])
+            self.assertIsNone(d["session_summary"])
+            self.assertIsNone(d["avg_set_rpe"])
+
+    def test_days_clamped_to_max(self):
+        client, self.app = _build_sessions_client()
+        resp = client.get("/api/health/sessions?days=999", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        self.assertLessEqual(len(body["days"]), 30)
+
+    def test_planned_set_count_from_circuit_blocks(self):
+        from datetime import date as date_cls
+        today = date_cls.today()
+        plan_rows = [{
+            "plan_id": 42,
+            "plan_date": today,
+            "phase": 2,
+            "week_num": 8,
+            "session_type": "strength_a",
+            "target_rpe": 7.5,
+            "target_hr_zone": 3,
+            "is_skipped": False,
+            "blocks": {
+                "type": "circuit",
+                "rounds": 3,
+                "exercises": [
+                    {"name": "Goblet squat", "format": "reps"},
+                    {"name": "Plank", "format": "duration"},
+                ],
+                "finisher": {
+                    "rounds": 2,
+                    "exercises": [
+                        {"name": "Dead bug", "format": "reps"},
+                    ],
+                },
+            },
+        }]
+        client, self.app = _build_sessions_client(plan_rows=plan_rows)
+        resp = client.get("/api/health/sessions?days=1", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        today_row = body["days"][0]
+        # main: rounds=3 × 2 exercises = 6; finisher: rounds=2 × 1 = 2; total = 8
+        self.assertEqual(today_row["planned_set_count"], 8)
+        self.assertEqual(today_row["phase"], 2)
+        self.assertEqual(today_row["target_rpe"], 7.5)
+        self.assertEqual(today_row["target_hr_zone"], 3)
+
+    def test_aggregates_and_outliers(self):
+        from datetime import date as date_cls, datetime as datetime_cls
+        today = date_cls.today()
+        plan_rows = [{
+            "plan_id": 70,
+            "plan_date": today,
+            "phase": 2,
+            "week_num": 8,
+            "session_type": "strength_c",
+            "target_rpe": 7.0,
+            "target_hr_zone": 3,
+            "is_skipped": False,
+            "blocks": {"type": "circuit", "rounds": 3, "exercises": [{"name": "Goblet squat"}]},
+        }]
+        log_rows = [
+            # Three strength sets, one with high RPE
+            {"log_id": 1, "plan_id": 70, "log_type": "strength_set", "exercise": "Goblet squat",
+             "set_num": 1, "reps_done": 10, "weight_lbs": 35.0, "duration_sec": None,
+             "distance_m": None, "hr_avg": None, "hr_peak": None, "rpe_actual": 7.0,
+             "notes": None, "is_skipped": False, "logged_at": datetime_cls(2026, 6, 8, 18),
+             "logged_via": "manual"},
+            {"log_id": 2, "plan_id": 70, "log_type": "strength_set", "exercise": "Goblet squat",
+             "set_num": 2, "reps_done": 10, "weight_lbs": 40.0, "duration_sec": None,
+             "distance_m": None, "hr_avg": None, "hr_peak": None, "rpe_actual": 8.0,
+             "notes": "right knee tweak", "is_skipped": False,
+             "logged_at": datetime_cls(2026, 6, 8, 18, 5), "logged_via": "manual"},
+            {"log_id": 3, "plan_id": 70, "log_type": "strength_set", "exercise": "Goblet squat",
+             "set_num": 3, "reps_done": 8, "weight_lbs": 45.0, "duration_sec": None,
+             "distance_m": None, "hr_avg": None, "hr_peak": None, "rpe_actual": 9.5,
+             "notes": None, "is_skipped": False,
+             "logged_at": datetime_cls(2026, 6, 8, 18, 10), "logged_via": "manual"},
+            # session_summary
+            {"log_id": 4, "plan_id": 70, "log_type": "session_summary", "exercise": None,
+             "set_num": None, "reps_done": None, "weight_lbs": None, "duration_sec": None,
+             "distance_m": None, "hr_avg": None, "hr_peak": None, "rpe_actual": 8.5,
+             "notes": None, "is_skipped": False,
+             "logged_at": datetime_cls(2026, 6, 8, 18, 15), "logged_via": "manual"},
+        ]
+        client, self.app = _build_sessions_client(plan_rows=plan_rows, log_rows=log_rows)
+        resp = client.get("/api/health/sessions?days=1", headers={"X-API-Key": VALID_KEY})
+        body = resp.json()
+        d = body["days"][0]
+        self.assertEqual(d["logged_set_count"], 3)
+        # avg of 7, 8, 9.5 = 8.166... → 8.17
+        self.assertAlmostEqual(d["avg_set_rpe"], 8.17, places=2)
+        self.assertEqual(d["session_summary"]["rpe_actual"], 8.5)
+        # High-RPE outlier (>= 9): set 3
+        self.assertEqual(len(d["outliers"]["high_rpe_sets"]), 1)
+        self.assertEqual(d["outliers"]["high_rpe_sets"][0]["set_num"], 3)
+        # Pain keyword (tweak)
+        self.assertEqual(len(d["outliers"]["pain_notes"]), 1)
+        # planned=3, logged=3 → NOT incomplete
+        self.assertFalse(d["outliers"]["incomplete"])
+
+    def test_incomplete_when_logged_lt_planned(self):
+        from datetime import date as date_cls, datetime as datetime_cls
+        today = date_cls.today()
+        plan_rows = [{
+            "plan_id": 71, "plan_date": today, "phase": 1, "week_num": 1,
+            "session_type": "strength_a", "target_rpe": 7.0, "target_hr_zone": 3,
+            "is_skipped": False,
+            "blocks": {"type": "circuit", "rounds": 3, "exercises": [{"name": "Goblet squat"}]},
+        }]
+        # Only 1 of 3 planned sets logged
+        log_rows = [
+            {"log_id": 1, "plan_id": 71, "log_type": "strength_set", "exercise": "Goblet squat",
+             "set_num": 1, "reps_done": 10, "weight_lbs": 35.0, "duration_sec": None,
+             "distance_m": None, "hr_avg": None, "hr_peak": None, "rpe_actual": 7.0,
+             "notes": None, "is_skipped": False, "logged_at": datetime_cls(2026, 6, 8, 18),
+             "logged_via": "manual"},
+        ]
+        client, self.app = _build_sessions_client(plan_rows=plan_rows, log_rows=log_rows)
+        resp = client.get("/api/health/sessions?days=1", headers={"X-API-Key": VALID_KEY})
+        d = resp.json()["days"][0]
+        self.assertTrue(d["outliers"]["incomplete"])
+        self.assertEqual(d["outliers"]["incomplete_logged"], 1)
+        self.assertEqual(d["outliers"]["incomplete_planned"], 3)
+
+
 class TestLastLoggedEndpoint(unittest.TestCase):
     def setUp(self):
         self.app = None
