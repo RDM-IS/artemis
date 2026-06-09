@@ -727,5 +727,187 @@ class TestNagDayOfWeekSuppression(unittest.TestCase):
         self.assertNotIn(3, self._suppressed_dow())
 
 
+# ============================================================================
+# Unified capture: discriminator, unit conversion, cardio parse, propose/confirm
+# ============================================================================
+
+class TestCaptureDiscriminator(unittest.TestCase):
+    def test_cardio_paste_is_capture(self):
+        self.assertTrue(health.is_capture_paste(
+            "run-walk done. time 51:36, distance 3.28 miles, 121 bpm avg HR."))
+
+    def test_multi_segment_is_capture(self):
+        self.assertTrue(health.is_capture_paste(
+            "Run #1: .16 mile RPE 8. Run #2: .15 mile RPE 9."))
+
+    def test_strength_debrief_is_capture(self):
+        self.assertTrue(health.is_capture_paste("done. squats 3x10 @ 35 RPE 7. plank 30s."))
+
+    def test_question_is_not_capture(self):
+        self.assertFalse(health.is_capture_paste("what's today's workout"))
+        self.assertFalse(health.is_capture_paste("how was my last workout"))
+        self.assertFalse(health.is_capture_paste("show me this week's plan"))
+
+    def test_bare_done_is_not_capture(self):
+        # Bare 'done'/'finished' must still end a live session / hit the inbox.
+        self.assertFalse(health.is_capture_paste("done"))
+        self.assertFalse(health.is_capture_paste("finished"))
+
+
+class TestUnitConversion(unittest.TestCase):
+    def test_to_seconds(self):
+        self.assertEqual(health._to_seconds("51:36"), 3096)
+        self.assertEqual(health._to_seconds("1:48"), 108)
+        self.assertEqual(health._to_seconds("1:00:00"), 3600)
+        self.assertEqual(health._to_seconds(30), 30)
+        self.assertIsNone(health._to_seconds(None))
+        self.assertIsNone(health._to_seconds("nonsense"))
+
+    def test_to_meters(self):
+        self.assertEqual(health._to_meters(3.28, "mi"), 5278.6)
+        self.assertEqual(health._to_meters(0.16, "mi"), 257.5)
+        self.assertEqual(health._to_meters(200, "ft"), 61.0)
+        self.assertEqual(health._to_meters(100, "m"), 100.0)
+        self.assertEqual(health._to_meters(0.16, None), 257.5)  # default miles
+        self.assertIsNone(health._to_meters(None, "mi"))
+
+    def test_convert_units_strips_raw_keys(self):
+        row = {"exercise": "Run 1", "log_type": "cardio_block",
+               "distance": 0.16, "distance_unit": "mi", "duration": "1:48"}
+        out = health._convert_units(row)
+        self.assertEqual(out["distance_m"], 257.5)
+        self.assertEqual(out["duration_sec"], 108)
+        self.assertNotIn("distance", out)
+        self.assertNotIn("duration", out)
+
+
+_RUNWALK_JSON = {
+    "exercises": [
+        {"exercise": "Run 1", "log_type": "cardio_block", "round_num": 1,
+         "duration": "1:48", "distance": 0.16, "distance_unit": "mi",
+         "rpe_actual": 8.0, "hr_avg": 147, "is_skipped": False},
+        {"exercise": "Run 2", "log_type": "cardio_block", "round_num": 2,
+         "duration": "1:45", "distance": 0.15, "distance_unit": "mi",
+         "rpe_actual": 9.0, "hr_avg": 151, "is_skipped": False},
+    ],
+    "session_summary": {
+        "duration": "51:36", "distance": 3.28, "distance_unit": "mi",
+        "hr_avg": 121, "rpe_actual": 9.0,
+        "notes": "walk RPE 4, run RPE 9; felt good", "user_suggestion": None,
+    },
+}
+
+
+class TestCardioParse(unittest.TestCase):
+    def test_segments_and_summary(self):
+        with patch.object(health, "_call_claude_json", return_value=_RUNWALK_JSON):
+            reports = health.parse_workout_debrief("run-walk paste", plan=None)
+        cardio = [r for r in reports if r.log_type == "cardio_block"]
+        summary = [r for r in reports if r.log_type == "session_summary"]
+        self.assertEqual(len(cardio), 2)
+        self.assertEqual(len(summary), 1)
+        # Conversions are Python-side and deterministic.
+        self.assertEqual(cardio[0].distance_m, 257.5)
+        self.assertEqual(cardio[0].duration_sec, 108)
+        self.assertEqual(cardio[0].round_num, 1)
+        self.assertEqual(summary[0].distance_m, 5278.6)
+        self.assertEqual(summary[0].duration_sec, 3096)
+        self.assertEqual(summary[0].hr_avg, 121)
+
+
+class TestProposeConfirm(unittest.TestCase):
+    def test_propose_stores_and_writes_nothing(self):
+        with patch.object(health, "get_today_plan",
+                          return_value={"plan_id": 3, "session_type": "cardio_z2"}), \
+             patch.object(health, "_call_claude_json", return_value=_RUNWALK_JSON), \
+             patch.object(health, "store_capture_pending") as mock_store:
+            reply = health.build_and_store_proposal("run-walk paste", "chan1")
+        mock_store.assert_called_once()
+        # The pending payload carries the parsed reports + plan_id 3.
+        _chan, reports, plan_id = mock_store.call_args[0]
+        self.assertEqual(plan_id, 3)
+        self.assertTrue(any(r.log_type == "cardio_block" for r in reports))
+        self.assertIn("confirm", reply.lower())
+        self.assertIn("plan_id: 3", reply)
+
+    def test_propose_notes_missing_plan(self):
+        with patch.object(health, "get_today_plan", return_value=None), \
+             patch.object(health, "_call_claude_json", return_value=_RUNWALK_JSON), \
+             patch.object(health, "store_capture_pending"):
+            reply = health.build_and_store_proposal("run-walk paste", "chan1")
+        self.assertIn("plan_id=NULL", reply)
+
+    def test_commit_inserts_in_one_tx_and_returns_ids(self):
+        payload = {
+            "rows": [
+                {"exercise": "Run 1", "log_type": "cardio_block", "round_num": 1,
+                 "distance_m": 257.5, "duration_sec": 108, "rpe_actual": 8.0},
+                {"exercise": "session_summary", "log_type": "session_summary",
+                 "distance_m": 5278.6, "duration_sec": 3096},
+            ],
+            "plan_id": 3,
+        }
+        with patch.object(health, "load_capture_pending", return_value=payload), \
+             patch.object(health, "insert_session_logs_tx", return_value=[101, 102]) as mock_tx, \
+             patch.object(health, "clear_capture_pending") as mock_clear:
+            reply = health.commit_capture("chan1")
+        mock_tx.assert_called_once()
+        rows_arg, plan_arg = mock_tx.call_args[0]
+        self.assertEqual(plan_arg, 3)
+        self.assertEqual(len(rows_arg), 2)
+        mock_clear.assert_called_once()
+        self.assertIn("101, 102", reply)
+        self.assertIn("2 rows", reply)
+
+    def test_commit_with_no_pending(self):
+        with patch.object(health, "load_capture_pending", return_value=None):
+            reply = health.commit_capture("chan1")
+        self.assertIn("Nothing pending", reply)
+
+
+class TestRoutingRejectionInvariant(unittest.TestCase):
+    """Locks the routing-rejection invariant that originally caused the bug.
+
+    Invariant: a plan question must be claimed by plan-display (the
+    _handle_health_conversation path) BEFORE _handle_capture_propose is reached.
+    This guards against handler reordering OR an is_capture_paste regression
+    reintroducing the metrics-misrouting bug (a paste/question reaching the wrong
+    handler). Proven at the routing level, not just the predicate level — so if
+    someone reorders the _handle_mention dispatch later and this goes red, the
+    failure explains WHY it matters, not just that it broke.
+    """
+
+    def test_plan_question_routes_to_plan_display_not_capture(self):
+        # Canonical plan question. Both halves must hold:
+        #  (1) the capture predicate does NOT claim it, and
+        #  (2) the health-conversation path claims it as a plan-display intent
+        #      (plan_detail) first, so capture is never reached.
+        q = "what's today's workout"
+        self.assertFalse(health.is_capture_paste(q))
+        self.assertEqual(health.detect_health_intent(q), health.INTENT_PLAN_DETAIL)
+
+    def test_second_plan_phrasing_routes_to_plan_display_not_capture(self):
+        # Same invariant on a different phrasing, so the intent-routing half is
+        # not proven on a single string. "this week" is breadth → plan_lookup,
+        # which is also a plan-display intent handled before capture.
+        q = "show me this week's plan"
+        self.assertFalse(health.is_capture_paste(q))
+        self.assertEqual(health.detect_health_intent(q), health.INTENT_PLAN_LOOKUP)
+
+    def test_dispatch_orders_plan_display_before_capture(self):
+        # Source-level ordering guard (no import/mocking): in _handle_mention the
+        # plan-display dispatch MUST precede the capture-propose dispatch, so even
+        # a predicate regression cannot misroute a plan question to capture.
+        main_src = (_REPO_ROOT / "artemis" / "main.py").read_text()
+        hc = main_src.index("if _handle_health_conversation(post, question):")
+        cp = main_src.index("if _handle_capture_propose(post, question):")
+        self.assertLess(
+            hc, cp,
+            "plan-display (_handle_health_conversation) must dispatch before "
+            "_handle_capture_propose in _handle_mention — reordering reintroduces "
+            "the metrics-misrouting bug",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

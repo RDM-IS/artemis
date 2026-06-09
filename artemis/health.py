@@ -57,9 +57,12 @@ class MorningState(BaseModel):
 class ExerciseReport(BaseModel):
     exercise: str
     log_type: str = Field(..., pattern=r"^(strength_set|cardio_block|session_summary)$")
+    set_num: Optional[int] = None
+    round_num: Optional[int] = None
     reps_done: Optional[int] = None
     weight_lbs: Optional[float] = None
     duration_sec: Optional[int] = None
+    distance_m: Optional[float] = None
     rpe_actual: Optional[float] = None
     hr_avg: Optional[int] = None
     hr_peak: Optional[int] = None
@@ -208,7 +211,12 @@ def parse_morning_checkin(text: str) -> MorningState:
 # Workout debrief parser
 # ============================================================================
 
-_DEBRIEF_SYSTEM = """You parse a workout debrief message into structured exercise reports.
+_DEBRIEF_SYSTEM = """You parse a workout debrief (strength OR cardio) into structured rows.
+
+EXTRACT RAW VALUES ONLY. Do NOT do arithmetic or unit conversion — emit the
+number and its unit exactly as written; downstream code converts to meters and
+seconds. (e.g. "3.28 miles" → distance:3.28, distance_unit:"mi"; "1:48" →
+duration:"1:48".)
 
 Return ONLY valid JSON matching this schema, no other text:
 {
@@ -216,9 +224,13 @@ Return ONLY valid JSON matching this schema, no other text:
     {
       "exercise": "string",
       "log_type": "strength_set"|"cardio_block",
+      "set_num": int or null,
+      "round_num": int or null,
       "reps_done": int or null,
       "weight_lbs": float or null,
-      "duration_sec": int or null,
+      "duration": "MM:SS" string or seconds int or null,
+      "distance": float or null,
+      "distance_unit": "mi"|"ft"|"m" or null,
       "rpe_actual": float 1-10 or null,
       "hr_avg": int or null,
       "hr_peak": int or null,
@@ -228,6 +240,10 @@ Return ONLY valid JSON matching this schema, no other text:
     }
   ],
   "session_summary": {
+    "duration": "MM:SS" string or seconds int or null,
+    "distance": float or null,
+    "distance_unit": "mi"|"ft"|"m" or null,
+    "hr_avg": int or null,
     "rpe_actual": float or null,
     "notes": "string or null",
     "user_suggestion": "string or null"
@@ -235,16 +251,26 @@ Return ONLY valid JSON matching this schema, no other text:
 }
 
 RULES:
-- Each exercise mentioned by name → one row.
+- Each exercise/segment mentioned → one row.
 - Skipped exercises: is_skipped=true, notes="skipped: <reason>".
 - "RPE 8" or "8 out of 10" → rpe_actual.
-- "HR peak 159"/"peak HR 159" → hr_peak. "HR avg X" → hr_avg.
+- "HR peak 159"/"peak HR 159" → hr_peak. "HR 147"/"HR avg X"/"121 bpm avg" → hr_avg.
 - Weights: "@ 50lb"/"50 lbs"/"at 50" → weight_lbs.
 - Reps: "10 reps"/"x 10"/"10x" → reps_done.
-- Cardio: log_type="cardio_block". Strength: log_type="strength_set".
-- User suggestions for plan changes (e.g. "next time take it down", "should be harder",
-  "60 seconds is too short") → user_suggestion VERBATIM (paraphrasing forbidden).
-- session_summary RPE: "overall RPE X" or "felt RPE X" applied to the whole session.
+- Distance: ".16 mile"/"3.28 miles" → distance + distance_unit:"mi"; "200 ft" → "ft".
+- Duration / pace / splits: "51:36"/"1:48" → duration (keep the "MM:SS" string).
+- Strength: log_type="strength_set". Cardio (runs, intervals, rides, walks,
+  rows, treadmill) → log_type="cardio_block".
+- CARDIO SEGMENTS: a paste with "Run #1 … Run #2 …" or "Interval 1 …" → one
+  cardio_block row PER segment. Name them "Run 1","Run 2",… (or "Interval 1",…)
+  and set round_num to the segment index (1,2,3,…). Carry that segment's own
+  distance/duration/rpe_actual/hr_avg.
+- session_summary: the OVERALL totals — total duration, total distance, average
+  HR for the whole session, plus overall RPE and any free-text. If the paste
+  gives overall walk RPE + run RPE, put both in notes verbatim
+  (e.g. "walk RPE 4, run RPE 9; runs uphill / walks downhill, felt good").
+- User suggestions for plan changes ("next time take it down", "modify reverse
+  lunge next time", "60 seconds is too short") → user_suggestion VERBATIM.
 
 Today's plan context:
 {plan_context}
@@ -255,39 +281,119 @@ Input: "Burpees 15 reps RPE 10 HR peak 159, RDLs 10 at 50 RPE 6, rows were good 
 Output:
 {
   "exercises": [
-    {"exercise":"Burpees","log_type":"cardio_block","reps_done":15,"weight_lbs":null,"duration_sec":null,"rpe_actual":10.0,"hr_avg":null,"hr_peak":159,"notes":null,"user_suggestion":null,"is_skipped":false},
-    {"exercise":"RDL","log_type":"strength_set","reps_done":10,"weight_lbs":50.0,"duration_sec":null,"rpe_actual":6.0,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false},
-    {"exercise":"Rows","log_type":"strength_set","reps_done":null,"weight_lbs":null,"duration_sec":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"felt strong","user_suggestion":null,"is_skipped":false},
-    {"exercise":"Plank","log_type":"strength_set","reps_done":null,"weight_lbs":null,"duration_sec":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"skipped: knee was off","user_suggestion":null,"is_skipped":true}
+    {"exercise":"Burpees","log_type":"cardio_block","set_num":null,"round_num":null,"reps_done":15,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":10.0,"hr_avg":null,"hr_peak":159,"notes":null,"user_suggestion":null,"is_skipped":false},
+    {"exercise":"RDL","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":10,"weight_lbs":50.0,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":6.0,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false},
+    {"exercise":"Rows","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"felt strong","user_suggestion":null,"is_skipped":false},
+    {"exercise":"Plank","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"skipped: knee was off","user_suggestion":null,"is_skipped":true}
   ],
-  "session_summary": {"rpe_actual":8.0,"notes":"felt gassed","user_suggestion":null}
+  "session_summary": {"duration":null,"distance":null,"distance_unit":null,"hr_avg":null,"rpe_actual":8.0,"notes":"felt gassed","user_suggestion":null}
 }
 
 Input: "done. squats 3x10 @ 35 RPE 7. plank 30s. all good."
 Output:
 {
   "exercises": [
-    {"exercise":"Goblet squat","log_type":"strength_set","reps_done":10,"weight_lbs":35.0,"duration_sec":null,"rpe_actual":7.0,"hr_avg":null,"hr_peak":null,"notes":"3 sets","user_suggestion":null,"is_skipped":false},
-    {"exercise":"Plank","log_type":"strength_set","reps_done":null,"weight_lbs":null,"duration_sec":30,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false}
+    {"exercise":"Goblet squat","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":10,"weight_lbs":35.0,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":7.0,"hr_avg":null,"hr_peak":null,"notes":"3 sets","user_suggestion":null,"is_skipped":false},
+    {"exercise":"Plank","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":30,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false}
   ],
-  "session_summary": {"rpe_actual":null,"notes":null,"user_suggestion":null}
+  "session_summary": {"duration":null,"distance":null,"distance_unit":null,"hr_avg":null,"rpe_actual":null,"notes":null,"user_suggestion":null}
 }
 
-Input: "intervals done. 8 rounds, peak HR 152. rest was too easy at 60s, try 45 next time. overall RPE 7."
+Input: "run-walk done. time 51:36, distance 3.28 miles, 121 bpm avg HR. Run #1: .16 mile | 1:48 | RPE 8 | HR 147. Run #2: .15 mile | 1:45 | RPE 9 | HR 151. overall walk RPE 4 run RPE 9. runs uphill, walks downhill, felt good."
 Output:
 {
   "exercises": [
-    {"exercise":"Treadmill intervals","log_type":"cardio_block","reps_done":8,"weight_lbs":null,"duration_sec":null,"rpe_actual":7.0,"hr_avg":null,"hr_peak":152,"notes":null,"user_suggestion":"rest was too easy at 60s, try 45 next time","is_skipped":false}
+    {"exercise":"Run 1","log_type":"cardio_block","set_num":null,"round_num":1,"reps_done":null,"weight_lbs":null,"duration":"1:48","distance":0.16,"distance_unit":"mi","rpe_actual":8.0,"hr_avg":147,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false},
+    {"exercise":"Run 2","log_type":"cardio_block","set_num":null,"round_num":2,"reps_done":null,"weight_lbs":null,"duration":"1:45","distance":0.15,"distance_unit":"mi","rpe_actual":9.0,"hr_avg":151,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false}
   ],
-  "session_summary": {"rpe_actual":7.0,"notes":null,"user_suggestion":"rest was too easy at 60s, try 45 next time"}
+  "session_summary": {"duration":"51:36","distance":3.28,"distance_unit":"mi","hr_avg":121,"rpe_actual":9.0,"notes":"walk RPE 4, run RPE 9; runs uphill, walks downhill, felt good","user_suggestion":null}
 }
 """
 
 
-def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseReport]:
-    """Parse free-form workout debrief into structured exercise reports.
+# Unit conversion — the LLM extracts RAW values; Python converts deterministically
+# (no LLM arithmetic). Pure + testable without the API.
+_MILES_TO_M = 1609.34
+_FEET_TO_M = 0.3048
 
-    Returns N exercise rows + 1 session_summary row.
+
+def _to_seconds(duration) -> int | None:
+    """Convert a raw duration to whole seconds.
+
+    Accepts "MM:SS" / "H:MM:SS" strings or a numeric seconds value. Returns None
+    on anything unparseable.
+    """
+    if duration is None:
+        return None
+    if isinstance(duration, bool):
+        return None
+    if isinstance(duration, (int, float)):
+        return int(round(duration))
+    s = str(duration).strip()
+    if not s:
+        return None
+    if ":" in s:
+        try:
+            nums = [int(p) for p in s.split(":")]
+        except ValueError:
+            return None
+        secs = 0
+        for n in nums:
+            secs = secs * 60 + n
+        return secs
+    try:
+        return int(round(float(s)))
+    except ValueError:
+        return None
+
+
+def _to_meters(distance, unit) -> float | None:
+    """Convert a raw distance + unit to meters (1 decimal). mi/ft/m/km supported;
+    a missing/unknown unit defaults to miles."""
+    if distance is None:
+        return None
+    try:
+        val = float(distance)
+    except (TypeError, ValueError):
+        return None
+    u = (unit or "mi").strip().lower()
+    if u in ("mi", "mile", "miles"):
+        m = val * _MILES_TO_M
+    elif u in ("ft", "feet", "foot"):
+        m = val * _FEET_TO_M
+    elif u in ("m", "meter", "meters", "metre", "metres"):
+        m = val
+    elif u in ("km", "kilometer", "kilometers", "kilometre", "kilometres"):
+        m = val * 1000.0
+    else:
+        m = val * _MILES_TO_M
+    return round(m, 1)
+
+
+def _convert_units(row: dict) -> dict:
+    """Convert a raw parser row's distance/duration into distance_m/duration_sec.
+
+    Takes the {distance, distance_unit, duration, ...} dict the LLM emits and
+    returns a dict with duration_sec/distance_m populated and the raw keys
+    removed — ready to feed into ExerciseReport. Pure (no LLM, no I/O), so the
+    conversion math is unit-testable on its own.
+    """
+    out = dict(row)
+    raw_dur = out.pop("duration", None)
+    if out.get("duration_sec") is None and raw_dur is not None:
+        out["duration_sec"] = _to_seconds(raw_dur)
+    raw_dist = out.pop("distance", None)
+    raw_unit = out.pop("distance_unit", None)
+    if out.get("distance_m") is None and raw_dist is not None:
+        out["distance_m"] = _to_meters(raw_dist, raw_unit)
+    return out
+
+
+def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseReport]:
+    """Parse free-form workout debrief (strength OR cardio) into structured rows.
+
+    Returns N per-exercise/segment rows + 1 session_summary row. The LLM extracts
+    raw values; _convert_units does the deterministic mi/ft→m and MM:SS→sec math.
     Raises ValidationError if Claude output is malformed.
     """
     plan_context = "(no plan available)"
@@ -304,16 +410,19 @@ def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseR
 
     reports: list[ExerciseReport] = []
 
-    # Per-exercise rows
+    # Per-exercise / per-segment rows
     for ex in data.get("exercises", []):
         ex.setdefault("is_skipped", False)
-        reports.append(ExerciseReport(**ex))
+        reports.append(ExerciseReport(**_convert_units(ex)))
 
-    # Session summary row
-    summary = data.get("session_summary") or {}
+    # Session summary row — carries the overall totals (duration/distance/HR).
+    summary = _convert_units(data.get("session_summary") or {})
     reports.append(ExerciseReport(
         exercise="session_summary",
         log_type="session_summary",
+        duration_sec=summary.get("duration_sec"),
+        distance_m=summary.get("distance_m"),
+        hr_avg=summary.get("hr_avg"),
         rpe_actual=summary.get("rpe_actual"),
         notes=summary.get("notes"),
         user_suggestion=summary.get("user_suggestion"),
@@ -369,35 +478,300 @@ def upsert_daily_state(state: MorningState) -> None:
     )
 
 
+# Shared column list for both writers. The single insert maps every row by its
+# own log_type — cardio_block rows carry distance_m/round_num, strength_set rows
+# carry weight_lbs/reps_done, session_summary carries the totals. logged_via is
+# always 'mattermost' for this path (CHECK-valid).
+_SESSION_LOG_COLUMNS = (
+    "plan_id, log_type, exercise, set_num, round_num, reps_done, weight_lbs, "
+    "duration_sec, distance_m, rpe_actual, hr_avg, hr_peak, notes, "
+    "user_suggestion, is_skipped, logged_via"
+)
+_SESSION_LOG_PLACEHOLDERS = (
+    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'mattermost'"
+)
+
+
+def _row_params(r: ExerciseReport, plan_id: int | None) -> tuple:
+    return (
+        plan_id, r.log_type, r.exercise, r.set_num, r.round_num,
+        r.reps_done, r.weight_lbs, r.duration_sec, r.distance_m,
+        r.rpe_actual, r.hr_avg, r.hr_peak, r.notes, r.user_suggestion,
+        r.is_skipped,
+    )
+
+
 def insert_session_logs(reports: list[ExerciseReport], plan_id: int | None) -> int:
-    """Insert N session_log rows. Returns number of rows inserted."""
+    """Insert N session_log rows (one autocommit per row). Returns the count."""
     from knowledge.db import execute_write
 
+    sql = (
+        f"INSERT INTO health.session_log ({_SESSION_LOG_COLUMNS}) "
+        f"VALUES ({_SESSION_LOG_PLACEHOLDERS})"
+    )
     inserted = 0
     for r in reports:
-        execute_write(
-            """INSERT INTO health.session_log (
-                   plan_id, log_type, exercise, reps_done, weight_lbs,
-                   duration_sec, rpe_actual, hr_avg, hr_peak,
-                   notes, user_suggestion, is_skipped, logged_via
-               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'mattermost')""",
-            (
-                plan_id,
-                r.log_type,
-                r.exercise,
-                r.reps_done,
-                r.weight_lbs,
-                r.duration_sec,
-                r.rpe_actual,
-                r.hr_avg,
-                r.hr_peak,
-                r.notes,
-                r.user_suggestion,
-                r.is_skipped,
-            ),
-        )
+        execute_write(sql, _row_params(r, plan_id))
         inserted += 1
     return inserted
+
+
+def insert_session_logs_tx(reports: list[ExerciseReport], plan_id: int | None) -> list[int]:
+    """Insert all rows in ONE transaction; return the new log_ids in order.
+
+    Uses get_connection() (auto-commits on clean exit, rolls back on any
+    exception) so a multi-row cardio paste is all-or-nothing — no half-written
+    session. This is the confirm-leg writer.
+    """
+    from knowledge.db import get_connection
+
+    sql = (
+        f"INSERT INTO health.session_log ({_SESSION_LOG_COLUMNS}) "
+        f"VALUES ({_SESSION_LOG_PLACEHOLDERS}) RETURNING log_id"
+    )
+    ids: list[int] = []
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for r in reports:
+                cur.execute(sql, _row_params(r, plan_id))
+                ids.append(cur.fetchone()[0])
+    return ids
+
+
+# ============================================================================
+# Unified capture: routing discriminator + propose-then-confirm (durable)
+#
+# A cardio-metrics paste (or any debrief with real metrics) routes here, gets
+# echoed back as a both-units table, and is only written — in ONE transaction,
+# with the real log_ids posted back — after an explicit confirm/yes. The pending
+# payload lives in the durable system_state KV (NOT in-memory) so it survives a
+# `systemctl restart acos` between propose and confirm.
+# ============================================================================
+
+# Cardio-metric signals. A duration like MM:SS plus a distance/pace/HR token, or
+# >=2 labeled segments, is unambiguously a metrics paste. Strength debriefs are
+# caught by an RPE or set-pattern token. Bare "done"/"finished" (no metrics) is
+# intentionally NOT a capture — it must still end a live session / hit the inbox.
+_MMSS_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+_DISTANCE_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s*(?:mi|mile|miles|km|kilomet\w+|ft|feet|foot|meters?|metres?)\b",
+    re.IGNORECASE,
+)
+_HR_TOKEN_RE = re.compile(r"\b(?:hr|bpm|heart\s*rate)\b", re.IGNORECASE)
+_RPE_TOKEN_RE = re.compile(r"\brpe\s*\d", re.IGNORECASE)
+_SET_PATTERN_RE = re.compile(r"\b\d+\s*x\s*\d+\b|\b\d+\s*(?:lbs?|reps?)\b", re.IGNORECASE)
+_SEGMENT_RE = re.compile(r"\b(?:run|interval|lap|round)\s*#?\s*\d", re.IGNORECASE)
+
+
+def is_capture_paste(message: str) -> bool:
+    """True if `message` is a workout-metrics paste that must route to capture.
+
+    Deterministic discriminator (no LLM): a cardio paste (MM:SS + distance/HR, or
+    >=2 labeled segments) or a strength debrief carrying real metrics (an RPE or
+    a set pattern). A genuine question ("what's today's workout") has none of
+    these and returns False, so it still reaches plan-display.
+    """
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    has_mmss = bool(_MMSS_RE.search(msg))
+    has_dist = bool(_DISTANCE_RE.search(msg))
+    has_hr = bool(_HR_TOKEN_RE.search(msg))
+    if has_mmss and (has_dist or has_hr):
+        return True
+    if len(_SEGMENT_RE.findall(msg)) >= 2:
+        return True
+    if _RPE_TOKEN_RE.search(msg) or _SET_PATTERN_RE.search(msg):
+        return True
+    return False
+
+
+# ── Both-units display helpers ──────────────────────────────────────────────
+
+def _m_to_mi(meters) -> float:
+    return round(float(meters) / _MILES_TO_M, 2)
+
+
+def _sec_to_mmss(seconds) -> str:
+    s = int(seconds)
+    m, sec = divmod(s, 60)
+    return f"{m}:{sec:02d}"
+
+
+def _proposal_row_detail(r: "ExerciseReport") -> str:
+    """One-line, both-units detail for a proposed row."""
+    bits: list[str] = []
+    if r.set_num is not None:
+        bits.append(f"set {r.set_num}")
+    if r.reps_done is not None:
+        d = f"{r.reps_done} reps"
+        if r.weight_lbs is not None:
+            d += f" @ {_fmt_num(r.weight_lbs)}lb"
+        bits.append(d)
+    elif r.weight_lbs is not None:
+        bits.append(f"{_fmt_num(r.weight_lbs)}lb")
+    if r.distance_m is not None:
+        bits.append(f"{_fmt_num(r.distance_m)} m ({_m_to_mi(r.distance_m)} mi)")
+    if r.duration_sec is not None:
+        bits.append(f"{r.duration_sec} s ({_sec_to_mmss(r.duration_sec)})")
+    if r.rpe_actual is not None:
+        bits.append(f"RPE {_fmt_num(r.rpe_actual)}")
+    if r.hr_avg is not None:
+        bits.append(f"HR {r.hr_avg}")
+    if r.hr_peak is not None:
+        bits.append(f"peak HR {r.hr_peak}")
+    if r.is_skipped:
+        bits.append("SKIPPED")
+    return ", ".join(bits) if bits else "—"
+
+
+def format_capture_proposal(reports: list["ExerciseReport"], plan_id: int | None,
+                            plan_note: str) -> str:
+    """Render exactly what will be written — every row, both units — and ask to
+    confirm. Nothing is written by this function."""
+    seg = [r for r in reports if r.log_type != "session_summary"]
+    summ = [r for r in reports if r.log_type == "session_summary"]
+
+    lines = ["**About to log — review and confirm:**"]
+    lines.append(f"plan_id: {plan_id if plan_id is not None else 'NULL'}")
+    if plan_note:
+        lines.append(f"_{plan_note}_")
+
+    for r in seg:
+        tag = "round " + str(r.round_num) + " · " if r.round_num is not None else ""
+        lines.append(f"• [{r.log_type}] {tag}{r.exercise}: {_proposal_row_detail(r)}")
+
+    for s in summ:
+        detail = _proposal_row_detail(s)
+        lines.append(f"• [session_summary] {detail if detail != '—' else 'totals'}")
+        if s.notes:
+            lines.append(f"  notes: \"{s.notes}\"")
+        if s.user_suggestion:
+            lines.append(f"  suggestion: \"{s.user_suggestion}\"")
+
+    # Suggestions/notes captured on individual rows
+    for r in seg:
+        if r.user_suggestion:
+            lines.append(f"  suggestion ({r.exercise}): \"{r.user_suggestion}\"")
+
+    n = len(reports)
+    lines.append(f"\n{n} row{'s' if n != 1 else ''} total. Reply `confirm` to write, `cancel` to discard.")
+    return "\n".join(lines)
+
+
+# ── Durable pending payload (system_state KV) ───────────────────────────────
+
+def _capture_pending_key(channel_id: str) -> str:
+    return f"debrief_pending:{channel_id}"
+
+
+def _report_to_dict(r: "ExerciseReport") -> dict:
+    return r.model_dump() if hasattr(r, "model_dump") else r.dict()
+
+
+def store_capture_pending(channel_id: str, reports: list["ExerciseReport"],
+                          plan_id: int | None) -> None:
+    """Persist the parsed rows so confirm is deterministic and restart-safe."""
+    from artemis.quiet_hours import set_system_value
+    payload = {
+        "rows": [_report_to_dict(r) for r in reports],
+        "plan_id": plan_id,
+        "created_at": datetime.now(CT).isoformat(),
+    }
+    set_system_value(_capture_pending_key(channel_id), json.dumps(payload))
+
+
+def load_capture_pending(channel_id: str, max_age_sec: int = 600) -> dict | None:
+    """Return the pending payload if present and not expired, else None."""
+    from artemis.quiet_hours import get_system_value
+    raw = get_system_value(_capture_pending_key(channel_id))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    created = payload.get("created_at")
+    if created:
+        try:
+            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            if age > max_age_sec:
+                return None
+        except (ValueError, TypeError):
+            pass
+    return payload
+
+
+def clear_capture_pending(channel_id: str) -> None:
+    from artemis.quiet_hours import set_system_value
+    set_system_value(_capture_pending_key(channel_id), "")
+
+
+# ── Orchestration: propose / commit / cancel ────────────────────────────────
+
+def build_and_store_proposal(message: str, channel_id: str) -> str:
+    """Parse a capture paste, resolve plan_id (CT), store the durable pending
+    payload, and return the proposal text. Writes NOTHING to session_log.
+
+    plan_id is resolved from health.plan for *today in America/Chicago* — never
+    UTC (the date-reasoning bug). A missing plan row → plan_id=NULL, noted in the
+    proposal so a gap day still logs.
+    """
+    try:
+        plan = get_today_plan()
+    except Exception:
+        logger.exception("Failed to fetch today's plan for capture")
+        plan = None
+
+    try:
+        reports = parse_workout_debrief(message, plan)
+    except (ValidationError, json.JSONDecodeError, anthropic.APIError) as e:
+        logger.warning("Capture parse failed: %s", e)
+        return ("Couldn't parse that workout paste. Send metrics like "
+                "`time 51:36, distance 3.28 miles, 121 bpm, Run #1: .16 mi | 1:48 | RPE 8`.")
+    except Exception:
+        logger.exception("Capture parse failed (unknown)")
+        return "Couldn't parse that workout paste — check the format and try again."
+
+    plan_id = plan.get("plan_id") if plan else None
+    today_ct = datetime.now(CT).date().isoformat()
+    plan_note = "" if plan_id is not None else (
+        f"No plan seeded for today (CT {today_ct}) — logging with plan_id=NULL."
+    )
+
+    store_capture_pending(channel_id, reports, plan_id)
+    return format_capture_proposal(reports, plan_id, plan_note)
+
+
+def commit_capture(channel_id: str) -> str:
+    """Write the pending rows in one transaction; return log_ids + count."""
+    payload = load_capture_pending(channel_id)
+    if payload is None:
+        return "Nothing pending to write (it may have expired). Re-send the workout."
+
+    try:
+        reports = [ExerciseReport(**d) for d in payload.get("rows", [])]
+    except (ValidationError, TypeError) as e:
+        logger.warning("Pending capture payload invalid: %s", e)
+        clear_capture_pending(channel_id)
+        return "⚠️ Pending data was malformed — discarded. Re-send the workout."
+
+    plan_id = payload.get("plan_id")
+    try:
+        ids = insert_session_logs_tx(reports, plan_id)
+    except Exception:
+        logger.exception("Capture commit failed")
+        return "⚠️ Couldn't write the session — check DB. Nothing was logged."
+
+    clear_capture_pending(channel_id)
+    n = len(ids)
+    id_str = ", ".join(str(i) for i in ids)
+    return f"✅ Logged {n} row{'s' if n != 1 else ''} to session_log. log_ids: {id_str}."
+
+
+def cancel_capture(channel_id: str) -> str:
+    clear_capture_pending(channel_id)
+    return "Discarded — nothing written."
 
 
 # ============================================================================

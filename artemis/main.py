@@ -2123,16 +2123,19 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
 
     # ── log_workout_debrief (training) ──
     if intent.primary_action == "log_workout_debrief":
-        from artemis.health import handle_debrief_intent, handle_fix_intent
+        from artemis.health import build_and_store_proposal, handle_fix_intent
         # First check if this is a "fix <exercise> rpe <N>" edit
         fix_result = handle_fix_intent(question)
         if fix_result is not None:
             return fix_result
         try:
-            return handle_debrief_intent(question, message_id=post.get("id"))
+            # Unified capture: propose-then-confirm, never an immediate write.
+            # Belt-and-suspenders for debriefs the regex discriminator missed;
+            # most pastes are caught earlier by _handle_capture_propose.
+            return build_and_store_proposal(question, post.get("channel_id", ""))
         except Exception:
-            logger.exception("Workout debrief handler failed")
-            return "\u26a0\ufe0f Couldn\u2019t save debrief \u2014 check DB."
+            logger.exception("Workout debrief propose failed")
+            return "\u26a0\ufe0f Couldn\u2019t parse that debrief \u2014 try again."
 
     # ── trainer_override (training, T4) ──
     if intent.primary_action == "trainer_override":
@@ -2282,6 +2285,63 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
     return False
 
 
+def _handle_capture_propose(post: dict, question: str) -> bool:
+    """Unified workout-capture entry (cardio + strength debrief).
+
+    Highest-priority deterministic discriminator: a workout-metrics paste is
+    parsed and echoed back as a both-units proposal (NOTHING is written), with
+    the parsed rows stored in the durable system_state KV. The actual write
+    happens only on a later `confirm` (see _handle_debrief_confirm). Returns True
+    if this was a capture paste and a proposal was posted.
+
+    Runs AFTER _handle_health_conversation so the live-session set-logging loop
+    and plan reads are untouched; a cardio paste is something that loop never
+    claims, so it falls through to here instead of to the LLM general_reply.
+    """
+    from artemis.health import build_and_store_proposal, is_capture_paste
+
+    if not is_capture_paste(question):
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        reply = build_and_store_proposal(question, channel_id)
+    except Exception:
+        logger.exception("Capture propose failed")
+        return False
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _handle_debrief_confirm(post: dict, question: str) -> bool:
+    """Confirm/cancel leg for a pending workout capture (durable KV).
+
+    Only acts when a pending capture exists for this channel AND the reply is a
+    confirm/cancel word. On confirm, all rows insert in one transaction and the
+    real log_ids + count are posted back. Returns True if handled.
+    """
+    from artemis.health import cancel_capture, commit_capture, load_capture_pending
+
+    channel_id = post.get("channel_id", "")
+    if load_capture_pending(channel_id) is None:
+        return False
+
+    q = question.lower().strip()
+    if q in _CONFIRM_WORDS:
+        reply = commit_capture(channel_id)
+    elif q in _CANCEL_WORDS:
+        reply = cancel_capture(channel_id)
+    else:
+        return False
+
+    root_id = post.get("root_id") or post["id"]
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = _strip_wake_word(post.get("message", ""))
@@ -2302,11 +2362,23 @@ def _handle_mention(post: dict, thread: list[dict]):
         return
     if _handle_delete_confirm(post, question):
         return
+    # Confirm/cancel for a pending workout capture (cardio/strength debrief).
+    # Checked among the confirm flows so a `confirm`/`yes` reply lands here.
+    if _handle_debrief_confirm(post, question):
+        return
 
     # ── PB-009: conversational workout session + training history ──
     # Must run before inbox ('done' shadowing) and before _try_life_ops so the
     # RDS health path always wins over the legacy life_ops SQLite handlers.
     if _handle_health_conversation(post, question):
+        return
+
+    # ── Unified workout capture (cardio + strength debrief) ──
+    # Deterministic metrics-paste discriminator → propose-then-confirm. Runs
+    # after the live-session loop (which it never disturbs) but before inbox /
+    # _try_life_ops / the LLM router, so a cardio paste can never fall to
+    # plan-display or an "I can't write to the DB" reply.
+    if _handle_capture_propose(post, question):
         return
 
     # Try quiet hours session commands (goodnight, morning, override, extend)
