@@ -3160,3 +3160,482 @@ def build_context_slice(days_ahead: int = 3, recent: int = 3) -> str:
     except Exception:
         logger.debug("build_context_slice failed", exc_info=True)
         return ""
+
+
+# ============================================================================
+# Nutrition capture (PB-009 extension) — set target, log intake, budget coach
+#
+# INVARIANT: every handler here writes ONLY to the `health` schema
+# (nutrition_target / meal / nutrition_log). The cross-schema staple write
+# (health.meal -> acos.grocery_list) lives in artemis/life_ops.py, not here.
+#
+# Propose-then-confirm (durable system_state KV) for the target write — a target
+# change is consequential (it closes the prior open target). Intake logging is
+# append-only with NO confirm, matching the low-friction workout-logging UX.
+# ============================================================================
+
+INTENT_SET_NUTRITION_TARGET = "set_nutrition_target"
+INTENT_LOG_NUTRITION = "log_nutrition"
+INTENT_NUTRITION_STATUS = "nutrition_status"
+
+_NUTRITION_SLOTS = ("breakfast", "lunch", "dinner", "snack")
+
+
+class MealDef(BaseModel):
+    slot: str
+    name: str
+    kcal: Optional[int] = None
+    protein_g: Optional[int] = None
+    carb_g: Optional[int] = None
+    fat_g: Optional[int] = None
+    fiber_g: Optional[int] = None
+    times_per_week: int = 7
+    ingredients: list[dict] = Field(default_factory=list)
+
+
+class NutritionTarget(BaseModel):
+    # kcal + protein are NOT NULL in the schema and are never invented — the
+    # parser must extract them from what Ryan typed or the parse is rejected.
+    kcal: int
+    protein_g: int
+    effective_from: Optional[str] = None  # ISO date; defaults to CT-today on commit
+    carb_g: Optional[int] = None
+    fat_g: Optional[int] = None
+    fiber_g: Optional[int] = None
+    set_by: str = "joy"
+    notes: Optional[str] = None
+    meals: list[MealDef] = Field(default_factory=list)
+
+
+class NutritionEstimate(BaseModel):
+    kcal: Optional[int] = None
+    protein_g: Optional[int] = None
+    carb_g: Optional[int] = None
+    fat_g: Optional[int] = None
+    fiber_g: Optional[int] = None
+    confidence: str = "low"  # high | medium | low
+
+
+# ── Parsers (Claude) ────────────────────────────────────────────────────────
+
+_TARGET_SYSTEM = """You parse a nutrition TARGET that Ryan is entering on behalf of his
+registered dietitian (RD). Extract ONLY values explicitly stated. NEVER invent or
+back-calculate a number that wasn't given — a missing macro stays null.
+
+Return ONLY valid JSON, no other text:
+{
+  "kcal": int,                 // REQUIRED — calories/day
+  "protein_g": int,            // REQUIRED — grams/day
+  "effective_from": "YYYY-MM-DD" or null,
+  "carb_g": int or null,
+  "fat_g": int or null,
+  "fiber_g": int or null,
+  "set_by": string or null,    // who authored it; default null -> 'joy'
+  "notes": string or null,
+  "meals": [                   // optional; omit or [] if none given
+    {"slot":"breakfast|lunch|dinner|snack","name":string,
+     "kcal":int|null,"protein_g":int|null,"carb_g":int|null,"fat_g":int|null,
+     "fiber_g":int|null,"times_per_week":int,
+     "ingredients":[{"item":string,"qty":number|string,"unit":string}]}
+  ]
+}
+
+RULES:
+- kcal and protein_g are required. If the message has no calorie or no protein
+  number, return {"error":"missing kcal or protein"} instead.
+- "1,900" -> 1900. "215g protein" -> protein_g 215. "150 carbs" -> carb_g 150.
+- times_per_week defaults to 7 if a meal is daily / unspecified.
+- Do not fabricate ingredients or macros for a meal that wasn't described.
+
+Example:
+Input: new target from Joy: 1900 cal, 215g protein, 150g carb, 60g fat, 30g fiber
+Output: {"kcal":1900,"protein_g":215,"effective_from":null,"carb_g":150,"fat_g":60,"fiber_g":30,"set_by":"joy","notes":null,"meals":[]}
+"""
+
+_ESTIMATE_SYSTEM = """You estimate the calories and macros of an OFF-PLAN food description.
+This is a directional estimate for a budget coach — approximate, not precise.
+
+Return ONLY valid JSON, no other text:
+{"kcal":int,"protein_g":int,"carb_g":int,"fat_g":int,"fiber_g":int,
+ "confidence":"high|medium|low"}
+
+RULES:
+- confidence high = specific named items with clear portions ("6oz grilled chicken,
+  1 cup rice"); medium = common foods, vague portions ("a burger and fries");
+  low = ambiguous or restaurant/unknown-prep ("dinner out", "a few drinks").
+- Estimate total across everything described. Round to sensible whole numbers.
+
+Example:
+Input: 2 burgers, potato salad, a beer
+Output: {"kcal":1250,"protein_g":55,"carb_g":95,"fat_g":68,"fiber_g":6,"confidence":"medium"}
+"""
+
+
+def parse_nutrition_target(text: str) -> NutritionTarget:
+    """Parse a target-entry message into a NutritionTarget.
+
+    Raises ValueError/ValidationError if kcal/protein are absent (the RD envelope
+    is never invented) or the JSON is malformed.
+    """
+    data = _call_claude_json(_TARGET_SYSTEM, f"Input: {text}")
+    if isinstance(data, dict) and data.get("error"):
+        raise ValueError(str(data.get("error")))
+    if not data.get("set_by"):
+        data["set_by"] = "joy"
+    return NutritionTarget(**data)
+
+
+def estimate_nutrition(text: str) -> NutritionEstimate:
+    """Estimate macros for an off-plan food description via Claude."""
+    data = _call_claude_json(_ESTIMATE_SYSTEM, f"Input: {text}")
+    return NutritionEstimate(**data)
+
+
+# ── Open-target / meal lookups (health schema reads) ─────────────────────────
+
+def open_nutrition_target() -> dict | None:
+    """The current open target row (effective_to IS NULL), or None."""
+    from knowledge.db import execute_one
+    return execute_one(
+        "SELECT id, effective_from, kcal, protein_g, carb_g, fat_g, fiber_g "
+        "FROM health.nutrition_target WHERE effective_to IS NULL "
+        "ORDER BY effective_from DESC, id DESC LIMIT 1"
+    )
+
+
+def active_meal_for_slot(slot: str) -> dict | None:
+    """The active meal for `slot` under the open target, or None."""
+    from knowledge.db import execute_one
+    tgt = open_nutrition_target()
+    if not tgt:
+        return None
+    return execute_one(
+        "SELECT id, name, kcal, protein_g, carb_g, fat_g, fiber_g "
+        "FROM health.meal "
+        "WHERE active = true AND target_id = %s AND LOWER(slot) = LOWER(%s) "
+        "ORDER BY id LIMIT 1",
+        (tgt["id"], slot),
+    )
+
+
+# ── set_nutrition_target: propose / commit / cancel (confirmed write) ─────────
+
+def _nutrition_target_pending_key(channel_id: str) -> str:
+    return f"nutrition_target_pending:{channel_id}"
+
+
+def store_nutrition_target_pending(channel_id: str, target: NutritionTarget) -> None:
+    from artemis.quiet_hours import set_system_value
+    payload = target.model_dump()
+    payload["created_at"] = datetime.now(CT).isoformat()
+    set_system_value(_nutrition_target_pending_key(channel_id), json.dumps(payload))
+
+
+def load_nutrition_target_pending(channel_id: str, max_age_sec: int = 900) -> dict | None:
+    from artemis.quiet_hours import get_system_value
+    raw = get_system_value(_nutrition_target_pending_key(channel_id))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    created = payload.get("created_at")
+    if created:
+        try:
+            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            if age > max_age_sec:
+                return None
+        except (ValueError, TypeError):
+            pass
+    return payload
+
+
+def clear_nutrition_target_pending(channel_id: str) -> None:
+    from artemis.quiet_hours import set_system_value
+    set_system_value(_nutrition_target_pending_key(channel_id), "")
+
+
+def format_target_proposal(target: NutritionTarget) -> str:
+    eff = target.effective_from or datetime.now(CT).date().isoformat()
+    macros = [f"{target.kcal} kcal", f"{target.protein_g}g protein"]
+    if target.carb_g is not None:
+        macros.append(f"{target.carb_g}g carb")
+    if target.fat_g is not None:
+        macros.append(f"{target.fat_g}g fat")
+    if target.fiber_g is not None:
+        macros.append(f"{target.fiber_g}g fiber")
+    lines = [
+        "**New nutrition target — review and confirm:**",
+        f"effective {eff} (set_by {target.set_by})",
+        ", ".join(macros),
+    ]
+    if target.notes:
+        lines.append(f"_{target.notes}_")
+    if target.meals:
+        lines.append(f"\n{len(target.meals)} meal(s):")
+        for m in target.meals:
+            mm = [f"{m.kcal} kcal" if m.kcal is not None else None,
+                  f"{m.protein_g}g protein" if m.protein_g is not None else None]
+            detail = ", ".join(x for x in mm if x)
+            ing = f" — {len(m.ingredients)} ingredient(s)" if m.ingredients else ""
+            lines.append(f"• [{m.slot}] {m.name}"
+                         + (f" ({detail})" if detail else "")
+                         + f" ×{m.times_per_week}/wk{ing}")
+    lines.append("\nReply `confirm` to set this (closes the prior target), `cancel` to discard.")
+    return "\n".join(lines)
+
+
+def propose_nutrition_target(message: str, channel_id: str) -> str:
+    """Parse + stash the target proposal in the durable KV. Writes NOTHING."""
+    try:
+        target = parse_nutrition_target(message)
+    except (ValidationError, ValueError, anthropic.APIError) as e:
+        logger.warning("Nutrition target parse failed: %s", e)
+        return ("Couldn't read that target. Give me at least calories and protein, "
+                "e.g. `new target 1900 cal, 215g protein, 150g carb, 60g fat, 30g fiber`.")
+    except Exception:
+        logger.exception("Nutrition target parse failed (unknown)")
+        return "Couldn't parse that target — check the format and try again."
+    store_nutrition_target_pending(channel_id, target)
+    return format_target_proposal(target)
+
+
+def insert_nutrition_target_tx(target: NutritionTarget) -> int:
+    """Close the prior open target and insert the new one (+ any meals) in ONE
+    transaction, so the one_open_target index never sees two open rows."""
+    from knowledge.db import get_connection
+    eff_from = target.effective_from or datetime.now(CT).date().isoformat()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # Close the prior open target the day before the new one starts.
+            cur.execute(
+                "UPDATE health.nutrition_target "
+                "SET effective_to = (%s::date - INTERVAL '1 day')::date "
+                "WHERE effective_to IS NULL",
+                (eff_from,),
+            )
+            cur.execute(
+                "INSERT INTO health.nutrition_target "
+                "(effective_from, kcal, protein_g, carb_g, fat_g, fiber_g, set_by, notes) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (eff_from, target.kcal, target.protein_g, target.carb_g,
+                 target.fat_g, target.fiber_g, target.set_by, target.notes),
+            )
+            new_id = cur.fetchone()[0]
+            for m in target.meals:
+                cur.execute(
+                    "INSERT INTO health.meal "
+                    "(target_id, slot, name, kcal, protein_g, carb_g, fat_g, fiber_g, "
+                    " times_per_week, ingredients) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                    (new_id, m.slot, m.name, m.kcal, m.protein_g, m.carb_g, m.fat_g,
+                     m.fiber_g, m.times_per_week, json.dumps(m.ingredients)),
+                )
+    return new_id
+
+
+def commit_nutrition_target(channel_id: str) -> str:
+    payload = load_nutrition_target_pending(channel_id)
+    if payload is None:
+        return "Nothing pending (it may have expired). Re-send the target."
+    payload.pop("created_at", None)
+    try:
+        target = NutritionTarget(**payload)
+    except (ValidationError, TypeError) as e:
+        logger.warning("Pending target payload invalid: %s", e)
+        clear_nutrition_target_pending(channel_id)
+        return "⚠️ Pending target was malformed — discarded. Re-send it."
+    try:
+        new_id = insert_nutrition_target_tx(target)
+    except Exception:
+        logger.exception("Nutrition target commit failed")
+        return "⚠️ Couldn't write the target — check DB. Nothing changed."
+    clear_nutrition_target_pending(channel_id)
+    eff = target.effective_from or datetime.now(CT).date().isoformat()
+    extra = f" + {len(target.meals)} meal(s)" if target.meals else ""
+    return (f"Set. Target #{new_id} live from {eff}: "
+            f"{target.kcal} kcal, {target.protein_g}g protein{extra}. Prior target closed.")
+
+
+def cancel_nutrition_target(channel_id: str) -> str:
+    clear_nutrition_target_pending(channel_id)
+    return "Discarded — target unchanged."
+
+
+# ── log_nutrition: append-only, no confirm ───────────────────────────────────
+
+_ONPLAN_RE = re.compile(
+    r"^\s*(?:@?artemis[\s,:.\-]*)?"
+    r"(?:i\s+)?(?:had|ate|did|finished|done\s+with|done|log|logged)?\s*"
+    r"(?:my\s+)?(breakfast|lunch|dinner|snack)\s*"
+    r"(?:done|finished|complete|completed|logged)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _match_onplan_slot(message: str) -> str | None:
+    m = _ONPLAN_RE.match(message or "")
+    return m.group(1).lower() if m else None
+
+
+def _log_onplan(meal: dict, description: str) -> str:
+    from knowledge.db import execute_write
+    today = datetime.now(CT).date()
+    execute_write(
+        "INSERT INTO health.nutrition_log "
+        "(logged_date, meal_id, description, kcal, protein_g, carb_g, fat_g, fiber_g, estimated) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, false)",
+        (today, meal["id"], meal["name"], meal.get("kcal"), meal.get("protein_g"),
+         meal.get("carb_g"), meal.get("fat_g"), meal.get("fiber_g")),
+    )
+    bits = []
+    if meal.get("kcal") is not None:
+        bits.append(f"{meal['kcal']} kcal")
+    if meal.get("protein_g") is not None:
+        bits.append(f"{meal['protein_g']}g protein")
+    detail = f" ({', '.join(bits)})" if bits else ""
+    return f"Logged {meal['name']}{detail}. On plan."
+
+
+def _log_offplan(description: str) -> str:
+    try:
+        est = estimate_nutrition(description)
+    except (ValidationError, json.JSONDecodeError, anthropic.APIError) as e:
+        logger.warning("Off-plan estimate failed: %s", e)
+        return "Couldn't estimate that. Try naming the foods and rough portions."
+    except Exception:
+        logger.exception("Off-plan estimate failed (unknown)")
+        return "Couldn't estimate that right now — try again."
+    from knowledge.db import execute_write
+    today = datetime.now(CT).date()
+    execute_write(
+        "INSERT INTO health.nutrition_log "
+        "(logged_date, meal_id, description, kcal, protein_g, carb_g, fat_g, fiber_g, "
+        " estimated, confidence) "
+        "VALUES (%s, NULL, %s, %s, %s, %s, %s, %s, true, %s)",
+        (today, description, est.kcal, est.protein_g, est.carb_g, est.fat_g,
+         est.fiber_g, est.confidence),
+    )
+    bits = []
+    if est.kcal is not None:
+        bits.append(f"~{est.kcal} kcal")
+    if est.protein_g is not None:
+        bits.append(f"~{est.protein_g}g protein")
+    detail = (", ".join(bits)) if bits else "logged"
+    return f"Logged (est, {est.confidence}): {detail}. Off plan."
+
+
+def log_nutrition(message: str) -> str:
+    """Append an intake entry. On-plan slot phrases copy the meal's macros
+    verbatim (estimated=false); anything else is an LLM-estimated off-plan entry
+    (estimated=true). Append-only, no confirm."""
+    slot = _match_onplan_slot(message)
+    if slot:
+        meal = active_meal_for_slot(slot)
+        if meal:
+            return _log_onplan(meal, message)
+        return (f"No active {slot} defined under your current target. "
+                f"Tell me what you ate and I'll estimate it.")
+    return _log_offplan(message)
+
+
+# ── nutrition_status: off-plan budget coach (directional) ────────────────────
+
+_BUDGET_COACH_SYSTEM = TRAINER_VOICE_PROMPT + """
+You are the off-plan nutrition budget coach. Given today's remaining budget and a
+suggested nudge, reply in ONE or TWO short lines: state what's left, then exactly
+one actionable nudge. Directional, not gram-accurate — do not invent numbers or
+imply precision on estimated intake.
+"""
+
+
+def _budget_summary(row: dict) -> str:
+    parts = []
+    rk = row.get("remaining_kcal")
+    rp = row.get("remaining_protein_g")
+    if rk is not None:
+        parts.append(f"{int(rk)} kcal left")
+    if rp is not None:
+        parts.append(f"{int(rp)}g protein left")
+    for label, key in (("carb", "remaining_carb_g"), ("fat", "remaining_fat_g"),
+                       ("fiber", "remaining_fiber_g")):
+        v = row.get(key)
+        if v is not None:
+            parts.append(f"{int(v)}g {label} left")
+    return ", ".join(parts) if parts else "nothing logged yet"
+
+
+def _budget_nudge(row: dict) -> str:
+    rp = row.get("remaining_protein_g")
+    if rp is not None and rp > 50:
+        base = "Room for a protein-forward plate."
+    elif rp is not None and rp <= 0:
+        base = "Protein's covered — keep the rest light."
+    else:
+        base = "On track — keep portions tight."
+    tfib = row.get("target_fiber_g")
+    cfib = row.get("consumed_fiber_g")
+    if tfib and cfib is not None and cfib < tfib * 0.5:
+        base += " You're light on fiber."
+    return base
+
+
+def nutrition_status() -> str:
+    """Trainer-voice remaining-budget reply + one actionable nudge."""
+    from knowledge.db import execute_one
+    today = datetime.now(CT).date()
+    try:
+        row = execute_one("SELECT * FROM health.remaining_budget(%s)", (today,))
+    except Exception:
+        logger.exception("remaining_budget query failed")
+        return "⚠️ Couldn't pull today's budget — check DB."
+    if not row or row.get("target_kcal") is None:
+        return "No nutrition target set. Send Joy's plan: `new target 1900 cal, 215g protein, ...`."
+    facts = _budget_summary(row)
+    nudge = _budget_nudge(row)
+    fallback = f"{facts}. {nudge}"
+    try:
+        return _call_claude_text(_BUDGET_COACH_SYSTEM, f"Remaining today: {facts}. Nudge: {nudge}")
+    except Exception:
+        logger.debug("Budget-coach trainer-voice call failed; using structured fallback", exc_info=True)
+        return fallback
+
+
+# ── Intent detection (regex pre-router) ──────────────────────────────────────
+
+_NUT_STATUS_RE = re.compile(
+    r"\b(?:macros?|calories?|protein|carbs?|fiber|budget)\s+(?:left|remaining)\b"
+    r"|\bwhere\s+am\s+i\s+(?:today|at)\b"
+    r"|\bhow\s+(?:much|many)\b.*\b(?:left|remaining)\b"
+    r"|\bremaining\s+budget\b"
+    r"|\bwhat'?s\s+left\b",
+    re.IGNORECASE,
+)
+_NUT_TARGET_RE = re.compile(
+    r"\b(?:new|set|update)\s+(?:my\s+)?(?:nutrition\s+|macro\s+)?target\b"
+    r"|\bnew\s+(?:nutrition|meal)\s+plan\b"
+    r"|\bjoy\s+(?:set|wants|says|updated|gave|sent)\b",
+    re.IGNORECASE,
+)
+_NUT_LOG_RE = re.compile(
+    r"^\s*(?:@?artemis[\s,:.\-]*)?(?:log|track)\b"
+    r"|\bi\s+(?:ate|had)\b"
+    r"|\bfor\s+(?:breakfast|lunch|dinner|snack)\s+i\b",
+    re.IGNORECASE,
+)
+
+
+def detect_nutrition_intent(message: str) -> str | None:
+    """Regex pre-router for nutrition intents. Returns one of
+    INTENT_NUTRITION_STATUS / INTENT_SET_NUTRITION_TARGET / INTENT_LOG_NUTRITION,
+    or None. Order: status, then target, then logging (on-plan slot or explicit
+    log cue)."""
+    msg = message or ""
+    if _NUT_STATUS_RE.search(msg):
+        return INTENT_NUTRITION_STATUS
+    if _NUT_TARGET_RE.search(msg):
+        return INTENT_SET_NUTRITION_TARGET
+    if _match_onplan_slot(msg) or _NUT_LOG_RE.search(msg):
+        return INTENT_LOG_NUTRITION
+    return None
