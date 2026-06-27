@@ -2342,6 +2342,110 @@ def _handle_debrief_confirm(post: dict, question: str) -> bool:
     return True
 
 
+def _handle_nutrition_confirm(post: dict, question: str) -> bool:
+    """Confirm/cancel leg for the two confirmed nutrition writes:
+    a pending nutrition-target change, or a pending grocery-staples batch.
+
+    Each guards on its own durable pending payload, so a bare `confirm`/`cancel`
+    only acts when exactly that flow is awaiting one. Returns True if handled.
+    """
+    from artemis.health import (
+        cancel_nutrition_target,
+        commit_nutrition_target,
+        load_nutrition_target_pending,
+    )
+    from artemis.life_ops import (
+        cancel_grocery_staples,
+        commit_grocery_staples,
+        load_staples_pending,
+    )
+
+    channel_id = post.get("channel_id", "")
+    q = question.lower().strip()
+    if q not in _CONTROL_WORDS:
+        return False
+
+    reply = None
+    if load_nutrition_target_pending(channel_id) is not None:
+        reply = (commit_nutrition_target(channel_id) if q in _CONFIRM_WORDS
+                 else cancel_nutrition_target(channel_id))
+    elif load_staples_pending(channel_id) is not None:
+        reply = (commit_grocery_staples(channel_id) if q in _CONFIRM_WORDS
+                 else cancel_grocery_staples(channel_id))
+    else:
+        return False
+
+    root_id = post.get("root_id") or post["id"]
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+_BUILD_GROCERY_RE = re.compile(
+    r"\bbuild\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list\b"
+    r"|\bgenerate\s+(?:my\s+|the\s+)?(?:grocery|shopping)\s+list\b"
+    r"|\bgrocery\s+staples\b",
+    re.IGNORECASE,
+)
+
+
+def _handle_grocery_staples(post: dict, question: str) -> bool:
+    """`@artemis build grocery list` — propose the week's staples from the active
+    meal plan (READS health.meal, proposes a write to acos.grocery_list). The
+    upsert happens only on a later `confirm`. Returns True if this was a build
+    request and a proposal was posted."""
+    if not _BUILD_GROCERY_RE.search(question or ""):
+        return False
+    from artemis.life_ops import build_grocery_staples
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        reply = build_grocery_staples(channel_id)
+    except Exception:
+        logger.exception("Grocery staple build failed")
+        reply = "⚠️ Couldn't build the staples list — check DB."
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _handle_nutrition(post: dict, question: str) -> bool:
+    """PB-009 nutrition: set target (propose-then-confirm), log intake
+    (append-only), or budget status. Runs before _try_life_ops so the dynamic
+    budget coach wins over the static health-command stub. Returns True if a
+    nutrition intent matched and a reply was posted."""
+    from artemis.health import (
+        INTENT_LOG_NUTRITION,
+        INTENT_NUTRITION_STATUS,
+        INTENT_SET_NUTRITION_TARGET,
+        detect_nutrition_intent,
+        log_nutrition,
+        nutrition_status,
+        propose_nutrition_target,
+    )
+
+    intent = detect_nutrition_intent(question)
+    if intent is None:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        if intent == INTENT_SET_NUTRITION_TARGET:
+            reply = propose_nutrition_target(question, channel_id)
+        elif intent == INTENT_NUTRITION_STATUS:
+            reply = nutrition_status()
+        else:
+            reply = log_nutrition(question)
+    except Exception:
+        logger.exception("Nutrition handler failed (%s)", intent)
+        reply = "⚠️ Nutrition handler hit an error — check DB."
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_mention(post: dict, thread: list[dict]):
     """Handle an @artemis mention."""
     question = _strip_wake_word(post.get("message", ""))
@@ -2365,6 +2469,22 @@ def _handle_mention(post: dict, thread: list[dict]):
     # Confirm/cancel for a pending workout capture (cardio/strength debrief).
     # Checked among the confirm flows so a `confirm`/`yes` reply lands here.
     if _handle_debrief_confirm(post, question):
+        return
+    # Confirm/cancel for a pending nutrition-target change or grocery-staples
+    # batch — each guards on its own durable pending payload.
+    if _handle_nutrition_confirm(post, question):
+        return
+
+    # ── PB-009 nutrition: build-staples, then target/log/status ──
+    # Runs BEFORE the workout conversation so an on-plan meal log ("breakfast
+    # done") isn't shadowed by the debrief/session loop's bare-"done" handling,
+    # and before _try_life_ops so the dynamic budget coach + staple generator win
+    # over the static grocery/health command stubs. detect_nutrition_intent only
+    # fires on nutrition-specific patterns, so bare "done"/RPE/morning check-ins
+    # still fall through to the training handlers untouched.
+    if _handle_grocery_staples(post, question):
+        return
+    if _handle_nutrition(post, question):
         return
 
     # ── PB-009: conversational workout session + training history ──
