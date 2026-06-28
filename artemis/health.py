@@ -2405,6 +2405,42 @@ def handle_workout_session(message: str) -> str | None:
 
 
 # ----------------------------------------------------------------------------
+# Ad-hoc rest day — RDS replacement for the removed life_ops.log_rest_day
+#
+# Rest is a PLAN property in the canonical schema, so an ad-hoc "skip today"
+# marks today's health.plan row is_skipped (CT date) rather than inserting a
+# workout row. This also keeps the 21:00 nag quiet (run_nag_check skips
+# is_skipped plans). Phrases mirror the legacy life_ops handler verbatim.
+# ----------------------------------------------------------------------------
+
+_REST_DAY_PHRASES = ("skip today", "rest day", "taking today off", "day off")
+
+
+def handle_rest_day(message: str) -> str | None:
+    """Mark today's plan (CT) as a rest day. Returns a trainer-voice ack, or
+    None when the message isn't a rest-day request (so the caller falls through).
+
+    UPDATE-only: if no plan is seeded for today the row count is 0 and nothing
+    changes, but the ack is still returned — a rest day with no plan needs no
+    nag-suppression. Replaces the deleted SQLite life_ops.log_rest_day path.
+    """
+    q = (message or "").lower().strip()
+    if not q or not any(kw in q for kw in _REST_DAY_PHRASES):
+        return None
+    from knowledge.db import execute_write
+    today = datetime.now(CT).date()
+    try:
+        execute_write(
+            "UPDATE health.plan SET is_skipped = TRUE WHERE plan_date = %s",
+            (today,),
+        )
+    except Exception:
+        logger.exception("Failed to mark rest day")
+        return "⚠️ Couldn't log the rest day — check DB."
+    return "Rest day logged. Recovery matters."
+
+
+# ----------------------------------------------------------------------------
 # Build 5 — history Q&A (handle_plan_query)
 # ----------------------------------------------------------------------------
 
