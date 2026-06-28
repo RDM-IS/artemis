@@ -37,7 +37,6 @@ from artemis.commitments import (
     log_calendar_action,
     parse_close_title,
 )
-from artemis.crm import format_contacts_list, init_db as init_crm_db, list_contacts
 from artemis.crm_client import CRMClient
 from artemis.inbox import (
     format_inbox_status,
@@ -2527,16 +2526,20 @@ def _handle_mention(post: dict, thread: list[dict]):
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
 
-    if q_lower == "contacts":
-        contacts = list_contacts()
-        reply = format_contacts_list(contacts)
-        if _mm:
-            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
-        return
-
-    if q_lower == "leads":
-        leads = list_contacts(status="lead")
-        reply = format_contacts_list(leads)
+    if q_lower in ("contacts", "leads"):
+        # Routed to the RDS CRM API (CRMClient) — the SQLite crm.py contacts
+        # store was removed. `leads` passes status='lead' to the API; an API
+        # that doesn't filter returns all. Gated/handled like `crm status`.
+        crm = CRMClient()
+        if crm.is_available():
+            try:
+                status = "lead" if q_lower == "leads" else None
+                reply = crm.format_contacts(crm.get_contacts(status=status))
+            except Exception:
+                logger.exception("CRM contacts fetch failed")
+                reply = "⚠️ CRM API error — check logs."
+        else:
+            reply = "CRM API not configured (CRM_API_URL / CRM_API_KEY not set)."
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
@@ -2855,11 +2858,10 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments + inbox_threads + contacts)
+    # Init databases (commitments + inbox_threads)
     from artemis.inbox import get_db as init_inbox_db
     get_db()
     init_inbox_db()
-    init_crm_db()
 
     # Load health plan context
     load_health_plan()
