@@ -329,5 +329,18 @@ class TestLiveCommitments(unittest.TestCase):
         self.assertEqual(len(cm.get_commitments_for_client("bigcorp")), 1)  # ILIKE
 
 
+# ============================================================================
+# No-SQLite regression guard — reintroducing SQLite in this module fails CI
+# ============================================================================
+
+class TestNoSqlite(unittest.TestCase):
+    def test_module_has_no_sqlite_binding(self):
+        self.assertFalse(hasattr(cm, "sqlite3"))
+
+    def test_source_has_no_sqlite_import(self):
+        src = Path(cm.__file__).read_text().lower()
+        self.assertNotIn("import sqlite3", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

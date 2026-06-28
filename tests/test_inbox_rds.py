@@ -343,5 +343,18 @@ class TestLiveInbox(unittest.TestCase):
         self.assertIsNone(inbox.get_thread("g4")["snoozed_until"])
 
 
+# ============================================================================
+# No-SQLite regression guard — reintroducing SQLite in this module fails CI
+# ============================================================================
+
+class TestNoSqlite(unittest.TestCase):
+    def test_module_has_no_sqlite_binding(self):
+        self.assertFalse(hasattr(inbox, "sqlite3"))
+
+    def test_source_has_no_sqlite_import(self):
+        src = Path(inbox.__file__).read_text().lower()
+        self.assertNotIn("import sqlite3", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
