@@ -1,9 +1,9 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-06-28T00:43:27Z_
+_Generated: 2026-06-28T12:16:24Z_
 
 ## Git
 - Branch: main
-- Head: a3dd2d6 feat(ops): generated context snapshot — kills hand-maintained drift
+- Head: c5a4335 chore(sqlite): final dead-reference cleanup + harden execute_* parameterization
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
@@ -23,11 +23,11 @@ _Generated: 2026-06-28T00:43:27Z_
 - PB-009: Personal Training
 
 ## Migrations (latest 5)
-- 013_health_schema.sql
-- 014_calendar_audit.sql
-- 015_health_session_log_round_num.sql
 - 016_nutrition_schema.sql
 - 017_grocery_to_acos.sql
+- 018_inbox_threads.sql
+- 019_quiet_hours_state.sql
+- 020_commitments.sql
 
 ## artemis/ modules
 - __init__.py
@@ -38,7 +38,6 @@ _Generated: 2026-06-28T00:43:27Z_
 - calendar_cache.py
 - commitments.py
 - config.py
-- crm.py
 - crm_client.py
 - crm_query.py
 - crm_write_guard.py
@@ -76,25 +75,34 @@ _Generated: 2026-06-28T00:43:27Z_
 - audit_log
 - calendar_audit
 - circuit_breaker_status
+- commitments
 - data_vault_satellites
 - entities
 - expenses
 - founder_loans
 - funding_events
+- grocery_list
 - guardrail_violations
+- inbox_threads
 - mrr_snapshots
 - osint_signals
 - pending_crm_writes
 - pipeline_events
 - processed_billing
+- quiet_state
 - relationships
 - schema_migrations
+- system_state
+- timezone_overrides
 - v_gold_contacts
 - velocity_ledger
 
 ### schema `health`
 - adjustments
 - daily_state
+- meal
+- nutrition_log
+- nutrition_target
 - phase_config
 - plan
 - session_log
