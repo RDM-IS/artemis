@@ -107,11 +107,25 @@ def get_booking_links() -> dict:
     return get_secret("rdmis/dev/booking-links")
 
 
+@lru_cache(maxsize=None)
 def get_crm_api_key() -> str:
-    """Returns CRM API key string.
-    Secret name: rdmis/dev/crm-api-key"""
-    secret = get_secret("rdmis/dev/crm-api-key")
-    return secret["api_key"]
+    """Returns the CRM API key string.
+    Secret name: rdmis/dev/crm-api-key
+
+    Defensive about the stored shape. The sibling *-api-key secrets are JSON
+    ({"api_key": "..."}) — see get_anthropic_key / get_health_api_key — but this
+    tolerates a raw-string secret too: it reads the SecretString, tries JSON
+    first (dict → "api_key", bare JSON string → its value) and falls back to the
+    raw value when it isn't JSON. Cached per process like get_secret()."""
+    client = boto3.client("secretsmanager", region_name=REGION)
+    raw = client.get_secret_value(SecretId="rdmis/dev/crm-api-key")["SecretString"]
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip()
+    if isinstance(parsed, dict):
+        return (parsed.get("api_key") or "").strip()
+    return str(parsed).strip()
 
 
 def get_health_api_key() -> str:
