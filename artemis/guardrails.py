@@ -8,52 +8,36 @@ This guardrail fires regardless of autonomy mode (Learning, Active, Live).
 
 import logging
 import re
-import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
-from artemis.commitments import get_db
+from knowledge import db as knowledge_db
 
 logger = logging.getLogger(__name__)
 
 # Internal domains — emails on these domains are NOT flagged
 _INTERNAL_DOMAINS = frozenset({"rdm.is", "gmail.com"})
 
-# SQLite table for guardrail violation logging
-_CREATE_VIOLATIONS = """
-CREATE TABLE IF NOT EXISTS guardrail_violations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-    event_summary TEXT NOT NULL,
-    external_attendees TEXT NOT NULL,
-    outcome TEXT NOT NULL
-)
-"""
-
-
-def _ensure_table(db: sqlite3.Connection) -> None:
-    db.execute(_CREATE_VIOLATIONS)
-    db.commit()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+# guardrail_type recorded for the external-attendee guard. Matches the value
+# used by the one-time SQLite→Postgres backfill (migrate_sqlite_to_postgres.py).
+_EXTERNAL_ATTENDEE_GUARDRAIL = "external_calendar_attendee"
 
 
 def log_violation(
     event_summary: str,
     external_attendees: list[str],
     outcome: str,
-    db: sqlite3.Connection | None = None,
 ) -> None:
-    """Log a guardrail violation to SQLite. outcome: 'blocked', 'approved', 'denied'."""
-    conn = db or get_db()
-    _ensure_table(conn)
-    conn.execute(
-        "INSERT INTO guardrail_violations (timestamp, event_summary, external_attendees, outcome) "
-        "VALUES (?, ?, ?, ?)",
-        (_now_iso(), event_summary, ", ".join(external_attendees), outcome),
+    """Log a guardrail violation to acos.guardrail_violations in RDS.
+
+    outcome: 'blocked', 'approved', 'denied'. created_at is set by the table's
+    now() default; external_attendees is stored as a Postgres TEXT[].
+    """
+    knowledge_db.log_guardrail_violation(
+        guardrail_type=_EXTERNAL_ATTENDEE_GUARDRAIL,
+        event_summary=event_summary,
+        outcome=outcome,
+        external_attendees=external_attendees,
     )
-    conn.commit()
     logger.warning(
         "GUARDRAIL VIOLATION [%s]: event='%s', external=%s",
         outcome, event_summary, external_attendees,
