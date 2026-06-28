@@ -1,15 +1,22 @@
 """Quiet hours session management — silence scheduled jobs during off-hours.
 
 State-based quiet system with manual goodnight/morning, working session
-overrides with inactivity timers, and timezone overrides stored in SQLite.
+overrides with inactivity timers, and timezone overrides. Backed by RDS
+(acos.system_state / acos.quiet_state / acos.timezone_overrides, migration 019)
+via knowledge.db; no SQLite remains in this module.
+
+Timezone handling is the module's own: get_active_timezone() resolves the
+override (if set and unexpired) else config.HOME_TIMEZONE, and every wall-clock
+window check goes through it. Stored instants are TIMESTAMPTZ, so override-expiry
+and inactivity-elapsed comparisons are absolute and unambiguous.
 """
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from artemis import config
-from artemis.commitments import get_db
+from knowledge.db import execute_one, execute_write
 
 logger = logging.getLogger(__name__)
 
@@ -102,11 +109,6 @@ def _parse_time(t: str) -> time:
     return time(int(parts[0]), int(parts[1]))
 
 
-def _now_utc_iso() -> str:
-    """Current UTC time as ISO string."""
-    return datetime.utcnow().isoformat()
-
-
 # ---------------------------------------------------------------------------
 # City / timezone resolution
 # ---------------------------------------------------------------------------
@@ -132,16 +134,17 @@ def resolve_city_timezone(city_or_tz: str) -> str | None:
 
 
 def get_active_timezone() -> str:
-    """Return the active timezone — override if set and not expired, else HOME_TIMEZONE."""
+    """Return the active timezone — override if set and not expired, else HOME_TIMEZONE.
+
+    The not-expired check is an absolute-instant comparison done in SQL
+    (expires_at > now()) on the TIMESTAMPTZ column — tz-agnostic and unambiguous.
+    """
     try:
-        conn = get_db()
-        row = conn.execute(
-            "SELECT timezone, expires_at FROM timezone_overrides WHERE id = 1"
-        ).fetchone()
+        row = execute_one(
+            "SELECT timezone FROM acos.timezone_overrides WHERE id = 1 AND expires_at > now()"
+        )
         if row:
-            expires_at = datetime.fromisoformat(row["expires_at"])
-            if datetime.utcnow() < expires_at:
-                return row["timezone"]
+            return row["timezone"]
     except Exception:
         logger.debug("Failed to check timezone override", exc_info=True)
 
@@ -166,10 +169,7 @@ def get_tz_abbrev(tz_name: str | None = None) -> str:
 def get_system_value(key: str) -> str | None:
     """Read a value from the system_state table."""
     try:
-        conn = get_db()
-        row = conn.execute(
-            "SELECT value FROM system_state WHERE key = ?", (key,)
-        ).fetchone()
+        row = execute_one("SELECT value FROM acos.system_state WHERE key = %s", (key,))
         return row["value"] if row else None
     except Exception:
         logger.debug("Failed to read system_state[%s]", key, exc_info=True)
@@ -179,12 +179,11 @@ def get_system_value(key: str) -> str | None:
 def set_system_value(key: str, value: str) -> None:
     """Upsert a value into the system_state table."""
     try:
-        conn = get_db()
-        conn.execute(
-            "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, value, _now_utc_iso()),
+        execute_write(
+            "INSERT INTO acos.system_state (key, value, updated_at) VALUES (%s, %s, now()) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+            (key, value),
         )
-        conn.commit()
     except Exception:
         logger.exception("Failed to write system_state[%s]", key)
 
@@ -197,35 +196,31 @@ def set_system_value(key: str, value: str) -> None:
 def _get_quiet_row() -> dict | None:
     """Read the quiet_state singleton row. Returns dict or None."""
     try:
-        conn = get_db()
-        row = conn.execute("SELECT * FROM quiet_state WHERE id = 1").fetchone()
-        return dict(row) if row else None
+        return execute_one("SELECT * FROM acos.quiet_state WHERE id = 1")
     except Exception:
         logger.debug("Failed to read quiet_state", exc_info=True)
         return None
 
 
 def _upsert_quiet_state(**kwargs) -> None:
-    """Insert or update the quiet_state singleton row."""
-    kwargs["updated_at"] = _now_utc_iso()
+    """Insert or update the quiet_state singleton (id = 1) via ON CONFLICT.
+
+    updated_at is always server-side now(); only the columns the caller passes
+    are written (others keep their value on update, or take their default on
+    first insert) — preserving the SQLite select-then-update-only-given-columns
+    behavior. last_interaction is passed as a tz-aware datetime by callers.
+    """
+    cols = list(kwargs.keys())
+    insert_cols = ["id"] + cols + ["updated_at"]
+    insert_vals = ["1"] + ["%s"] * len(cols) + ["now()"]
+    set_parts = [f"{c} = EXCLUDED.{c}" for c in cols] + ["updated_at = now()"]
+    sql = (
+        f"INSERT INTO acos.quiet_state ({', '.join(insert_cols)}) "
+        f"VALUES ({', '.join(insert_vals)}) "
+        f"ON CONFLICT (id) DO UPDATE SET {', '.join(set_parts)}"
+    )
     try:
-        conn = get_db()
-        row = conn.execute("SELECT id FROM quiet_state WHERE id = 1").fetchone()
-        if row:
-            sets = ", ".join(f"{k} = ?" for k in kwargs)
-            conn.execute(
-                f"UPDATE quiet_state SET {sets} WHERE id = 1",
-                list(kwargs.values()),
-            )
-        else:
-            kwargs["id"] = 1
-            cols = ", ".join(kwargs.keys())
-            placeholders = ", ".join("?" for _ in kwargs)
-            conn.execute(
-                f"INSERT INTO quiet_state ({cols}) VALUES ({placeholders})",
-                list(kwargs.values()),
-            )
-        conn.commit()
+        execute_write(sql, tuple(kwargs.values()))
     except Exception:
         logger.exception("Failed to upsert quiet_state")
 
@@ -344,7 +339,7 @@ def start_override(until_time: str | None = None) -> str:
     _upsert_quiet_state(
         override_active=1,
         override_until=until_time,
-        last_interaction=_now_utc_iso(),
+        last_interaction=datetime.now(timezone.utc),
     )
 
     if until_time:
@@ -362,7 +357,7 @@ def start_override(until_time: str | None = None) -> str:
 
 def extend_override() -> str:
     """Reset the inactivity timer on the working session override."""
-    _upsert_quiet_state(last_interaction=_now_utc_iso())
+    _upsert_quiet_state(last_interaction=datetime.now(timezone.utc))
     timeout = config.OVERRIDE_TIMEOUT_MINUTES
     return f"\u23f1 Timer reset \u2014 going quiet after {timeout} min of inactivity."
 
@@ -377,9 +372,8 @@ def check_override_expiry() -> str | None:
     if not state or not state.get("override_active"):
         return None
 
-    now = datetime.utcnow()
-
-    # Check time-based override limit (override until X)
+    # Check time-based override limit (override until X) — wall-clock comparison
+    # in the ACTIVE timezone (unchanged: already correct).
     until = state.get("override_until")
     if until:
         tz_name = get_active_timezone()
@@ -396,12 +390,16 @@ def check_override_expiry() -> str | None:
                 f"Say `@artemis override` to keep working."
             )
 
-    # Check inactivity timeout
+    # Check inactivity timeout — absolute elapsed time. last_interaction is a
+    # TIMESTAMPTZ (psycopg2 → tz-aware datetime); compare against aware now.
     last = state.get("last_interaction")
     if last:
         try:
-            last_dt = datetime.fromisoformat(last)
-            elapsed = (now - last_dt).total_seconds() / 60
+            if isinstance(last, str):
+                last = datetime.fromisoformat(last)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 60
             if elapsed >= config.OVERRIDE_TIMEOUT_MINUTES:
                 _upsert_quiet_state(override_active=0, override_until=None, is_quiet=1)
                 return (
@@ -418,7 +416,7 @@ def update_last_interaction() -> None:
     """Record an @mention interaction for inactivity tracking."""
     state = _get_quiet_row()
     if state and state.get("override_active"):
-        _upsert_quiet_state(last_interaction=_now_utc_iso())
+        _upsert_quiet_state(last_interaction=datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -457,18 +455,16 @@ def quiet_hours_status() -> str:
     else:
         lines.append(f"\u2600\ufe0f Outside quiet hours ({start_str} - {end_str} {tz_abbrev}).")
 
-    # Timezone override
+    # Timezone override — show only if still active (expiry filtered in SQL).
     try:
-        conn = get_db()
-        row = conn.execute(
-            "SELECT timezone, city_name, expires_at FROM timezone_overrides WHERE id = 1"
-        ).fetchone()
+        row = execute_one(
+            "SELECT timezone, city_name, expires_at FROM acos.timezone_overrides "
+            "WHERE id = 1 AND expires_at > now()"
+        )
         if row:
-            expires_at = datetime.fromisoformat(row["expires_at"])
-            if datetime.utcnow() < expires_at:
-                city = row["city_name"] or row["timezone"]
-                expires_str = expires_at.strftime("%b %d")
-                lines.append(f"\U0001f30d Timezone: {city} ({row['timezone']}) until {expires_str}.")
+            city = row["city_name"] or row["timezone"]
+            expires_str = row["expires_at"].strftime("%b %d")
+            lines.append(f"\U0001f30d Timezone: {city} ({row['timezone']}) until {expires_str}.")
     except Exception:
         pass
 
@@ -476,26 +472,27 @@ def quiet_hours_status() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Timezone override CRUD (unchanged)
+# Timezone override CRUD
 # ---------------------------------------------------------------------------
 
 
 def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> str:
     """Set a timezone override that expires after `days` days."""
-    expires_at = datetime.utcnow() + timedelta(days=days)
+    # Absolute instant `days` out, stored tz-aware (TIMESTAMPTZ).
+    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
     tz_abbrev = get_tz_abbrev(tz_name)
     start_str = _parse_time(config.QUIET_HOURS_START).strftime("%I:%M %p").lstrip("0")
     end_str = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
     expires_str = expires_at.strftime("%B %d")
 
     try:
-        conn = get_db()
-        conn.execute(
-            "INSERT OR REPLACE INTO timezone_overrides (id, timezone, expires_at, city_name) "
-            "VALUES (1, ?, ?, ?)",
-            (tz_name, expires_at.isoformat(), city_name or tz_name),
+        execute_write(
+            "INSERT INTO acos.timezone_overrides (id, timezone, expires_at, city_name) "
+            "VALUES (1, %s, %s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET timezone = EXCLUDED.timezone, "
+            "expires_at = EXCLUDED.expires_at, city_name = EXCLUDED.city_name, set_at = now()",
+            (tz_name, expires_at, city_name or tz_name),
         )
-        conn.commit()
     except Exception:
         logger.exception("Failed to set timezone override")
         return "\u26a0\ufe0f Failed to set timezone override \u2014 check logs."
@@ -510,9 +507,7 @@ def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> s
 def clear_timezone_override() -> str:
     """Clear the active timezone override."""
     try:
-        conn = get_db()
-        conn.execute("DELETE FROM timezone_overrides WHERE id = 1")
-        conn.commit()
+        execute_write("DELETE FROM acos.timezone_overrides WHERE id = 1")
     except Exception:
         logger.exception("Failed to clear timezone override")
         return "\u26a0\ufe0f Failed to clear timezone override \u2014 check logs."
@@ -522,20 +517,17 @@ def clear_timezone_override() -> str:
 
 
 def check_expired_overrides() -> str | None:
-    """Check if the timezone override has expired. Returns announcement or None."""
-    try:
-        conn = get_db()
-        row = conn.execute(
-            "SELECT timezone, city_name, expires_at FROM timezone_overrides WHERE id = 1"
-        ).fetchone()
-        if not row:
-            return None
+    """Check if the timezone override has expired. Returns announcement or None.
 
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if datetime.utcnow() >= expires_at:
-            city = row["city_name"] or row["timezone"]
-            conn.execute("DELETE FROM timezone_overrides WHERE id = 1")
-            conn.commit()
+    Atomic: delete the row iff it is expired (expires_at <= now(), an absolute
+    instant comparison in SQL) and announce only when a row was actually removed.
+    """
+    try:
+        row = execute_write(
+            "DELETE FROM acos.timezone_overrides WHERE id = 1 AND expires_at <= now() "
+            "RETURNING timezone, city_name"
+        )
+        if row:
             home_abbrev = get_tz_abbrev(config.HOME_TIMEZONE)
             return (
                 f"\U0001f30d Timezone override expired \u2014 reverting to {config.HOME_TIMEZONE} "
