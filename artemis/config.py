@@ -147,9 +147,6 @@ QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", "04:00")
 HOME_TIMEZONE = os.environ.get("HOME_TIMEZONE", "America/Chicago")
 OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 
-# Database
-SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", "artemis.db"))
-
 
 def _bool(val: str, default: bool = False) -> bool:
     if val is None or val == "":

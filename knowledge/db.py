@@ -65,8 +65,22 @@ def get_connection():
         _pool.putconn(conn)
 
 
-def execute_query(sql: str, params: tuple | dict = ()):
-    """Execute a query and return all rows as list of dicts."""
+def execute_query(sql: str, params: tuple | dict | None = None):
+    """Execute a parameterized query and return all rows as list of dicts.
+
+    ALWAYS pass dynamic/user values via `params` — psycopg2 binds them safely.
+    Never %-format or f-string values into `sql` (SQL-injection + quote landmine).
+
+        # right — parameterized:
+        execute_query("SELECT * FROM acos.entities WHERE name = %s", (name,))
+        execute_query("UPDATE t SET v = %(v)s WHERE k = %(k)s", {"v": v, "k": k})
+        # wrong — string-built:
+        execute_query(f"SELECT * FROM acos.entities WHERE name = '{name}'")
+
+    params defaults to None: psycopg2 then sends `sql` verbatim (no %-binding
+    pass), so a literal % (e.g. an inline LIKE) needs no `%%` escaping. When you
+    DO pass params, literal %% must still be doubled as before.
+    """
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
@@ -75,14 +89,22 @@ def execute_query(sql: str, params: tuple | dict = ()):
             return []
 
 
-def execute_one(sql: str, params: tuple | dict = ()):
-    """Execute a query and return the first row as dict, or None."""
+def execute_one(sql: str, params: tuple | dict | None = None):
+    """Execute a parameterized query and return the first row as dict, or None.
+
+    See execute_query for the parameterization contract.
+    """
     rows = execute_query(sql, params)
     return dict(rows[0]) if rows else None
 
 
-def execute_write(sql: str, params: tuple | dict = ()):
-    """Execute an INSERT/UPDATE/DELETE. Returns the first row if RETURNING clause used."""
+def execute_write(sql: str, params: tuple | dict | None = None):
+    """Execute a parameterized INSERT/UPDATE/DELETE; returns the first row if a
+    RETURNING clause is used, else None.
+
+    See execute_query for the parameterization contract — pass values via
+    `params`, never interpolate them into `sql`.
+    """
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)

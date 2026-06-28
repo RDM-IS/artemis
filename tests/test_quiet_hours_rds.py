@@ -305,5 +305,18 @@ class TestLiveQuietHours(unittest.TestCase):
         self.assertEqual(quiet_hours.get_active_timezone(), "Europe/Paris")
 
 
+# ============================================================================
+# No-SQLite regression guard — reintroducing SQLite in this module fails CI
+# ============================================================================
+
+class TestNoSqlite(unittest.TestCase):
+    def test_module_has_no_sqlite_binding(self):
+        self.assertFalse(hasattr(quiet_hours, "sqlite3"))
+
+    def test_source_has_no_sqlite_import(self):
+        src = Path(quiet_hours.__file__).read_text().lower()
+        self.assertNotIn("import sqlite3", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

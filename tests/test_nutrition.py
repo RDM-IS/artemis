@@ -538,5 +538,18 @@ class TestLiveSchema(unittest.TestCase):
         self.assertEqual(self.cur.rowcount, 1)
 
 
+# ============================================================================
+# No-SQLite regression guard — life_ops (grocery/staples) must stay off SQLite
+# ============================================================================
+
+class TestNoSqlite(unittest.TestCase):
+    def test_module_has_no_sqlite_binding(self):
+        self.assertFalse(hasattr(life_ops, "sqlite3"))
+
+    def test_source_has_no_sqlite_import(self):
+        src = Path(life_ops.__file__).read_text().lower()
+        self.assertNotIn("import sqlite3", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
