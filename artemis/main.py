@@ -57,10 +57,8 @@ from artemis.inbox import (
 )
 from artemis.gmail import GmailClient
 from artemis.life_ops import (
-    get_db as init_life_ops_db,
     handle_grocery_command,
     handle_health_command,
-    handle_workout_command,
     load_health_plan,
 )
 from artemis.mattermost import MattermostClient
@@ -1664,15 +1662,20 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
 
 
 def _try_life_ops(question: str) -> str | None:
-    """Try workout, grocery, and health commands in order."""
+    """Try ad-hoc rest day, then grocery and health commands in order.
+
+    Workout logging was removed — the RDS health path (_handle_health_conversation,
+    which runs earlier in dispatch) owns sessions, set-logging, debrief/capture,
+    and history Q&A. Ad-hoc rest day stays HERE (not in the early health handler)
+    so calendar/inbox claim a "day off"/"rest day" event first — the same low
+    precedence the legacy workout handler had.
+    """
     q = question.lower()
-    if any(kw in q for kw in [
-        "workout", "let's work out", "lets work out", "bench", "squat", "rdl",
-        "sets", "reps", "lbs", "rest day", "skip today", "taking today off",
-    ]):
-        result = handle_workout_command(question)
-        if result:
-            return result
+    # Ad-hoc rest day → RDS (replaces life_ops.log_rest_day; marks health.plan).
+    from artemis.health import handle_rest_day
+    rest = handle_rest_day(question)
+    if rest:
+        return rest
     if any(kw in q for kw in [
         "grocery", "shopping list", "add to list", "going to aldi",
         "heading to aldi", "need to get", "need ", "put ", "got ",
@@ -2852,12 +2855,11 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments + inbox_threads + contacts + life_ops)
+    # Init databases (commitments + inbox_threads + contacts)
     from artemis.inbox import get_db as init_inbox_db
     get_db()
     init_inbox_db()
     init_crm_db()
-    init_life_ops_db()
 
     # Load health plan context
     load_health_plan()
