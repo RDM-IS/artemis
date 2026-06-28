@@ -2858,10 +2858,9 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments + inbox_threads)
-    from artemis.inbox import get_db as init_inbox_db
+    # Init databases (commitments). inbox_threads now lives in RDS
+    # (acos.inbox_threads, migration 018) — no local table to create.
     get_db()
-    init_inbox_db()
 
     # Load health plan context
     load_health_plan()

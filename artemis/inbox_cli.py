@@ -7,7 +7,6 @@ from artemis.inbox import (
     format_snoozed_list,
     format_waiting_list,
     get_counts,
-    get_db,
     list_by_state,
     mark_done,
     mark_noise,
@@ -41,11 +40,10 @@ def _cli():
     noise_p.add_argument("id", help="Gmail thread ID (or prefix)")
 
     args = parser.parse_args()
-    db = get_db()
 
     if args.command == "list":
-        na = list_by_state(NEEDS_ACTION, db=db)
-        w = list_by_state(WAITING, db=db)
+        na = list_by_state(NEEDS_ACTION)
+        w = list_by_state(WAITING)
         if na:
             print("\n== NEEDS ACTION ==")
             for t in na:
@@ -59,23 +57,23 @@ def _cli():
             print("Inbox zero! No threads need attention.")
 
     elif args.command == "stats":
-        counts = get_counts(db=db)
+        counts = get_counts()
         print(format_inbox_status(counts))
 
     elif args.command == "done":
         from artemis.inbox import resolve_thread_id
-        tid = resolve_thread_id(args.id, db=db)
+        tid = resolve_thread_id(args.id)
         if tid:
-            mark_done(tid, db=db)
+            mark_done(tid)
             print(f"Marked {args.id} as DONE")
         else:
             print(f"Thread not found: {args.id}")
 
     elif args.command == "snooze":
         from artemis.inbox import resolve_thread_id
-        tid = resolve_thread_id(args.id, db=db)
+        tid = resolve_thread_id(args.id)
         if tid:
-            mark_snoozed(tid, args.period, db=db)
+            mark_snoozed(tid, args.period)
             print(f"Snoozed {args.id} for {args.period}")
         else:
             print(f"Thread not found: {args.id}")
@@ -83,21 +81,21 @@ def _cli():
     elif args.command == "waiting":
         if args.id:
             from artemis.inbox import resolve_thread_id
-            tid = resolve_thread_id(args.id, db=db)
+            tid = resolve_thread_id(args.id)
             if tid:
-                mark_waiting(tid, waiting_on=args.on, db=db)
+                mark_waiting(tid, waiting_on=args.on)
                 print(f"Marked {args.id} as WAITING (on: {args.on or 'unspecified'})")
             else:
                 print(f"Thread not found: {args.id}")
         else:
-            threads = list_by_state(WAITING, db=db)
+            threads = list_by_state(WAITING)
             print(format_waiting_list(threads))
 
     elif args.command == "noise":
         from artemis.inbox import resolve_thread_id
-        tid = resolve_thread_id(args.id, db=db)
+        tid = resolve_thread_id(args.id)
         if tid:
-            mark_noise(tid, db=db)
+            mark_noise(tid)
             print(f"Marked {args.id} as NOISE")
         else:
             print(f"Thread not found: {args.id}")
