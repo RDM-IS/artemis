@@ -1,117 +1,36 @@
-"""SQLite-backed commitment tracker with CLI."""
+"""Work-deadline commitment tracker (RDS-backed) with CLI.
+
+Standalone deadlines with effort-based start alerts and a free-text client —
+backed by acos.commitments (Postgres/RDS, migration 020) via knowledge.db. This
+is distinct from the CRM API's public.commitments (contact-scoped, status='open'),
+which crm_query / the scheduler radar / `crm status` read; see migration 020.
+
+No SQLite remains: this was the last module on the shared SQLite hub, so after it
+artemis.db has no writers. The two audit helpers that historically lived here on
+that hub (log_claude_call, log_calendar_action) keep their import surface but now
+write the existing acos audit tables (acos.audit_log / acos.calendar_audit).
+
+"Today"-relative due-date logic is anchored to America/Chicago — the box runs UTC
+(a day ahead of CT after ~19:00), so bare current_date would flag due/overdue a
+day early.
+"""
 
 import argparse
 import difflib
 import logging
 import re
-import sqlite3
-from datetime import date, datetime
-from pathlib import Path
 
-from artemis import config
+from knowledge.db import execute_one, execute_query, execute_write
 
 logger = logging.getLogger(__name__)
 
-CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS commitments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    due_date TEXT NOT NULL,
-    effort_days INTEGER NOT NULL DEFAULT 1,
-    client TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-)
-"""
-
-CREATE_AUDIT_LOG = """
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-    model TEXT NOT NULL,
-    prompt_hash TEXT NOT NULL,
-    response_length INTEGER NOT NULL
-)
-"""
-
-CREATE_CALENDAR_AUDIT = """
-CREATE TABLE IF NOT EXISTS calendar_audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-    action TEXT NOT NULL,
-    event_id TEXT NOT NULL,
-    summary TEXT NOT NULL DEFAULT '',
-    attendees TEXT NOT NULL DEFAULT '',
-    user_approved INTEGER NOT NULL DEFAULT 0,
-    auto_created INTEGER NOT NULL DEFAULT 0,
-    notes TEXT NOT NULL DEFAULT ''
-)
-"""
-
-CREATE_TIMEZONE_OVERRIDES = """
-CREATE TABLE IF NOT EXISTS timezone_overrides (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    timezone TEXT NOT NULL,
-    set_at TEXT NOT NULL DEFAULT (datetime('now')),
-    expires_at TEXT NOT NULL,
-    city_name TEXT NOT NULL DEFAULT ''
-)
-"""
-
-CREATE_QUIET_STATE = """
-CREATE TABLE IF NOT EXISTS quiet_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    is_quiet INTEGER NOT NULL DEFAULT 0,
-    manual_override INTEGER NOT NULL DEFAULT 0,
-    wake_time TEXT,
-    override_active INTEGER NOT NULL DEFAULT 0,
-    override_until TEXT,
-    last_interaction TEXT,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-)
-"""
-
-CREATE_SYSTEM_STATE = """
-CREATE TABLE IF NOT EXISTS system_state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-)
-"""
+# CT anchor for every "today"-relative due-date comparison.
+_CT_TODAY_SQL = "(now() AT TIME ZONE 'America/Chicago')::date"
 
 
-def get_db(db_path: Path | None = None) -> sqlite3.Connection:
-    path = db_path or config.SQLITE_PATH
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute(CREATE_TABLE)
-    conn.execute(CREATE_AUDIT_LOG)
-    conn.execute(CREATE_CALENDAR_AUDIT)
-    conn.execute(CREATE_TIMEZONE_OVERRIDES)
-    conn.execute(CREATE_QUIET_STATE)
-    conn.execute(CREATE_SYSTEM_STATE)
-    conn.commit()
-    return conn
-
-
-def log_calendar_action(
-    action: str,
-    event_id: str,
-    summary: str = "",
-    attendees: str = "",
-    user_approved: bool = False,
-    auto_created: bool = False,
-    notes: str = "",
-    db: sqlite3.Connection | None = None,
-) -> None:
-    """Log a calendar write action (create/delete) to the audit trail."""
-    conn = db or get_db()
-    conn.execute(
-        "INSERT INTO calendar_audit_log (action, event_id, summary, attendees, user_approved, auto_created, notes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (action, event_id, summary, attendees, int(user_approved), int(auto_created), notes),
-    )
-    conn.commit()
+# ---------------------------------------------------------------------------
+# Commitment CRUD
+# ---------------------------------------------------------------------------
 
 
 def add_commitment(
@@ -119,103 +38,67 @@ def add_commitment(
     due_date: str,
     effort_days: int = 1,
     client: str = "",
-    db: sqlite3.Connection | None = None,
 ) -> int:
-    conn = db or get_db()
-    cursor = conn.execute(
-        "INSERT INTO commitments (title, due_date, effort_days, client) VALUES (?, ?, ?, ?)",
+    row = execute_write(
+        "INSERT INTO acos.commitments (title, due_date, effort_days, client) "
+        "VALUES (%s, %s, %s, %s) RETURNING id",
         (title, due_date, effort_days, client),
     )
-    conn.commit()
-    return cursor.lastrowid
+    return row["id"] if row else 0
 
 
-def list_commitments(
-    status: str = "active", db: sqlite3.Connection | None = None
-) -> list[dict]:
-    conn = db or get_db()
-    rows = conn.execute(
-        "SELECT * FROM commitments WHERE status = ? ORDER BY due_date", (status,)
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def update_status(
-    commitment_id: int, status: str, db: sqlite3.Connection | None = None
-) -> None:
-    conn = db or get_db()
-    conn.execute(
-        "UPDATE commitments SET status = ? WHERE id = ?", (status, commitment_id)
+def list_commitments(status: str = "active") -> list[dict]:
+    return execute_query(
+        "SELECT * FROM acos.commitments WHERE status = %s ORDER BY due_date",
+        (status,),
     )
-    conn.commit()
 
 
-def get_due_soon(days: int = 3, db: sqlite3.Connection | None = None) -> list[dict]:
-    """Get active commitments due within `days` days."""
-    conn = db or get_db()
-    today = date.today().isoformat()
-    rows = conn.execute(
-        """
-        SELECT * FROM commitments
-        WHERE status = 'active'
-          AND due_date <= date(?, '+' || ? || ' days')
-        ORDER BY due_date
-        """,
-        (today, days),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def update_status(commitment_id: int, status: str) -> None:
+    execute_write(
+        "UPDATE acos.commitments SET status = %s WHERE id = %s",
+        (status, commitment_id),
+    )
 
 
-def get_start_alerts(db: sqlite3.Connection | None = None) -> list[dict]:
-    """Get commitments where remaining days <= effort_days (should start now)."""
-    conn = db or get_db()
-    today = date.today().isoformat()
-    rows = conn.execute(
-        """
-        SELECT * FROM commitments
-        WHERE status = 'active'
-          AND (julianday(due_date) - julianday(?)) <= effort_days
-        ORDER BY due_date
-        """,
-        (today,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def get_due_soon(days: int = 3) -> list[dict]:
+    """Get active commitments due within `days` days (CT-anchored)."""
+    return execute_query(
+        f"""SELECT * FROM acos.commitments
+            WHERE status = 'active'
+              AND due_date <= {_CT_TODAY_SQL} + %s
+            ORDER BY due_date""",
+        (days,),
+    )
 
 
-def get_commitments_for_client(
-    client: str, db: sqlite3.Connection | None = None
-) -> list[dict]:
-    conn = db or get_db()
-    rows = conn.execute(
-        "SELECT * FROM commitments WHERE status = 'active' AND client LIKE ? ORDER BY due_date",
+def get_start_alerts() -> list[dict]:
+    """Get commitments where remaining days <= effort_days (should start now).
+
+    CT-anchored: remaining days = due_date - CT today (date - date = int days).
+    """
+    return execute_query(
+        f"""SELECT * FROM acos.commitments
+            WHERE status = 'active'
+              AND (due_date - {_CT_TODAY_SQL}) <= effort_days
+            ORDER BY due_date"""
+    )
+
+
+def get_commitments_for_client(client: str) -> list[dict]:
+    # ILIKE preserves SQLite LIKE's case-insensitive substring match.
+    return execute_query(
+        "SELECT * FROM acos.commitments WHERE status = 'active' AND client ILIKE %s "
+        "ORDER BY due_date",
         (f"%{client}%",),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Schema migration — add closed_at if missing
-# ---------------------------------------------------------------------------
-
-def _migrate_closed_at(db: sqlite3.Connection) -> None:
-    """Add closed_at column to commitments table if it doesn't exist."""
-    try:
-        cols = {row[1] for row in db.execute("PRAGMA table_info(commitments)").fetchall()}
-        if "closed_at" not in cols:
-            db.execute("ALTER TABLE commitments ADD COLUMN closed_at TEXT")
-            db.commit()
-            logger.info("Migration: added closed_at column to commitments table")
-    except Exception:
-        logger.exception("Migration failed for closed_at column")
+    )
 
 
 # ---------------------------------------------------------------------------
 # Close commitment with fuzzy matching
 # ---------------------------------------------------------------------------
 
-def close_commitment(
-    title_query: str, db: sqlite3.Connection | None = None
-) -> dict:
+def close_commitment(title_query: str) -> dict:
     """Close a commitment by fuzzy-matching the title.
 
     Returns a result dict:
@@ -223,10 +106,7 @@ def close_commitment(
       {"status": "ambiguous", "matches": list[dict]}
       {"status": "not_found", "open": list[dict]}
     """
-    conn = db or get_db()
-    _migrate_closed_at(conn)
-
-    open_commitments = list_commitments(status="active", db=conn)
+    open_commitments = list_commitments(status="active")
     if not open_commitments:
         return {"status": "not_found", "open": []}
 
@@ -236,11 +116,10 @@ def close_commitment(
     if len(matches) == 1:
         matched_title = matches[0]
         matched = next(c for c in open_commitments if c["title"] == matched_title)
-        conn.execute(
-            "UPDATE commitments SET status = 'closed', closed_at = datetime('now') WHERE id = ?",
+        execute_write(
+            "UPDATE acos.commitments SET status = 'closed', closed_at = now() WHERE id = %s",
             (matched["id"],),
         )
-        conn.commit()
         logger.info("Closed commitment #%d: %s", matched["id"], matched_title)
         return {"status": "closed", "title": matched_title, "id": matched["id"]}
 
@@ -254,10 +133,10 @@ def close_commitment(
 def format_close_result(result: dict) -> str:
     """Format the close_commitment result for Mattermost."""
     if result["status"] == "closed":
-        return f"\u2705 Commitment closed: *{result['title']}*"
+        return f"✅ Commitment closed: *{result['title']}*"
 
     if result["status"] == "ambiguous":
-        lines = ["Found multiple matches \u2014 which did you mean?"]
+        lines = ["Found multiple matches — which did you mean?"]
         for i, c in enumerate(result["matches"], 1):
             lines.append(f"{i}. {c['title']}")
         return "\n".join(lines)
@@ -268,7 +147,7 @@ def format_close_result(result: dict) -> str:
         return "No open commitments."
     lines = ["No match found. Open commitments:"]
     for c in open_items:
-        lines.append(f"\u2022 {c['title']}")
+        lines.append(f"• {c['title']}")
     return "\n".join(lines)
 
 
@@ -276,12 +155,13 @@ def format_commitments_list(commitments: list[dict]) -> str:
     """Format a list of commitments for Mattermost."""
     if not commitments:
         return "No open commitments."
-    lines = [f"\u2705 **Open commitments ({len(commitments)}):**"]
+    lines = [f"✅ **Open commitments ({len(commitments)}):**"]
     for c in commitments:
-        created = c.get("created_at", "")[:10]
+        # created_at is a TIMESTAMPTZ (datetime); due_date a DATE. str()[:10] → the date.
+        created = str(c.get("created_at") or "")[:10]
         client = c.get("client", "")
         client_str = f" ({client})" if client else ""
-        lines.append(f"\u2022 **{c['title']}**{client_str} \u2014 due {c['due_date']}, created {created}")
+        lines.append(f"• **{c['title']}**{client_str} — due {c['due_date']}, created {created}")
     return "\n".join(lines)
 
 
@@ -308,18 +188,59 @@ def parse_close_title(text: str) -> str | None:
     return None
 
 
-def log_claude_call(
-    model: str,
-    prompt_hash: str,
-    response_length: int,
-    db: sqlite3.Connection | None = None,
+# ---------------------------------------------------------------------------
+# Audit helpers — kept here for their import surface, repointed off the SQLite
+# hub to the existing acos audit tables. Both best-effort: an audit-write hiccup
+# must never break the caller's flow (LLM call / calendar write).
+# ---------------------------------------------------------------------------
+
+
+def log_claude_call(model: str, prompt_hash: str, response_length: int) -> None:
+    """Record an LLM call to acos.audit_log (was the SQLite audit_log table)."""
+    try:
+        from knowledge.db import log_audit
+        log_audit(
+            agent="claude",
+            action="llm_call",
+            metadata={
+                "model": model,
+                "prompt_hash": prompt_hash,
+                "response_length": response_length,
+            },
+        )
+    except Exception:
+        logger.debug("log_claude_call audit write failed", exc_info=True)
+
+
+def log_calendar_action(
+    action: str,
+    event_id: str,
+    summary: str = "",
+    attendees: str = "",
+    user_approved: bool = False,
+    auto_created: bool = False,
+    notes: str = "",
 ) -> None:
-    conn = db or get_db()
-    conn.execute(
-        "INSERT INTO audit_log (model, prompt_hash, response_length) VALUES (?, ?, ?)",
-        (model, prompt_hash, response_length),
-    )
-    conn.commit()
+    """Record a calendar write/lifecycle action to acos.calendar_audit (was the
+    SQLite calendar_audit_log table).
+
+    Maps summary→title and the comma-string attendees→the JSONB list; user_approved
+    → approved_by. acos.calendar_audit has no notes/auto_created columns, so those
+    descriptive fields are not persisted (flagged in the migration PR). Captures the
+    'draft'/'cancelled' lifecycle actions that _audit_calendar_write does not.
+    """
+    try:
+        from knowledge.db import log_calendar_audit
+        attendee_list = [a.strip() for a in attendees.split(",") if a.strip()] if attendees else []
+        log_calendar_audit(
+            action=action,
+            event_id=event_id,
+            title=summary,
+            attendees=attendee_list,
+            approved_by="ryan" if user_approved else None,
+        )
+    except Exception:
+        logger.debug("log_calendar_action audit write failed", exc_info=True)
 
 
 def _cli():
