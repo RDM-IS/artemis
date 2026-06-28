@@ -31,7 +31,6 @@ from artemis.commitments import (
     close_commitment,
     format_close_result,
     format_commitments_list,
-    get_db,
     list_commitments,
     get_commitments_for_client,
     log_calendar_action,
@@ -2858,9 +2857,9 @@ def main():
     _start_time = time.time()
     logger.info("Starting Artemis...")
 
-    # Init databases (commitments). inbox_threads now lives in RDS
-    # (acos.inbox_threads, migration 018) — no local table to create.
-    get_db()
+    # All state now lives in RDS (acos.* / public.*) — no local SQLite tables to
+    # create. commitments was the last SQLite module (migration 020); artemis.db
+    # has no writers anymore.
 
     # Load health plan context
     load_health_plan()
