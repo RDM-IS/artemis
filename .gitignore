@@ -13,3 +13,13 @@ api/package/
 api/function.zip
 calendar_token.json
 lambda.zip
+credentials.json
+token.json
+calendar_token.json
+.env
+artemis.db
+lambda.zip
+.DS_Store
+UQ3o
+__pycache__/
+*.pyc
