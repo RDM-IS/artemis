@@ -1,15 +1,16 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-06-28T12:16:24Z_
+_Generated: 2026-06-28T22:34:54Z_
 
 ## Git
 - Branch: main
-- Head: c5a4335 chore(sqlite): final dead-reference cleanup + harden execute_* parameterization
+- Head: 3f5fb22 docs: add context baseline — CLAUDE.md operating guide + ARTEMIS_STATE (#53)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
 - Public IP: 3.227.229.186
 - Host: ip-172-31-2-193.ec2.internal
 - Python: Python 3.9.25
+- acos.service: active | ExecStart: ExecStart=/usr/bin/python3.11 -m artemis.main
 
 ## Playbooks (PLAYBOOKS.md)
 - PB-001: Demo Access Notification (v2)
