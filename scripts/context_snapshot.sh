@@ -13,7 +13,7 @@ mkdir -p context
   echo "- Origin: $(git remote get-url origin)"
   echo
   echo "## Runtime (only meaningful when run ON EC2)"
-  IP=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "n/a (not on EC2)")
+  TOK=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); IP=$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "n/a")
   echo "- Public IP: ${IP}"
   echo "- Host: $(hostname)"
   echo "- Python: $(python3 --version 2>&1)"
@@ -31,6 +31,6 @@ mkdir -p context
   ls artemis/*.py | xargs -n1 basename | sed 's/^/- /'
   echo
   echo "## Database (live RDS)"
-  python3 scripts/context_db.py 2>/dev/null || echo "- (db dump skipped — run on a host with RDS access + secrets)"
+  ( set -a; [ -f .env ] && . ./.env; set +a; PYTHONPATH="$PWD" /usr/bin/python3.11 scripts/context_db.py ) 2>/dev/null || echo "- (db dump skipped — run on a host with RDS access + secrets)"
 } > "$OUT"
 echo "Wrote $OUT"
