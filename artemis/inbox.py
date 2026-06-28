@@ -1,12 +1,17 @@
-"""Inbox zero tracking — every email thread gets a state, nothing is silently dropped."""
+"""Inbox zero tracking — every email thread gets a state, nothing is silently dropped.
+
+Backend: acos.inbox_threads (Postgres/RDS) via knowledge.db. Migrated off SQLite
+(migration 018); no SQLite remains in this module. Every "today" comparison is
+anchored to America/Chicago — the box runs UTC, a day ahead of CT after ~19:00,
+so bare current_date would resurface snoozes / flag due items a day early.
+"""
 
 import logging
 import re
-import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from artemis import config
-from artemis.commitments import get_db as _get_commitments_db
+from knowledge.db import execute_one, execute_query, execute_write
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +23,26 @@ DONE = "DONE"
 NOISE = "NOISE"
 
 VALID_STATES = {NEEDS_ACTION, WAITING, SNOOZED, DONE, NOISE}
+
+# CT anchor. (now() AT TIME ZONE 'America/Chicago')::date is "today in CT" inside
+# SQL; _ct_today() is the same value for the DATE columns we write in Python.
+_CT = ZoneInfo("America/Chicago")
+_CT_TODAY_SQL = "(now() AT TIME ZONE 'America/Chicago')::date"
+
+
+def _ct_today() -> date:
+    return datetime.now(_CT).date()
+
+
+def _coerce_date(value):
+    """Best-effort to a date. psycopg2 returns DATE columns as date objects, but
+    format_* may also be handed ISO strings (tests / legacy callers)."""
+    if value is None or isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
 
 
 def should_keep_in_inbox(state: str) -> bool:
@@ -53,42 +78,6 @@ SNOOZE_PERIODS = {
     "2w": timedelta(weeks=2),
 }
 
-CREATE_INBOX_THREADS = """
-CREATE TABLE IF NOT EXISTS inbox_threads (
-    id TEXT PRIMARY KEY,
-    subject TEXT,
-    sender TEXT,
-    sender_domain TEXT,
-    state TEXT NOT NULL DEFAULT 'NEEDS_ACTION',
-    snoozed_until DATE,
-    waiting_on TEXT,
-    waiting_since DATE,
-    due_date DATE,
-    client TEXT,
-    notes TEXT,
-    first_seen_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    last_updated_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    last_nudged_at TIMESTAMP,
-    mattermost_post_id TEXT
-)
-"""
-
-
-def get_db() -> sqlite3.Connection:
-    """Get a database connection with inbox_threads table ensured."""
-    conn = _get_commitments_db()
-    conn.execute(CREATE_INBOX_THREADS)
-    conn.commit()
-    return conn
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _today_iso() -> str:
-    return date.today().isoformat()
-
 
 # ---------------------------------------------------------------------------
 # Core CRUD
@@ -101,55 +90,43 @@ def upsert_thread(
     sender: str,
     state: str = NEEDS_ACTION,
     client: str = "",
-    db: sqlite3.Connection | None = None,
 ) -> bool:
-    """Create a thread record if it doesn't already exist. Returns True if created."""
-    conn = db or get_db()
-    existing = conn.execute(
-        "SELECT id FROM inbox_threads WHERE id = ?", (thread_id,)
-    ).fetchone()
-    if existing:
-        return False
+    """Create a thread record if it doesn't already exist. Returns True if created.
 
+    ON CONFLICT DO NOTHING makes the "create-if-absent" atomic; first_seen_at /
+    last_updated_at fall to the table's NOW() defaults.
+    """
     sender_domain = ""
     if "@" in sender:
         sender_domain = sender.split("@")[-1].lower().rstrip(">")
 
-    conn.execute(
-        """INSERT INTO inbox_threads
-           (id, subject, sender, sender_domain, state, client, first_seen_at, last_updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (thread_id, subject, sender, sender_domain, state, client, _now_iso(), _now_iso()),
+    row = execute_write(
+        """INSERT INTO acos.inbox_threads
+               (id, subject, sender, sender_domain, state, client)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           ON CONFLICT (id) DO NOTHING
+           RETURNING id""",
+        (thread_id, subject, sender, sender_domain, state, client),
     )
-    conn.commit()
-    return True
+    return row is not None
 
 
-def get_thread(thread_id: str, db: sqlite3.Connection | None = None) -> dict | None:
-    conn = db or get_db()
-    row = conn.execute("SELECT * FROM inbox_threads WHERE id = ?", (thread_id,)).fetchone()
-    return dict(row) if row else None
+def get_thread(thread_id: str) -> dict | None:
+    return execute_one("SELECT * FROM acos.inbox_threads WHERE id = %s", (thread_id,))
 
 
-def set_state(
-    thread_id: str,
-    state: str,
-    db: sqlite3.Connection | None = None,
-    **kwargs,
-) -> bool:
+def set_state(thread_id: str, state: str, **kwargs) -> bool:
     """Transition a thread to a new state. Extra kwargs set optional columns."""
     if state not in VALID_STATES:
         logger.error("Invalid state: %s", state)
         return False
 
-    conn = db or get_db()
-    existing = get_thread(thread_id, db=conn)
-    if not existing:
+    if not get_thread(thread_id):
         logger.warning("Thread %s not found", thread_id)
         return False
 
-    sets = ["state = ?", "last_updated_at = ?"]
-    params: list = [state, _now_iso()]
+    sets = ["state = %s", "last_updated_at = now()"]
+    params: list = [state]
 
     # Clear snooze fields when leaving SNOOZED
     if state != SNOOZED:
@@ -162,56 +139,58 @@ def set_state(
 
     for col in ("snoozed_until", "waiting_on", "waiting_since", "due_date", "client", "notes", "mattermost_post_id"):
         if col in kwargs:
-            sets.append(f"{col} = ?")
+            sets.append(f"{col} = %s")
             params.append(kwargs[col])
 
     params.append(thread_id)
-    conn.execute(f"UPDATE inbox_threads SET {', '.join(sets)} WHERE id = ?", params)
-    conn.commit()
+    execute_write(f"UPDATE acos.inbox_threads SET {', '.join(sets)} WHERE id = %s", params)
 
-    # Log state change to audit_log
-    conn.execute(
-        "INSERT INTO audit_log (model, prompt_hash, response_length) VALUES (?, ?, ?)",
-        ("inbox_state_change", f"{thread_id}:{state}", 0),
-    )
-    conn.commit()
+    # Audit trail for the state change. Was a piggyback INSERT into the shared
+    # SQLite audit_log (severed with commitments.get_db); now routes to the
+    # existing acos.audit_log via log_audit. Best-effort — never fail the
+    # transition because the audit write hiccuped.
+    try:
+        from knowledge.db import log_audit
+        log_audit(
+            agent="inbox",
+            action="state_change",
+            outcome=state,
+            metadata={"thread_id": thread_id, "state": state},
+        )
+    except Exception:
+        logger.debug("inbox state-change audit write failed", exc_info=True)
     return True
 
 
-def mark_done(thread_id: str, db: sqlite3.Connection | None = None) -> bool:
-    return set_state(thread_id, DONE, db=db)
+def mark_done(thread_id: str) -> bool:
+    return set_state(thread_id, DONE)
 
 
-def mark_noise(thread_id: str, db: sqlite3.Connection | None = None) -> bool:
-    return set_state(thread_id, NOISE, db=db)
+def mark_noise(thread_id: str) -> bool:
+    return set_state(thread_id, NOISE)
 
 
-def mark_waiting(
-    thread_id: str, waiting_on: str = "", db: sqlite3.Connection | None = None
-) -> bool:
+def mark_waiting(thread_id: str, waiting_on: str = "") -> bool:
     return set_state(
         thread_id,
         WAITING,
-        db=db,
         waiting_on=waiting_on,
-        waiting_since=_today_iso(),
+        waiting_since=_ct_today(),
     )
 
 
-def mark_snoozed(
-    thread_id: str, period: str, db: sqlite3.Connection | None = None
-) -> bool:
+def mark_snoozed(thread_id: str, period: str) -> bool:
     """Snooze a thread. period must be one of: 1d, 3d, 1w, 2w."""
     delta = SNOOZE_PERIODS.get(period)
     if not delta:
         logger.error("Invalid snooze period: %s (valid: %s)", period, list(SNOOZE_PERIODS))
         return False
-    until = (date.today() + delta).isoformat()
-    return set_state(thread_id, SNOOZED, db=db, snoozed_until=until)
+    until = _ct_today() + delta
+    return set_state(thread_id, SNOOZED, snoozed_until=until)
 
 
-def mark_needs_action(thread_id: str, db: sqlite3.Connection | None = None) -> bool:
-    return set_state(thread_id, NEEDS_ACTION, db=db)
+def mark_needs_action(thread_id: str) -> bool:
+    return set_state(thread_id, NEEDS_ACTION)
 
 
 # ---------------------------------------------------------------------------
@@ -219,112 +198,99 @@ def mark_needs_action(thread_id: str, db: sqlite3.Connection | None = None) -> b
 # ---------------------------------------------------------------------------
 
 
-def list_by_state(state: str, db: sqlite3.Connection | None = None) -> list[dict]:
-    conn = db or get_db()
-    rows = conn.execute(
-        "SELECT * FROM inbox_threads WHERE state = ? ORDER BY last_updated_at DESC",
+def list_by_state(state: str) -> list[dict]:
+    return execute_query(
+        "SELECT * FROM acos.inbox_threads WHERE state = %s ORDER BY last_updated_at DESC",
         (state,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+    )
 
 
-def get_stale_needs_action(hours: int = 24, db: sqlite3.Connection | None = None) -> list[dict]:
-    """NEEDS_ACTION threads with no update in `hours` hours."""
-    conn = db or get_db()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-    rows = conn.execute(
-        """SELECT * FROM inbox_threads
+def get_stale_needs_action(hours: int = 24) -> list[dict]:
+    """NEEDS_ACTION threads with no update in `hours` hours.
+
+    NOT CT-anchored: this is an absolute elapsed-time comparison on a TIMESTAMPTZ
+    (last_updated_at < now() - interval), which is zone-independent.
+    """
+    return execute_query(
+        """SELECT * FROM acos.inbox_threads
            WHERE state = 'NEEDS_ACTION'
-             AND last_updated_at < ?
+             AND last_updated_at < now() - make_interval(hours => %s)
            ORDER BY last_updated_at ASC""",
-        (cutoff,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        (hours,),
+    )
 
 
-def get_stale_waiting(days: int = 3, db: sqlite3.Connection | None = None) -> list[dict]:
-    """WAITING threads where waiting_since is older than `days` days."""
-    conn = db or get_db()
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
-    rows = conn.execute(
-        """SELECT * FROM inbox_threads
+def get_stale_waiting(days: int = 3) -> list[dict]:
+    """WAITING threads where waiting_since is older than `days` days.
+
+    CT-anchored: waiting_since is a DATE compared against CT "today" minus days.
+    """
+    return execute_query(
+        f"""SELECT * FROM acos.inbox_threads
            WHERE state = 'WAITING'
-             AND waiting_since <= ?
+             AND waiting_since <= {_CT_TODAY_SQL} - %s
            ORDER BY waiting_since ASC""",
-        (cutoff,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        (days,),
+    )
 
 
-def get_due_today(db: sqlite3.Connection | None = None) -> list[dict]:
-    conn = db or get_db()
-    today = _today_iso()
-    rows = conn.execute(
-        """SELECT * FROM inbox_threads
+def get_due_today() -> list[dict]:
+    """NEEDS_ACTION/WAITING threads due on or before CT today (CT-anchored)."""
+    return execute_query(
+        f"""SELECT * FROM acos.inbox_threads
            WHERE state IN ('NEEDS_ACTION', 'WAITING')
              AND due_date IS NOT NULL
-             AND due_date <= ?
-           ORDER BY due_date ASC""",
-        (today,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_snoozed_due(db: sqlite3.Connection | None = None) -> list[dict]:
-    """SNOOZED threads where snoozed_until <= today."""
-    conn = db or get_db()
-    today = _today_iso()
-    rows = conn.execute(
-        """SELECT * FROM inbox_threads
-           WHERE state = 'SNOOZED'
-             AND snoozed_until <= ?
-           ORDER BY snoozed_until ASC""",
-        (today,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def can_nudge(thread_id: str, min_hours: int = 12, db: sqlite3.Connection | None = None) -> bool:
-    """Check if enough time has passed since last nudge."""
-    conn = db or get_db()
-    row = conn.execute(
-        "SELECT last_nudged_at FROM inbox_threads WHERE id = ?", (thread_id,)
-    ).fetchone()
-    if not row or not row["last_nudged_at"]:
-        return True
-    try:
-        last = datetime.strptime(row["last_nudged_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - last).total_seconds() >= min_hours * 3600
-    except (ValueError, TypeError):
-        return True
-
-
-def record_nudge(thread_id: str, db: sqlite3.Connection | None = None) -> None:
-    conn = db or get_db()
-    conn.execute(
-        "UPDATE inbox_threads SET last_nudged_at = ? WHERE id = ?",
-        (_now_iso(), thread_id),
+             AND due_date <= {_CT_TODAY_SQL}
+           ORDER BY due_date ASC"""
     )
-    conn.commit()
 
 
-def get_counts(db: sqlite3.Connection | None = None) -> dict[str, int]:
-    conn = db or get_db()
-    rows = conn.execute(
-        "SELECT state, COUNT(*) as cnt FROM inbox_threads GROUP BY state"
-    ).fetchall()
+def get_snoozed_due() -> list[dict]:
+    """SNOOZED threads where snoozed_until <= CT today (CT-anchored)."""
+    return execute_query(
+        f"""SELECT * FROM acos.inbox_threads
+           WHERE state = 'SNOOZED'
+             AND snoozed_until <= {_CT_TODAY_SQL}
+           ORDER BY snoozed_until ASC"""
+    )
+
+
+def can_nudge(thread_id: str, min_hours: int = 12) -> bool:
+    """Check if enough time has passed since last nudge.
+
+    NOT CT-anchored: an absolute elapsed-time comparison on last_nudged_at.
+    A missing thread or a never-nudged thread returns True (as before).
+    """
+    row = execute_one(
+        """SELECT (last_nudged_at IS NULL
+                   OR last_nudged_at < now() - make_interval(hours => %s)) AS can_nudge
+           FROM acos.inbox_threads WHERE id = %s""",
+        (min_hours, thread_id),
+    )
+    if row is None:
+        return True
+    return bool(row["can_nudge"])
+
+
+def record_nudge(thread_id: str) -> None:
+    execute_write(
+        "UPDATE acos.inbox_threads SET last_nudged_at = now() WHERE id = %s",
+        (thread_id,),
+    )
+
+
+def get_counts() -> dict[str, int]:
+    rows = execute_query(
+        "SELECT state, COUNT(*) AS cnt FROM acos.inbox_threads GROUP BY state"
+    )
     return {r["state"]: r["cnt"] for r in rows}
 
 
-def set_mattermost_post_id(
-    thread_id: str, post_id: str, db: sqlite3.Connection | None = None
-) -> None:
-    conn = db or get_db()
-    conn.execute(
-        "UPDATE inbox_threads SET mattermost_post_id = ? WHERE id = ?",
+def set_mattermost_post_id(thread_id: str, post_id: str) -> None:
+    execute_write(
+        "UPDATE acos.inbox_threads SET mattermost_post_id = %s WHERE id = %s",
         (post_id, thread_id),
     )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -371,15 +337,13 @@ def format_inbox_status(counts: dict[str, int]) -> str:
 def format_waiting_list(threads: list[dict]) -> str:
     if not threads:
         return "No threads in WAITING state."
+    today = _ct_today()
     lines = ["**Waiting on replies:**"]
     for t in threads:
         days = 0
-        if t.get("waiting_since"):
-            try:
-                ws = date.fromisoformat(t["waiting_since"])
-                days = (date.today() - ws).days
-            except ValueError:
-                pass
+        ws = _coerce_date(t.get("waiting_since"))
+        if ws:
+            days = (today - ws).days
         who = t.get("waiting_on") or "unknown"
         lines.append(f"- **{t['subject']}** — waiting on {who} ({days}d)")
     return "\n".join(lines)
@@ -394,10 +358,9 @@ def format_snoozed_list(threads: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_morning_inbox_section(db: sqlite3.Connection | None = None) -> str:
+def format_morning_inbox_section() -> str:
     """Format inbox zero section for the morning brief."""
-    conn = db or get_db()
-    counts = get_counts(db=conn)
+    counts = get_counts()
     na = counts.get(NEEDS_ACTION, 0)
     w = counts.get(WAITING, 0)
 
@@ -405,14 +368,14 @@ def format_morning_inbox_section(db: sqlite3.Connection | None = None) -> str:
     if na > 0:
         lines.append(f"- **{na}** email thread{'s' if na != 1 else ''} need{'s' if na == 1 else ''} action")
     if w > 0:
-        waiting = list_by_state(WAITING, db=conn)
+        waiting = list_by_state(WAITING)
         who_list = [t.get("waiting_on", "someone") for t in waiting if t.get("waiting_on")]
         if who_list:
             lines.append(f"- **{w}** thread{'s' if w != 1 else ''} waiting on: {', '.join(who_list)}")
         else:
             lines.append(f"- **{w}** thread{'s' if w != 1 else ''} waiting on replies")
 
-    due_today = get_due_today(db=conn)
+    due_today = get_due_today()
     if due_today:
         for t in due_today:
             lines.append(f"- **Due today**: {t['subject']} (from {t['sender']})")
@@ -449,14 +412,13 @@ def parse_inbox_command(text: str) -> tuple[str, str, str] | None:
     return (cmd, thread_id, extra)
 
 
-def resolve_thread_id(short_id: str, db: sqlite3.Connection | None = None) -> str | None:
+def resolve_thread_id(short_id: str) -> str | None:
     """Resolve a short thread ID prefix to a full Gmail thread ID."""
     if not short_id:
         return None
-    conn = db or get_db()
-    rows = conn.execute(
-        "SELECT id FROM inbox_threads WHERE id LIKE ?", (f"{short_id}%",)
-    ).fetchall()
+    rows = execute_query(
+        "SELECT id FROM acos.inbox_threads WHERE id LIKE %s", (f"{short_id}%",)
+    )
     if len(rows) == 1:
         return rows[0]["id"]
     if len(rows) > 1:
