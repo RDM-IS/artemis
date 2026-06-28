@@ -22,7 +22,15 @@ class CRMClient:
     def __init__(self):
         from knowledge.secrets import get_crm_api_key
         self.base_url = config.CRM_API_URL.rstrip("/")
-        self._api_key = get_crm_api_key() if self.base_url else ""
+        # Key from Secrets Manager (rdmis/dev/crm-api-key) — never env/disk. If
+        # it can't be resolved, degrade to "" so is_available() reports the same
+        # graceful "not configured" state instead of raising at construction.
+        self._api_key = ""
+        if self.base_url:
+            try:
+                self._api_key = get_crm_api_key()
+            except Exception:
+                logger.warning("CRM API key unavailable from Secrets Manager — CRM disabled")
         self._headers = {
             "X-API-Key": self._api_key,
             "Content-Type": "application/json",
