@@ -18,7 +18,6 @@ from artemis.commitments import (
     get_commitments_for_client,
     list_commitments,
 )
-from artemis.crm import get_contact, upsert_contact
 from artemis.gmail import GmailClient
 from artemis.mattermost import MattermostClient
 from artemis.inbox import (
@@ -398,7 +397,16 @@ class ArtemisScheduler:
                                 playbook_match, orig.get("subject", ""), len(orig.get("snippet", "")),
                             )
                     elif orig and full_body_fetches < _MAX_FULL_FETCHES:
-                        needs_full = bool(get_contact(orig.get("from_email", "")))
+                        # Known CRM contact? Check the RDS CRM API (was SQLite
+                        # crm.get_contact). Unavailable/error → treat as unknown
+                        # (snippet only), exactly as a None lookup did before.
+                        needs_full = False
+                        from_email = orig.get("from_email", "")
+                        if from_email and self.crm.is_available():
+                            try:
+                                needs_full = bool(self.crm.find_contact_by_email(from_email))
+                            except Exception:
+                                logger.debug("CRM contact lookup failed for %s", from_email)
                         if needs_full:
                             body = self.gmail.get_full_message(orig["id"])
                             if body:

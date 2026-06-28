@@ -115,8 +115,11 @@ class CRMClient:
     # Contacts
     # ------------------------------------------------------------------
 
-    def get_contacts(self) -> list[dict]:
-        result = self._get("/contacts")
+    def get_contacts(self, status: str | None = None) -> list[dict]:
+        """List contacts. Optional status filter is passed to the API as a query
+        param (mirrors get_commitments); an API that ignores it returns all."""
+        params = {"status": status} if status else {}
+        result = self._get("/contacts", **params)
         return result if isinstance(result, list) else result.get("items", []) if isinstance(result, dict) else []
 
     def get_contact(self, contact_id: str) -> dict | None:
@@ -143,6 +146,32 @@ class CRMClient:
 
     def create_contact(self, data: dict) -> dict:
         return self._post("/contacts", data)
+
+    @staticmethod
+    def format_contacts(contacts: list[dict]) -> str:
+        """Format a contacts list for Mattermost.
+
+        Replaces the legacy crm.format_contacts_list; tolerant of the API's field
+        names (company/organization, email/email_primary, last_contact/last_contacted).
+        """
+        if not contacts:
+            return "No contacts found."
+        lines = []
+        for c in contacts:
+            parts = [f"**{c.get('name', '?')}**"]
+            company = c.get("company") or c.get("organization") or c.get("org_name")
+            if company:
+                parts.append(f"({company})")
+            email = c.get("email") or c.get("email_primary")
+            if email:
+                parts.append(f"— {email}")
+            if c.get("status"):
+                parts.append(f"[{c['status']}]")
+            last = c.get("last_contact") or c.get("last_contacted")
+            if last:
+                parts.append(f"last contact: {last}")
+            lines.append(" ".join(parts))
+        return "\n".join(f"- {line}" for line in lines)
 
     # ------------------------------------------------------------------
     # Deals
