@@ -471,32 +471,59 @@ _DISPOSITION_PAST = {
 # Category for `file ## as <cat>` is constrained to label-safe chars to prevent
 # label-path injection; archive/file land under the @artemis/* namespace.
 _ARCHIVE_LABEL = "@artemis/archive"
+# Upper bound on operands in one disposition command — caps a runaway range
+# (`archive 1-99999`) so it refuses once instead of flooding per-number.
+_DISPOSITION_MAX_BATCH = 100
 
 
 def _parse_numbers(s: str) -> list[int]:
-    """Parse a comma/space-separated number list, deduped in first-seen order."""
+    """Parse a comma/space list of numbers and/or inclusive ranges, deduped in
+    first-seen order.
+
+    Supports singles ("2"), inclusive ranges ("1-5" → 1,2,3,4,5), and mixes
+    ("1-3, 7, 9-11" → 1,2,3,7,9,10,11). A reversed range ("5-1") and any
+    non-numeric token are ignored. Resolve-or-refuse downstream still validates
+    every expanded number against the listing mapping, so out-of-range numbers
+    just refuse per-number.
+    """
     out: list[int] = []
+    seen: set[int] = set()
+
+    def _add(n: int) -> None:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+
     for tok in re.split(r"[,\s]+", s.strip()):
-        if tok.isdigit():
-            n = int(tok)
-            if n not in out:
-                out.append(n)
+        if not tok:
+            continue
+        rng = re.match(r"^(\d+)-(\d+)$", tok)
+        if rng:
+            a, b = int(rng.group(1)), int(rng.group(2))
+            if a <= b:
+                for n in range(a, b + 1):
+                    _add(n)
+            # a > b (reversed) → malformed, ignore the token
+        elif tok.isdigit():
+            _add(int(tok))
+        # else: non-numeric token ignored
     return out
 
 
 def _parse_disposition_command(question: str) -> tuple[str, list[int], str | None] | None:
     """Parse a disposition command. Returns (verb, numbers, category|None) or None.
 
-    Forms: `archive 2` · `delete 1, 5, 9` · `spam 20` · `file 3 as billing`.
-    Numbers-only operands (so `delete event …` never matches here). Category is
+    Forms: `archive 2` · `delete 1, 5, 9` · `spam 20` · `file 3 as billing`, plus
+    inclusive ranges and mixes: `archive 1-5` · `archive 1-3, 7, 9-11`. Operands
+    are numbers/ranges only (so `delete event …` never matches here). Category is
     constrained to [\\w/-] — no spaces, no label-path injection.
     """
     q = question.strip()
-    m = re.match(r"^file\s+([\d,\s]+?)\s+as\s+([\w/-]+)\s*$", q, re.IGNORECASE)
+    m = re.match(r"^file\s+([\d,\s-]+?)\s+as\s+([\w/-]+)\s*$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(1))
         return ("file", nums, m.group(2).lower()) if nums else None
-    m = re.match(r"^(archive|delete|spam)\s+([\d,\s]+)$", q, re.IGNORECASE)
+    m = re.match(r"^(archive|delete|spam)\s+([\d,\s-]+)$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(2))
         return (m.group(1).lower(), nums, None) if nums else None
@@ -609,6 +636,17 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
     verb, numbers, category = parsed
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
+
+    # Guard a runaway range (e.g. `archive 1-99999`) from flooding the channel
+    # with per-number refusals. Real listings are at most a few hundred.
+    if len(numbers) > _DISPOSITION_MAX_BATCH:
+        reply = (
+            f"That's {len(numbers)} items — too many at once. "
+            f"Use a range within the listing (say `inbox` to see the count)."
+        )
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
 
     state = _inbox_listing_state.get(channel_id)
     mapping = state.get("mapping") if state else None
