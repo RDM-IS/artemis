@@ -481,10 +481,11 @@ def _parse_numbers(s: str) -> list[int]:
     first-seen order.
 
     Supports singles ("2"), inclusive ranges ("1-5" → 1,2,3,4,5), and mixes
-    ("1-3, 7, 9-11" → 1,2,3,7,9,10,11). A reversed range ("5-1") and any
-    non-numeric token are ignored. Resolve-or-refuse downstream still validates
-    every expanded number against the listing mapping, so out-of-range numbers
-    just refuse per-number.
+    ("1-3, 7, 9-11" → 1,2,3,7,9,10,11). Separators are commas, whitespace, "&",
+    and the word "and" (so "1 & 2" and "1 and 2" both parse). A reversed range
+    ("5-1") and any non-numeric token are ignored. Resolve-or-refuse downstream
+    still validates every expanded number against the listing mapping, so
+    out-of-range numbers just refuse per-number.
     """
     out: list[int] = []
     seen: set[int] = set()
@@ -494,8 +495,8 @@ def _parse_numbers(s: str) -> list[int]:
             seen.add(n)
             out.append(n)
 
-    for tok in re.split(r"[,\s]+", s.strip()):
-        if not tok:
+    for tok in re.split(r"[,\s&]+", s.strip()):
+        if not tok or tok.lower() == "and":
             continue
         rng = re.match(r"^(\d+)-(\d+)$", tok)
         if rng:
@@ -514,20 +515,70 @@ def _parse_disposition_command(question: str) -> tuple[str, list[int], str | Non
     """Parse a disposition command. Returns (verb, numbers, category|None) or None.
 
     Forms: `archive 2` · `delete 1, 5, 9` · `spam 20` · `file 3 as billing`, plus
-    inclusive ranges and mixes: `archive 1-5` · `archive 1-3, 7, 9-11`. Operands
-    are numbers/ranges only (so `delete event …` never matches here). Category is
-    constrained to [\\w/-] — no spaces, no label-path injection.
+    inclusive ranges/mixes (`archive 1-5` · `archive 1-3, 7, 9-11`), the `&`
+    separator (`archive 1 & 2`), and `as`/`under`/`in`/`to` for filing
+    (`file 3 under billing`). Operands are numbers/ranges only (so `delete event …`
+    never matches here). Category is constrained to [\\w/-] — no spaces, no
+    label-path injection.
     """
     q = question.strip()
-    m = re.match(r"^file\s+([\d,\s-]+?)\s+as\s+([\w/-]+)\s*$", q, re.IGNORECASE)
+    m = re.match(r"^file\s+([\d,\s&-]+?)\s+(?:as|under|in|to)\s+([\w/-]+)\s*$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(1))
         return ("file", nums, m.group(2).lower()) if nums else None
-    m = re.match(r"^(archive|delete|spam)\s+([\d,\s-]+)$", q, re.IGNORECASE)
+    m = re.match(r"^(archive|delete|spam)\s+([\d,\s&-]+)$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(2))
         return (m.group(1).lower(), nums, None) if nums else None
     return None
+
+
+def _slugify_category(text: str) -> str:
+    """Turn a free-text category ("founder loans") into a label-safe slug
+    ("founder-loans"): lowercase, punctuation dropped, spaces→hyphens, capped."""
+    s = re.sub(r"[^\w\s/-]", "", text.strip().lower())
+    s = re.sub(r"[\s_]+", "-", s)
+    return s.strip("-/")[:40]
+
+
+def _is_pure_number_ref(s: str) -> bool:
+    """True iff s is ONLY listing-number tokens/separators (digits, N-M ranges,
+    commas, '&', the word 'and', whitespace) — e.g. '1 & 2', '1-3, 7'. Guards the
+    declarative form so ordinary prose ('the attendees are 3') can't be read as a
+    file command."""
+    tokens = [t for t in re.split(r"[,\s&]+", s.strip()) if t]
+    if not tokens:
+        return False
+    for t in tokens:
+        if t.lower() == "and":
+            continue
+        if not re.match(r"^\d+(-\d+)?$", t):
+            return False
+    return True
+
+
+def _parse_listing_reference(question: str) -> tuple[list[int], str] | None:
+    """Listing-gated declarative form: '<numbers> are|is <category>'
+    (e.g. '1 & 2 are founder loans'). Returns (numbers, category_slug) or None.
+
+    Only a PURE numeric prefix qualifies, so this never fires on ordinary prose.
+    This is NOT an explicit disposition verb — the caller proposes the matching
+    `file` command rather than auto-acting, and only when a listing is active and
+    at least one number resolves.
+    """
+    m = re.match(r"^(.+?)\s+(?:are|is)\s+(.+)$", question.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    prefix, tail = m.group(1), m.group(2)
+    if not _is_pure_number_ref(prefix):
+        return None
+    nums = _parse_numbers(prefix)
+    cat = _slugify_category(tail)
+    # A real category is a short label; a long clause ("…coming to the meeting
+    # next week…") is prose, not a filing target — don't treat it as a reference.
+    if not (nums and cat) or cat.count("-") > 2:
+        return None
+    return (nums, cat)
 
 
 def _verify_disposition(verb: str, post_labels: list[str] | None, expected_label_id: str | None) -> bool:
@@ -630,12 +681,39 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
 
     Returns True if it handled (or refused) a disposition command, else False.
     """
-    parsed = _parse_disposition_command(question)
-    if not parsed:
-        return False
-    verb, numbers, category = parsed
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
+    state = _inbox_listing_state.get(channel_id)
+    mapping = state.get("mapping") if state else None
+
+    parsed = _parse_disposition_command(question)
+
+    # EMAIL-ROUTING (context-aware routing): when a listing is ACTIVE in this
+    # channel, a declarative reference to listing numbers ("1 & 2 are founder
+    # loans") must resolve in listing context — NOT fall through to the keyword/
+    # financial classifiers (the HEALTH-1 context-blind-routing class, which
+    # mis-fired the financial report on "founder loans"). It carries no explicit
+    # disposition verb, so we PROPOSE the matching `file` command rather than
+    # auto-mutating on a loosely-phrased declarative (propose-then-confirm). Only
+    # fires when a listing is active and at least one number actually resolves.
+    if not parsed:
+        if mapping:
+            ref = _parse_listing_reference(question)
+            if ref and any(n in mapping for n in ref[0]):
+                nums, cat = ref
+                nums_str = ", ".join(str(n) for n in nums)
+                plural = "s" if len(nums) > 1 else ""
+                reply = (
+                    f"\U0001f4cc That refers to inbox item{plural} {nums_str}. "
+                    f"To file under `@artemis/{cat}`: `file {nums_str} as {cat}` "
+                    f"(or `archive`/`delete`/`spam` {nums_str})."
+                )
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+                return True
+        return False
+
+    verb, numbers, category = parsed
 
     # Guard a runaway range (e.g. `archive 1-99999`) from flooding the channel
     # with per-number refusals. Real listings are at most a few hundred.
@@ -648,8 +726,6 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return True
 
-    state = _inbox_listing_state.get(channel_id)
-    mapping = state.get("mapping") if state else None
     if not mapping:
         reply = "No active inbox listing — say `inbox` first, then e.g. `archive 2`."
         if _mm:
