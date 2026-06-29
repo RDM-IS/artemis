@@ -1,16 +1,15 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-06-28T22:34:54Z_
+_Generated: 2026-06-29T01:45:52Z_
 
 ## Git
 - Branch: main
-- Head: 3f5fb22 docs: add context baseline — CLAUDE.md operating guide + ARTEMIS_STATE (#53)
+- Head: 9e4580b fix(gmail): default list_inbox_message_ids query to in:inbox
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
 - Public IP: 3.227.229.186
 - Host: ip-172-31-2-193.ec2.internal
 - Python: Python 3.9.25
-- acos.service: active | ExecStart: ExecStart=/usr/bin/python3.11 -m artemis.main
 
 ## Playbooks (PLAYBOOKS.md)
 - PB-001: Demo Access Notification (v2)
@@ -24,11 +23,11 @@ _Generated: 2026-06-28T22:34:54Z_
 - PB-009: Personal Training
 
 ## Migrations (latest 5)
-- 016_nutrition_schema.sql
 - 017_grocery_to_acos.sql
 - 018_inbox_threads.sql
 - 019_quiet_hours_state.sql
 - 020_commitments.sql
+- 021_email_index.sql
 
 ## artemis/ modules
 - __init__.py
@@ -44,6 +43,7 @@ _Generated: 2026-06-28T22:34:54Z_
 - crm_write_guard.py
 - crm_writer.py
 - demo_intake.py
+- email_index.py
 - gmail.py
 - google_drive.py
 - google_sheets.py
@@ -78,6 +78,7 @@ _Generated: 2026-06-28T22:34:54Z_
 - circuit_breaker_status
 - commitments
 - data_vault_satellites
+- email_index
 - entities
 - expenses
 - founder_loans
@@ -129,6 +130,6 @@ _Generated: 2026-06-28T22:34:54Z_
 - v_founder_loan_balance
 
 ### health.plan — next 3 days
-- 2026-06-28: cardio_z2
 - 2026-06-29: strength_a
 - 2026-06-30: rest_mobility
+- 2026-07-01: cardio_intervals
