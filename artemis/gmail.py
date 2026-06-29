@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.utils import parseaddr
@@ -13,6 +14,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from artemis import config
 from knowledge.secrets import get_gmail_credentials, get_gmail_token, put_secret
@@ -204,17 +206,26 @@ class GmailClient:
         logger.info("Listed %d message IDs (q=%s)", len(ids), query)
         return ids
 
-    def get_message_metadata(self, ids: list[str]) -> list[dict]:
-        """Batch-fetch lightweight metadata for a list of message IDs.
+    def get_message_metadata(
+        self, ids: list[str], max_retries: int = 5, base_delay: float = 1.0
+    ) -> list[dict]:
+        """Fetch lightweight metadata for a list of message IDs, sequentially.
 
-        Uses Gmail's batch HTTP endpoint (chunks of 100, the API per-batch max)
-        to fetch From/Subject/Date headers + snippet + labelIds + internalDate
+        Fetches From/Subject/Date headers + snippet + labelIds + internalDate
         WITHOUT message bodies. Bodies stay on-demand via get_full_message /
-        _extract_body. Per-message failures are logged and skipped, never fatal.
+        _extract_body.
+
+        Deliberately SEQUENTIAL, not a batch HTTP request: Gmail's batch endpoint
+        fires the sub-requests concurrently and trips 429 "Too many concurrent
+        requests for user" on larger ID lists, which silently broke the
+        full-inbox sync E1 exists to do. One-at-a-time GETs are never concurrent,
+        and each rate-limited GET is retried with exponential backoff
+        (base_delay, ×2 each attempt, capped) up to `max_retries` times before it
+        is given up on. A given-up ID is logged and skipped — never fatal.
 
         Returns a list of dicts (shape mirrors get_recent_messages, plus
-        `internal_date`, the epoch-ms received instant). Order is NOT guaranteed
-        to match `ids` — callers key on the `id` field.
+        `internal_date`, the epoch-ms received instant), in input order minus any
+        IDs that failed all retries.
         """
         if not self.service:
             logger.error("Gmail not authenticated — cannot fetch metadata")
@@ -226,46 +237,77 @@ class GmailClient:
             return []
 
         results: list[dict] = []
+        rate_limited = 0
+        for mid in ids:
+            meta = self._fetch_one_metadata(mid, max_retries, base_delay)
+            if meta is not None:
+                results.append(meta)
+                if meta.pop("_was_rate_limited", False):
+                    rate_limited += 1
 
-        def _callback(request_id, response, exception):
-            if exception is not None:
-                logger.warning("Metadata fetch failed for %s: %s", request_id, exception)
-                return
-            headers = {
-                h["name"]: h["value"]
-                for h in response.get("payload", {}).get("headers", [])
-            }
-            results.append({
-                "id": response["id"],
-                "thread_id": response["threadId"],
-                "from": headers.get("From", ""),
-                "from_email": parseaddr(headers.get("From", ""))[1],
-                "subject": headers.get("Subject", ""),
-                "date": headers.get("Date", ""),
-                "snippet": response.get("snippet", ""),
-                "label_ids": response.get("labelIds", []),
-                "internal_date": response.get("internalDate"),
-            })
-
-        try:
-            for start in range(0, len(ids), 100):
-                chunk = ids[start:start + 100]
-                batch = self.service.new_batch_http_request(callback=_callback)
-                for mid in chunk:
-                    batch.add(
-                        self.service.users().messages().get(
-                            userId="me", id=mid, format="metadata",
-                            metadataHeaders=["From", "Subject", "Date"],
-                        ),
-                        request_id=mid,
-                    )
-                batch.execute()
-        except Exception:
-            logger.exception("Batch metadata fetch failed")
-            return results
-
-        logger.info("Fetched metadata for %d/%d messages", len(results), len(ids))
+        logger.info(
+            "Fetched metadata for %d/%d messages (%d needed backoff retries)",
+            len(results), len(ids), rate_limited,
+        )
         return results
+
+    def _fetch_one_metadata(
+        self, message_id: str, max_retries: int, base_delay: float
+    ) -> dict | None:
+        """Fetch one message's metadata with exponential backoff on rate limits.
+
+        Retries on 429 and 5xx (and 403 rate/quota variants) — transient errors;
+        any other HttpError (404, auth, etc.) is non-retryable and returns None.
+        Returns the metadata dict (carrying a private `_was_rate_limited` flag the
+        caller strips for logging) or None if it gave up / hit a hard error.
+        """
+        delay = base_delay
+        backed_off = False
+        for attempt in range(max_retries + 1):
+            try:
+                msg = (
+                    self.service.users()
+                    .messages()
+                    .get(userId="me", id=message_id, format="metadata",
+                         metadataHeaders=["From", "Subject", "Date"])
+                    .execute()
+                )
+                headers = {
+                    h["name"]: h["value"]
+                    for h in msg.get("payload", {}).get("headers", [])
+                }
+                return {
+                    "id": msg["id"],
+                    "thread_id": msg["threadId"],
+                    "from": headers.get("From", ""),
+                    "from_email": parseaddr(headers.get("From", ""))[1],
+                    "subject": headers.get("Subject", ""),
+                    "date": headers.get("Date", ""),
+                    "snippet": msg.get("snippet", ""),
+                    "label_ids": msg.get("labelIds", []),
+                    "internal_date": msg.get("internalDate"),
+                    "_was_rate_limited": backed_off,
+                }
+            except HttpError as exc:
+                status = getattr(exc.resp, "status", None)
+                retryable = status == 429 or (status is not None and 500 <= status < 600)
+                if status == 403 and re.search(r"rate|quota", str(exc), re.IGNORECASE):
+                    retryable = True
+                if retryable and attempt < max_retries:
+                    backed_off = True
+                    logger.warning(
+                        "Gmail %s on metadata fetch %s — backoff %.1fs (attempt %d/%d)",
+                        status, message_id, delay, attempt + 1, max_retries,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 32.0)
+                    continue
+                logger.warning("Metadata fetch failed for %s: %s", message_id, exc)
+                return None
+            except Exception:
+                logger.exception("Metadata fetch errored for %s", message_id)
+                return None
+        return None
 
     def get_full_message(self, message_id: str) -> str:
         """Fetch the full body of a message.  Prefers text/plain, falls back to HTML.
