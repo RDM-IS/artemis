@@ -2525,6 +2525,30 @@ def _handle_mention(post: dict, thread: list[dict]):
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
 
+    # TEMP debug (Phase E1): sync the email_index mirror from Gmail, then report
+    # the working-set count + first 5 rows. Verifies Artemis now sees the ENTIRE
+    # unread inbox (e.g. 95), not just the last 5. Read-only — no dispositions.
+    if q_lower in ("index status", "email index status"):
+        from artemis import email_index
+        try:
+            summary = email_index.sync_from_gmail(_gmail)
+            rows = email_index.query_working_set(limit=5, offset=0)
+            lines = [
+                f"\U0001f4c7 **Email index** — {summary['working_set']} in working set "
+                f"(listed {summary['listed']}, fetched {summary['fetched']}, "
+                f"upserted {summary['upserted']}, pruned {summary['pruned']})",
+            ]
+            for r in rows:
+                subj = (r.get("subject") or "(no subject)")[:60]
+                lines.append(f"- {r.get('sender', '?')} — {subj}")
+            reply = "\n".join(lines)
+        except Exception:
+            logger.exception("index status command failed")
+            reply = "⚠️ index status failed — check logs."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return
+
     if q_lower in ("contacts", "leads"):
         # Routed to the RDS CRM API (CRMClient) — the SQLite crm.py contacts
         # store was removed. `leads` passes status='lead' to the API; an API
