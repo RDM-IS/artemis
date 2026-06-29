@@ -15,6 +15,7 @@ If a fact in 3–4 conflicts with 1–2, 1–2 win. Flag the drift; don't propag
 
 - **Facts about the running system** → `context/CONTEXT.generated.md` (generated, committed).
 - **Architecture, roadmap, backlog, decisions** → `docs/ARTEMIS_STATE.md` (authored, committed).
+- **Email subsystem design** → `docs/EMAIL_MODEL.md` (authoritative; Gmail is source of truth, two-path model, the invariants). Read before any inbox/email work.
 - **Secrets** → AWS Secrets Manager via `knowledge/secrets.py` only. **Never on disk**, never in `.env` (only non-secret config like URLs lives in `.env`). `.env`, `credentials.json`, tokens are gitignored.
 
 ## Session start
@@ -44,6 +45,7 @@ Never delete a branch on ahead/behind counts — squash/rebase merges leave bran
 - **Never invent/deny capabilities.** No confabulated "I've learned that…" — there is no cognition/learning layer yet. Deterministic intent classification must not be overridden by an LLM classifier into a fabricated path.
 - **CT-anchor "today."** RDS runs UTC; bare `current_date` is a day ahead of Central after ~7pm. For any "today/due-today/overdue" comparison use `(now() at time zone 'America/Chicago')::date`. Elapsed-duration comparisons (24h/12h) are tz-independent — leave them.
 - **One system of record.** RDS is authoritative for all operational state. SQLite is fully retired; `artemis.db` is deleted; tests guard against reintroduction. Don't add a parallel store.
+- **Gmail is the source of truth for email.** Never build a parallel authoritative inbox state. `acos.email_index` is a mirror; `acos.audit_log` is the action ledger. Verify actions against Gmail before reporting success.
 - **Solo-operator scale.** No enterprise patterns (Data Vault 2.0, separate dimensional warehouse, full Iceberg/Glue/Athena). Medallion discipline inside Postgres.
 
 ## Branch & PR policy
