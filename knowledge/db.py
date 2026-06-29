@@ -244,19 +244,50 @@ def log_audit(
     api_cost_usd: float = 0.0,
     metadata: dict = None,
     persona: str = None,
+    *,
+    message_id: str = None,
+    thread_id: str = None,
+    source: str = None,
+    action_class: str = None,
+    sender: str = None,
+    sender_domain: str = None,
+    subject: str = None,
+    prior_labels: list = None,
+    applied_labels: list = None,
+    removed_labels: list = None,
+    verified: bool = None,
 ) -> str:
-    """Log an agent action to the audit trail. Returns UUID."""
+    """Log an agent action to the audit trail. Returns UUID.
+
+    The keyword-only args after `persona` are the EMAIL_MODEL.md ML-corpus
+    columns added in migration 022. They are referenced in the INSERT ONLY when
+    at least one is supplied, so existing callers (which pass none) emit the exact
+    same INSERT as before and work with or without 022 applied. Callers that DO
+    pass them require 022 — migrate-first.
+    """
     import json
+    cols = ["agent", "persona", "action", "domain", "confidence",
+            "outcome", "token_count", "api_cost_usd", "metadata"]
+    vals = [agent, persona, action, domain, confidence,
+            outcome, token_count, api_cost_usd, json.dumps(metadata or {})]
+
+    corpus = {
+        "message_id": message_id, "thread_id": thread_id, "source": source,
+        "action_class": action_class, "sender": sender,
+        "sender_domain": sender_domain, "subject": subject,
+        "prior_labels": prior_labels, "applied_labels": applied_labels,
+        "removed_labels": removed_labels, "verified": verified,
+    }
+    if any(v is not None for v in corpus.values()):
+        for col, val in corpus.items():
+            cols.append(col)
+            vals.append(val)
+
+    placeholders = ", ".join(["%s"] * len(cols))
     row = execute_write(
-        """
-        INSERT INTO acos.audit_log (
-            agent, persona, action, domain, confidence,
-            outcome, token_count, api_cost_usd, metadata
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (agent, persona, action, domain, confidence,
-         outcome, token_count, api_cost_usd, json.dumps(metadata or {})),
+        f"INSERT INTO acos.audit_log ({', '.join(cols)}) "
+        f"VALUES ({placeholders}) RETURNING id",
+        tuple(vals),
     )
     return str(row["id"]) if row else ""
 

@@ -195,3 +195,25 @@ def count_working_set() -> int:
         (_WORKING_STATES,),
     )
     return int(row["n"]) if row else 0
+
+
+def get_by_message_id(message_id: str) -> dict | None:
+    """Fetch one mirror row by Gmail message_id, or None. Used by E3 to read the
+    cached corpus features (sender/sender_domain/subject/thread_id) for an audit
+    entry without an extra Gmail call."""
+    return execute_one(
+        "SELECT * FROM acos.email_index WHERE message_id = %s", (message_id,)
+    )
+
+
+def drop_from_index(message_id: str) -> bool:
+    """Remove one row after a VERIFIED terminal disposition (archived/filed/
+    deleted/spammed) — it has left the working set, so the mirror drops it (its
+    history lives in Gmail + audit_log, per EMAIL_MODEL.md). Returns True if a
+    row was removed. Read-only callers never use this; only a confirmed
+    disposition does."""
+    row = execute_write(
+        "DELETE FROM acos.email_index WHERE message_id = %s RETURNING message_id",
+        (message_id,),
+    )
+    return row is not None
