@@ -12,8 +12,9 @@ no sends, and NO audit entries — indexing is observation, not action (audit_lo
 is reserved for state-changing actions). Path/playbook matching, snooze
 resurfacing, and the disposition command surface are later phases.
 
-Working set (v1): `in:inbox is:unread`. sync_from_gmail() lists the full set
-from Gmail, hydrates lightweight metadata, upserts, and prunes rows that have
+Working set (v1): `in:inbox` (every inbox email needs disposition; read-state is
+a display hint, not the filter). sync_from_gmail() lists the full set from
+Gmail, hydrates lightweight metadata, upserts, and prunes rows that have
 left the working set — EXCEPT rows parked in state 'snoozed'/'pending', which
 must survive a sync that no longer sees them (they resurface later). The mirror
 is rebuilt every cycle, so a transient empty read self-heals on the next sync.
@@ -25,9 +26,12 @@ from knowledge.db import execute_one, execute_query, execute_write
 
 logger = logging.getLogger(__name__)
 
-# Working-set query (EMAIL_MODEL.md "Surfacing at scale" v1): unread + in inbox
-# = "needs action". Read-in-inbox is a deferred lower tier.
-WORKING_SET_QUERY = "in:inbox is:unread"
+# Working-set query (EMAIL_MODEL.md "Surfacing at scale" v1): everything in the
+# inbox needs disposition. NOT filtered on is:unread — verified on the box that
+# Ryan reads mail without dispositioning it (32 in inbox, 0 unread), so "unread"
+# would hide the entire working set. Read-state is kept as displayed metadata
+# (is_unread column / listing hint), not a filter.
+WORKING_SET_QUERY = "in:inbox"
 
 # States that constitute the active working set (the mirror only ever holds
 # these; terminal dispositions are pruned). 'snoozed'/'pending' are protected
