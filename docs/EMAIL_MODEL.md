@@ -77,7 +77,7 @@ This schema makes "how does Ryan dispose of emails like this" a query, which is 
 
 ## Surfacing at scale
 
-- **Working set (v1):** `in:inbox is:unread` = "needs action." (Read-in-inbox is a lower tier, deferred.)
+- **Working set (v1):** `in:inbox` = "needs action." Everything in the inbox needs disposition regardless of read state — Ryan reads mail without dispositioning it, so `is:unread` would hide the real working set. Read-state is a display hint (`is_unread`), **not** the filter.
 - **Listing:** numbered, paginated — `inbox` shows the first page (default 20) with `more` to continue, plus a total count ("23 need action — showing 1–20"). IDs are fresh per listing; act on them immediately (`archive 2, 5, 9`).
 - Full-inbox visibility is the hard requirement: Artemis can see and act on email #1–95, not just the last 5.
 
