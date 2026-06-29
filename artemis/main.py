@@ -118,6 +118,29 @@ _DUP_OVERRIDE_PHRASE = "override duplicate"
 # Stores slots and email context for send/confirm/edit flow
 _pending_availability: dict[str, dict] = {}
 
+# E2: per-channel inbox-listing state (the numbered-listing cursor + the
+# number→message_id mapping E3 will act on). Keyed by channel_id. In-memory only
+# — resets on restart, which is fine for v1 (a fresh `inbox` rebuilds it).
+# Each value:
+#   {"offset": int,          # rows already shown — where `more` resumes
+#    "total": int,           # working-set size at the time of the listing
+#    "mapping": {int: str}}  # displayed number → Gmail message_id
+# THE E3 HANDOFF: `archive 3` (E3) resolves 3 → message_id from "mapping" here.
+# Numbers are per-listing and GLOBAL across pages (1..total): a fresh listing
+# (`inbox`/`triage`/…) re-syncs, resets the cursor, and CLEARS the mapping
+# (re-numbering from 1); `more` extends the same mapping with the next page's
+# numbers without re-syncing (so 1..total stay stable for the whole listing).
+_inbox_listing_state: dict[str, dict] = {}
+_INBOX_PAGE_SIZE = 20
+
+# Phrases that open a fresh numbered inbox listing (E2). `more` pages an existing
+# listing. These are repointed away from the old inbox_threads summary in
+# _handle_inbox_command to the index-backed _handle_inbox_listing.
+_INBOX_LISTING_PHRASES = frozenset({
+    "inbox", "triage", "triage inbox",
+    "what's in my inbox", "whats in my inbox", "what is in my inbox",
+})
+
 
 @app.route("/webhook/uptime", methods=["POST"])
 def uptime_webhook():
@@ -331,6 +354,109 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
         logger.exception("Failed to add training slice to mention context")
 
     return UNTRUSTED_PREFIX + "\n".join(parts) if parts else "No context available."
+
+
+def _inbox_display_sender(row: dict) -> str:
+    """Readable sender for a listing line. The index stores the raw From header
+    ('Name <addr>') in `sender`; prefer the display name, fall back to the bare
+    address, then to whatever's there."""
+    from email.utils import parseaddr
+    raw = (row.get("sender") or "").strip()
+    name, addr = parseaddr(raw)
+    return name or addr or raw or "(unknown sender)"
+
+
+def _render_inbox_listing(channel_id: str, fresh: bool) -> str:
+    """Render one page of the index-backed numbered inbox listing (E2).
+
+    fresh=True  → sync from Gmail, reset the per-channel cursor + mapping, show
+                  page 1. fresh=False (`more`) → page the already-synced working
+                  set from the stored cursor WITHOUT re-syncing (keeps numbering
+                  1..total stable across the listing).
+
+    Read-only: syncs the mirror and queries it; never mutates Gmail. Stores the
+    displayed number→message_id mapping in _inbox_listing_state for E3.
+    """
+    from artemis import email_index
+
+    if fresh:
+        # Sync-on-command: refresh the mirror from Gmail before listing.
+        email_index.sync_from_gmail(_gmail)
+        total = email_index.count_working_set()
+        state = {"offset": 0, "total": total, "mapping": {}}
+        _inbox_listing_state[channel_id] = state
+    else:
+        state = _inbox_listing_state.get(channel_id)
+        if not state:
+            return "No active inbox listing — say `inbox` to start one."
+        total = state["total"]
+
+    offset = state["offset"]
+    if total == 0:
+        return "\U0001f4ec **Inbox** — 0 emails. Inbox zero \U0001f389"
+    if offset >= total:
+        return f"That's all {total} — say `inbox` to refresh the list."
+
+    rows = email_index.query_working_set(limit=_INBOX_PAGE_SIZE, offset=offset)
+    if not rows:
+        return f"That's all {total} — say `inbox` to refresh the list."
+
+    start_num = offset + 1
+    end_num = offset + len(rows)
+    lines = [
+        f"\U0001f4ec **Inbox** — {total} email{'s' if total != 1 else ''} "
+        f"(showing {start_num}–{end_num})",
+    ]
+    for i, r in enumerate(rows):
+        num = start_num + i
+        sender = _inbox_display_sender(r)
+        subj = (r.get("subject") or "(no subject)").strip() or "(no subject)"
+        if len(subj) > 70:
+            subj = subj[:69] + "…"
+        lines.append(f"{num}. {sender} — {subj}")
+        # THE E3 HANDOFF: record number → Gmail message_id for this listing.
+        state["mapping"][num] = r["message_id"]
+
+    # Advance the cursor so a following `more` resumes after this page.
+    state["offset"] = end_num
+    if end_num < total:
+        lines.append(f"\nSay `more` for {end_num + 1}–{total}.")
+    return "\n".join(lines)
+
+
+def _handle_inbox_listing(post: dict, question: str) -> bool:
+    """E2: numbered, paginated inbox listing from the email_index mirror.
+
+    Handles the listing phrases (inbox / triage / triage inbox / what's in my
+    inbox) and `more` for pagination. Repoints those phrases AWAY from the old
+    inbox_threads summary in _handle_inbox_command. Strictly read-only — no Gmail
+    mutations, no dispositions (E3 acts on the mapping this leaves behind).
+
+    Returns True if it handled the message, else False (so other inbox
+    subcommands — waiting/snoozed/done/snooze/wait/noise — still reach the old
+    handler).
+    """
+    q = question.lower().strip()
+    fresh = q in _INBOX_LISTING_PHRASES
+    is_more = q == "more"
+    if not (fresh or is_more):
+        return False
+
+    channel_id = post.get("channel_id", "")
+    # Only intercept the generic word `more` when THIS channel has a live
+    # listing; otherwise let it fall through to the LLM untouched.
+    if is_more and channel_id not in _inbox_listing_state:
+        return False
+
+    root_id = post.get("root_id") or post["id"]
+    try:
+        reply = _render_inbox_listing(channel_id, fresh=fresh)
+    except Exception:
+        logger.exception("inbox listing failed")
+        reply = "⚠️ Inbox listing failed — check logs."
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
 
 
 def _handle_inbox_command(post: dict, question: str) -> bool:
@@ -2506,7 +2632,16 @@ def _handle_mention(post: dict, thread: list[dict]):
     if _handle_quiet_command(post, question):
         return
 
-    # Try inbox commands (done, wait, snooze, noise, inbox, waiting, snoozed)
+    # E2: index-backed numbered inbox listing. Runs BEFORE _handle_inbox_command
+    # so `inbox`/`triage`/`triage inbox`/`what's in my inbox` (+ `more`) are
+    # served from the email_index mirror instead of the old inbox_threads
+    # summary. The other inbox subcommands still fall through to the old handler.
+    if _handle_inbox_listing(post, question):
+        return
+
+    # Try inbox commands (done, wait, snooze, noise, waiting, snoozed)
+    # NB: `inbox` is now repointed above to the index-backed listing; the
+    # cmd=="inbox" branch here is left intact but no longer reached (E5 retires).
     if _handle_inbox_command(post, question):
         return
 
