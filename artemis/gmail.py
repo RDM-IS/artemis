@@ -163,7 +163,7 @@ class GmailClient:
 
         return detailed
 
-    def list_inbox_message_ids(self, query: str = "in:inbox is:unread") -> list[str]:
+    def list_inbox_message_ids(self, query: str = "in:inbox") -> list[str]:
         """Return ALL Gmail message IDs matching `query`, paginating fully.
 
         Unlike get_recent_messages (one capped page) this walks nextPageToken
