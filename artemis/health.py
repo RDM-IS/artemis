@@ -1627,12 +1627,30 @@ def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -
     if resolved.get("notes"):
         lines.append(f"_{resolved['notes']}_")
 
-    # Recovery-day override notice if morning state suggests it
-    if state:
+    # Surface the inputs this post was calibrated on. A calibrated-but-fine day
+    # must never be indistinguishable from a no-data day (trust-the-data, not
+    # the report): if the morning check-in never reached health.daily_state, say
+    # so loudly instead of silently emitting the base plan. This is the surface
+    # that would have made HEALTH-1 visible the morning it happened — a missing
+    # check-in now shows as an explicit line rather than being absorbed.
+    if not state:
+        lines.insert(0, "_No check-in logged today — using base plan, uncalibrated._")
+    else:
         sleep = state.get("sleep_hrs")
         energy = state.get("energy")
         if (sleep is not None and sleep < 5) or (energy is not None and energy <= 2):
             lines.insert(0, "**Recovery override.** Sleep low or energy low. Today drops to mobility + walk.")
+        else:
+            bits = []
+            if sleep is not None:
+                bits.append(f"sleep {sleep:g}h")
+            if energy is not None:
+                bits.append(f"energy {energy}")
+            rhr = state.get("resting_hr")
+            if rhr is not None:
+                bits.append(f"RHR {rhr}")
+            echo = ", ".join(bits) if bits else "check-in logged"
+            lines.insert(0, f"_Check-in: {echo} — holding the full session._")
 
     lines.append("gym.rdm.is is up — full plan there.")
     return "\n".join(lines)

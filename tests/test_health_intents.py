@@ -634,6 +634,35 @@ class TestPromptBuilders(unittest.TestCase):
         out = build_calibrated_plan_post(self._PLAN_STRENGTH, resolved, state=state)
         self.assertIn("Recovery override", out)
 
+    def test_calibration_echoes_inputs_when_holding(self):
+        """state present, no override → post echoes the check-in it read."""
+        from artemis.health import build_calibrated_plan_post
+        resolved = {
+            "location": "downstairs gym",
+            "equipment": ["PowerBlock dumbbells"],
+            "first_lift": "Goblet squat",
+            "notes": None,
+        }
+        state = {"sleep_hrs": 5.0, "energy": 4, "resting_hr": 58}
+        out = build_calibrated_plan_post(self._PLAN_STRENGTH, resolved, state=state)
+        self.assertIn("Check-in:", out)
+        self.assertIn("sleep 5h", out)
+        self.assertIn("energy 4", out)
+        self.assertNotIn("Recovery override", out)
+        self.assertNotIn("No check-in logged", out)
+
+    def test_calibration_announces_missing_checkin(self):
+        """state is None (HEALTH-1 regression guard) → loud, not silent."""
+        from artemis.health import build_calibrated_plan_post
+        resolved = {
+            "location": "downstairs gym",
+            "equipment": ["PowerBlock dumbbells"],
+            "first_lift": "Goblet squat",
+            "notes": None,
+        }
+        out = build_calibrated_plan_post(self._PLAN_STRENGTH, resolved, state=None)
+        self.assertIn("No check-in logged", out)
+
 
 # ============================================================================
 # T4: Scheduler-job-style tests (test the inner logic, not the cron)
