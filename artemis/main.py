@@ -2369,31 +2369,13 @@ def _handle_correction(post: dict, question: str, thread: list[dict]) -> str | N
     if not correction.learned_rule or correction.confidence < 0.4:
         return None
 
-    # Store the learned rule
-    try:
-        from knowledge.db import execute_write as _db_write
-        _db_write(
-            """INSERT INTO acos.data_vault_satellites
-               (entity_id, satellite_type, content, layer, crm_syncable, metadata)
-               VALUES (
-                   (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
-                   'intent_example',
-                   %s,
-                   'gold',
-                   false,
-                   '{}'
-               )""",
-            (json.dumps({
-                "user_said": tracked["original_message"][:200],
-                "correct_action": correction.correct_intent,
-                "rule": correction.learned_rule,
-                "learned_at": datetime.now(timezone.utc).isoformat(),
-            }),),
-        )
-    except Exception:
-        logger.exception("Failed to store learned intent rule")
-
-    # Re-process the original message with the correction
+    # HEALTH-1: NO persistent "learning" here. The old path wrote a fabricated
+    # rule into acos.data_vault_satellites (rejected Data Vault 2.0 table) and
+    # replied "I've learned that ..." — confabulation with no real backing
+    # store, including "rules" about its own mistakes. Real learning belongs to
+    # the gated cognition layer (acos.cognition_log), not this stub. We keep
+    # only the useful, side-effect-free behavior: re-run the original message so
+    # the corrected action actually happens. We never claim to have learned.
     reprocess_result = None
     try:
         from artemis.intent import route_intent
@@ -2404,7 +2386,6 @@ def _handle_correction(post: dict, question: str, thread: list[dict]) -> str | N
             new_intent.primary_action,
             correction.original_intent,
         )
-        # Execute the corrected action if it matches
         if new_intent.primary_action == correction.correct_intent or new_intent.confidence >= 0.6:
             reprocess_result = _handle_intent_routed(
                 post, tracked["original_message"], thread
@@ -2412,11 +2393,11 @@ def _handle_correction(post: dict, question: str, thread: list[dict]) -> str | N
     except Exception:
         logger.debug("Re-processing after correction failed", exc_info=True)
 
-    response = f"\U0001f4a1 Got it \u2014 I've learned that \"{correction.learned_rule}\"."
+    # Honest response: if we could re-run the corrected action, return its
+    # result; otherwise fall through (None) to normal handling. No "I learned".
     if reprocess_result:
-        response += f"\n\nLet me try that again:\n\n{reprocess_result}"
-
-    return response
+        return f"Got it — re-running that:\n\n{reprocess_result}"
+    return None
 
 
 def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str | None:
@@ -2571,42 +2552,16 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             logger.exception("Trainer override handler failed")
             return "\u26a0\ufe0f Couldn\u2019t save trainer override \u2014 check DB."
 
-    # ── add_note ──
+    # ── add_note — DISABLED (HEALTH-1) ──
+    # The old stub wrote raw user text into acos.data_vault_satellites (a
+    # rejected Data Vault 2.0 table) and replied "Noted", confabulating a
+    # capture that nothing consumed. Worse, it swallowed mis-classified
+    # messages — a morning check-in the LLM tagged add_note got eaten here
+    # instead of being logged to health.daily_state. Until the gated cognition
+    # layer (acos.cognition_log) exists, add_note falls through to the normal
+    # Claude reply rather than faking a note. See docs/ARTEMIS_STATE.md §2.
     if intent.primary_action == "add_note":
-        from knowledge.db import execute_write as db_write
-
-        # Find entity to attach the note to
-        entity_id = None
-        entity_name = None
-        if intent.entities:
-            from artemis.crm_writer import _find_entity_by_name, _find_entity_by_name_fuzzy
-            for name in intent.entities:
-                ent = _find_entity_by_name(name) or _find_entity_by_name_fuzzy(name)
-                if ent:
-                    entity_id = str(ent["id"])
-                    entity_name = ent["name"]
-                    break
-
-        if entity_id:
-            db_write(
-                """INSERT INTO acos.data_vault_satellites
-                   (entity_id, satellite_type, content, layer, metadata)
-                   VALUES (%s, 'business_context', %s, 'silver', '{}')""",
-                (entity_id, question),
-            )
-            return f"\U0001f4dd Noted on **{entity_name}**: _{question[:200]}_"
-        else:
-            # No entity found — store as a general note on a generic entity
-            db_write(
-                """INSERT INTO acos.data_vault_satellites
-                   (entity_id, satellite_type, content, layer, metadata)
-                   VALUES (
-                       (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
-                       'business_context', %s, 'silver', '{}'
-                   )""",
-                (question,),
-            )
-            return f"\U0001f4dd Noted: _{question[:200]}_"
+        return None
 
     # ── financial_summary ──
     if intent.primary_action == "financial_summary":
@@ -2682,6 +2637,7 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
             detect_health_intent,
             get_plan_detail,
             get_plan_lookup,
+            handle_morning_intent,
             handle_plan_query,
             handle_workout_session,
         )
@@ -2694,6 +2650,14 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
             reply = get_plan_detail(question)
         elif intent == INTENT_PLAN_LOOKUP:
             reply = get_plan_lookup(question)
+        elif intent == "log_morning_state":
+            # HEALTH-1: a positive deterministic morning check-in wins outright
+            # and is UNOVERRIDABLE. This runs before the correction handler and
+            # the LLM intent router, so a check-in ("slept 5 energy 4 ...") can
+            # never be mis-tagged as add_note and swallowed by the confabulating
+            # note stub. handle_morning_intent always returns a string (the
+            # trainer-voice confirm or a parse-error hint), so reply is truthy.
+            reply = handle_morning_intent(question, message_id=post.get("id"))
         else:
             # Read-intent (history Q&A) first, then the session loop.
             reply = handle_plan_query(question)
