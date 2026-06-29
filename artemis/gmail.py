@@ -541,6 +541,88 @@ class GmailClient:
             logger.exception("Failed to archive message %s", message_id)
             return False
 
+    def get_message_labels(self, message_id: str) -> list[str] | None:
+        """Re-read a message's current Gmail labelIds (the disposition VERIFY read).
+
+        Uses format='minimal' (labelIds only, no headers/body) — cheap. Returns
+        the list of labelIds, or None on error (caller must treat None as
+        "could not verify", never as success).
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot read labels")
+            return None
+        if not self._refresh_if_needed():
+            logger.warning("get_message_labels: token refresh failed")
+            return None
+        try:
+            msg = (
+                self.service.users()
+                .messages()
+                .get(userId="me", id=message_id, format="minimal")
+                .execute()
+            )
+            return msg.get("labelIds", [])
+        except Exception:
+            logger.exception("Failed to read labels for %s", message_id)
+            return None
+
+    def modify_labels(
+        self, message_id: str,
+        add_label_ids: list[str] | None = None,
+        remove_label_ids: list[str] | None = None,
+    ) -> bool:
+        """Generic single-call label modify (the disposition primitive).
+
+        Adds/removes the given labelIds in ONE Gmail modify call (atomic on
+        Gmail's side). Pass resolved labelIds — system labels are their own ids
+        ('INBOX', 'UNREAD', 'SPAM'); user labels resolve via ensure_gmail_label.
+        Returns True if the API call succeeded (caller must still VERIFY via a
+        post-read — success here is "request accepted", not "state confirmed").
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot modify labels")
+            return False
+        if not self._refresh_if_needed():
+            logger.warning("modify_labels: token refresh failed")
+            return False
+        body: dict = {}
+        if add_label_ids:
+            body["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body["removeLabelIds"] = remove_label_ids
+        if not body:
+            return True
+        try:
+            self.service.users().messages().modify(
+                userId="me", id=message_id, body=body,
+            ).execute()
+            logger.info("Modified labels on %s: +%s -%s",
+                        message_id, add_label_ids or [], remove_label_ids or [])
+            return True
+        except Exception:
+            logger.exception("Failed to modify labels on %s", message_id)
+            return False
+
+    def trash_message(self, message_id: str) -> bool:
+        """Move a message to Trash (the `delete` disposition). Gmail's trash()
+        removes INBOX and adds the TRASH label. Returns True on API success
+        (caller VERIFIES via a post-read)."""
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot trash")
+            return False
+        if not self._refresh_if_needed():
+            logger.warning("trash_message: token refresh failed")
+            return False
+        try:
+            self.service.users().messages().trash(
+                userId="me", id=message_id,
+            ).execute()
+            logger.info("Trashed message %s", message_id)
+            return True
+        except Exception:
+            logger.exception("Failed to trash message %s", message_id)
+            return False
+
     def get_message_id_header(self, message_id: str) -> str:
         """Get the Message-ID header of a Gmail message for reply threading."""
         if not self.service:

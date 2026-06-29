@@ -459,6 +459,190 @@ def _handle_inbox_listing(post: dict, question: str) -> bool:
     return True
 
 
+# ── E3: dispositions (act → verify → log), resolved from the E2 mapping ──────
+# Gmail is the source of truth: we resolve a number → message_id, act against
+# Gmail, RE-READ the labels to verify the change actually happened, log the real
+# result via log_audit (with corpus features), and report ONLY what we verified.
+# No outbound (reply/forward) — that's E4. Read EMAIL_MODEL.md "Actions".
+
+_DISPOSITION_PAST = {
+    "archive": "Archived", "file": "Filed", "delete": "Deleted", "spam": "Marked spam on",
+}
+# Category for `file ## as <cat>` is constrained to label-safe chars to prevent
+# label-path injection; archive/file land under the @artemis/* namespace.
+_ARCHIVE_LABEL = "@artemis/archive"
+
+
+def _parse_numbers(s: str) -> list[int]:
+    """Parse a comma/space-separated number list, deduped in first-seen order."""
+    out: list[int] = []
+    for tok in re.split(r"[,\s]+", s.strip()):
+        if tok.isdigit():
+            n = int(tok)
+            if n not in out:
+                out.append(n)
+    return out
+
+
+def _parse_disposition_command(question: str) -> tuple[str, list[int], str | None] | None:
+    """Parse a disposition command. Returns (verb, numbers, category|None) or None.
+
+    Forms: `archive 2` · `delete 1, 5, 9` · `spam 20` · `file 3 as billing`.
+    Numbers-only operands (so `delete event …` never matches here). Category is
+    constrained to [\\w/-] — no spaces, no label-path injection.
+    """
+    q = question.strip()
+    m = re.match(r"^file\s+([\d,\s]+?)\s+as\s+([\w/-]+)\s*$", q, re.IGNORECASE)
+    if m:
+        nums = _parse_numbers(m.group(1))
+        return ("file", nums, m.group(2).lower()) if nums else None
+    m = re.match(r"^(archive|delete|spam)\s+([\d,\s]+)$", q, re.IGNORECASE)
+    if m:
+        nums = _parse_numbers(m.group(2))
+        return (m.group(1).lower(), nums, None) if nums else None
+    return None
+
+
+def _verify_disposition(verb: str, post_labels: list[str] | None, expected_label_id: str | None) -> bool:
+    """Re-read truth: does Gmail's post-action label state match the intent?
+    post_labels is None when the verify read failed → treat as UNVERIFIED."""
+    if post_labels is None:
+        return False
+    labels = set(post_labels)
+    if verb in ("archive", "file"):
+        return "INBOX" not in labels and bool(expected_label_id) and expected_label_id in labels
+    if verb == "delete":
+        return "TRASH" in labels and "INBOX" not in labels
+    if verb == "spam":
+        return "SPAM" in labels and "INBOX" not in labels
+    return False
+
+
+def _execute_disposition(verb: str, num: int, message_id: str, category: str | None) -> dict:
+    """Act on Gmail → verify → log via log_audit → drop the index row if verified.
+
+    Returns {num, ok(bool=verified), display, detail}. Never reports success
+    unless the post-action Gmail re-read confirmed the change.
+    """
+    from artemis import email_index
+    from knowledge.db import log_audit
+
+    g = _gmail
+    row = email_index.get_by_message_id(message_id) or {}
+    sender = row.get("sender", "") or ""
+    sender_domain = row.get("sender_domain", "") or ""
+    subject = row.get("subject", "") or ""
+    thread_id = row.get("thread_id", "") or ""
+    display = _inbox_display_sender(row) if row else f"#{num}"
+
+    if not g or not getattr(g, "service", None):
+        return {"num": num, "ok": False, "display": display, "detail": "Gmail not connected"}
+
+    # Labels at decision time (for the corpus + delta computation).
+    prior_labels = g.get_message_labels(message_id)
+
+    # Execute against Gmail.
+    expected_label_id = None
+    api_ok = False
+    if verb in ("archive", "file"):
+        label_name = _ARCHIVE_LABEL if verb == "archive" else f"@artemis/{category}"
+        expected_label_id = g.ensure_gmail_label(label_name)
+        if not expected_label_id:
+            return {"num": num, "ok": False, "display": display,
+                    "detail": f"could not ensure label {label_name}"}
+        api_ok = g.modify_labels(
+            message_id, add_label_ids=[expected_label_id],
+            remove_label_ids=["INBOX", "UNREAD"],
+        )
+    elif verb == "delete":
+        api_ok = g.trash_message(message_id)
+    elif verb == "spam":
+        api_ok = g.modify_labels(
+            message_id, add_label_ids=["SPAM"], remove_label_ids=["INBOX"],
+        )
+
+    # Verify against Gmail (re-read), regardless of api_ok — truth, not report.
+    post_labels = g.get_message_labels(message_id)
+    verified = _verify_disposition(verb, post_labels, expected_label_id)
+
+    prior_set = set(prior_labels or [])
+    post_set = set(post_labels or [])
+    applied = sorted(post_set - prior_set)
+    removed = sorted(prior_set - post_set)
+
+    # Log the REAL result (verified or not) with corpus features.
+    try:
+        meta = {"category": category} if verb == "file" else None
+        log_audit(
+            agent="inbox", action=verb,
+            outcome="verified" if verified else "unverified",
+            message_id=message_id, thread_id=thread_id, source="user_directed",
+            action_class="disposition", sender=sender, sender_domain=sender_domain,
+            subject=subject, prior_labels=prior_labels or [], applied_labels=applied,
+            removed_labels=removed, verified=verified, metadata=meta,
+        )
+    except Exception:
+        logger.exception("log_audit failed for disposition %s on %s", verb, message_id)
+
+    # Drop the mirror row only on a VERIFIED terminal disposition.
+    if verified:
+        try:
+            email_index.drop_from_index(message_id)
+        except Exception:
+            logger.exception("drop_from_index failed for %s", message_id)
+        return {"num": num, "ok": True, "display": display,
+                "detail": category if verb == "file" else ""}
+
+    detail = "could not confirm in Gmail" if api_ok else "Gmail action failed"
+    return {"num": num, "ok": False, "display": display, "detail": detail}
+
+
+def _handle_disposition_command(post: dict, question: str) -> bool:
+    """E3: archive/delete/file/spam <numbers>. Resolve-or-refuse on numbers,
+    act+verify+log per item, report verified-only. Read EMAIL_MODEL.md.
+
+    Returns True if it handled (or refused) a disposition command, else False.
+    """
+    parsed = _parse_disposition_command(question)
+    if not parsed:
+        return False
+    verb, numbers, category = parsed
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    state = _inbox_listing_state.get(channel_id)
+    mapping = state.get("mapping") if state else None
+    if not mapping:
+        reply = "No active inbox listing — say `inbox` first, then e.g. `archive 2`."
+        if _mm:
+            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+        return True
+
+    lines: list[str] = []
+    for n in numbers:
+        message_id = mapping.get(n)
+        if not message_id:
+            # Resolve-or-refuse: never guess, never act on an unresolved number.
+            lines.append(f"\U0001f6ab #{n} — not in the current listing (say `inbox` to refresh)")
+            continue
+        try:
+            res = _execute_disposition(verb, n, message_id, category)
+        except Exception:
+            logger.exception("disposition %s failed on #%s", verb, n)
+            lines.append(f"⚠️ #{n} — disposition errored, check logs")
+            continue
+        if res["ok"]:
+            mapping.pop(n, None)  # the item left the working set — retire its number
+            extra = f" as {res['detail']}" if verb == "file" and res.get("detail") else ""
+            lines.append(f"✅ {_DISPOSITION_PAST[verb]} #{n} ({res['display']}){extra}")
+        else:
+            lines.append(f"⚠️ #{n} ({res['display']}) — {res['detail']}")
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+    return True
+
+
 def _handle_inbox_command(post: dict, question: str) -> bool:
     """Try to handle an inbox zero command. Returns True if handled."""
     parsed = parse_inbox_command(question)
@@ -2637,6 +2821,13 @@ def _handle_mention(post: dict, thread: list[dict]):
     # served from the email_index mirror instead of the old inbox_threads
     # summary. The other inbox subcommands still fall through to the old handler.
     if _handle_inbox_listing(post, question):
+        return
+
+    # E3: disposition commands (archive/delete/file/spam <numbers>) resolved from
+    # the E2 mapping, executed against Gmail, verified, logged. Runs before the
+    # old handler and the LLM so these requests act+verify instead of reaching the
+    # router that confabulates "On it" without touching Gmail.
+    if _handle_disposition_command(post, question):
         return
 
     # Try inbox commands (done, wait, snooze, noise, waiting, snoozed)
