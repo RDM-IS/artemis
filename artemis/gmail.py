@@ -163,6 +163,110 @@ class GmailClient:
 
         return detailed
 
+    def list_inbox_message_ids(self, query: str = "in:inbox is:unread") -> list[str]:
+        """Return ALL Gmail message IDs matching `query`, paginating fully.
+
+        Unlike get_recent_messages (one capped page) this walks nextPageToken
+        until exhausted, so the caller sees the ENTIRE working set — not just the
+        last 20. This is the fix for "Artemis only sees the last 5": the full
+        inbox is listed here (cheap — ids only), metadata is hydrated separately
+        by get_message_metadata, and bodies stay on-demand via get_full_message.
+
+        Returns a list of message-id strings (no metadata). Returns [] on auth
+        failure or API error (logged) — callers that prune off this list must
+        treat that as "no working set observed", not "inbox is empty".
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot list message IDs")
+            return []
+        if not self._refresh_if_needed():
+            logger.warning("list_inbox_message_ids: token refresh failed")
+            return []
+
+        ids: list[str] = []
+        page_token = None
+        try:
+            while True:
+                resp = (
+                    self.service.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=500, pageToken=page_token)
+                    .execute()
+                )
+                ids.extend(m["id"] for m in resp.get("messages", []))
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+        except Exception:
+            logger.exception("Failed to list inbox message IDs (q=%s)", query)
+            return []
+
+        logger.info("Listed %d message IDs (q=%s)", len(ids), query)
+        return ids
+
+    def get_message_metadata(self, ids: list[str]) -> list[dict]:
+        """Batch-fetch lightweight metadata for a list of message IDs.
+
+        Uses Gmail's batch HTTP endpoint (chunks of 100, the API per-batch max)
+        to fetch From/Subject/Date headers + snippet + labelIds + internalDate
+        WITHOUT message bodies. Bodies stay on-demand via get_full_message /
+        _extract_body. Per-message failures are logged and skipped, never fatal.
+
+        Returns a list of dicts (shape mirrors get_recent_messages, plus
+        `internal_date`, the epoch-ms received instant). Order is NOT guaranteed
+        to match `ids` — callers key on the `id` field.
+        """
+        if not self.service:
+            logger.error("Gmail not authenticated — cannot fetch metadata")
+            return []
+        if not ids:
+            return []
+        if not self._refresh_if_needed():
+            logger.warning("get_message_metadata: token refresh failed")
+            return []
+
+        results: list[dict] = []
+
+        def _callback(request_id, response, exception):
+            if exception is not None:
+                logger.warning("Metadata fetch failed for %s: %s", request_id, exception)
+                return
+            headers = {
+                h["name"]: h["value"]
+                for h in response.get("payload", {}).get("headers", [])
+            }
+            results.append({
+                "id": response["id"],
+                "thread_id": response["threadId"],
+                "from": headers.get("From", ""),
+                "from_email": parseaddr(headers.get("From", ""))[1],
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "snippet": response.get("snippet", ""),
+                "label_ids": response.get("labelIds", []),
+                "internal_date": response.get("internalDate"),
+            })
+
+        try:
+            for start in range(0, len(ids), 100):
+                chunk = ids[start:start + 100]
+                batch = self.service.new_batch_http_request(callback=_callback)
+                for mid in chunk:
+                    batch.add(
+                        self.service.users().messages().get(
+                            userId="me", id=mid, format="metadata",
+                            metadataHeaders=["From", "Subject", "Date"],
+                        ),
+                        request_id=mid,
+                    )
+                batch.execute()
+        except Exception:
+            logger.exception("Batch metadata fetch failed")
+            return results
+
+        logger.info("Fetched metadata for %d/%d messages", len(results), len(ids))
+        return results
+
     def get_full_message(self, message_id: str) -> str:
         """Fetch the full body of a message.  Prefers text/plain, falls back to HTML.
 
