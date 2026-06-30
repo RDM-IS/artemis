@@ -522,10 +522,11 @@ def _parse_disposition_command(question: str) -> tuple[str, list[int], str | Non
     label-path injection.
     """
     q = question.strip()
-    m = re.match(r"^file\s+([\d,\s&-]+?)\s+(?:as|under|in|to)\s+([\w/-]+)\s*$", q, re.IGNORECASE)
+    m = re.match(r"^file\s+([\d,\s&-]+?)\s+(?:as|under|in|to)\s+(.+?)\s*$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(1))
-        return ("file", nums, m.group(2).lower()) if nums else None
+        cat = _slugify_category(m.group(2))  # multi-word → slug ("founder loans"→"founder-loans")
+        return ("file", nums, cat) if (nums and cat) else None
     m = re.match(r"^(archive|delete|spam)\s+([\d,\s&-]+)$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(2))
@@ -675,18 +676,222 @@ def _execute_disposition(verb: str, num: int, message_id: str, category: str | N
     return {"num": num, "ok": False, "display": display, "detail": detail}
 
 
-def _handle_disposition_command(post: dict, question: str) -> bool:
-    """E3: archive/delete/file/spam <numbers>. Resolve-or-refuse on numbers,
-    act+verify+log per item, report verified-only. Read EMAIL_MODEL.md.
+_DISPOSITION_VERBS = {"archive", "delete", "spam", "file"}
+_FILE_PREPS = {"as", "under", "in", "to"}
+# Reversible (label-only, mailbox-local) vs consequential dispositions. A
+# COMPOUND batch with a consequential verb is proposed-then-confirmed; a
+# reversible-only batch auto-executes. Single commands are unchanged.
+_CONSEQUENTIAL_VERBS = {"delete", "spam"}
 
-    Returns True if it handled (or refused) a disposition command, else False.
+
+def _strip_parentheticals(s: str) -> str:
+    """Drop `(inline comments)` so `14 delete (was a test)` parses as `14 delete`."""
+    return re.sub(r"\([^)]*\)", " ", s)
+
+
+def _looks_dispositional(question: str) -> bool:
+    """True iff the line carries a disposition verb AND a listing-number token.
+    Gates the in-context refusal: a disposition-SHAPED line that fails to parse
+    during an active listing must refuse-in-context, never fall through to the
+    keyword/financial classifier (the bug that mis-fired the financial report on
+    `file ... as founder loans`)."""
+    q = _strip_parentheticals(question).lower()
+    toks = [t for t in re.split(r"[\s,&]+", q.strip()) if t]
+    has_verb = any(t in _DISPOSITION_VERBS for t in toks)
+    has_num = any(re.match(r"^\d+(-\d+)?$", t) for t in toks)
+    return has_verb and has_num
+
+
+def _parse_compound_dispositions(
+    question: str,
+) -> list[tuple[str, list[int], str | None]] | None:
+    """Parse a BATCH of disposition groups on one line. Numbers may sit on either
+    side of the verb; `file as <category>` may be multi-word (slugified);
+    parentheticals are stripped. Mixable per group:
+        nums-first : `1-4 archive` · `5-7, 13 file as founder loans`
+        verb-first : `archive 1-4`  · `file 5-7 as founder-loans`
+    A `file` category runs until the next number-or-verb token, so the next
+    group's numbers terminate it. Groups returned in order; a group whose numbers
+    don't resolve (or a `file` with no category) is dropped. Returns None if the
+    line isn't disposition-shaped at all.
+    """
+    q = _strip_parentheticals(question).strip()
+    if not q:
+        return None
+    toks = q.split()
+    if not any(t.lower() in _DISPOSITION_VERBS for t in toks):
+        return None
+
+    def is_num(t: str) -> bool:
+        return bool(re.match(r"^\d+(-\d+)?$", t.strip(",&")))
+
+    groups: list[tuple[str, list[int], str | None]] = []
+    i, n = 0, len(toks)
+    while i < n:
+        tok = toks[i]
+        low = tok.lower()
+        nums_src: list[str] = []
+        verb: str | None = None
+
+        if is_num(tok):
+            # nums-first: leading numbers then a required verb.
+            while i < n and is_num(toks[i]):
+                nums_src.append(toks[i]); i += 1
+            if i < n and toks[i].lower() in _DISPOSITION_VERBS:
+                verb = toks[i].lower(); i += 1
+            else:
+                continue  # numbers with no following verb — stray, keep scanning
+        elif low in _DISPOSITION_VERBS:
+            # verb-first: verb then numbers (file may carry them before `as`).
+            # Lookahead: a number whose NEXT token is a verb leads the following
+            # (nums-first) group, so don't steal it — `archive 1-2 5-7 file as x`
+            # means archive 1-2, then file 5-7, not archive 1-2,5-7.
+            verb = low; i += 1
+            while i < n and is_num(toks[i]):
+                if nums_src and i + 1 < n and toks[i + 1].lower() in _DISPOSITION_VERBS:
+                    break  # this number leads the next group, not ours
+                nums_src.append(toks[i]); i += 1
+        else:
+            i += 1
+            continue
+
+        category: str | None = None
+        if verb == "file":
+            if i < n and toks[i].lower() in _FILE_PREPS:
+                i += 1
+            cat_words: list[str] = []
+            while (
+                i < n
+                and not is_num(toks[i])
+                and toks[i].lower() not in _DISPOSITION_VERBS
+            ):
+                cat_words.append(toks[i]); i += 1
+            category = _slugify_category(" ".join(cat_words)) or None
+
+        nums = _parse_numbers(" ".join(nums_src))
+        if verb and nums and not (verb == "file" and not category):
+            groups.append((verb, nums, category))
+
+    return groups or None
+
+
+def _format_disposition_plan(groups: list[tuple[str, list[int], str | None]]) -> str:
+    """One-line-per-group readback of a parsed batch, for confirm-then-act."""
+    def rng(nums: list[int]) -> str:
+        return ", ".join(str(x) for x in nums)
+    out = []
+    for verb, nums, cat in groups:
+        out.append(f"file {rng(nums)} → `@artemis/{cat}`" if verb == "file"
+                   else f"{verb} {rng(nums)}")
+    return "\n".join(f"  • {p}" for p in out)
+
+
+def _execute_disposition_group(
+    channel_id: str, mapping: dict, verb: str, numbers: list[int],
+    category: str | None,
+) -> list[str]:
+    """Act+verify+log each number in one group; return per-item report lines.
+    Mutates `mapping` (retires verified numbers). Shared by single & compound."""
+    lines: list[str] = []
+    for n in numbers:
+        message_id = mapping.get(n)
+        if not message_id:
+            # Resolve-or-refuse: never guess, never act on an unresolved number.
+            lines.append(f"\U0001f6ab #{n} — not in the current listing (say `inbox` to refresh)")
+            continue
+        try:
+            res = _execute_disposition(verb, n, message_id, category)
+        except Exception:
+            logger.exception("disposition %s failed on #%s", verb, n)
+            lines.append(f"⚠️ #{n} — disposition errored, check logs")
+            continue
+        if res["ok"]:
+            mapping.pop(n, None)  # the item left the working set — retire its number
+            extra = f" as {res['detail']}" if verb == "file" and res.get("detail") else ""
+            lines.append(f"✅ {_DISPOSITION_PAST[verb]} #{n} ({res['display']}){extra}")
+        else:
+            lines.append(f"⚠️ #{n} ({res['display']}) — {res['detail']}")
+    return lines
+
+
+def _handle_disposition_command(post: dict, question: str) -> bool:
+    """E3: archive/delete/file/spam <numbers>, single or COMPOUND batch.
+    Resolve-or-refuse on numbers, act+verify+log per item, report verified-only.
+    A disposition-SHAPED line during an active listing is handled here or refused
+    in-context — it never falls through to the financial/LLM classifier.
+    Read EMAIL_MODEL.md. Returns True if handled (or refused), else False.
     """
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
     state = _inbox_listing_state.get(channel_id)
     mapping = state.get("mapping") if state else None
 
+    # ── Pending compound confirm (consequential batch awaiting yes/no) ──
+    # Defer to the canonical _pending_confirms system if one is open for this
+    # channel — never steal a calendar/CRM control word. Reuses _CONFIRM_WORDS/
+    # _CANCEL_WORDS so the confirm vocabulary can't drift between subsystems.
+    pending = state.get("pending_dispositions") if state else None
+    if pending and channel_id not in _pending_confirms:
+        ans = _strip_parentheticals(question).strip().lower()
+        if ans in _CONFIRM_WORDS:
+            state.pop("pending_dispositions", None)
+            lines: list[str] = []
+            for verb, numbers, category in pending:
+                lines.extend(_execute_disposition_group(channel_id, mapping or {}, verb, numbers, category))
+            if _mm:
+                _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+            return True
+        if ans in _CANCEL_WORDS:
+            state.pop("pending_dispositions", None)
+            if _mm:
+                _mm.post_to_channel_id(channel_id, "Cancelled — nothing was changed.", root_id=root_id)
+            return True
+        # Anything else: fall through to re-parse (treat as a new command).
+
     parsed = _parse_disposition_command(question)
+
+    # ── COMPOUND batch (multiple groups, or a form the single parser missed) ──
+    if not parsed:
+        compound = _parse_compound_dispositions(question)
+        if compound:
+            if not mapping:
+                if _mm:
+                    _mm.post_to_channel_id(
+                        channel_id,
+                        "No active inbox listing — say `inbox` first, then e.g. `archive 2`.",
+                        root_id=root_id,
+                    )
+                return True
+            total = sum(len(g[1]) for g in compound)
+            if total > _DISPOSITION_MAX_BATCH:
+                if _mm:
+                    _mm.post_to_channel_id(
+                        channel_id,
+                        f"That's {total} items — too many at once. Use smaller ranges.",
+                        root_id=root_id,
+                    )
+                return True
+            destructive = any(v in _CONSEQUENTIAL_VERBS for v, _, _ in compound)
+            plan = _format_disposition_plan(compound)
+            if destructive:
+                # propose-then-confirm: the parse itself is the new risky surface,
+                # and the batch deletes/spams — read it back, wait for `yes`.
+                if state is not None:
+                    state["pending_dispositions"] = compound
+                reply = (
+                    f"\U0001f4cb Parsed {len(compound)} groups ({total} items):\n{plan}\n\n"
+                    f"This batch includes delete/spam. Reply `yes` to run it, `no` to cancel."
+                )
+                if _mm:
+                    _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+                return True
+            # reversible-only (archive/file) → execute now, with a parse readback.
+            lines = [f"\U0001f4cb Parsed {len(compound)} groups:", plan, ""]
+            for verb, numbers, category in compound:
+                lines.extend(_execute_disposition_group(channel_id, mapping, verb, numbers, category))
+            if _mm:
+                _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+            return True
 
     # EMAIL-ROUTING (context-aware routing): when a listing is ACTIVE in this
     # channel, a declarative reference to listing numbers ("1 & 2 are founder
@@ -711,6 +916,22 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
                 if _mm:
                     _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
                 return True
+        # ARCHITECTURAL GUARD: a disposition-SHAPED line (verb + number) that
+        # reached here failed every parse. With a listing active, refuse IN
+        # CONTEXT — it must never fall through to the keyword/financial/LLM
+        # classifier (which mis-routed `file ... as founder loans` to the
+        # financial report). Reversibility: this only refuses, never acts.
+        if mapping and _looks_dispositional(question):
+            reply = (
+                "\u26a0\ufe0f Couldn't parse that as inbox actions. Grammar:\n"
+                "  • `archive 1-4` · `delete 2, 5` · `spam 9`\n"
+                "  • `file 5-7, 13 as founder loans` (multi-word ok)\n"
+                "  • batch: `archive 1-4  file 5-7 as founder loans  delete 14`\n"
+                "Numbers may go before or after the verb."
+            )
+            if _mm:
+                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            return True
         return False
 
     verb, numbers, category = parsed
@@ -732,26 +953,7 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return True
 
-    lines: list[str] = []
-    for n in numbers:
-        message_id = mapping.get(n)
-        if not message_id:
-            # Resolve-or-refuse: never guess, never act on an unresolved number.
-            lines.append(f"\U0001f6ab #{n} — not in the current listing (say `inbox` to refresh)")
-            continue
-        try:
-            res = _execute_disposition(verb, n, message_id, category)
-        except Exception:
-            logger.exception("disposition %s failed on #%s", verb, n)
-            lines.append(f"⚠️ #{n} — disposition errored, check logs")
-            continue
-        if res["ok"]:
-            mapping.pop(n, None)  # the item left the working set — retire its number
-            extra = f" as {res['detail']}" if verb == "file" and res.get("detail") else ""
-            lines.append(f"✅ {_DISPOSITION_PAST[verb]} #{n} ({res['display']}){extra}")
-        else:
-            lines.append(f"⚠️ #{n} ({res['display']}) — {res['detail']}")
-
+    lines = _execute_disposition_group(channel_id, mapping, verb, numbers, category)
     if _mm:
         _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
     return True
