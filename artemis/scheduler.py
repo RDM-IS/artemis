@@ -274,18 +274,39 @@ class ArtemisScheduler:
     def _archive_for_state(self, message_id: str, state: str, subject: str = "") -> None:
         """State-conditional archive gate (spec §2).
 
-        NEEDS_ACTION stays in INBOX; everything else is filed (archived).
-        Under FILING_DRY_RUN the decision is only logged — no mutation — so the
-        rubric can be verified against live mail before touching anything.
+        NEEDS_ACTION stays in INBOX; everything else is filed. Filing now goes
+        through the SAME audited/labeled primitive as commands — INBOX is never
+        stripped without an @artemis/* label and an audit row (location
+        invariant). Financial documents are kept in the inbox regardless of
+        state: filing them is a loan-vs-paid decision only a command can make.
+        Under FILING_DRY_RUN the decision is only logged — no mutation.
         """
+        from artemis.billing import is_financial_document
+
         if should_keep_in_inbox(state):
             logger.info("Filing gate: KEEP inbox [%s] state=%s", subject, state)
+            return
+        if is_financial_document(subject):
+            logger.info(
+                "Filing gate: KEEP inbox [%s] state=%s (financial — awaits command)",
+                subject, state,
+            )
             return
         if config.FILING_DRY_RUN:
             logger.info("Filing gate: DRY-RUN would ARCHIVE [%s] state=%s", subject, state)
             return
-        self.gmail.archive_message(message_id)
-        logger.info("Filing gate: ARCHIVED [%s] state=%s", subject, state)
+
+        # Audited, labeled archive — NOT a bare gmail.archive_message().
+        from artemis.main import file_message_for_automation
+
+        res = file_message_for_automation(message_id, triage_state=state, gmail_client=self.gmail)
+        if res.get("ok"):
+            logger.info("Filing gate: ARCHIVED [%s] state=%s (labeled+audited)", subject, state)
+        else:
+            logger.error(
+                "Filing gate: archive UNVERIFIED [%s] state=%s — %s; mail left in place",
+                subject, state, res.get("detail", "?"),
+            )
 
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
