@@ -166,5 +166,40 @@ class TestConsequentialClassification(unittest.TestCase):
         self.assertNotIn("file", main._CONSEQUENTIAL_VERBS)
 
 
+class TestWordOrderAndHashNumbers(unittest.TestCase):
+    """Ryan's real phrasings from the live session: category-before-numbers and
+    #-prefixed indices. Both single and compound parsers must accept them."""
+
+    def test_file_as_category_then_numbers(self):
+        self.assertEqual(
+            main._parse_disposition_command("file as founder-loan 15, 16, 17, 18, 19"),
+            ("file", [15, 16, 17, 18, 19], "founder-loan"),
+        )
+        self.assertEqual(
+            main._parse_compound_dispositions("File as founder-loan 15, 16, 17, 18, 19"),
+            [("file", [15, 16, 17, 18, 19], "founder-loan")],
+        )
+
+    def test_hash_prefixed_numbers(self):
+        self.assertEqual(
+            main._parse_disposition_command("file as founder-loan #15"),
+            ("file", [15], "founder-loan"),
+        )
+        self.assertEqual(
+            main._parse_disposition_command("spam #1, #2, #3"),
+            ("spam", [1, 2, 3], None),
+        )
+        self.assertEqual(
+            main._parse_disposition_command("delete #14, #16-#20"),
+            ("delete", [14, 16, 17, 18, 19, 20], None),
+        )
+
+    def test_both_file_word_orders_equivalent(self):
+        a = main._parse_disposition_command("file 15, 16 as founder-loan")
+        b = main._parse_disposition_command("file as founder-loan 15, 16")
+        self.assertEqual(a, ("file", [15, 16], "founder-loan"))
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

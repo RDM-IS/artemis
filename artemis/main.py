@@ -498,7 +498,8 @@ def _parse_numbers(s: str) -> list[int]:
     for tok in re.split(r"[,\s&]+", s.strip()):
         if not tok or tok.lower() == "and":
             continue
-        rng = re.match(r"^(\d+)-(\d+)$", tok)
+        tok = tok.lstrip("#")  # accept #15, #1-#3 style references
+        rng = re.match(r"^(\d+)-#?(\d+)$", tok)
         if rng:
             a, b = int(rng.group(1)), int(rng.group(2))
             if a <= b:
@@ -522,12 +523,19 @@ def _parse_disposition_command(question: str) -> tuple[str, list[int], str | Non
     label-path injection.
     """
     q = question.strip()
-    m = re.match(r"^file\s+([\d,\s&-]+?)\s+(?:as|under|in|to)\s+(.+?)\s*$", q, re.IGNORECASE)
+    # `file <nums> as <category>` — numbers before category.
+    m = re.match(r"^file\s+([\d,\s&#-]+?)\s+(?:as|under|in|to)\s+(.+?)\s*$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(1))
         cat = _slugify_category(m.group(2))  # multi-word → slug ("founder loans"→"founder-loans")
         return ("file", nums, cat) if (nums and cat) else None
-    m = re.match(r"^(archive|delete|spam)\s+([\d,\s&-]+)$", q, re.IGNORECASE)
+    # `file as <category> <nums>` — category before numbers (the natural inverse).
+    m = re.match(r"^file\s+(?:as|under|in|to)\s+(.+?)\s+([\d,\s&#-]+)$", q, re.IGNORECASE)
+    if m:
+        cat = _slugify_category(m.group(1))
+        nums = _parse_numbers(m.group(2))
+        return ("file", nums, cat) if (nums and cat) else None
+    m = re.match(r"^(archive|delete|spam)\s+([\d,\s&#-]+)$", q, re.IGNORECASE)
     if m:
         nums = _parse_numbers(m.group(2))
         return (m.group(1).lower(), nums, None) if nums else None
@@ -753,7 +761,7 @@ def _parse_compound_dispositions(
         return None
 
     def is_num(t: str) -> bool:
-        return bool(re.match(r"^\d+(-\d+)?$", t.strip(",&")))
+        return bool(re.match(r"^#?\d+(-#?\d+)?$", t.strip(",&")))
 
     groups: list[tuple[str, list[int], str | None]] = []
     i, n = 0, len(toks)
@@ -797,6 +805,12 @@ def _parse_compound_dispositions(
             ):
                 cat_words.append(toks[i]); i += 1
             category = _slugify_category(" ".join(cat_words)) or None
+            # `file as <category> <nums>` — numbers AFTER the category bind to
+            # this file group (the natural inverse of `file <nums> as <cat>`).
+            while i < n and is_num(toks[i]):
+                if nums_src and i + 1 < n and toks[i + 1].lower() in _DISPOSITION_VERBS:
+                    break
+                nums_src.append(toks[i]); i += 1
 
         nums = _parse_numbers(" ".join(nums_src))
         if verb and nums and not (verb == "file" and not category):
