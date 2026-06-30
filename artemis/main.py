@@ -597,8 +597,19 @@ def _verify_disposition(verb: str, post_labels: list[str] | None, expected_label
     return False
 
 
-def _execute_disposition(verb: str, num: int, message_id: str, category: str | None) -> dict:
+def _execute_disposition(
+    verb: str, num: int | None, message_id: str, category: str | None,
+    *, source: str = "user_directed", gmail_client=None,
+    metadata_extra: dict | None = None,
+) -> dict:
     """Act on Gmail → verify → log via log_audit → drop the index row if verified.
+
+    The SINGLE audited/labeled filing primitive. Out-of-inbox ALWAYS carries an
+    @artemis/* label AND an audit row — there is no bare strip. Commands and the
+    autonomous filing gate both flow through here; `source` distinguishes them
+    (user_directed vs automation_*), `metadata_extra` carries context like the
+    triage state. `gmail_client` lets a caller (e.g. the scheduler) pass its own
+    client; defaults to the module global.
 
     Returns {num, ok(bool=verified), display, detail}. Never reports success
     unless the post-action Gmail re-read confirmed the change.
@@ -606,13 +617,13 @@ def _execute_disposition(verb: str, num: int, message_id: str, category: str | N
     from artemis import email_index
     from knowledge.db import log_audit
 
-    g = _gmail
+    g = gmail_client or _gmail
     row = email_index.get_by_message_id(message_id) or {}
     sender = row.get("sender", "") or ""
     sender_domain = row.get("sender_domain", "") or ""
     subject = row.get("subject", "") or ""
     thread_id = row.get("thread_id", "") or ""
-    display = _inbox_display_sender(row) if row else f"#{num}"
+    display = _inbox_display_sender(row) if row else (f"#{num}" if num else message_id[:12])
 
     if not g or not getattr(g, "service", None):
         return {"num": num, "ok": False, "display": display, "detail": "Gmail not connected"}
@@ -651,14 +662,16 @@ def _execute_disposition(verb: str, num: int, message_id: str, category: str | N
 
     # Log the REAL result (verified or not) with corpus features.
     try:
-        meta = {"category": category} if verb == "file" else None
+        meta = {"category": category} if verb == "file" else {}
+        if metadata_extra:
+            meta = {**(meta or {}), **metadata_extra}
         log_audit(
             agent="inbox", action=verb,
             outcome="verified" if verified else "unverified",
-            message_id=message_id, thread_id=thread_id, source="user_directed",
+            message_id=message_id, thread_id=thread_id, source=source,
             action_class="disposition", sender=sender, sender_domain=sender_domain,
             subject=subject, prior_labels=prior_labels or [], applied_labels=applied,
-            removed_labels=removed, verified=verified, metadata=meta,
+            removed_labels=removed, verified=verified, metadata=(meta or None),
         )
     except Exception:
         logger.exception("log_audit failed for disposition %s on %s", verb, message_id)
@@ -674,6 +687,23 @@ def _execute_disposition(verb: str, num: int, message_id: str, category: str | N
 
     detail = "could not confirm in Gmail" if api_ok else "Gmail action failed"
     return {"num": num, "ok": False, "display": display, "detail": detail}
+
+
+def file_message_for_automation(message_id: str, triage_state: str, gmail_client=None) -> dict:
+    """Audited, labeled archive for the autonomous filing gate.
+
+    Same primitive as a command disposition — strips INBOX, applies
+    @artemis/archive, re-reads to verify, writes an audit row, drops the mirror.
+    Replaces the legacy bare `gmail.archive_message()` so automation can NEVER
+    again remove mail from the inbox without a label + audit row (the location
+    invariant). `triage_state` is recorded in the audit metadata so the WHY
+    (NOISE/DONE) is preserved without proliferating labels.
+    """
+    return _execute_disposition(
+        "archive", None, message_id, None,
+        source="automation_triage", gmail_client=gmail_client,
+        metadata_extra={"triage_state": triage_state},
+    )
 
 
 _DISPOSITION_VERBS = {"archive", "delete", "spam", "file"}
