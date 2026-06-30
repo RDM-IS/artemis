@@ -39,6 +39,13 @@ There is no third state. Out-of-inbox-without-`@artemis/*`-label = violation (or
 ### Outbound (external, irreversible) — ALWAYS draft-then-confirm
 - **`reply to ## with ___`**, **`forward ##`**, **send** → Artemis **drafts**, posts the draft to Ryan, waits for explicit send-confirmation, THEN sends. **Even when Ryan directs it** — the send itself is the Brad-Spaits boundary. A playbook may NEVER auto-send; it can only draft-and-propose.
 
+### Disposition grammar (parsing rules)
+- **Numbers** are listing indices: singles, comma lists, `&`/`and`, and inclusive ranges (`1-4`). All forms mix: `archive 1-3, 7, 9-11`.
+- **Categories may be multi-word** and are slugified: `file 1 as founder loan` → `@artemis/founder-loan`; `file 5-7, 13 as founder loans` → `@artemis/founder-loans`. (Filing an email is a label move only — it is **not** a financial transaction and writes nothing to the founder-loan ledger.)
+- **Compound batches** put several groups on one line; numbers may sit before or after the verb: `1-4 archive  5-7 file as founder loans  14 delete`. A `file` category runs until the next number-or-verb token. Parentheticals are stripped (`14 delete (was a test)`).
+- **Reversible-only batches** (archive/file) auto-execute with a parse readback. **Batches containing delete/spam** are proposed-then-confirmed (read back the parsed plan, wait for `yes`/`no`) — the inference is the risky surface, so the parse is confirmed before any destructive act.
+- **Shape guard (anti-misroute):** a disposition-shaped line (verb + number) that fails to parse while a listing is active is **refused in context** — it must never fall through to the keyword/financial/LLM classifier. This closes the class where `file … as founder loans` mis-fired the read-only financial report.
+
 ## Data model
 
 | Store | Role | Lifetime |
