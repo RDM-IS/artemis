@@ -18,6 +18,31 @@ from knowledge.secrets import get_gmail_token
 
 logger = logging.getLogger(__name__)
 
+# Financial-document signals. An email matching these must NEVER be auto-filed
+# by the triage gate — it stays in INBOX awaiting an explicit command
+# (`file N as founder loan` / `as paid`), because filing it is a financial
+# decision (loan vs RDMIS-paid) the classifier cannot make from the email alone.
+# This is the guard against the incident where receipts/invoices were swept to a
+# label-less archive as state=DONE. Conservative by design: a false keep costs a
+# glance, a false auto-file loses a tax/ledger document.
+_FINANCIAL_SIGNALS = re.compile(
+    r"\b(invoice|receipt|refund|payment|billing|statement|subscription"
+    r"|charged?|paid|amount\s+due|past\s+due|balance\s+due|order\s+confirmation)\b",
+    re.IGNORECASE,
+)
+
+
+def is_financial_document(subject: str = "", sender: str = "") -> bool:
+    """True if subject/sender looks like a bill, receipt, invoice, or payment.
+
+    Used by the triage filing gate to KEEP such mail in the inbox for a manual
+    `file … as <category>` command instead of auto-archiving it.
+    """
+    return bool(
+        _FINANCIAL_SIGNALS.search(subject or "")
+        or _FINANCIAL_SIGNALS.search(sender or "")
+    )
+
 # ---------------------------------------------------------------------------
 # Postgres state tracking — processed billing message IDs
 # ---------------------------------------------------------------------------
