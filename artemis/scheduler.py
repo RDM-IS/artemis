@@ -271,6 +271,62 @@ class ArtemisScheduler:
 
     _state_from_triage = staticmethod(state_from_triage)
 
+    def _apply_playbook_rules(self, messages: list[dict]) -> list[dict]:
+        """Match each new message against active chat-authored rules; dispose the
+        matches through the audited primitive and drop them from the pool.
+
+        Rules are a hard layer ahead of the LLM triage: a match archives/spams/
+        files with a labeled, verified, audited action tagged to the rule id.
+        Body matching fetches the full body lazily, only for a candidate that
+        needs it. Unmatched messages flow on to the normal triage path.
+        """
+        from artemis import playbook_rules
+        from artemis.main import file_message_for_rule
+
+        try:
+            active = playbook_rules.list_rules(active_only=True)
+        except Exception:
+            logger.exception("playbook rules unavailable — skipping rule pass")
+            return messages
+        if not active:
+            return messages
+
+        remaining: list[dict] = []
+        for m in messages:
+            def _fetch_body(msg=m):
+                return self.gmail.get_full_message(msg["id"]) or ""
+
+            try:
+                rule = playbook_rules.match_message(
+                    m.get("from_email", ""), m.get("subject", ""), body_fetcher=_fetch_body,
+                )
+            except Exception:
+                logger.exception("rule match failed for %s", m.get("id"))
+                rule = None
+
+            if not rule:
+                remaining.append(m)
+                continue
+
+            res = file_message_for_rule(m["id"], rule, gmail_client=self.gmail)
+            if res.get("ok"):
+                playbook_rules.record_fired(rule["id"])
+                logger.info(
+                    "Rule #%s fired on [%s] → %s%s",
+                    rule["id"], m.get("subject", ""), rule["action"],
+                    f" @artemis/{rule.get('action_label')}" if rule["action"] == "file" else "",
+                )
+                # Disposed + audited + index dropped by the primitive; do not
+                # re-add to the pool (it has left the inbox).
+            else:
+                # Unverified → leave it in the normal triage path, don't lose it.
+                logger.error(
+                    "Rule #%s UNVERIFIED on [%s] — %s; falling through to triage",
+                    rule["id"], m.get("subject", ""), res.get("detail", "?"),
+                )
+                remaining.append(m)
+        return remaining
+
     def _archive_for_state(self, message_id: str, state: str, subject: str = "") -> None:
         """State-conditional archive gate (spec §2).
 
@@ -324,6 +380,13 @@ class ArtemisScheduler:
 
             for m in new_messages:
                 self._seen_message_ids.add(m["id"])
+
+            # Feature #1: chat-authored playbook rules run FIRST — a user rule is a
+            # hard rule and takes precedence over the LLM triage. Matched messages
+            # are disposed through the audited primitive and removed from the pool.
+            new_messages = self._apply_playbook_rules(new_messages)
+            if not new_messages:
+                return
 
             # Immediate post for priority contacts
             priority_msgs = [

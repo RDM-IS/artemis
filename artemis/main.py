@@ -697,6 +697,21 @@ def _execute_disposition(
     return {"num": num, "ok": False, "display": display, "detail": detail}
 
 
+def file_message_for_rule(message_id: str, rule: dict, gmail_client=None) -> dict:
+    """Execute a chat-authored playbook rule's action on one message, through the
+    SAME audited/labeled primitive as everything else. source='automation_rule',
+    with rule id/name in the audit metadata so every rule-driven action is
+    traceable to the rule that caused it (automation is inspectable, not trusted).
+    """
+    action = rule.get("action")
+    category = rule.get("action_label") if action == "file" else None
+    return _execute_disposition(
+        action, None, message_id, category,
+        source="automation_rule", gmail_client=gmail_client,
+        metadata_extra={"rule_id": rule.get("id"), "rule_name": rule.get("name")},
+    )
+
+
 def file_message_for_automation(message_id: str, triage_state: str, gmail_client=None) -> dict:
     """Audited, labeled archive for the autonomous filing gate.
 
@@ -856,6 +871,102 @@ def _execute_disposition_group(
         else:
             lines.append(f"⚠️ #{n} ({res['display']}) — {res['detail']}")
     return lines
+
+
+def _handle_rule_command(post: dict, question: str) -> bool:
+    """Chat-authored playbook rules (feature #1): `rules`, `rule add <spec>`,
+    `rule off <id>`. Authoring is propose-then-confirm — the spec is parsed
+    deterministically, echoed for confirmation, and only create_rule() writes the
+    row. The LLM never authors a rule; every message here is rendered from the
+    parsed struct or the written row. Returns True if handled.
+    """
+    from artemis import playbook_rules
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    q = question.strip()
+    ql = q.lower()
+
+    def _say(text: str) -> None:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, text, root_id=root_id)
+
+    # 1) Pending rule-activation confirm (type-gated; coexists with other confirms).
+    pending = _pending_confirms.get(channel_id)
+    if pending and pending.get("type") == "playbook_rule":
+        if ql in _CONFIRM_WORDS:
+            del _pending_confirms[channel_id]
+            spec = pending["spec"]
+            try:
+                row = playbook_rules.create_rule(
+                    name=pending["name"], action=spec["action"],
+                    action_label=spec["action_label"],
+                    match_sender=spec["match_sender"],
+                    match_subject=spec["match_subject"],
+                    match_body=spec["match_body"],
+                )
+            except Exception as exc:
+                logger.exception("create_rule failed")
+                _say(f"\u26a0\ufe0f Couldn't save the rule: {exc}")
+                return True
+            # Confirmation rendered FROM THE WRITTEN ROW — not fabricated.
+            _say(
+                f"\u2705 Rule #{row['id']} active — {playbook_rules.describe_rule(row)}\n"
+                f"It runs on new inbox mail from now on. `rules` to review, "
+                f"`rule off {row['id']}` to disable."
+            )
+            return True
+        if ql in _CANCEL_WORDS:
+            del _pending_confirms[channel_id]
+            _say("Cancelled — no rule created.")
+            return True
+        # else: fall through and re-parse as a fresh command
+
+    # 2) List active rules.
+    if ql in ("rules", "list rules", "show rules"):
+        rows = playbook_rules.list_rules(active_only=True)
+        if not rows:
+            _say('No active rules. Add one, e.g. `rule add archive '
+                 'from:cloudflare-workers-and-pages body:"Deploy successful"`.')
+            return True
+        lines = ["\U0001f4cb Active rules:"]
+        for r in rows:
+            fired = f"fired {r['times_fired']}\u00d7" if r.get("times_fired") else "never fired"
+            lines.append(f"  #{r['id']} — {playbook_rules.describe_rule(r)}  ({fired})")
+        lines.append("\nDisable one with `rule off <id>`.")
+        _say("\n".join(lines))
+        return True
+
+    # 3) Deactivate a rule.
+    m = re.match(r"^rule\s+(?:off|disable|remove|delete)\s+#?(\d+)\s*$", ql)
+    if m:
+        rid = int(m.group(1))
+        _say(f"\u2705 Rule #{rid} deactivated." if playbook_rules.deactivate_rule(rid)
+             else f"No rule #{rid} found.")
+        return True
+
+    # 4) Add a rule → propose-then-confirm.
+    m = re.match(r"^rule\s+add\s+(.+)$", q, re.IGNORECASE | re.DOTALL)
+    if m:
+        try:
+            spec = playbook_rules.parse_rule_spec(m.group(1))
+        except playbook_rules.RuleSpecError as exc:
+            _say(f"\u26a0\ufe0f {exc}\n\nFormat: `rule add <archive|spam|file as LABEL> "
+                 '[from:…] [subject:"…"] [body:"…"]`')
+            return True
+        anchor = spec.get("match_sender") or spec.get("match_subject") or spec.get("match_body")
+        name = f"{spec['action']}:{anchor}"[:80]
+        _pending_confirms[channel_id] = {
+            "type": "playbook_rule", "spec": spec, "name": name, "timestamp": time.time(),
+        }
+        _say(
+            f"\U0001f4cb Proposed rule — **{playbook_rules.describe_rule(spec)}**\n"
+            f"This becomes standing automation on all new inbox mail. "
+            f"Reply `yes` to activate, `no` to cancel."
+        )
+        return True
+
+    return False
 
 
 def _handle_disposition_command(post: dict, question: str) -> bool:
@@ -3174,6 +3285,13 @@ def _handle_mention(post: dict, thread: list[dict]):
 
     # Try quiet hours session commands (goodnight, morning, override, extend)
     if _handle_quiet_command(post, question):
+        return
+
+    # Feature #1: chat-authored playbook rules (`rules`, `rule add …`, `rule off`)
+    # plus their activation confirm. Runs before the inbox handlers so the rule
+    # commands aren't shadowed and a rule-activation `yes` is consumed here, not
+    # by the LLM (which would otherwise fabricate "rule added").
+    if _handle_rule_command(post, question):
         return
 
     # E2: index-backed numbered inbox listing. Runs BEFORE _handle_inbox_command
