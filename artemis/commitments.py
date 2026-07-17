@@ -35,16 +35,62 @@ _CT_TODAY_SQL = "(now() AT TIME ZONE 'America/Chicago')::date"
 
 def add_commitment(
     title: str,
-    due_date: str,
+    due_date: str | None,
     effort_days: int = 1,
     client: str = "",
+    status: str = "active",
+    dossier_id: int | None = None,
+    meeting_id: int | None = None,
 ) -> int:
+    """Insert a commitment. Returns the new id.
+
+    PB-010 extensions (all backward-compatible defaults):
+      * status — 'draft' for dossier-extracted to-dos awaiting a bless; 'active'
+        (default) for explicit/immediate ones. Drafts are invisible to the
+        reminder radar (get_due_soon/get_start_alerts filter status='active').
+      * dossier_id / meeting_id — soft provenance so a to-do attributes to the
+        person and the meeting it came from. Nullable; free-standing commitments
+        pass neither.
+      * due_date may be None (undated to-do) — migration 024 dropped the NOT NULL.
+    """
     row = execute_write(
-        "INSERT INTO acos.commitments (title, due_date, effort_days, client) "
-        "VALUES (%s, %s, %s, %s) RETURNING id",
-        (title, due_date, effort_days, client),
+        "INSERT INTO acos.commitments "
+        "(title, due_date, effort_days, client, status, dossier_id, meeting_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (title, due_date or None, effort_days, client, status, dossier_id, meeting_id),
     )
     return row["id"] if row else 0
+
+
+def get_commitment(commitment_id: int) -> dict | None:
+    """Fetch a single commitment row by id (re-read for confirm-from-row)."""
+    return execute_one(
+        "SELECT * FROM acos.commitments WHERE id = %s", (commitment_id,)
+    )
+
+
+def activate_commitment(commitment_id: int) -> dict | None:
+    """Flip a draft commitment to active (the bless transition). Returns the
+    re-read row so the caller confirms from written state, never an LLM claim."""
+    execute_write(
+        "UPDATE acos.commitments SET status = 'active' WHERE id = %s AND status = 'draft'",
+        (commitment_id,),
+    )
+    return get_commitment(commitment_id)
+
+
+def update_commitment_title(commitment_id: int, title: str) -> None:
+    """Replace a commitment's title (the `edit N: <text>` review action)."""
+    execute_write(
+        "UPDATE acos.commitments SET title = %s WHERE id = %s",
+        (title, commitment_id),
+    )
+
+
+def delete_commitment(commitment_id: int) -> None:
+    """Hard-delete a commitment (the `drop N` review action — only ever used on a
+    draft that Ryan rejected before it entered the record)."""
+    execute_write("DELETE FROM acos.commitments WHERE id = %s", (commitment_id,))
 
 
 def list_commitments(status: str = "active") -> list[dict]:

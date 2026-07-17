@@ -413,3 +413,56 @@ Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
   detection + handlers + nag logic, all DB and Claude calls mocked
 - API: 12 tests in `tests/api/test_health.py` (auth envelopes, CORS,
   no_plan envelope, JSONB serialization)
+
+---
+
+## PB-010: Meeting Intelligence / Colleague Dossiers
+
+**Module:** `artemis/dossier.py` · **Migration:** `024_dossier.sql`
+**Intent:** deterministic short-circuit in `intent.detect_dossier_intent`,
+wired ahead of the LLM classifier in `main._handle_dossier_command`.
+
+**Concept.** One dossier per person, five sections: (1) Position & terrain,
+(2) What they need from me — both Ryan-authored; (3) Interaction log
+(append-only, draft→bless); (4) Open loops (undated `dossier_loop` watch-items +
+dated `acos.commitments` carrying a `dossier_id`); (5) Idea bank with
+cross-pollination provenance.
+
+**The wall.** Artemis extracts/connects/drafts (statistics); nothing enters the
+record until Ryan blesses (semantics). Every autonomous write lands in a
+draft/proposed state. Confirmations always render from the re-read written row
+(no-fabrication gate). Org-agnostic schema (FCA is the first tenant).
+
+**Commands.**
+- `met with <names> [about <topic>] [on YYYY-MM-DD]` + notes (or a text
+  attachment) → immutable `dossier_meeting` capture, attendee linking (unknowns
+  become inactive stubs), then autonomous draft extraction.
+- `dossier review` → numbered pending drafts grouped by person;
+  `bless all` · `bless 1-4` · `bless 1 & 3` · `edit 2: <text>` · `drop 4`.
+- `brief <x> [about <y>]` / `prepare a meeting package` / `i'm meeting with <x>`
+  → read-only pre-brief (open loops, needs, strongest idea, recent context;
+  ⚠️ flags an empty idea bank). Multi-person packages dedupe shared loops/ideas.
+- `remind me to <task> <when>` → immediate commitment (explicit, no bless);
+  attaches a `dossier_id` if a known name appears; an "I emailed X …" phrasing
+  also drafts a one-line log touch (inferred).
+- `what's on the to dos today | this week` → CT-anchored to-dos (overdue → today
+  → rest of week), dossier-linked items attributed; draft to-dos listed separately.
+- `dossier show <name> [--drafts]` · `dossier new <name>` ·
+  `dossier set <name> position:|needs: <text>` (propose-then-confirm).
+
+**Seed:** `scripts/seed_dossiers.py` (idempotent) parses
+`scripts/seed_data/*.md` — see the README there for the format.
+
+**Coverage note.** Canonical to-do home is `acos.commitments` (migration 020),
+extended by 024 with nullable `due_date` + `dossier_id`/`meeting_id`. Dossier
+action items are `status='draft'` commitments, invisible to the reminder radar
+until blessed.
+
+**Deferred (PB-010b / later):** staleness nudges, calendar-triggered auto-briefs,
+Obsidian `generated/dossiers/*` projection, approval-queue web UI, pgvector
+search over raw notes.
+
+**Testing:** `python3.11 -m artemis.test_dossier` — mocked tier (parsing,
+resolution, deterministic routing, commitment origin, CT windows, malformed-LLM
+safety) always runs; LIVE Postgres tier (migrations + real state machine) runs
+when a local PG is reachable.
