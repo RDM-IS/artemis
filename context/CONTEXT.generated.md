@@ -1,16 +1,15 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-07-17T20:16:36Z_
+_Generated: 2026-07-17T21:48:48Z_
 
 ## Git
 - Branch: main
-- Head: 3327646 feat(dossier): PB-010 meeting intelligence / colleague dossiers (#70)
+- Head: 9ffb770 fix(mattermost): websocket ping keepalive to detect half-open connections (#71)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
 - Public IP: 3.227.229.186
 - Host: ip-172-31-2-193.ec2.internal
 - Python: Python 3.9.25
-- acos.service: active | ExecStart: ExecStart=/usr/bin/python3.11 -m artemis.main
 
 ## Playbooks (PLAYBOOKS.md)
 - PB-001: Demo Access Notification (v2)
@@ -69,6 +68,7 @@ _Generated: 2026-07-17T20:16:36Z_
 - test_billing.py
 - test_dossier.py
 - test_guardrails.py
+- test_mattermost.py
 - utils.py
 - version.py
 - voice.py
