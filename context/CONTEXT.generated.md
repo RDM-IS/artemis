@@ -1,15 +1,16 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-06-29T01:45:52Z_
+_Generated: 2026-07-17T20:16:36Z_
 
 ## Git
 - Branch: main
-- Head: 9e4580b fix(gmail): default list_inbox_message_ids query to in:inbox
+- Head: 3327646 feat(dossier): PB-010 meeting intelligence / colleague dossiers (#70)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
 - Public IP: 3.227.229.186
 - Host: ip-172-31-2-193.ec2.internal
 - Python: Python 3.9.25
+- acos.service: active | ExecStart: ExecStart=/usr/bin/python3.11 -m artemis.main
 
 ## Playbooks (PLAYBOOKS.md)
 - PB-001: Demo Access Notification (v2)
@@ -21,13 +22,14 @@ _Generated: 2026-06-29T01:45:52Z_
 - PB-007: Billing Intake
 - PB-008: CRM Write Guard
 - PB-009: Personal Training
+- PB-010: Meeting Intelligence / Colleague Dossiers
 
 ## Migrations (latest 5)
-- 017_grocery_to_acos.sql
-- 018_inbox_threads.sql
-- 019_quiet_hours_state.sql
 - 020_commitments.sql
 - 021_email_index.sql
+- 022_audit_log_email_corpus.sql
+- 023_playbook_rules.sql
+- 024_dossier.sql
 
 ## artemis/ modules
 - __init__.py
@@ -43,6 +45,7 @@ _Generated: 2026-06-29T01:45:52Z_
 - crm_write_guard.py
 - crm_writer.py
 - demo_intake.py
+- dossier.py
 - email_index.py
 - gmail.py
 - google_drive.py
@@ -58,11 +61,13 @@ _Generated: 2026-06-29T01:45:52Z_
 - mattermost.py
 - monitors.py
 - parser.py
+- playbook_rules.py
 - prompts.py
 - quiet_hours.py
 - scheduler.py
 - scheduling.py
 - test_billing.py
+- test_dossier.py
 - test_guardrails.py
 - utils.py
 - version.py
@@ -78,6 +83,12 @@ _Generated: 2026-06-29T01:45:52Z_
 - circuit_breaker_status
 - commitments
 - data_vault_satellites
+- dossier
+- dossier_entry
+- dossier_idea
+- dossier_loop
+- dossier_meeting
+- dossier_meeting_attendee
 - email_index
 - entities
 - expenses
@@ -90,6 +101,7 @@ _Generated: 2026-06-29T01:45:52Z_
 - osint_signals
 - pending_crm_writes
 - pipeline_events
+- playbook_rules
 - processed_billing
 - quiet_state
 - relationships
@@ -130,6 +142,6 @@ _Generated: 2026-06-29T01:45:52Z_
 - v_founder_loan_balance
 
 ### health.plan — next 3 days
-- 2026-06-29: strength_a
-- 2026-06-30: rest_mobility
-- 2026-07-01: cardio_intervals
+- 2026-07-17: rest_mobility
+- 2026-07-18: cardio_z2
+- 2026-07-19: cardio_z2
