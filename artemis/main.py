@@ -133,6 +133,13 @@ _pending_availability: dict[str, dict] = {}
 _inbox_listing_state: dict[str, dict] = {}
 _INBOX_PAGE_SIZE = 20
 
+# PB-010 dossier review state: per-channel {display_number → pending-item dict}
+# from dossier.render_review(). `bless`/`edit`/`drop` resolve numbers against this
+# (the same number→row indirection E2/E3 use for the inbox). In-memory; a fresh
+# `dossier review` rebuilds it. bless/edit/drop only fire when this is populated
+# for the channel — otherwise a bare `drop 4` falls through to the LLM.
+_dossier_review_state: dict[str, dict] = {}
+
 # Phrases that open a fresh numbered inbox listing (E2). `more` pages an existing
 # listing. These are repointed away from the old inbox_threads summary in
 # _handle_inbox_command to the index-backed _handle_inbox_listing.
@@ -965,6 +972,192 @@ def _handle_rule_command(post: dict, question: str) -> bool:
             f"Reply `yes` to activate, `no` to cancel."
         )
         return True
+
+    return False
+
+
+def _collect_post_attachments(post: dict) -> list[dict]:
+    """Fetch text attachments referenced by a Mattermost post → list of
+    {filename, ext, content(bytes)} for dossier capture. The text-only policy
+    (reject binaries) is applied downstream in dossier._extract_attachment_text."""
+    file_ids = post.get("file_ids") or []
+    if not file_ids:
+        meta = post.get("metadata") or {}
+        file_ids = [f.get("id") for f in (meta.get("files") or []) if f.get("id")]
+    out = []
+    for fid in file_ids:
+        if not _mm:
+            break
+        try:
+            info = _mm.get_file_metadata(fid)
+            content = _mm.get_file_content(fid)
+            out.append({"filename": info.get("name"), "ext": info.get("extension"),
+                        "content": content})
+        except Exception:
+            logger.exception("failed to fetch dossier attachment %s", fid)
+    return out
+
+
+def _parse_brief_args(q: str) -> tuple[str, str | None]:
+    """Extract (person, topic) from the brief phrasings: `brief jeremy about x`,
+    `prepare a meeting package for jeremy`, `i'm meeting with jeremy about x[,
+    prepare a meeting package]`."""
+    s = q.strip()
+    # Strip a LEADING trigger first (so `prepare a meeting package for jeremy`
+    # keeps `jeremy`), then a TRAILING `…, prepare a meeting package` clause (the
+    # `i'm meeting with jeremy about x, prepare a meeting package` form).
+    s = re.sub(r"^(?:brief|i'?m\s+meeting\s+with|meeting\s+with)\s+", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"^prepare\s+(?:a\s+)?meeting\s+package(?:\s+for)?\s+", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"[,;]?\s*prepare\s+(?:a\s+)?meeting\s+package\b.*$", "", s, flags=re.IGNORECASE).strip()
+    topic = None
+    tm = re.search(r"\s+about\s+(.+)$", s, re.IGNORECASE)
+    if tm:
+        topic = tm.group(1).strip().rstrip(".")
+        s = s[:tm.start()].strip()
+    return s.strip(" ,."), topic
+
+
+def _handle_dossier_subcommand(post: dict, q: str, say, channel_id: str) -> bool:
+    """`dossier review | show | new | set` dispatch. Returns True (always handles a
+    `dossier …` message — falls to a help line for anything unrecognized)."""
+    from artemis import dossier
+    ql = q.lower()
+
+    if re.match(r"^dossier\s+review\b", ql):
+        reply, mapping = dossier.render_review()
+        if mapping:
+            _dossier_review_state[channel_id] = mapping
+        else:
+            _dossier_review_state.pop(channel_id, None)
+        say(reply)
+        return True
+
+    m = re.match(r"^dossier\s+show\s+(.+)$", q, re.IGNORECASE)
+    if m:
+        arg = m.group(1).strip()
+        include_drafts = bool(re.search(r"--drafts\b", arg, re.IGNORECASE))
+        arg = re.sub(r"--drafts\b", "", arg, flags=re.IGNORECASE).strip()
+        say(dossier.show(arg, include_drafts=include_drafts))
+        return True
+
+    m = re.match(r"^dossier\s+new\s+(.+)$", q, re.IGNORECASE)
+    if m:
+        say(dossier.dossier_new(m.group(1).strip()))
+        return True
+
+    if re.match(r"^dossier\s+set\b", ql):
+        parsed = dossier.parse_set_command(q)
+        if parsed.get("error"):
+            say(parsed["error"])
+            return True
+        # Propose-then-confirm — these are Ryan-authored sections; echo, wait for yes.
+        preview = parsed["value"]
+        if len(preview) > 300:
+            preview = preview[:297] + "…"
+        _pending_confirms[channel_id] = {
+            "type": "dossier_set", "dossier_id": parsed["dossier_id"],
+            "column": parsed["column"], "field": parsed["field"],
+            "full_name": parsed["full_name"], "value": parsed["value"],
+            "timestamp": time.time(),
+        }
+        say(f"\U0001f4cb Set **{parsed['field']}** for {parsed['full_name']}?\n"
+            f"> {preview}\n\nReply `yes` to save, `no` to cancel.")
+        return True
+
+    say("Dossier commands: `dossier review` · `dossier show <name> [--drafts]` · "
+        "`dossier new <name>` · `dossier set <name> position:|needs: <text>`")
+    return True
+
+
+def _handle_dossier_command(post: dict, question: str) -> bool:
+    """PB-010 deterministic dossier router — evaluated BEFORE the LLM classifier
+    (it runs ahead of _handle_intent_routed in the mention chain) and unoverridable
+    on a positive match. Confirmations render from written rows (no-fabrication
+    gate). Returns True if handled, else False (falls through).
+    """
+    from artemis import dossier
+    from artemis.intent import detect_dossier_intent
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    def say(text: str) -> None:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, text, root_id=root_id)
+
+    q = question.strip()
+    ql = q.lower()
+
+    # Pending `dossier set` confirm (propose-then-confirm). Checked regardless of
+    # tag because the `yes`/`no` reply carries no dossier trigger word. Other
+    # confirm handlers already ran and ignore a non-matching pending type.
+    pending = _pending_confirms.get(channel_id)
+    if pending and pending.get("type") == "dossier_set":
+        if ql in _CONFIRM_WORDS:
+            del _pending_confirms[channel_id]
+            row = dossier.apply_set(pending["dossier_id"], pending["column"], pending["value"])
+            if row:
+                val = row.get(pending["column"]) or ""
+                say(f"✅ Saved **{pending['field']}** for {row['full_name']}:\n> {val}")
+            else:
+                say("⚠️ Couldn't write that section — check logs.")
+            return True
+        if ql in _CANCEL_WORDS:
+            del _pending_confirms[channel_id]
+            say("Cancelled — nothing changed.")
+            return True
+        # else: fall through and re-parse as a fresh command
+
+    tag = detect_dossier_intent(question)
+    if not tag:
+        return False
+
+    # ── review-context commands: only when a review is pending for this channel ──
+    if tag in ("bless", "drop", "edit"):
+        mapping = _dossier_review_state.get(channel_id)
+        if not mapping:
+            return False  # no pending review → let it fall through to the LLM
+        if tag == "bless":
+            rest = q[len("bless"):].strip()
+            if rest.lower() in ("all", "everything"):
+                say(dossier.bless_all(mapping))
+            else:
+                nums = _parse_numbers(rest)
+                say(dossier.bless_items(nums, mapping) if nums
+                    else "Usage: `bless all` · `bless 1-4` · `bless 1 & 3`")
+        elif tag == "drop":
+            nums = _parse_numbers(q[len("drop"):])
+            say("\n".join(dossier.drop_item(n, mapping) for n in nums) if nums
+                else "Usage: `drop <n>`")
+        else:  # edit
+            m = re.match(r"^edit\s+(\d+)\s*:\s*(.+)$", q, re.IGNORECASE | re.DOTALL)
+            say(dossier.edit_item(int(m.group(1)), m.group(2).strip(), mapping) if m
+                else "Usage: `edit <n>: <new text>`")
+        if not mapping:  # review emptied out
+            _dossier_review_state.pop(channel_id, None)
+        return True
+
+    if tag == "capture":
+        say(dossier.capture_meeting(question, _collect_post_attachments(post)))
+        return True
+
+    if tag == "brief":
+        person, topic = _parse_brief_args(q)
+        say(dossier.brief(person, topic) if person
+            else "Who are you meeting? `brief <name> [about <topic>]`")
+        return True
+
+    if tag == "remind":
+        say(dossier.direct_commitment(question) or "Try `remind me to <task> <when>`.")
+        return True
+
+    if tag == "todos":
+        window = "today" if re.search(r"\btoday\b", ql) else "week"
+        say(dossier.todos(window))
+        return True
+
+    if tag == "dossier":
+        return _handle_dossier_subcommand(post, q, say, channel_id)
 
     return False
 
@@ -3292,6 +3485,13 @@ def _handle_mention(post: dict, thread: list[dict]):
     # commands aren't shadowed and a rule-activation `yes` is consumed here, not
     # by the LLM (which would otherwise fabricate "rule added").
     if _handle_rule_command(post, question):
+        return
+
+    # PB-010: dossier / meeting intelligence. Deterministic short-circuit ahead of
+    # the LLM classifier (met with / brief / remind me / dossier … / bless / to-dos).
+    # A positive match is unoverridable — the message never reaches route_intent.
+    # bless/drop/edit only fire when a review is pending for the channel.
+    if _handle_dossier_command(post, question):
         return
 
     # E2: index-backed numbered inbox listing. Runs BEFORE _handle_inbox_command

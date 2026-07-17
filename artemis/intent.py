@@ -101,6 +101,56 @@ _ROUTER_SYSTEM = (
 )
 
 
+# ---------------------------------------------------------------------------
+# PB-010 dossier: deterministic short-circuit, evaluated BEFORE the LLM
+# classifier and unoverridable on a positive match (same principle as the
+# HEALTH-1 fix — a positive deterministic detection must not be re-routed by the
+# probabilistic router). This is pure regex, no LLM. main.py wires the returned
+# tag to the dossier handlers ahead of route_intent(), so the classifier never
+# even runs on a dossier phrase.
+# ---------------------------------------------------------------------------
+
+# Ordered (first match wins). Each entry: (route_tag, compiled_pattern).
+_DOSSIER_PATTERNS = [
+    # review-context commands (main.py gates these on a pending review so a bare
+    # "drop 4" outside a review still falls through to the LLM).
+    ("bless", re.compile(r"^bless\b", re.IGNORECASE)),
+    ("drop", re.compile(r"^drop\s+\d", re.IGNORECASE)),
+    ("edit", re.compile(r"^edit\s+\d+\s*:", re.IGNORECASE)),
+    # dossier subcommands: dossier review/show/new/set/…
+    ("dossier", re.compile(r"^dossier\b", re.IGNORECASE)),
+    # capture a meeting
+    ("capture", re.compile(r"^met\s+with\b", re.IGNORECASE)),
+    # pre-brief / meeting package
+    ("brief", re.compile(
+        r"(?:\bprepare\s+(?:a\s+)?meeting\s+package\b|^brief\b|^i'?m\s+meeting\s+with\b)",
+        re.IGNORECASE)),
+    # direct commitment. `^remind me` plus the mid-sentence `remind me to …` form
+    # (§3.5: "I emailed X about Y, remind me to follow up <when>").
+    ("remind", re.compile(r"^remind\s+me\b|\bremind\s+me\s+to\b", re.IGNORECASE)),
+    # to-do queries (read-only). The bare form requires a contiguous todo(s) token
+    # so ordinary prose ("to do the thing") doesn't misfire.
+    ("todos", re.compile(
+        r"what'?s\s+on\s+(?:the\s+)?to[\s-]?dos?\b|^to-?dos\b", re.IGNORECASE)),
+]
+
+
+def detect_dossier_intent(text: str) -> str | None:
+    """Return a PB-010 route tag for `text`, or None if no dossier trigger fires.
+
+    Deterministic and side-effect-free. A positive result is authoritative — the
+    caller must NOT hand the message to route_intent() (the LLM classifier) after
+    a hit, which is what makes the routing unoverridable.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    for tag, pattern in _DOSSIER_PATTERNS:
+        if pattern.search(t):
+            return tag
+    return None
+
+
 @dataclass
 class IntentResult:
     primary_action: str = "general_reply"

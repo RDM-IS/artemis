@@ -79,6 +79,18 @@ class MattermostClient:
         resp = self._api("POST", "/posts", json=payload)
         return resp.json()
 
+    def get_file_metadata(self, file_id: str) -> dict:
+        """Metadata for an uploaded file (name, extension, size, mime_type)."""
+        resp = self._api("GET", f"/files/{file_id}/info")
+        return resp.json()
+
+    def get_file_content(self, file_id: str) -> bytes:
+        """Fetch the raw bytes of an uploaded file by id. Callers decode/guard the
+        content-type themselves (PB-010 dossier capture accepts text formats only,
+        rejects binaries)."""
+        resp = self._api("GET", f"/files/{file_id}")
+        return resp.content
+
     def get_thread_posts(self, post_id: str, limit: int = 10) -> list[dict]:
         resp = self._api("GET", f"/posts/{post_id}/thread")
         data = resp.json()
