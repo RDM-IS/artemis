@@ -492,10 +492,20 @@ Two migration-026 corrections vs the spec DDL (both surfaced): the
 draft rows (also `valid_to IS NULL`) coexist without collision; and a nullable
 `evidence` column stores the draft signal's provenance quote for the review item.
 
+### PB-010d — Org profiles (migration 027)
+
+Organizations get profiles parallel to person dossiers, split by authorship:
+- **Authored sections** (`org set <orgkey> overview:|active_work:|opportunities:|display_name: <text>`) — Ryan writes them, propose-then-confirm; prose is terminal (an embedded `key:` never splits). Artemis never edits these.
+- **Org notes** — append-only, drafted by extraction from an `org_notes` schema field (org-level facts only, evidence-gated; person facts are never org notes and the EXT-1 critique pass enforces category fit). Reviewed as `[org-note <org>]` items, approved with meeting provenance.
+
+`org <orgname>` render: display_name → overview → active work → opportunities → people tree → recent approved notes (cap 5, overflow → `org notes <org>`). Empty sections omitted; a bare auto-created profile shows the roster only. Extraction auto-creates a bare profile (statistics act) so an org note's FK holds — 3rd-party intel ("FDIC is hiring" from an FCA meeting) is valid. Briefs prepend the shared org's overview first-sentence when all attendees share a profiled org.
+
 **Deferred (PB-010b / later):** staleness nudges, calendar-triggered auto-briefs,
 Obsidian `generated/dossiers/*` projection, approval-queue web UI, pgvector
 search over raw notes. **PB-010c-deferred:** matrix/dotted-line orgs (edges
 table), relationship-type taxonomy (§1 prose carries it), org-chart web viz.
+**PB-010d-deferred:** org-to-org relationships, org-level open-loops, editing/
+retiring individual approved notes (append-only for now).
 
 **Testing:** `python3.11 -m artemis.test_dossier` — mocked tier (parsing,
 resolution, deterministic routing, commitment origin, CT windows, malformed-LLM
