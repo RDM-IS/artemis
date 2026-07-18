@@ -1050,22 +1050,18 @@ def _handle_dossier_subcommand(post: dict, q: str, say, channel_id: str) -> bool
         if parsed.get("error"):
             say(parsed["error"])
             return True
-        # Propose-then-confirm — these are Ryan-authored sections; echo, wait for yes.
-        preview = parsed["value"]
-        if len(preview) > 300:
-            preview = preview[:297] + "…"
+        # Propose-then-confirm — Ryan-authored §1/§2 prose AND org-assignment facts.
         _pending_confirms[channel_id] = {
             "type": "dossier_set", "dossier_id": parsed["dossier_id"],
-            "column": parsed["column"], "field": parsed["field"],
-            "full_name": parsed["full_name"], "value": parsed["value"],
+            "full_name": parsed["full_name"], "payload": parsed["payload"],
             "timestamp": time.time(),
         }
-        say(f"\U0001f4cb Set **{parsed['field']}** for {parsed['full_name']}?\n"
-            f"> {preview}\n\nReply `yes` to save, `no` to cancel.")
+        say(f"\U0001f4cb Set for {parsed['full_name']}?\n"
+            f"> {parsed['preview']}\n\nReply `yes` to save, `no` to cancel.")
         return True
 
     say("Dossier commands: `dossier review` · `dossier show <name> [--drafts]` · "
-        "`dossier new <name>` · `dossier set <name> position:|needs: <text>`")
+        "`dossier new <name>` · `dossier set <name> position:|needs:|title:|reports_to:|org: …`")
     return True
 
 
@@ -1095,12 +1091,8 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
     if pending and pending.get("type") == "dossier_set":
         if ql in _CONFIRM_WORDS:
             del _pending_confirms[channel_id]
-            row = dossier.apply_set(pending["dossier_id"], pending["column"], pending["value"])
-            if row:
-                val = row.get(pending["column"]) or ""
-                say(f"✅ Saved **{pending['field']}** for {row['full_name']}:\n> {val}")
-            else:
-                say("⚠️ Couldn't write that section — check logs.")
+            # apply_set renders the confirmation from the written rows.
+            say(dossier.apply_set(pending["dossier_id"], pending["payload"]))
             return True
         if ql in _CANCEL_WORDS:
             del _pending_confirms[channel_id]
@@ -1164,10 +1156,29 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
         say(dossier.todos(window))
         return True
 
+    if tag == "org":
+        say(dossier.org_query(_org_query_arg(q)))
+        return True
+
     if tag == "dossier":
         return _handle_dossier_subcommand(post, q, say, channel_id)
 
     return False
+
+
+def _org_query_arg(q: str) -> str:
+    """Extract the subject of an org query from `org <arg>` or a natural form
+    (`where does X fit`, `who does X report to`, `who reports to X`)."""
+    m = re.match(r"^org\b\s*(.*)$", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().rstrip("?").strip()
+    for pat in (r"where\s+does\s+(.+?)\s+fit\b",
+                r"who\s+does\s+(.+?)\s+reports?\s+to\b",
+                r"who\s+reports?\s+to\s+(.+?)\s*$"):
+        m = re.search(pat, q, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().rstrip("?").strip()
+    return ""
 
 
 def _handle_disposition_command(post: dict, question: str) -> bool:

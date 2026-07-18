@@ -458,9 +458,44 @@ extended by 024 with nullable `due_date` + `dossier_id`/`meeting_id`. Dossier
 action items are `status='draft'` commitments, invisible to the reminder radar
 until approved.
 
+### PB-010c — Org assignments & org chart (migration 026)
+
+People are org-independent; **employment** is the org-scoped fact
+(`acos.org_assignment`, effective-dated). The org tag moved off `acos.dossier`
+onto this table so reorgs/job-changes accrue history. Reporting edges are FACTS
+Ryan approves — the LLM never asserts structure; renders read only approved
+current rows (drafts invisible).
+
+- **Set (propose-then-confirm):** `dossier set jennifer title: …` ·
+  `… reports_to: <slug>` · `… org: fca-odae` · `… org_root[: false]`. Multiple in
+  one line: `dossier set sarah org: fdic, title: Senior Examiner` (a comma inside
+  a title value is kept — a comma only splits fields before a `key:`). Each change
+  is close-and-insert (close current row `valid_to=today`, insert new current
+  carrying forward unchanged fields); same-value → no-op. `reports_to` to an
+  unknown slug is refused with a `dossier new` offer.
+- **Queries (read-only, deterministic-routed):** `org <person>` (title/org, chain
+  up via recursive CTE with a depth-20 cycle guard, directs, peers) ·
+  `org <orgname>` (roster as a tree where edges exist, flat where not) ·
+  `org history <person>`. Natural forms route too: *where does X fit*, *who does
+  X report to*, *who reports to X*. Bare `org` → usage hint (never LLM). Person
+  slug wins over an org of the same name (the alternative is noted).
+- **Extraction:** an optional `org_signals` array drafts stated edges only
+  (`{dossier_slug, field, value, evidence}` — no quote → no signal; structure is
+  never inferred from a title). Signals enter the review queue as `[org]` items;
+  approve runs the same close-and-insert as `dossier set`.
+- **Surfaces:** `dossier show` / `brief` headers gain `<title> · <org>`;
+  multi-person briefs group attendees under their org; a reporting change within
+  60 days adds a "recent reorg" line.
+
+Two migration-026 corrections vs the spec DDL (both surfaced): the
+`one_current_assignment` unique index is scoped `… AND status='approved'` so
+draft rows (also `valid_to IS NULL`) coexist without collision; and a nullable
+`evidence` column stores the draft signal's provenance quote for the review item.
+
 **Deferred (PB-010b / later):** staleness nudges, calendar-triggered auto-briefs,
 Obsidian `generated/dossiers/*` projection, approval-queue web UI, pgvector
-search over raw notes.
+search over raw notes. **PB-010c-deferred:** matrix/dotted-line orgs (edges
+table), relationship-type taxonomy (§1 prose carries it), org-chart web viz.
 
 **Testing:** `python3.11 -m artemis.test_dossier` — mocked tier (parsing,
 resolution, deterministic routing, commitment origin, CT windows, malformed-LLM

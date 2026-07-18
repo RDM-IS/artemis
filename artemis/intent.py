@@ -128,6 +128,16 @@ _DOSSIER_PATTERNS = [
     # direct commitment. `^remind me` plus the mid-sentence `remind me to …` form
     # (§3.5: "I emailed X about Y, remind me to follow up <when>").
     ("remind", re.compile(r"^remind\s+me\b|\bremind\s+me\s+to\b", re.IGNORECASE)),
+    # PB-010c org chart (read-only). `^org <arg>` plus natural forms; bare `org`
+    # still matches (→ usage hint in the handler, never LLM fallthrough). `\borg\b`
+    # so "organize"/"organic" never trip it. Placed after the dossier prefixes,
+    # before todos.
+    ("org", re.compile(r"^org\b", re.IGNORECASE)),
+    ("org", re.compile(
+        r"\bwhere\s+does\s+\S.*\bfit\b"
+        r"|\bwho\s+does\s+\S.*\breports?\s+to\b"
+        r"|\bwho\s+reports?\s+to\s+\S",
+        re.IGNORECASE)),
     # to-do queries (read-only). Broadened (STAB-1 B4) so date questions never
     # fall to the LLM router: bare "todos", any "what's/what are … to-do(s)", and
     # any to-do(s) token paired with a timeframe (today/tomorrow/this week/next
