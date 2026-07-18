@@ -44,6 +44,11 @@ except Exception as _main_exc:  # pragma: no cover
     artemis_main = None
     _MAIN_OK = False
 
+# EXT-1: draft_extraction now calls _extract_two_pass -> (data, meta). Tests that
+# stub the LLM return this meta alongside the extraction.
+_META = {"model": "test-model", "input_tokens": 0, "output_tokens": 0,
+         "corrections": 0, "fallback": False}
+
 _MIG_001 = (_REPO_ROOT / "migrations" / "001_create_acos_schema.sql").read_text()
 _MIG_020 = (_REPO_ROOT / "migrations" / "020_commitments.sql").read_text()
 _MIG_024 = (_REPO_ROOT / "migrations" / "024_dossier.sql").read_text()
@@ -318,7 +323,8 @@ class TestMalformedExtraction(unittest.TestCase):
                           return_value=[{"dossier_id": 1, "slug": "j", "full_name": "Jennifer Xu"}]), \
              patch.object(dossier, "_build_extraction_context", return_value=""), \
              patch.object(dossier, "execute_write", writes), \
-             patch.object(dossier, "_llm_extract", return_value=None), \
+             patch.object(dossier, "_extract_two_pass", return_value=(None, _META)), \
+             patch.object(dossier, "log_audit", MagicMock()), \
              patch.object(commitments, "add_commitment", MagicMock()) as add, \
              patch.object(dossier, "_audit", MagicMock()):
             msg = dossier.draft_extraction(1)
@@ -692,7 +698,7 @@ class TestLiveSchema(LiveBase):
         # B2: a one-line note is NOT swallowed into topic — raw_notes = full message.
         self._mk("dennis", "Dennis Shields")
         msg = "met with dennis about parser test\nquick one-liner note"
-        with patch.object(dossier, "_llm_extract", return_value={"log_entry": None}):
+        with patch.object(dossier, "_extract_two_pass", return_value=({"log_entry": None}, _META)):
             dossier.capture_meeting(msg)
         m = _one("SELECT raw_notes, topic FROM acos.dossier_meeting ORDER BY meeting_id DESC LIMIT 1")
         self.assertEqual(m["raw_notes"], msg)          # entire message, verbatim
@@ -709,7 +715,7 @@ class TestLiveCapture(LiveBase):
                       "ideas": [{"text": "co-author a case study", "cross_pollinate_slug": None}],
                       "action_items": [{"text": "email the demo link", "due_date": None}]}
         full_message = f"met with jennifer about connector\n{notes}"
-        with patch.object(dossier, "_llm_extract", return_value=extraction):
+        with patch.object(dossier, "_extract_two_pass", return_value=(extraction, _META)):
             reply = dossier.capture_meeting(full_message)
         self.assertIn("Captured meeting #1", reply)
         m = _one("SELECT * FROM acos.dossier_meeting WHERE meeting_id=1")
@@ -724,7 +730,7 @@ class TestLiveCapture(LiveBase):
         self.assertEqual(_one("SELECT count(*) c FROM acos.commitments WHERE status='draft'")["c"], 1)
 
     def test_unknown_attendee_creates_inactive_stub(self):
-        with patch.object(dossier, "_llm_extract", return_value={"log_entry": None}):
+        with patch.object(dossier, "_extract_two_pass", return_value=({"log_entry": None}, _META)):
             reply = dossier.capture_meeting("met with zoe about intro\nquick sync")
         stub = _one("SELECT * FROM acos.dossier WHERE lower(full_name)='zoe'")
         self.assertIsNotNone(stub)
@@ -1183,6 +1189,130 @@ class TestLiveBackfill(unittest.TestCase):
             with admin.cursor() as c:
                 c.execute("DROP DATABASE IF EXISTS artemis_dossier_bf")
             admin.close()
+
+
+
+# ============================================================================
+# EXT-1 — extraction quality (two-pass, evidence, model)
+# ============================================================================
+
+_ATT = {"full_name": "Dennis Rowe", "slug": "dennis", "dossier_id": 3}
+_MTG = {"meeting_id": 1, "occurred_on": date(2026, 7, 17), "topic": "rollout"}
+
+
+class TestExtractionTwoPass(unittest.TestCase):
+    def test_pass2_drops_unsupported_and_counts_corrections(self):
+        def fake(system, user, max_tokens=1600):
+            if system is dossier._EXTRACT_SYSTEM:
+                return ({"log_entry": "Met.",
+                         "open_loops": [{"text": "real loop", "evidence": "x"},
+                                        {"text": "hallucinated", "evidence": ""}]},
+                        {"input_tokens": 10, "output_tokens": 20})
+            return ({"log_entry": "Met.", "open_loops": [{"text": "real loop", "evidence": "x"}]},
+                    {"input_tokens": 5, "output_tokens": 8})
+        with patch.object(dossier, "_llm_call", side_effect=fake):
+            final, meta = dossier._extract_two_pass("notes", _ATT, "ctx", _MTG)
+        self.assertEqual(len(final["open_loops"]), 1)          # UNSUPPORTED dropped
+        self.assertEqual(meta["corrections"], 1)
+        self.assertFalse(meta["fallback"])
+        self.assertEqual(meta["input_tokens"], 15)             # summed across passes
+        self.assertEqual(meta["output_tokens"], 28)
+
+    def test_pass2_failure_falls_back_with_warning(self):
+        def fake(system, user, max_tokens=1600):
+            if system is dossier._EXTRACT_SYSTEM:
+                return ({"log_entry": "Met."}, {"input_tokens": 10, "output_tokens": 20})
+            return (None, {"input_tokens": 5, "output_tokens": 0})   # pass 2 malformed
+        with patch.object(dossier, "_llm_call", side_effect=fake), \
+             self.assertLogs("artemis.dossier", level="WARNING") as cm:
+            final, meta = dossier._extract_two_pass("notes", _ATT, "ctx", _MTG)
+        self.assertEqual(final["log_entry"], "Met.")           # pass-1 candidate survives
+        self.assertTrue(meta["fallback"])
+        self.assertTrue(any("pass 2 failed" in line for line in cm.output))
+
+    def test_pass1_failure_returns_none(self):
+        with patch.object(dossier, "_llm_call",
+                          return_value=(None, {"input_tokens": 0, "output_tokens": 0})):
+            final, meta = dossier._extract_two_pass("notes", _ATT, "ctx", _MTG)
+        self.assertIsNone(final)
+
+    def test_dennis_counterexample_cannot_survive_pass2(self):
+        # Pass 1 emits the canonical bad claim; pass 2 corrects it to a held meeting.
+        def fake(system, user, max_tokens=1600):
+            if system is dossier._EXTRACT_SYSTEM:
+                return ({"log_entry": "No direct interaction with Dennis noted."},
+                        {"input_tokens": 8, "output_tokens": 8})
+            return ({"log_entry": "Discussed the rollout; Dennis's plan is a listening tour first.",
+                     "log_entry_evidence": "we're going to start with a listening tour"},
+                    {"input_tokens": 5, "output_tokens": 10})
+        with patch.object(dossier, "_llm_call", side_effect=fake):
+            final, meta = dossier._extract_two_pass(
+                "we're going to start with a listening tour", _ATT, "ctx", _MTG)
+        self.assertNotIn("no direct interaction", final["log_entry"].lower())
+        self.assertIn("listening tour", final["log_entry"].lower())
+        self.assertGreaterEqual(meta["corrections"], 1)
+
+
+class TestEvidenceRender(unittest.TestCase):
+    def _render_with_entry(self, entry_id):
+        rows = [{"entry_id": entry_id, "dossier_id": 1, "entry_text": "Discussed rollout.",
+                 "entry_date": date(2026, 7, 17), "full_name": "Dennis Rowe"}]
+
+        def fake_q(sql, params=None):
+            if "dossier_entry e" in sql and "status = 'draft'" in sql:
+                return rows
+            return []
+
+        with patch.object(dossier, "execute_query", side_effect=fake_q):
+            reply, _ = dossier.render_review()
+        return reply
+
+    def test_evidence_renders_arrow(self):
+        dossier._draft_evidence.clear()
+        dossier._draft_evidence[("entry", 7)] = "we're going to start with a listening tour"
+        try:
+            reply = self._render_with_entry(7)
+        finally:
+            dossier._draft_evidence.clear()
+        self.assertIn("↳", reply)
+        self.assertIn("listening tour", reply)
+
+    def test_absent_evidence_no_empty_arrow(self):
+        dossier._draft_evidence.clear()
+        reply = self._render_with_entry(8)      # no evidence stored for #8
+        self.assertNotIn("↳", reply)
+
+
+class TestExtractModel(unittest.TestCase):
+    def test_default_sane_and_override(self):
+        self.assertTrue(dossier._extract_model())               # non-empty default
+        with patch.object(dossier.config, "EXTRACT_MODEL", "claude-test-override"):
+            self.assertEqual(dossier._extract_model(), "claude-test-override")
+
+    def test_llm_call_uses_extract_model_and_reads_usage(self):
+        fake_resp = MagicMock()
+        fake_resp.content = [MagicMock(text='{"log_entry":"x"}')]
+        fake_resp.usage = MagicMock(input_tokens=3, output_tokens=4)
+        fake_client = MagicMock()
+        fake_client.messages.create.return_value = fake_resp
+        with patch("artemis.dossier.anthropic.Anthropic", return_value=fake_client), \
+             patch.object(dossier, "get_anthropic_key", return_value="k"), \
+             patch.object(dossier.config, "EXTRACT_MODEL", "claude-xyz"), \
+             patch.object(dossier, "log_claude_call", MagicMock()):
+            data, usage = dossier._llm_call("sys", "user")
+        self.assertEqual(data, {"log_entry": "x"})
+        self.assertEqual(usage, {"input_tokens": 3, "output_tokens": 4})
+        self.assertEqual(fake_client.messages.create.call_args.kwargs["model"], "claude-xyz")
+
+
+class TestPromptBudget(unittest.TestCase):
+    def test_fixed_overhead_under_budget(self):
+        total = len(dossier._EXTRACT_SYSTEM) + len(dossier._CRITIQUE_SYSTEM)
+        self.assertLess(total, 16000)                            # ~4k tokens of fixed overhead
+        # exemplars + the Dennis counter-example are present
+        self.assertIn("listening tour", dossier._EXTRACT_SYSTEM)
+        self.assertIn("No direct interaction with Dennis", dossier._EXTRACT_SYSTEM)
+        self.assertIn("seemed defensive", dossier._EXTRACT_SYSTEM)
 
 
 if __name__ == "__main__":

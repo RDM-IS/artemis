@@ -42,6 +42,12 @@ TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
 BRIEF_LEAD_TIME_MINUTES = int(os.environ.get("BRIEF_LEAD_TIME_MINUTES", "90"))
 MORNING_BRIEF_TIME = os.environ.get("MORNING_BRIEF_TIME", "07:30")
 
+# LLM models. Dossier extraction (EXT-1) uses a frontier model — a few calls/day,
+# quality-critical, latency-insensitive (drafts are reviewed async). Overridable
+# via env so the model string is never buried/hardcoded to rot; the default is the
+# strongest model already proven available in this account (briefs.py uses it).
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "claude-opus-4-6")
+
 # Monitoring
 MONITORED_DOMAINS = _list(os.environ.get("MONITORED_DOMAINS", ""))
 DOMAIN_EXPIRY_DATES = _domain_expiry_map(os.environ.get("DOMAIN_EXPIRY_DATES", ""))
