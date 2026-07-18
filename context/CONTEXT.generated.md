@@ -1,9 +1,9 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-07-18T02:40:31Z_
+_Generated: 2026-07-18T21:23:48Z_
 
 ## Git
 - Branch: main
-- Head: 58f29b9 feat(stab-1): stability + PB-010 hardening (#72)
+- Head: a30845f feat(dossier): PB-010d org profiles (authored sections + org notes) (#76)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
@@ -24,11 +24,11 @@ _Generated: 2026-07-18T02:40:31Z_
 - PB-010: Meeting Intelligence / Colleague Dossiers
 
 ## Migrations (latest 5)
-- 021_email_index.sql
-- 022_audit_log_email_corpus.sql
 - 023_playbook_rules.sql
 - 024_dossier.sql
 - 025_dossier_approve.sql
+- 026_org_assignment.sql
+- 027_org_profile.sql
 
 ## artemis/ modules
 - __init__.py
@@ -99,6 +99,9 @@ _Generated: 2026-07-18T02:40:31Z_
 - guardrail_violations
 - inbox_threads
 - mrr_snapshots
+- org_assignment
+- org_note
+- org_profile
 - osint_signals
 - pending_crm_writes
 - pipeline_events
