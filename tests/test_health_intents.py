@@ -894,19 +894,47 @@ class TestRoutingRejectionInvariant(unittest.TestCase):
         self.assertFalse(health.is_capture_paste(q))
         self.assertEqual(health.detect_health_intent(q), health.INTENT_PLAN_LOOKUP)
 
-    def test_dispatch_orders_plan_display_before_capture(self):
-        # Source-level ordering guard (no import/mocking): in _handle_mention the
-        # plan-display dispatch MUST precede the capture-propose dispatch, so even
-        # a predicate regression cannot misroute a plan question to capture.
-        main_src = (_REPO_ROOT / "artemis" / "main.py").read_text()
-        hc = main_src.index("if _handle_health_conversation(post, question):")
-        cp = main_src.index("if _handle_capture_propose(post, question):")
-        self.assertLess(
-            hc, cp,
-            "plan-display (_handle_health_conversation) must dispatch before "
-            "_handle_capture_propose in _handle_mention — reordering reintroduces "
-            "the metrics-misrouting bug",
-        )
+    def _chain_names(self):
+        """Parse the ORDERED handler names out of _handle_mention's
+        deterministic_chain (source-level, no import/mocking)."""
+        import re as _re
+        src = (_REPO_ROOT / "artemis" / "main.py").read_text()
+        start = src.index("deterministic_chain = [")
+        block = src[start:src.index("]", start)]
+        return _re.findall(r'\("(\w+)",', block)
+
+    def test_dispatch_chain_order_pinned(self):
+        # The dispatch sequence is asserted EXPLICITLY so any reorder breaks CI.
+        names = self._chain_names()
+        for n in ("dossier_command", "health_conversation", "capture_propose",
+                  "nutrition", "grocery_staples"):
+            self.assertIn(n, names, f"{n} missing from deterministic_chain")
+        # (1) fix/dispatch-order: an explicit dossier/org verb outranks topical
+        #     health/nutrition keyword matching.
+        self.assertLess(names.index("dossier_command"), names.index("health_conversation"),
+                        "dossier_command must dispatch BEFORE health_conversation")
+        self.assertLess(names.index("dossier_command"), names.index("nutrition"))
+        self.assertLess(names.index("dossier_command"), names.index("grocery_staples"))
+        # (2) preserved invariant: plan-display before capture-propose.
+        self.assertLess(names.index("health_conversation"), names.index("capture_propose"))
+        # (3) confirm flows still lead — a `yes`/`confirm` reaches its pending
+        #     handler before any content router.
+        for confirm in ("calendar_confirm", "delete_confirm", "debrief_confirm",
+                        "nutrition_confirm"):
+            self.assertLess(names.index(confirm), names.index("dossier_command"),
+                            f"{confirm} must precede dossier_command")
+
+    def test_capture_message_routes_to_dossier_not_health(self):
+        # The exact 2026-07-18 misroute: a `met with …` capture whose notes carry
+        # weekday/plan words. Health must NOT claim it; the dossier detector must.
+        from artemis.intent import detect_dossier_intent
+        msg = ("met with dennis about extraction test\n"
+               "the plan for friday is a listening tour before budget asks")
+        self.assertIsNone(health.detect_health_intent(msg),
+                          "health must not claim a `met with` capture (weekday/plan "
+                          "words in the notes are not a plan query)")
+        self.assertEqual(detect_dossier_intent(msg), "capture",
+                         "the dossier capture detector must own this message")
 
 
 if __name__ == "__main__":

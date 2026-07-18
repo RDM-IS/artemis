@@ -1054,20 +1054,29 @@ def detect_health_intent(message: str) -> str | None:
     if _OVERRIDE_RE.match(message):
         return INTENT_TRAINER_OVERRIDE
 
+    # The plan-QUERY family (plan_detail depth, plan_lookup breadth, meta, and the
+    # retrieval fallback) are single-utterance ASKS — evaluate them against the
+    # FIRST LINE only. This "require plan-intent phrasing" rule stops weekday/plan
+    # words buried in a multi-line message (e.g. meeting-capture notes:
+    # "met with dennis…\n…the plan for friday…") from masquerading as a plan
+    # query. Logging intents (debrief/morning) keep the full message — a debrief
+    # paste is legitimately multi-line.
+    head = message.split("\n", 1)[0]
+
     # Depth vs breadth: a multi-day request is always breadth (plan_lookup). A
     # single-day request — explicit detail OR a bare "today's workout" — is
     # depth (plan_detail). Depth is checked first so single-day wins.
-    if not _MULTIDAY_RE.search(message):
-        if _PLAN_DETAIL_RE.search(message) or _SINGLE_DAY_PLAN_RE.search(message):
+    if not _MULTIDAY_RE.search(head):
+        if _PLAN_DETAIL_RE.search(head) or _SINGLE_DAY_PLAN_RE.search(head):
             return INTENT_PLAN_DETAIL
 
     # Meta / database asks ("deep query the workout database") → read health.plan.
-    if _PLAN_META_RE.search(message):
+    if _PLAN_META_RE.search(head):
         return INTENT_PLAN_DETAIL
 
     # Plan-lookup (breadth read-intent): requires a plan noun plus a temporal/
     # show cue, so it can't collide with "done"/"RPE"/"slept".
-    if _PLAN_LOOKUP_RE.search(message):
+    if _PLAN_LOOKUP_RE.search(head):
         return INTENT_PLAN_LOOKUP
     # Debrief next because "done" + "RPE X" is more specific than
     # the morning trigger which catches "sleep"/"slept".
@@ -1082,7 +1091,7 @@ def detect_health_intent(message: str) -> str | None:
     # ("why is zone 2 important", "how's my training going", "is the rower better
     # than running") fall through to the now plan-aware general_reply path. The
     # scrub_db_denial output guard remains the anti-denial backstop.
-    if not _CONCEPTUAL_RE.search(message) and _PLAN_RETRIEVAL_RE.search(message):
+    if not _CONCEPTUAL_RE.search(head) and _PLAN_RETRIEVAL_RE.search(head):
         return INTENT_PLAN_DETAIL
     return None
 
