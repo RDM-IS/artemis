@@ -211,14 +211,14 @@ def dossier_new(raw_name: str) -> str:
 
 
 _SET_USAGE = (
-    "Usage: `dossier set <person> <field>: <value>` — fields: `position` · `needs` · "
-    "`title` · `reports_to` · `org` · `org_root`. Multiple ok: "
+    "Usage: `dossier set <person> <field>: <value>` — fields: `name` · `position` · "
+    "`needs` · `title` · `reports_to` · `org` · `org_root`. Multiple ok: "
     "`dossier set sarah org: fdic, title: Senior Examiner`."
 )
 # Colon-delimited field keys. Order matters (longest-first: needs_from_me before
 # needs, org_root before org) so the alternation binds the right key.
 _SET_KEY_RE = re.compile(
-    r"\b(position|terrain|needs_from_me|needs|title|reports_to|org_root|org)\s*:",
+    r"\b(position|terrain|needs_from_me|needs|name|title|reports_to|org_root|org)\s*:",
     re.IGNORECASE,
 )
 _SET_BARE_ROOT_RE = re.compile(r"\borg_root\b(?!\s*:)", re.IGNORECASE)
@@ -288,9 +288,15 @@ def parse_set_command(text: str) -> dict:
 
     sections: dict[str, str] = {}
     assignment: dict[str, object] = {}
+    name_change: str | None = None
     preview: list[str] = []
     for key, val in fields:
-        if key in ("position", "terrain", "needs", "needs_from_me"):
+        if key == "name":
+            if not val:
+                return {"error": "`name:` needs a value, e.g. `dossier set jen name: Jennifer Magouda`."}
+            name_change = val
+            preview.append(f"name → {val}")
+        elif key in ("position", "terrain", "needs", "needs_from_me"):
             if not val:
                 return {"error": "Nothing after the colon — give me the text to set."}
             col = "position_terrain" if key in ("position", "terrain") else "needs_from_me"
@@ -326,7 +332,7 @@ def parse_set_command(text: str) -> dict:
 
     return {"ok": True, "dossier_id": d["dossier_id"], "slug": d["slug"],
             "full_name": d["full_name"], "preview": "; ".join(preview),
-            "payload": {"sections": sections, "assignment": assignment}}
+            "payload": {"sections": sections, "assignment": assignment, "name": name_change}}
 
 
 def apply_set(dossier_id: int, payload: dict) -> str:
@@ -334,6 +340,15 @@ def apply_set(dossier_id: int, payload: dict) -> str:
     FROM the written rows. Handles §1/§2 sections and org-assignment fields."""
     person = get_dossier(dossier_id)
     lines: list[str] = []
+    name_change = payload.get("name")
+    if name_change:
+        execute_write(
+            "UPDATE acos.dossier SET full_name = %s, updated_at = now() WHERE dossier_id = %s",
+            (name_change, dossier_id),
+        )
+        _audit("dossier_set_name", dossier_id, {"full_name": name_change})
+        row = get_dossier(dossier_id)
+        lines.append(f"✅ Renamed to **{row['full_name']}** (slug `{row['slug']}` unchanged).")
     sections = payload.get("sections") or {}
     for col, val in sections.items():
         if col not in ("position_terrain", "needs_from_me"):
@@ -1360,7 +1375,9 @@ def _recent_reorg_note(dossier_id: int) -> str | None:
         "ORDER BY valid_to DESC LIMIT 1",
         (dossier_id, cur["org"]),
     )
-    if prior and prior["reports_to"] != cur["reports_to"]:
+    # Papercut: a reorg is a CHANGE of an existing edge. Recording the FIRST edge
+    # (prior had no reports_to) is not a reorg — require a real prior manager.
+    if prior and prior["reports_to"] is not None and prior["reports_to"] != cur["reports_to"]:
         return f"reporting line changed {fmt_date(cur['valid_from'])} — recent reorg."
     return None
 

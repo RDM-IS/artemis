@@ -1315,5 +1315,46 @@ class TestPromptBudget(unittest.TestCase):
         self.assertIn("seemed defensive", dossier._EXTRACT_SYSTEM)
 
 
+# ============================================================================
+# Dossier papercuts — name-change + first-edge-is-not-a-reorg
+# ============================================================================
+
+class TestSetName(unittest.TestCase):
+    def test_parse_name(self):
+        with patch.object(dossier, "_find_dossiers", side_effect=_fake_find(_ORG_PEOPLE)):
+            p = dossier.parse_set_command("dossier set jennifer name: Jennifer Magouda")
+        self.assertEqual(p["payload"]["name"], "Jennifer Magouda")
+
+
+class TestSetNameLive(LiveOrgBase):
+    def test_apply_name_change_keeps_slug(self):
+        d = self._mk("jennifer", "Jennifer Xu")
+        parsed = {"sections": {}, "assignment": {}, "name": "Jennifer Magouda"}
+        msg = dossier.apply_set(d["dossier_id"], parsed)
+        row = _one("SELECT full_name, slug FROM acos.dossier WHERE dossier_id=%s", (d["dossier_id"],))
+        self.assertEqual(row["full_name"], "Jennifer Magouda")
+        self.assertEqual(row["slug"], "jennifer")          # identity slug unchanged
+        self.assertIn("Renamed", msg)
+
+
+class TestReorgNote(LiveOrgBase):
+    def test_first_edge_is_not_a_reorg(self):
+        jer = self._mk("jeremy", "Jeremy Vale")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        self._assign(jen["dossier_id"], org="fca-odae")               # backfill-style, no edge
+        self._assign(jen["dossier_id"], reports_to=jer["dossier_id"])  # FIRST edge
+        self.assertIsNone(dossier._recent_reorg_note(jen["dossier_id"]))
+
+    def test_changed_edge_is_a_reorg(self):
+        jer = self._mk("jeremy", "Jeremy Vale")
+        den = self._mk("dennis", "Dennis Rowe")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        self._assign(jen["dossier_id"], org="fca-odae", reports_to=jer["dossier_id"])
+        self._assign(jen["dossier_id"], reports_to=den["dossier_id"])  # manager CHANGED
+        note = dossier._recent_reorg_note(jen["dossier_id"])
+        self.assertIsNotNone(note)
+        self.assertIn("recent reorg", note)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
