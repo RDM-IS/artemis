@@ -3244,6 +3244,13 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
     """
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
+    # Never claim a message that a deterministic dossier/org verb owns (met with /
+    # dossier / brief / org / remind / review-context). Belt-and-suspenders behind
+    # the dispatch order: even if the chain is reordered, health won't swallow a
+    # capture whose notes happen to contain weekday/plan words.
+    from artemis.intent import detect_dossier_intent
+    if detect_dossier_intent(question):
+        return False
     try:
         from artemis.health import (
             INTENT_PLAN_DETAIL,
@@ -3471,13 +3478,18 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("delete_confirm", _handle_delete_confirm),
         ("debrief_confirm", _handle_debrief_confirm),
         ("nutrition_confirm", _handle_nutrition_confirm),
+        # PB-010 dossier/org: an explicit capture/authoring verb (met with /
+        # dossier / brief / org / remind / review-context) outranks topical keyword
+        # matching. Placed AHEAD of the nutrition/health matchers so meeting notes
+        # that happen to contain weekday/plan words can't be claimed by
+        # health_conversation (the HEALTH-1 principle — deterministic intent wins).
+        ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
         ("nutrition", _handle_nutrition),
         ("health_conversation", _handle_health_conversation),
         ("capture_propose", _handle_capture_propose),
         ("quiet_command", _handle_quiet_command),
         ("rule_command", _handle_rule_command),
-        ("dossier_command", _handle_dossier_command),
         ("inbox_listing", _handle_inbox_listing),
         ("disposition_command", _handle_disposition_command),
         ("inbox_command", _handle_inbox_command),
