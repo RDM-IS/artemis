@@ -47,6 +47,17 @@ def init_pool(min_conn: int = 2, max_conn: int = 10):
     logger.info("Knowledge DB pool initialized (%d-%d connections)", min_conn, max_conn)
 
 
+def close_pool() -> None:
+    """Close all pooled connections (STAB-1 A3 clean shutdown). Idempotent."""
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.closeall()
+        except Exception:
+            logger.debug("db pool closeall failed", exc_info=True)
+        _pool = None
+
+
 @contextmanager
 def get_connection():
     """Context manager that checks out a connection and returns it on exit."""

@@ -367,9 +367,9 @@ def _get_message_full(gmail_client, message_id: str) -> dict | None:
     if not gmail_client.service:
         return None
     try:
-        return gmail_client.service.users().messages().get(
+        return gmail_client._exec(gmail_client.service.users().messages().get(
             userId="me", id=message_id, format="full"
-        ).execute()
+        ))
     except Exception:
         logger.exception("Failed to fetch full message %s", message_id)
         return None
@@ -399,11 +399,11 @@ def get_demo_messages(gmail_client) -> list[str]:
     try:
         gmail_client.authenticate()
 
-        results = gmail_client.service.users().messages().list(
+        results = gmail_client._exec(gmail_client.service.users().messages().list(
             userId="me",
             q='from:demo@rdm.is subject:"Lucint demo accessed"',
             maxResults=20,
-        ).execute()
+        ))
 
         message_ids = []
         for msg_ref in results.get("messages", []):
@@ -443,11 +443,11 @@ def _dry_run():
     # Search for recent demo emails
     print("Searching for demo notification emails...")
     try:
-        results = gmail.service.users().messages().list(
+        results = gmail._exec(gmail.service.users().messages().list(
             userId="me",
             q='from:demo@rdm.is subject:"Lucint demo accessed"',
             maxResults=5,
-        ).execute()
+        ))
     except Exception as e:
         print(f"Search failed: {e}")
         sys.exit(1)

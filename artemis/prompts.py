@@ -101,6 +101,13 @@ Answer the question using the context provided. Be concise and direct.
 
 {SAFETY_INSTRUCTION}
 
+DATE & NUMBER FIDELITY (critical): When your answer restates anything containing a
+date or an amount that appears in the provided tool/DB output, quote it VERBATIM as
+given. Never recompute it, never convert a date to a weekday, never paraphrase or
+"correct" a date or number. If the data says "due Wednesday, Jul 22" or "$1,250",
+write exactly that. Dates and amounts in the context are already code-rendered
+facts — restating them differently is an error.
+
 You have access to:
 - Recent Gmail threads
 - Today's calendar

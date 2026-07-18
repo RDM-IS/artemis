@@ -8,9 +8,9 @@ from zoneinfo import ZoneInfo
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 from artemis import config
+from knowledge import google_clients
 from knowledge.secrets import get_gmail_credentials, get_calendar_token, put_secret
 
 logger = logging.getLogger(__name__)
@@ -22,9 +22,25 @@ SCOPES = [
 
 
 class CalendarClient:
+    # STAB-1 A1: thread-local service (see GmailClient) — no cross-thread transport.
+    _API, _VER = "calendar", "v3"
+
     def __init__(self):
-        self.service = None
+        self._creds = None
+        self._authed: bool = False
         self.scope_mismatch: bool = False
+
+    @property
+    def service(self):
+        """This thread's Calendar service, or None if unauthenticated. Built lazily
+        and cached per thread (STAB-1 A1)."""
+        if not self._authed or not self._creds:
+            return None
+        return google_clients.get_service(self._API, self._VER, self._creds)
+
+    def _exec(self, request):
+        """Execute a Calendar request, healing this thread's transport on error."""
+        return google_clients.execute(request, name=self._API, version=self._VER)
 
     def authenticate(self, mm_client=None):
         """Authenticate with Google Calendar API.
@@ -60,7 +76,7 @@ class CalendarClient:
                         except Exception:
                             logger.debug("Failed to post auth alert to Mattermost")
                     # Continue with degraded mode — no Calendar
-                    self.service = None
+                    self._authed = False
                     return
             else:
                 # Interactive flow — local dev only (won't work on Lambda/EC2)
@@ -90,7 +106,7 @@ class CalendarClient:
             self.scope_mismatch = True
 
         self._creds = creds
-        self.service = build("calendar", "v3", credentials=creds)
+        self._authed = True
         logger.info("Calendar authenticated")
 
     def _refresh_if_needed(self) -> bool:
@@ -120,7 +136,7 @@ class CalendarClient:
         end_of_day = start_of_day + timedelta(days=1)
 
         try:
-            result = (
+            result = self._exec(
                 self.service.events()
                 .list(
                     calendarId="primary",
@@ -129,7 +145,6 @@ class CalendarClient:
                     singleEvents=True,
                     orderBy="startTime",
                 )
-                .execute()
             )
         except Exception:
             logger.exception("Failed to fetch calendar events")
@@ -186,7 +201,7 @@ class CalendarClient:
             end_dt = end_date if end_date.tzinfo else end_date.replace(tzinfo=local_tz)
 
         try:
-            result = (
+            result = self._exec(
                 self.service.events()
                 .list(
                     calendarId="primary",
@@ -195,7 +210,6 @@ class CalendarClient:
                     singleEvents=True,
                     orderBy="startTime",
                 )
-                .execute()
             )
         except Exception:
             logger.exception("Failed to fetch events for range %s to %s", start_date, end_date)
@@ -270,7 +284,7 @@ class CalendarClient:
         time_max = target_datetime + timedelta(hours=window_hours)
 
         try:
-            result = (
+            result = self._exec(
                 self.service.events()
                 .list(
                     calendarId="primary",
@@ -279,7 +293,6 @@ class CalendarClient:
                     singleEvents=True,
                     orderBy="startTime",
                 )
-                .execute()
             )
         except Exception:
             logger.exception("Failed to fetch events for conflict check")
@@ -312,7 +325,7 @@ class CalendarClient:
             logger.error("Calendar not authenticated — cannot delete event")
             return False
         try:
-            self.service.events().delete(calendarId="primary", eventId=event_id).execute()
+            self._exec(self.service.events().delete(calendarId="primary", eventId=event_id))
             logger.info("Deleted calendar event %s", event_id)
             return True
         except Exception:
@@ -324,7 +337,7 @@ class CalendarClient:
         if not self.service:
             return None
         try:
-            event = self.service.events().get(calendarId="primary", eventId=event_id).execute()
+            event = self._exec(self.service.events().get(calendarId="primary", eventId=event_id))
             start = event.get("start", {})
             return {
                 "id": event["id"],
@@ -433,10 +446,9 @@ class CalendarClient:
             insert_kwargs["conferenceDataVersion"] = 1
 
         try:
-            event = (
+            event = self._exec(
                 self.service.events()
                 .insert(**insert_kwargs)
-                .execute()
             )
             event_id = event.get("id", "")
             logger.info("Created calendar event %s: %s", event_id, summary)
@@ -454,10 +466,9 @@ class CalendarClient:
         if not self.service or not event_id:
             return ""
         try:
-            event = (
+            event = self._exec(
                 self.service.events()
                 .get(calendarId="primary", eventId=event_id)
-                .execute()
             )
         except Exception:
             logger.exception("Failed to fetch event %s for Meet link", event_id)

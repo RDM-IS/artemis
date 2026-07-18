@@ -114,7 +114,7 @@ _ROUTER_SYSTEM = (
 _DOSSIER_PATTERNS = [
     # review-context commands (main.py gates these on a pending review so a bare
     # "drop 4" outside a review still falls through to the LLM).
-    ("bless", re.compile(r"^bless\b", re.IGNORECASE)),
+    ("approve", re.compile(r"^approve\b", re.IGNORECASE)),
     ("drop", re.compile(r"^drop\s+\d", re.IGNORECASE)),
     ("edit", re.compile(r"^edit\s+\d+\s*:", re.IGNORECASE)),
     # dossier subcommands: dossier review/show/new/set/…
@@ -128,10 +128,18 @@ _DOSSIER_PATTERNS = [
     # direct commitment. `^remind me` plus the mid-sentence `remind me to …` form
     # (§3.5: "I emailed X about Y, remind me to follow up <when>").
     ("remind", re.compile(r"^remind\s+me\b|\bremind\s+me\s+to\b", re.IGNORECASE)),
-    # to-do queries (read-only). The bare form requires a contiguous todo(s) token
-    # so ordinary prose ("to do the thing") doesn't misfire.
+    # to-do queries (read-only). Broadened (STAB-1 B4) so date questions never
+    # fall to the LLM router: bare "todos", any "what's/what are … to-do(s)", and
+    # any to-do(s) token paired with a timeframe (today/tomorrow/this week/next
+    # week). The token allows "todo(s)", "to-do(s)", and "to dos" (space only when
+    # PLURAL) — so ordinary prose "to do the thing" / "what to do about X" (space +
+    # singular verb) never misfires.
     ("todos", re.compile(
-        r"what'?s\s+on\s+(?:the\s+)?to[\s-]?dos?\b|^to-?dos\b", re.IGNORECASE)),
+        r"^(?:todos?|to-dos?|to\s+dos)\b"
+        r"|what(?:'?s| are| is)\b[^\n]*\b(?:todos?|to-dos?|to\s+dos)\b"
+        r"|\b(?:todos?|to-dos?|to\s+dos)\b[^\n]*\b(?:today|tomorrow|this\s+week|next\s+week)\b"
+        r"|\b(?:today|tomorrow|this\s+week|next\s+week)(?:'s)?\s+(?:todos?|to-dos?|to\s+dos)\b",
+        re.IGNORECASE)),
 ]
 
 

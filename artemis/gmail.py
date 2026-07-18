@@ -13,10 +13,10 @@ from email.utils import parseaddr
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from artemis import config
+from knowledge import google_clients
 from knowledge.secrets import get_gmail_credentials, get_gmail_token, put_secret
 
 logger = logging.getLogger(__name__)
@@ -32,11 +32,30 @@ SCOPES = [
 
 
 class GmailClient:
+    # STAB-1 A1: the service is thread-local (built per thread from shared creds)
+    # so the scheduler threads and the websocket/mention thread never share an
+    # httplib2 transport. `.service` is a property, not an attribute.
+    _API, _VER = "gmail", "v1"
+
     def __init__(self):
-        self.service = None
+        self._creds = None
+        self._authed: bool = False
         self._last_history_id: str | None = None
         self.scope_mismatch: bool = False
         self._label_cache: dict[str, str] = {}
+
+    @property
+    def service(self):
+        """This thread's Gmail service, or None if not authenticated. Built lazily
+        and cached per thread (STAB-1 A1) — never shared across threads."""
+        if not self._authed or not self._creds:
+            return None
+        return google_clients.get_service(self._API, self._VER, self._creds)
+
+    def _exec(self, request):
+        """Execute a Gmail request, discarding + rebuilding this thread's service
+        on a transport-layer error (STAB-1 A1)."""
+        return google_clients.execute(request, name=self._API, version=self._VER)
 
     def authenticate(self, mm_client=None):
         """Authenticate with Gmail API.
@@ -72,7 +91,7 @@ class GmailClient:
                         except Exception:
                             logger.debug("Failed to post auth alert to Mattermost")
                     # Continue with degraded mode — no Gmail
-                    self.service = None
+                    self._authed = False
                     return
             else:
                 # Interactive flow — local dev only (won't work on Lambda/EC2)
@@ -103,7 +122,7 @@ class GmailClient:
             self.scope_mismatch = True
 
         self._creds = creds
-        self.service = build("gmail", "v1", credentials=creds)
+        self._authed = True
         logger.info("Gmail authenticated")
 
     def _refresh_if_needed(self) -> bool:
@@ -128,11 +147,10 @@ class GmailClient:
             return []
 
         try:
-            results = (
+            results = self._exec(
                 self.service.users()
                 .messages()
                 .list(userId="me", q=query, maxResults=max_results)
-                .execute()
             )
         except Exception:
             logger.exception("Failed to list Gmail messages")
@@ -142,12 +160,11 @@ class GmailClient:
         detailed = []
         for msg_ref in messages:
             try:
-                msg = (
+                msg = self._exec(
                     self.service.users()
                     .messages()
                     .get(userId="me", id=msg_ref["id"], format="metadata",
                          metadataHeaders=["From", "Subject", "Date"])
-                    .execute()
                 )
                 headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
                 detailed.append({
@@ -189,11 +206,10 @@ class GmailClient:
         page_token = None
         try:
             while True:
-                resp = (
+                resp = self._exec(
                     self.service.users()
                     .messages()
                     .list(userId="me", q=query, maxResults=500, pageToken=page_token)
-                    .execute()
                 )
                 ids.extend(m["id"] for m in resp.get("messages", []))
                 page_token = resp.get("nextPageToken")
@@ -265,12 +281,11 @@ class GmailClient:
         backed_off = False
         for attempt in range(max_retries + 1):
             try:
-                msg = (
+                msg = self._exec(
                     self.service.users()
                     .messages()
                     .get(userId="me", id=message_id, format="metadata",
                          metadataHeaders=["From", "Subject", "Date"])
-                    .execute()
                 )
                 headers = {
                     h["name"]: h["value"]
@@ -320,11 +335,10 @@ class GmailClient:
             logger.warning("get_full_message: token refresh failed")
             return ""
         try:
-            msg = (
+            msg = self._exec(
                 self.service.users()
                 .messages()
                 .get(userId="me", id=message_id, format="full")
-                .execute()
             )
             body = self._extract_body(msg.get("payload", {}))
             truncated = body[:10_000]
@@ -407,12 +421,11 @@ class GmailClient:
         if not self.service:
             return None
         try:
-            thread = (
+            thread = self._exec(
                 self.service.users()
                 .threads()
                 .get(userId="me", id=thread_id, format="metadata",
                      metadataHeaders=["From", "Subject", "Date"])
-                .execute()
             )
             messages = []
             for msg in thread.get("messages", []):
@@ -466,7 +479,7 @@ class GmailClient:
         if not self.service:
             return ""
         try:
-            profile = self.service.users().getProfile(userId="me").execute()
+            profile = self._exec(self.service.users().getProfile(userId="me"))
             return profile.get("emailAddress", "")
         except Exception:
             logger.exception("Failed to get user profile")
@@ -530,11 +543,11 @@ class GmailClient:
             logger.error("Gmail not authenticated — cannot archive")
             return False
         try:
-            self.service.users().messages().modify(
+            self._exec(self.service.users().messages().modify(
                 userId="me",
                 id=message_id,
                 body={"removeLabelIds": ["INBOX"]},
-            ).execute()
+            ))
             logger.info("Archived message %s", message_id)
             return True
         except Exception:
@@ -555,11 +568,10 @@ class GmailClient:
             logger.warning("get_message_labels: token refresh failed")
             return None
         try:
-            msg = (
+            msg = self._exec(
                 self.service.users()
                 .messages()
                 .get(userId="me", id=message_id, format="minimal")
-                .execute()
             )
             return msg.get("labelIds", [])
         except Exception:
@@ -593,9 +605,9 @@ class GmailClient:
         if not body:
             return True
         try:
-            self.service.users().messages().modify(
+            self._exec(self.service.users().messages().modify(
                 userId="me", id=message_id, body=body,
-            ).execute()
+            ))
             logger.info("Modified labels on %s: +%s -%s",
                         message_id, add_label_ids or [], remove_label_ids or [])
             return True
@@ -614,9 +626,9 @@ class GmailClient:
             logger.warning("trash_message: token refresh failed")
             return False
         try:
-            self.service.users().messages().trash(
+            self._exec(self.service.users().messages().trash(
                 userId="me", id=message_id,
-            ).execute()
+            ))
             logger.info("Trashed message %s", message_id)
             return True
         except Exception:
@@ -628,12 +640,11 @@ class GmailClient:
         if not self.service:
             return ""
         try:
-            msg = (
+            msg = self._exec(
                 self.service.users()
                 .messages()
                 .get(userId="me", id=message_id, format="metadata",
                      metadataHeaders=["Message-ID"])
-                .execute()
             )
             headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
             return headers.get("Message-ID", "")
@@ -683,10 +694,10 @@ class GmailClient:
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
         try:
-            self.service.users().messages().send(
+            self._exec(self.service.users().messages().send(
                 userId="me",
                 body={"raw": raw, "threadId": thread_id},
-            ).execute()
+            ))
             logger.info("Sent reply in thread %s to %s", thread_id, to)
             return True
         except Exception:
@@ -720,12 +731,11 @@ class GmailClient:
         in_reply_to = ""
         if thread_id:
             try:
-                thread = (
+                thread = self._exec(
                     self.service.users()
                     .threads()
                     .get(userId="me", id=thread_id, format="metadata",
                          metadataHeaders=["Message-ID"])
-                    .execute()
                 )
                 msgs = thread.get("messages", [])
                 if msgs:
@@ -757,9 +767,9 @@ class GmailClient:
 
         logger.info("Attempting Gmail send to %s (thread=%s)", to, thread_id or "new")
         try:
-            result = self.service.users().messages().send(
+            result = self._exec(self.service.users().messages().send(
                 userId="me", body=send_body,
-            ).execute()
+            ))
             logger.info("Gmail send success: message_id=%s to=%s", result.get("id"), to)
             return True
         except Exception as e:
@@ -795,21 +805,21 @@ class GmailClient:
             return None
 
         try:
-            labels = self.service.users().labels().list(userId="me").execute()
+            labels = self._exec(self.service.users().labels().list(userId="me"))
             for lbl in labels.get("labels", []):
                 if lbl["name"].lower() == label_name.lower():
                     self._label_cache[label_name] = lbl["id"]
                     return lbl["id"]
 
             # Label doesn't exist — create it
-            new_label = self.service.users().labels().create(
+            new_label = self._exec(self.service.users().labels().create(
                 userId="me",
                 body={
                     "name": label_name,
                     "labelListVisibility": "labelShow",
                     "messageListVisibility": "show",
                 },
-            ).execute()
+            ))
             label_id = new_label["id"]
             self._label_cache[label_name] = label_id
             logger.info("Created Gmail label '%s' (id=%s)", label_name, label_id)
@@ -832,11 +842,11 @@ class GmailClient:
             return False
 
         try:
-            self.service.users().messages().modify(
+            self._exec(self.service.users().messages().modify(
                 userId="me",
                 id=message_id,
                 body={"addLabelIds": [label_id]},
-            ).execute()
+            ))
             logger.info("Applied label '%s' to message %s", label_name, message_id)
             return True
         except Exception:

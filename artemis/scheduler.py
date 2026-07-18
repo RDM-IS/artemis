@@ -156,6 +156,12 @@ class ArtemisScheduler:
             id="update_check",
         )
 
+        # STAB-1 A2: websocket watchdog — every 60s, force-close a half-open socket
+        # so the reconnect loop fires (the 2026-07-17 silent-death guard).
+        self.scheduler.add_job(
+            self.job_ws_watchdog, "interval", seconds=60, id="ws_watchdog",
+        )
+
         # PB-005: Commitment deadline reminders — weekdays at 8:15am
         self.scheduler.add_job(
             self.job_commitment_reminders, "cron", hour=8, minute=15, day_of_week="mon-fri",
@@ -915,6 +921,14 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("Focus reminder failed")
 
+    def job_ws_watchdog(self):
+        """STAB-1 A2: force-close the Mattermost websocket if it's gone stale
+        (>90s with no event/pong), so the reconnect loop can re-establish it."""
+        try:
+            self.mm.watchdog_check()
+        except Exception:
+            logger.debug("ws watchdog job failed", exc_info=True)
+
     def job_update_check(self):
         """Check GitHub for new commits and post if an update is available."""
         if self._is_quiet():
@@ -934,7 +948,9 @@ class ArtemisScheduler:
             self.mm.post_message(
                 config.CHANNEL_OPS,
                 f"\U0001f504 Artemis update available \u2014 latest commit: {latest_hash} ({latest_date}).\n"
-                f"Run `git pull && pip install -r requirements.txt && restart` to update.",
+                f"Deploy with `bash scripts/deploy.sh` on the box (pull \u2192 migrate \u2192 "
+                f"restart, atomically). Never a bare `git pull` \u2014 that leaves the "
+                f"running process stale and migrations unapplied (STAB-1 A5).",
             )
         except Exception:
             # GitHub unreachable — skip silently per spec
@@ -1285,9 +1301,9 @@ class ArtemisScheduler:
                 # by comparing to cached state — only announce once
                 if not getattr(self, "_billing_label_announced", False):
                     try:
-                        results = self.gmail.service.users().messages().list(
+                        results = self.gmail._exec(self.gmail.service.users().messages().list(
                             userId="me", labelIds=[label_id], maxResults=1
-                        ).execute()
+                        ))
                         if not results.get("messages"):
                             self.mm.post_message(
                                 config.CHANNEL_OPS,
