@@ -48,6 +48,7 @@ _MIG_001 = (_REPO_ROOT / "migrations" / "001_create_acos_schema.sql").read_text(
 _MIG_020 = (_REPO_ROOT / "migrations" / "020_commitments.sql").read_text()
 _MIG_024 = (_REPO_ROOT / "migrations" / "024_dossier.sql").read_text()
 _MIG_025 = (_REPO_ROOT / "migrations" / "025_dossier_approve.sql").read_text()
+_MIG_026 = (_REPO_ROOT / "migrations" / "026_org_assignment.sql").read_text()
 
 
 # ============================================================================
@@ -136,6 +137,20 @@ class TestDeterministicNotOverridable(unittest.TestCase):
         with patch.object(main, "_mm", MagicMock()):
             handled = main._handle_dossier_command(post, "approve 1")
         self.assertFalse(handled)
+
+    def test_org_query_routes_deterministically(self):
+        main = artemis_main
+        for msg, expect_arg in [("org jennifer", "jennifer"),
+                                ("where does dennis fit in the org chart", "dennis"),
+                                ("who reports to jeremy", "jeremy")]:
+            post = {"channel_id": "c1", "id": "p1", "message": msg}
+            with patch.object(main, "_mm", MagicMock()), \
+                 patch("artemis.dossier.org_query", return_value="chart") as oq, \
+                 patch("artemis.intent.route_intent") as router:
+                handled = main._handle_dossier_command(post, msg)
+            self.assertTrue(handled, msg)
+            oq.assert_called_once_with(expect_arg)
+            router.assert_not_called()
 
 
 class TestAttendeeResolution(unittest.TestCase):
@@ -578,6 +593,7 @@ def setUpModule():
             cur.execute(_MIG_020)
             cur.execute(_MIG_024)
             cur.execute(_MIG_025)
+            cur.execute(_MIG_026)
         _LIVE = True
     except Exception as e:
         sys.stderr.write(f"[test_dossier] live PG unavailable, skipping: {e}\n")
@@ -614,7 +630,7 @@ class LiveBase(unittest.TestCase):
         dossier.execute_query, dossier.execute_one, dossier.execute_write = _q, _one, _w
         dossier.log_audit = lambda *a, **k: ""
         commitments.execute_query, commitments.execute_one, commitments.execute_write = _q, _one, _w
-        for t in ("dossier_idea", "dossier_loop", "dossier_entry",
+        for t in ("org_assignment", "dossier_idea", "dossier_loop", "dossier_entry",
                   "dossier_meeting_attendee", "dossier_meeting", "dossier"):
             with _CONN.cursor() as cur:
                 cur.execute(f"TRUNCATE acos.{t} RESTART IDENTITY CASCADE")
@@ -845,6 +861,328 @@ class TestLiveCommitmentIntegration(LiveBase):
         # provenance persisted
         row = _one("SELECT dossier_id FROM acos.commitments WHERE title='today thing'")
         self.assertEqual(row["dossier_id"], d["dossier_id"])
+
+
+
+# ============================================================================
+# PB-010c — Org assignments & org chart
+# ============================================================================
+
+def _fake_find(known):
+    """Return a _find_dossiers stub over {slug: dossier_dict} (matches slug, full
+    name, or first name)."""
+    def f(name):
+        n = (name or "").lower()
+        out = []
+        for slug, d in known.items():
+            fn = d["full_name"].lower()
+            if n in (slug.lower(), fn, fn.split()[0]):
+                out.append(d)
+        return out
+    return f
+
+
+_ORG_PEOPLE = {
+    "jennifer": {"dossier_id": 1, "slug": "jennifer", "full_name": "Jennifer Xu", "active": True},
+    "jeremy": {"dossier_id": 2, "slug": "jeremy", "full_name": "Jeremy Vale", "active": True},
+    "dennis": {"dossier_id": 3, "slug": "dennis", "full_name": "Dennis Rowe", "active": True},
+    "sarah": {"dossier_id": 4, "slug": "sarah", "full_name": "Sarah Lin", "active": True},
+}
+
+
+class TestParseSetGrammar(unittest.TestCase):
+    def _parse(self, text):
+        with patch.object(dossier, "_find_dossiers", side_effect=_fake_find(_ORG_PEOPLE)):
+            return dossier.parse_set_command(text)
+
+    def test_title(self):
+        p = self._parse("dossier set jennifer title: Associate Director of Data")
+        self.assertNotIn("error", p)
+        self.assertEqual(p["payload"]["assignment"]["title"], "Associate Director of Data")
+
+    def test_reports_to_known(self):
+        p = self._parse("dossier set jennifer reports_to: jeremy")
+        self.assertEqual(p["payload"]["assignment"]["reports_to"], 2)
+
+    def test_reports_to_unknown_offers(self):
+        p = self._parse("dossier set jennifer reports_to: nobody")
+        self.assertIn("error", p)
+        self.assertIn("dossier new nobody", p["error"])
+
+    def test_reports_to_self_rejected(self):
+        p = self._parse("dossier set jennifer reports_to: jennifer")
+        self.assertIn("error", p)
+        self.assertIn("themselves", p["error"])
+
+    def test_org_move(self):
+        p = self._parse("dossier set jennifer org: fdic")
+        self.assertEqual(p["payload"]["assignment"]["org"], "fdic")
+
+    def test_org_root_bare_true(self):
+        p = self._parse("dossier set jeremy org_root")
+        self.assertIs(p["payload"]["assignment"]["is_root"], True)
+
+    def test_org_root_false(self):
+        p = self._parse("dossier set jeremy org_root: false")
+        self.assertIs(p["payload"]["assignment"]["is_root"], False)
+
+    def test_multi_field_single_command(self):
+        p = self._parse("dossier set sarah org: fdic, title: Senior Examiner")
+        a = p["payload"]["assignment"]
+        self.assertEqual(a["org"], "fdic")
+        self.assertEqual(a["title"], "Senior Examiner")
+
+    def test_comma_inside_title_value_kept(self):
+        # The comma is part of the title, not a field separator (no key follows it).
+        p = self._parse("dossier set dennis title: Deputy Director, ODAE")
+        self.assertEqual(p["payload"]["assignment"]["title"], "Deputy Director, ODAE")
+
+    def test_section_still_parses(self):
+        p = self._parse("dossier set jennifer needs: wants a warm intro")
+        self.assertEqual(p["payload"]["sections"]["needs_from_me"], "wants a warm intro")
+
+    def test_section_prose_not_split_on_embedded_key(self):
+        # Free-text prose containing a 'word:' matching a field key must stay whole
+        # and NOT spawn an assignment field.
+        p = self._parse("dossier set jennifer needs: keep her looped on org: strategy")
+        self.assertEqual(p["payload"]["sections"]["needs_from_me"], "keep her looped on org: strategy")
+        self.assertEqual(p["payload"]["assignment"], {})
+
+
+class TestOrgIntent(unittest.TestCase):
+    def test_triggers_route_to_org(self):
+        for text in ["org jennifer", "org fca-odae", "org history jennifer",
+                     "where does dennis fit in the org chart",
+                     "who does jennifer report to", "who reports to jeremy", "org"]:
+            self.assertEqual(intent_mod.detect_dossier_intent(text), "org", text)
+
+    def test_org_bare_still_matches(self):
+        self.assertEqual(intent_mod.detect_dossier_intent("org"), "org")
+
+    def test_regression_non_triggers(self):
+        for text in ["organize my day", "organic search results", "what's the org's revenue"]:
+            self.assertNotEqual(intent_mod.detect_dossier_intent(text), "org", text)
+
+    def test_existing_routing_unaffected(self):
+        self.assertEqual(intent_mod.detect_dossier_intent("dossier show jennifer"), "dossier")
+        self.assertEqual(intent_mod.detect_dossier_intent("what's on the todos today"), "todos")
+        self.assertEqual(intent_mod.detect_dossier_intent("met with dennis about x"), "capture")
+
+
+class TestOrgSignalExtraction(unittest.TestCase):
+    """org_signals draft only with a stated evidence quote; structure never inferred."""
+
+    def _apply(self, org_signals):
+        meeting = {"meeting_id": 5, "occurred_on": date(2026, 7, 17)}
+        d = {"dossier_id": 1, "slug": "jen", "full_name": "Jennifer"}
+        target = {"dossier_id": 2, "slug": "sarah", "full_name": "Sarah"}
+        mgr = {"dossier_id": 3, "slug": "jeremy", "full_name": "Jeremy"}
+        by_slug = {"sarah": target, "jeremy": mgr}
+        writes = []
+
+        def fake_w(sql, params=None):
+            if "INSERT INTO acos.org_assignment" in sql:
+                writes.append(params)
+
+        with patch.object(dossier, "execute_one", return_value={"entry_id": 1}), \
+             patch.object(dossier, "execute_write", side_effect=fake_w), \
+             patch.object(dossier, "get_dossier_by_slug", side_effect=lambda s: by_slug.get(s)), \
+             patch.object(dossier, "current_assignment", return_value={"org": "fca-odae"}), \
+             patch.object(commitments, "add_commitment", MagicMock()), \
+             patch.object(dossier, "_audit", MagicMock()):
+            dossier._apply_draft(meeting, d, {"log_entry": "x", "org_signals": org_signals})
+        return writes
+
+    def test_title_signal_writes_no_reports_to(self):
+        w = self._apply([{"dossier_slug": "sarah", "field": "title", "value": "Analyst",
+                          "evidence": "Sarah is now the data analyst"}])
+        self.assertEqual(len(w), 1)
+        # params: (dossier_id, org, title, reports_to, evidence, valid_from)
+        self.assertEqual(w[0][2], "Analyst")   # title set
+        self.assertIsNone(w[0][3])             # reports_to NOT inferred from a title
+
+    def test_reports_to_signal(self):
+        w = self._apply([{"dossier_slug": "sarah", "field": "reports_to", "value": "jeremy",
+                          "evidence": "Sarah joined Jeremy's team"}])
+        self.assertEqual(len(w), 1)
+        self.assertEqual(w[0][3], 3)           # reports_to = jeremy's dossier_id
+
+    def test_no_evidence_skipped(self):
+        w = self._apply([{"dossier_slug": "sarah", "field": "title", "value": "Analyst", "evidence": ""}])
+        self.assertEqual(w, [])                # no quote → no write (no inference)
+
+
+class LiveOrgBase(LiveBase):
+    def _assign(self, dossier_id, **changes):
+        return dossier.apply_assignment(dossier_id, changes)
+
+
+class TestLiveOrgAssignment(LiveOrgBase):
+    def test_close_and_insert(self):
+        d = self._mk("jennifer", "Jennifer Xu")
+        did = d["dossier_id"]
+        self._assign(did, org="fca-odae")
+        self._assign(did, title="Associate Director of Data")
+        rows = _q("SELECT * FROM acos.org_assignment WHERE dossier_id=%s ORDER BY assignment_id", (did,))
+        self.assertEqual(len(rows), 2)
+        self.assertIsNotNone(rows[0]["valid_to"])          # old row closed
+        self.assertIsNone(rows[1]["valid_to"])             # new row current
+        self.assertEqual(rows[1]["title"], "Associate Director of Data")
+        cur = _q("SELECT * FROM acos.org_assignment WHERE dossier_id=%s AND valid_to IS NULL AND status='approved'", (did,))
+        self.assertEqual(len(cur), 1)                      # unique index holds
+
+    def test_same_value_no_op(self):
+        d = self._mk("jennifer", "Jennifer Xu")
+        did = d["dossier_id"]
+        self._assign(did, org="fca-odae", title="Analyst")
+        before = _one("SELECT count(*) c FROM acos.org_assignment WHERE dossier_id=%s", (did,))["c"]
+        msg = self._assign(did, title="Analyst")
+        after = _one("SELECT count(*) c FROM acos.org_assignment WHERE dossier_id=%s", (did,))["c"]
+        self.assertIn("Already current", msg)
+        self.assertEqual(before, after)
+
+    def test_carry_forward_unchanged_fields(self):
+        j = self._mk("jeremy", "Jeremy Vale")
+        d = self._mk("jennifer", "Jennifer Xu")
+        did = d["dossier_id"]
+        self._assign(did, org="fca-odae", title="Analyst", reports_to=j["dossier_id"])
+        self._assign(did, title="Senior Analyst")            # only title changes
+        cur = _one("SELECT * FROM acos.org_assignment WHERE dossier_id=%s AND valid_to IS NULL", (did,))
+        self.assertEqual(cur["title"], "Senior Analyst")
+        self.assertEqual(cur["reports_to"], j["dossier_id"])  # carried forward
+
+
+class TestLiveOrgChart(LiveOrgBase):
+    def test_chain_and_root(self):
+        jer = self._mk("jeremy", "Jeremy Vale")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        den = self._mk("dennis", "Dennis Rowe")
+        self._assign(jer["dossier_id"], org="fca-odae", title="Director", is_root=True)
+        self._assign(jen["dossier_id"], org="fca-odae", title="Assoc Dir", reports_to=jer["dossier_id"])
+        self._assign(den["dossier_id"], org="fca-odae", title="Deputy Dir", reports_to=jer["dossier_id"])
+        out = dossier.org_person_render(jen)
+        self.assertIn("Reports up: Jeremy Vale", out)
+        self.assertIn("Peers: Dennis Rowe", out)
+        root_out = dossier.org_person_render(jer)
+        self.assertIn("top of fca-odae", root_out)
+        self.assertIn("Directs:", root_out)
+
+    def test_unknown_line_vs_root(self):
+        jen = self._mk("jennifer", "Jennifer Xu")
+        self._assign(jen["dossier_id"], org="fca-odae")     # no reports_to, not root
+        out = dossier.org_person_render(jen)
+        self.assertIn("reporting line not recorded above Jennifer Xu", out)
+
+    def test_cycle_terminates(self):
+        a = self._mk("aaa", "Person A")
+        b = self._mk("bbb", "Person B")
+        self._assign(a["dossier_id"], org="x", reports_to=b["dossier_id"])
+        self._assign(b["dossier_id"], org="x", reports_to=a["dossier_id"])
+        out = dossier.org_person_render(a)
+        self.assertIn("cycle", out.lower())
+
+    def test_no_assignment_offer(self):
+        jen = self._mk("jennifer", "Jennifer Xu")
+        out = dossier.org_person_render(jen)
+        self.assertIn("no reporting line recorded", out)
+
+
+class TestLiveOrgListing(LiveOrgBase):
+    def test_tree_and_flat(self):
+        jer = self._mk("jeremy", "Jeremy Vale")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        sol = self._mk("solo", "Solo Person")
+        self._assign(jer["dossier_id"], org="fca-odae", is_root=True)
+        self._assign(jen["dossier_id"], org="fca-odae", reports_to=jer["dossier_id"])
+        self._assign(sol["dossier_id"], org="fca-odae")     # no edge → flat top-level
+        out = dossier.org_org("fca-odae")
+        self.assertIn("3 on file", out)
+        self.assertIn("  • Jennifer Xu", out)               # nested under Jeremy
+        self.assertIn("• Solo Person", out)
+
+    def test_person_org_ambiguity_slug_wins(self):
+        p = self._mk("acme", "Acme Person")
+        bob = self._mk("bob", "Bob")
+        self._assign(bob["dossier_id"], org="acme")         # 'acme' is also an org
+        out = dossier.org_query("acme")
+        self.assertIn("Acme Person", out)                   # person (slug) wins
+        self.assertIn("also an org", out)
+
+
+class TestLiveOrgHistory(LiveOrgBase):
+    def test_history_ordering(self):
+        jen = self._mk("jennifer", "Jennifer Xu")
+        self._assign(jen["dossier_id"], org="fca-odae", title="Analyst")
+        self._assign(jen["dossier_id"], title="Senior Analyst")
+        out = dossier.org_history("jennifer")
+        self.assertLess(out.index("Senior Analyst"), out.index("Analyst,"))  # newest first
+        self.assertIn("present", out)
+
+
+class TestLiveOrgSignalReview(LiveOrgBase):
+    def test_draft_invisible_then_approve_executes(self):
+        jen = self._mk("jennifer", "Jennifer Xu")
+        sar = self._mk("sarah", "Sarah Lin")
+        self._assign(jen["dossier_id"], org="fca-odae")
+        self._assign(sar["dossier_id"], org="fca-odae")     # sarah current in fca-odae
+        meeting = _one("INSERT INTO acos.dossier_meeting (occurred_on, topic, raw_notes) "
+                       "VALUES (%s,'sync','notes') RETURNING *", (date(2026, 7, 17),))
+        dossier._apply_draft(meeting, jen, {
+            "log_entry": "Discussed the team.",
+            "org_signals": [{"dossier_slug": "sarah", "field": "reports_to", "value": "jennifer",
+                             "evidence": "Sarah joined Jennifer's team"}],
+        })
+        # draft invisible to org render: no manager edge shown despite the draft
+        pre = dossier.org_person_render(sar)
+        self.assertNotIn("Reports up", pre)
+        self.assertIn("reporting line not recorded above Sarah Lin", pre)
+        # surfaces in review
+        items = dossier.pending_items()
+        org_items = [it for it in items if it["type"] == "org"]
+        self.assertEqual(len(org_items), 1)
+        # approve executes the edge
+        _reply, mapping = dossier.render_review()
+        num = next(n for n, it in mapping.items() if it["type"] == "org")
+        dossier.approve_items([num], mapping)
+        cur = _one("SELECT * FROM acos.org_assignment WHERE dossier_id=%s AND valid_to IS NULL AND status='approved'",
+                   (sar["dossier_id"],))
+        self.assertEqual(cur["reports_to"], jen["dossier_id"])
+        self.assertEqual(_one("SELECT count(*) c FROM acos.org_assignment WHERE status='draft'")["c"], 0)
+
+
+class TestLiveBackfill(unittest.TestCase):
+    def test_backfill_and_drop_column(self):
+        if not _LIVE:
+            self.skipTest("no local Postgres")
+        admin = _admin_connect()
+        admin.autocommit = True
+        with admin.cursor() as c:
+            c.execute("DROP DATABASE IF EXISTS artemis_dossier_bf")
+            c.execute("CREATE DATABASE artemis_dossier_bf")
+        admin.close()
+        conn = psycopg2.connect(dbname="artemis_dossier_bf")
+        conn.autocommit = True
+        try:
+            with conn.cursor() as c:
+                c.execute(_MIG_001)
+                c.execute(_MIG_020)   # 024 ALTERs acos.commitments
+                c.execute(_MIG_024)
+                for slug, name in [("jennifer", "Jennifer"), ("jeremy", "Jeremy"), ("dennis", "Dennis")]:
+                    c.execute("INSERT INTO acos.dossier (slug, full_name) VALUES (%s,%s)", (slug, name))
+                c.execute(_MIG_026)
+                c.execute("SELECT count(*) FROM acos.org_assignment "
+                          "WHERE org='fca-odae' AND valid_to IS NULL AND status='approved'")
+                self.assertEqual(c.fetchone()[0], 3)
+                c.execute("SELECT count(*) FROM information_schema.columns "
+                          "WHERE table_schema='acos' AND table_name='dossier' AND column_name='org'")
+                self.assertEqual(c.fetchone()[0], 0)        # org column dropped
+        finally:
+            conn.close()
+            admin = _admin_connect()
+            admin.autocommit = True
+            with admin.cursor() as c:
+                c.execute("DROP DATABASE IF EXISTS artemis_dossier_bf")
+            admin.close()
 
 
 if __name__ == "__main__":

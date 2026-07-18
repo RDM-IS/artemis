@@ -205,41 +205,146 @@ def dossier_new(raw_name: str) -> str:
     )
 
 
+_SET_USAGE = (
+    "Usage: `dossier set <person> <field>: <value>` — fields: `position` · `needs` · "
+    "`title` · `reports_to` · `org` · `org_root`. Multiple ok: "
+    "`dossier set sarah org: fdic, title: Senior Examiner`."
+)
+# Colon-delimited field keys. Order matters (longest-first: needs_from_me before
+# needs, org_root before org) so the alternation binds the right key.
+_SET_KEY_RE = re.compile(
+    r"\b(position|terrain|needs_from_me|needs|title|reports_to|org_root|org)\s*:",
+    re.IGNORECASE,
+)
+_SET_BARE_ROOT_RE = re.compile(r"\borg_root\b(?!\s*:)", re.IGNORECASE)
+
+
+_SECTION_KEYS = {"position", "terrain", "needs", "needs_from_me"}
+
+
+def _scan_set_fields(region: str) -> list[tuple[str, str]]:
+    """Scan `key: value [, key: value …]` into ordered (key, value) pairs. A value
+    runs until the NEXT key marker, so a value may contain commas
+    ('Deputy Director, ODAE') — a comma only separates fields when followed by a
+    key. `org_root` may appear bare (→ value '').
+
+    Section fields (position/terrain/needs) are FREE PROSE and terminal: their
+    value runs to the end of the region and scanning stops, so prose that happens
+    to contain a 'word:' matching a field key ('keep her looped on org: strategy')
+    is never split into a spurious assignment field."""
+    markers = [(m.start(), m.end(), m.group(1).lower(), True) for m in _SET_KEY_RE.finditer(region)]
+    markers += [(m.start(), m.end(), "org_root", False) for m in _SET_BARE_ROOT_RE.finditer(region)]
+    markers.sort()
+    fields = []
+    for i, (s, e, key, has_colon) in enumerate(markers):
+        if key in _SECTION_KEYS:
+            fields.append((key, region[e:].strip()))  # prose → to end, stop scanning
+            break
+        nxt = markers[i + 1][0] if i + 1 < len(markers) else len(region)
+        val = region[e:nxt].strip().rstrip(",").strip() if has_colon else ""
+        fields.append((key, val))
+    return fields
+
+
 def parse_set_command(text: str) -> dict:
-    """Parse `dossier set <person> position:|needs: <text>`. Returns
-    {slug, dossier_id, full_name, field, column, value} or {error: msg}."""
-    m = re.match(
-        r"^dossier\s+set\s+(.+?)\s+(position|terrain|needs|needs_from_me)\s*:\s*(.+)$",
-        (text or "").strip(), re.IGNORECASE | re.DOTALL,
-    )
+    """Parse `dossier set <person> <field>: <value>[, …]`. Ryan-authored §1/§2
+    prose and org-assignment facts (title/reports_to/org/org_root) share one
+    grammar. Returns {ok, dossier_id, slug, full_name, preview, payload} or
+    {error}. reports_to is resolved to a dossier here so an unknown target is
+    caught at parse time (offer `dossier new`), never written."""
+    m = re.match(r"^dossier\s+set\s+(.+)$", (text or "").strip(), re.IGNORECASE | re.DOTALL)
     if not m:
-        return {"error": "Usage: `dossier set <person> position: <text>` or "
-                         "`dossier set <person> needs: <text>`"}
-    person, field_raw, value = m.group(1).strip(), m.group(2).lower(), m.group(3).strip()
-    if not value:
-        return {"error": "Nothing after the colon — give me the text to set."}
+        return {"error": _SET_USAGE}
+    rest = m.group(1).strip()
+
+    first = None
+    km = _SET_KEY_RE.search(rest)
+    if km:
+        first = km.start()
+    bm = _SET_BARE_ROOT_RE.search(rest)
+    if bm and (first is None or bm.start() < first):
+        first = bm.start()
+    if first is None:
+        return {"error": _SET_USAGE}
+
+    person = rest[:first].strip()
+    if not person:
+        return {"error": _SET_USAGE}
     kind, d = resolve_attendee(person)
     if kind == "unknown":
         return {"error": f"No dossier for {person} — `dossier new {person}` first."}
     if kind == "ambiguous":
         opts = ", ".join(f"{x['full_name']} (`{x['slug']}`)" for x in d)
         return {"error": f"“{person}” is ambiguous — {opts}. Use the slug."}
-    column = "position_terrain" if field_raw in ("position", "terrain") else "needs_from_me"
-    field = "Position & terrain" if column == "position_terrain" else "What they need from me"
-    return {"slug": d["slug"], "dossier_id": d["dossier_id"],
-            "full_name": d["full_name"], "field": field, "column": column, "value": value}
+
+    fields = _scan_set_fields(rest[first:])
+    if not fields:
+        return {"error": _SET_USAGE}
+
+    sections: dict[str, str] = {}
+    assignment: dict[str, object] = {}
+    preview: list[str] = []
+    for key, val in fields:
+        if key in ("position", "terrain", "needs", "needs_from_me"):
+            if not val:
+                return {"error": "Nothing after the colon — give me the text to set."}
+            col = "position_terrain" if key in ("position", "terrain") else "needs_from_me"
+            label = "Position & terrain" if col == "position_terrain" else "What they need from me"
+            sections[col] = val
+            preview.append(f"{label} → {val if len(val) <= 120 else val[:117] + '…'}")
+        elif key == "title":
+            assignment["title"] = val or None
+            preview.append(f"title → {val or '(cleared)'}")
+        elif key == "org":
+            if not val:
+                return {"error": "`org:` needs a value, e.g. `org: fca-odae`."}
+            assignment["org"] = val
+            preview.append(f"org → {val}")
+        elif key == "reports_to":
+            if not val:
+                return {"error": "`reports_to:` needs a person, e.g. `reports_to: jeremy`."}
+            rk, rd = resolve_attendee(val)
+            if rk == "unknown":
+                return {"error": f"No dossier for “{val}” — `dossier new {val}` first, "
+                                 f"then set the reporting line."}
+            if rk == "ambiguous":
+                opts = ", ".join(f"{x['full_name']} (`{x['slug']}`)" for x in rd)
+                return {"error": f"“{val}” is ambiguous — {opts}. Use the slug."}
+            if rd["dossier_id"] == d["dossier_id"]:
+                return {"error": "A person can't report to themselves."}
+            assignment["reports_to"] = rd["dossier_id"]
+            preview.append(f"reports to → {rd['full_name']}")
+        elif key == "org_root":
+            is_root = val.strip().lower() not in ("false", "no", "off", "0")
+            assignment["is_root"] = is_root
+            preview.append(f"org root → {is_root}")
+
+    return {"ok": True, "dossier_id": d["dossier_id"], "slug": d["slug"],
+            "full_name": d["full_name"], "preview": "; ".join(preview),
+            "payload": {"sections": sections, "assignment": assignment}}
 
 
-def apply_set(dossier_id: int, column: str, value: str) -> dict | None:
-    """Write a Ryan-authored section (only after confirm). Returns the re-read row."""
-    if column not in ("position_terrain", "needs_from_me"):
-        return None
-    execute_write(
-        f"UPDATE acos.dossier SET {column} = %s, updated_at = now() WHERE dossier_id = %s",
-        (value, dossier_id),
-    )
-    _audit("dossier_set", dossier_id, {"column": column})
-    return get_dossier(dossier_id)
+def apply_set(dossier_id: int, payload: dict) -> str:
+    """Write the parsed set (only after confirm) and return a confirmation rendered
+    FROM the written rows. Handles §1/§2 sections and org-assignment fields."""
+    person = get_dossier(dossier_id)
+    lines: list[str] = []
+    sections = payload.get("sections") or {}
+    for col, val in sections.items():
+        if col not in ("position_terrain", "needs_from_me"):
+            continue
+        execute_write(
+            f"UPDATE acos.dossier SET {col} = %s, updated_at = now() WHERE dossier_id = %s",
+            (val, dossier_id),
+        )
+        _audit("dossier_set", dossier_id, {"column": col})
+        label = "Position & terrain" if col == "position_terrain" else "What they need from me"
+        row = get_dossier(dossier_id)
+        lines.append(f"✅ Saved **{label}** for {row['full_name']}.")
+    assignment = payload.get("assignment") or {}
+    if assignment:
+        lines.append(apply_assignment(dossier_id, assignment))
+    return "\n".join(lines) if lines else "Nothing to change."
 
 
 # ---------------------------------------------------------------------------
@@ -497,12 +602,19 @@ _EXTRACT_SYSTEM = (
     'that these notes resolve>],\n'
     '  "open_loops": ["short undated watch-item", ...],\n'
     '  "ideas": [{"text": "...", "cross_pollinate_slug": "<another dossier slug or null>"}],\n'
-    '  "action_items": [{"text": "concrete next step / commitment", "due_date": "YYYY-MM-DD or null"}]\n'
+    '  "action_items": [{"text": "concrete next step / commitment", "due_date": "YYYY-MM-DD or null"}],\n'
+    '  "org_signals": [{"dossier_slug": "<slug the fact is ABOUT>", "field": "title|reports_to|org", '
+    '"value": "<title text | a slug for reports_to | org name>", "evidence": "<exact quote from the notes>"}]\n'
     "}\n\n"
     "Rules:\n"
     "- If you propose ANY loops/ideas/action_items, you MUST also give a log_entry.\n"
     "- close_loops may ONLY contain loop_ids listed under Open loops for this person.\n"
     "- due_date only when the notes state or clearly imply one; else null.\n"
+    "- org_signals ONLY when the notes STATE an employment fact — who employs "
+    "someone, their title, or who they report to ('Sarah joined Jennifer's team', "
+    "'Tom is the new FDIC lead examiner'). NEVER infer reporting structure from a "
+    "title alone ('Director' does not imply anyone reports to them). Every "
+    "org_signal MUST carry an exact `evidence` quote; no quote → no signal.\n"
     "- Prefer fewer, higher-signal items over many. Empty arrays are fine."
 )
 
@@ -588,7 +700,8 @@ def _apply_draft(meeting: dict, d: dict, extraction: dict) -> dict:
     """Persist one attendee's extraction as DRAFTS. Returns counts. A draft never
     closes a loop — closures are proposals (see migration 024's loop model)."""
     did, mid, edate = d["dossier_id"], meeting["meeting_id"], meeting["occurred_on"]
-    counts = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0, "todos": 0}
+    counts = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0,
+              "todos": 0, "org": 0}
 
     entry_id = None
     log_entry = extraction.get("log_entry")
@@ -671,6 +784,45 @@ def _apply_draft(meeting: dict, d: dict, extraction: dict) -> dict:
         )
         counts["todos"] += 1
 
+    # org_signals → draft org_assignment rows (invisible to renders until approved).
+    # Only stated facts with an evidence quote; structure is NEVER inferred.
+    for sig in extraction.get("org_signals") or []:
+        if not isinstance(sig, dict):
+            continue
+        slug = str(sig.get("dossier_slug", "")).strip()
+        field = str(sig.get("field", "")).strip().lower()
+        value = str(sig.get("value", "")).strip()
+        evidence = str(sig.get("evidence", "")).strip()
+        if not (slug and field in ("title", "reports_to", "org") and value and evidence):
+            continue  # malformed / no-quote → never write (no inference)
+        target = get_dossier_by_slug(slug)
+        if not target:
+            continue
+        title_val = value if field == "title" else None
+        rt_val = None
+        org_val = value if field == "org" else None
+        mgr_org = None
+        if field == "reports_to":
+            mgr = get_dossier_by_slug(value)
+            if not mgr or mgr["dossier_id"] == target["dossier_id"]:
+                continue
+            rt_val = mgr["dossier_id"]
+            mgr_cur = current_assignment(mgr["dossier_id"])
+            mgr_org = mgr_cur["org"] if mgr_cur else None
+        if org_val is None:
+            # Prefer the target's own current org; for a reports_to signal fall back
+            # to the manager's org (the reorg likely happened within it) before the
+            # 'unknown' placeholder Ryan can fix on review.
+            cur = current_assignment(target["dossier_id"])
+            org_val = (cur["org"] if cur else None) or mgr_org or "unknown"
+        execute_write(
+            "INSERT INTO acos.org_assignment "
+            "(dossier_id, org, title, reports_to, status, evidence, valid_from) "
+            "VALUES (%s, %s, %s, %s, 'draft', %s, %s)",
+            (target["dossier_id"], org_val, title_val, rt_val, evidence, edate),
+        )
+        counts["org"] += 1
+
     _audit("draft_extraction", did, {"meeting_id": mid, **counts})
     return counts
 
@@ -688,7 +840,8 @@ def draft_extraction(meeting_id: int) -> str:
         "WHERE a.meeting_id = %s ORDER BY d.full_name",
         (meeting_id,),
     )
-    total = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0, "todos": 0}
+    total = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0,
+             "todos": 0, "org": 0}
     failed = []
     for d in attendees:
         extraction = _llm_extract(meeting["raw_notes"], d, _build_extraction_context(d))
@@ -711,6 +864,8 @@ def draft_extraction(meeting_id: int) -> str:
         bits.append(f"{total['ideas']} idea{'s' if total['ideas'] != 1 else ''}{cross}")
     if total["todos"]:
         bits.append(f"{total['todos']} to-do{'s' if total['todos'] != 1 else ''}")
+    if total["org"]:
+        bits.append(f"{total['org']} org signal{'s' if total['org'] != 1 else ''}")
     if not bits:
         msg = "Drafted for review: nothing extractable from the notes."
     else:
@@ -725,10 +880,11 @@ def draft_extraction(meeting_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 # Per-person type order within the review listing.
-_TYPE_RANK = {"entry": 0, "loop_close": 1, "loop_open": 2, "idea": 3, "commitment": 4}
+_TYPE_RANK = {"entry": 0, "loop_close": 1, "loop_open": 2, "idea": 3,
+              "commitment": 4, "org": 5}
 _TYPE_LABEL = {
     "entry": "entry", "loop_close": "loop close", "loop_open": "loop open",
-    "idea": "idea", "commitment": "to-do",
+    "idea": "idea", "commitment": "to-do", "org": "org",
 }
 
 
@@ -779,6 +935,22 @@ def pending_items() -> list[dict]:
         prov = f"due {fmt_date(r['due_date'])}" if r["due_date"] else None
         items.append({"type": "commitment", "id": r["id"], "dossier_id": r["dossier_id"],
                       "dossier_name": r["full_name"], "text": r["title"], "prov": prov})
+    for r in execute_query(
+        "SELECT a.assignment_id, a.dossier_id, a.org, a.title, a.reports_to, a.evidence, "
+        "d.full_name, m.full_name AS mgr_name "
+        "FROM acos.org_assignment a JOIN acos.dossier d ON d.dossier_id = a.dossier_id "
+        "LEFT JOIN acos.dossier m ON m.dossier_id = a.reports_to "
+        "WHERE a.status = 'draft'"
+    ):
+        if r["reports_to"]:
+            desc = f"reports to {r['mgr_name']}"
+        elif r["title"]:
+            desc = f"title: {r['title']}"
+        else:
+            desc = f"org: {r['org']}"
+        items.append({"type": "org", "id": r["assignment_id"], "dossier_id": r["dossier_id"],
+                      "dossier_name": r["full_name"], "text": desc,
+                      "prov": f'"{r["evidence"]}"' if r["evidence"] else None})
 
     items.sort(key=lambda it: (it["dossier_name"].lower(), _TYPE_RANK[it["type"]], it["id"]))
     return items
@@ -841,6 +1013,22 @@ def _approve_item(it: dict) -> bool:
     elif t == "commitment":
         row = commitments.activate_commitment(iid)
         ok = bool(row and row["status"] == "active")
+    elif t == "org":
+        draft = execute_one(
+            "SELECT * FROM acos.org_assignment WHERE assignment_id = %s AND status = 'draft'", (iid,)
+        )
+        if not draft:
+            return False
+        # Approve = same close-and-insert merge as `dossier set`, then consume the
+        # draft carrier. Only the fields the signal stated are applied.
+        changes: dict = {"org": draft["org"]}
+        if draft["title"] is not None:
+            changes["title"] = draft["title"]
+        if draft["reports_to"] is not None:
+            changes["reports_to"] = draft["reports_to"]
+        apply_assignment(draft["dossier_id"], changes)
+        execute_write("DELETE FROM acos.org_assignment WHERE assignment_id = %s AND status = 'draft'", (iid,))
+        ok = True
     else:
         return False
     if ok:
@@ -898,6 +1086,10 @@ def edit_item(num: int, new_text: str, mapping: dict) -> str:
     elif t == "commitment":
         commitments.update_commitment_title(iid, new_text)
         commitments.activate_commitment(iid)
+    elif t == "org":
+        return (f"#{num} is an org signal — a structured fact, not free text. "
+                f"`approve {num}` / `drop {num}`, or set it exactly with "
+                f"`dossier set …`.")
     else:  # loop_close has no editable text of its own
         return f"#{num} is a loop closure — it has no editable text. `approve {num}` or `drop {num}`."
     _audit(f"edit_approve_{t}", it["dossier_id"], {"id": iid})
@@ -930,6 +1122,8 @@ def drop_item(num: int, mapping: dict) -> str:
         execute_write("DELETE FROM acos.dossier_idea WHERE idea_id = %s AND status = 'proposed'", (iid,))
     elif t == "commitment":
         execute_write("DELETE FROM acos.commitments WHERE id = %s AND status = 'draft'", (iid,))
+    elif t == "org":
+        execute_write("DELETE FROM acos.org_assignment WHERE assignment_id = %s AND status = 'draft'", (iid,))
     _audit(f"drop_{t}", it["dossier_id"], {"id": iid})
     mapping.pop(num, None)
     verb = "Cancelled closure proposal on" if t == "loop_close" else "Dropped"
@@ -980,9 +1174,32 @@ def _strongest_idea(dossier_id: int, topic: str | None) -> dict | None:
     return ideas[0]  # newest
 
 
+def _recent_reorg_note(dossier_id: int) -> str | None:
+    """One line if this person's reporting line changed within 60 days (a prior
+    closed row in the same org had a different manager)."""
+    cur = current_assignment(dossier_id)
+    if not cur or not cur.get("valid_from"):
+        return None
+    if (_ct_today() - cur["valid_from"]).days > 60:
+        return None
+    prior = execute_one(
+        "SELECT reports_to FROM acos.org_assignment "
+        "WHERE dossier_id = %s AND org = %s AND valid_to IS NOT NULL AND status = 'approved' "
+        "ORDER BY valid_to DESC LIMIT 1",
+        (dossier_id, cur["org"]),
+    )
+    if prior and prior["reports_to"] != cur["reports_to"]:
+        return f"reporting line changed {fmt_date(cur['valid_from'])} — recent reorg."
+    return None
+
+
 def _brief_one(d: dict, topic: str | None, seen: set) -> str:
     did = d["dossier_id"]
-    lines = [f"### {d['full_name']}"]
+    hdr = _assignment_header(d)
+    lines = [f"### {d['full_name']}" + (f" — {hdr}" if hdr else "")]
+    reorg = _recent_reorg_note(did)
+    if reorg:
+        lines.append(f"  _({reorg})_")
 
     loops = _open_loops_and_commitments(did)
     fresh_loops = [l for l in loops if l["text"].lower() not in seen]
@@ -1046,9 +1263,22 @@ def brief(person_arg: str, topic: str | None = None) -> str:
         head += f" — *{topic}*"
     parts = [head]
     seen: set = set()
-    for d in dossiers:
-        parts.append("")
-        parts.append(_brief_one(d, topic, seen))
+    if len(dossiers) > 1:
+        # Multi-person: group attendees under their current org.
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for d in dossiers:
+            cur = current_assignment(d["dossier_id"])
+            groups[cur["org"] if cur else "\x00"].append(d)
+        for org in sorted(groups, key=lambda o: (o == "\x00", o)):
+            parts.append(f"\n## {'No org recorded' if org == chr(0) else org}")
+            for d in groups[org]:
+                parts.append("")
+                parts.append(_brief_one(d, topic, seen))
+    else:
+        for d in dossiers:
+            parts.append("")
+            parts.append(_brief_one(d, topic, seen))
     for nm in unknown:
         parts.append(f"\n_(no dossier for {nm} — `dossier new {nm}`)_")
     return "\n".join(parts)
@@ -1254,7 +1484,9 @@ def show(person: str, include_drafts: bool = False) -> str:
     loop_status = ("proposed", "open") if include_drafts else ("open",)
     idea_status = ("proposed", "active") if include_drafts else ("active",)
 
-    lines = [f"# {d['full_name']}  (`{d['slug']}`{'  ·  drafts shown' if include_drafts else ''})"]
+    hdr = _assignment_header(d)  # '<title> · <org>' when a current assignment exists
+    hdr_str = f" — {hdr}" if hdr else ""
+    lines = [f"# {d['full_name']}{hdr_str}  (`{d['slug']}`{'  ·  drafts shown' if include_drafts else ''})"]
 
     lines.append("\n## 1. Position & terrain")
     lines.append(d["position_terrain"] or "_(not captured)_")
@@ -1312,3 +1544,309 @@ def show(person: str, include_drafts: bool = False) -> str:
     else:
         lines.append("_(empty — you never walk in without one)_")
     return "\n".join(lines)
+
+
+# ============================================================================
+# PB-010c — Org assignments & org chart
+#
+# Employment is the org-scoped fact (acos.org_assignment, migration 026), kept
+# separate from the person (acos.dossier). Reporting edges are FACTS Ryan
+# approves; the LLM never asserts structure. Renders read ONLY approved current
+# rows (valid_to IS NULL AND status='approved'); drafts are invisible.
+# ============================================================================
+
+_ORG_USAGE = (
+    "Usage: `org <person>` (their spot in the chart) · `org <orgname>` (the roster) "
+    "· `org history <person>`. Set facts with `dossier set <name> title:|reports_to:|org:`."
+)
+_CHAIN_DEPTH_CAP = 20
+
+
+def _current_assignments(dossier_id: int) -> list[dict]:
+    return execute_query(
+        "SELECT * FROM acos.org_assignment "
+        "WHERE dossier_id = %s AND valid_to IS NULL AND status = 'approved' "
+        "ORDER BY valid_from DESC, assignment_id DESC",
+        (dossier_id,),
+    )
+
+
+def current_assignment(dossier_id: int, org: str | None = None) -> dict | None:
+    """The person's current approved assignment — for `org`, that org's row; else
+    the most recent current row (the primary employer)."""
+    rows = _current_assignments(dossier_id)
+    if org:
+        for r in rows:
+            if r["org"].lower() == org.lower():
+                return r
+        return None
+    return rows[0] if rows else None
+
+
+def _assignment_header(dossier: dict) -> str:
+    """'<title> · <org>' suffix for show/brief headers, or '' when no current
+    assignment exists. Renders only from an approved current row."""
+    cur = current_assignment(dossier["dossier_id"])
+    if not cur:
+        return ""
+    bits = [cur["title"]] if cur.get("title") else []
+    bits.append(cur["org"])
+    return " · ".join(bits)
+
+
+def apply_assignment(dossier_id: int, changes: dict) -> str:
+    """Close-and-insert an org assignment: close the current row (valid_to=today),
+    insert a new current row carrying forward unchanged fields. Same-value → no-op.
+    `changes` may carry org / title / reports_to (dossier_id) / is_root. Renders
+    from the written row."""
+    person = get_dossier(dossier_id)
+    cur_all = _current_assignments(dossier_id)
+    target_org = changes.get("org")
+    if not target_org:
+        orgs = {r["org"] for r in cur_all}
+        if len(orgs) == 1:
+            target_org = next(iter(orgs))
+        elif not orgs:
+            return ("No employer on file yet — set one first: "
+                    f"`dossier set {person['slug']} org: <org>`.")
+        else:
+            return ("Multiple current orgs on file — say which by adding "
+                    "`org: <org>` to the command.")
+
+    same_org_cur = next((r for r in cur_all if r["org"].lower() == target_org.lower()), None)
+    moving = bool(changes.get("org")) and same_org_cur is None and bool(cur_all)
+
+    base = (
+        {"title": same_org_cur["title"], "reports_to": same_org_cur["reports_to"],
+         "is_root": same_org_cur["is_root"]}
+        if same_org_cur else {"title": None, "reports_to": None, "is_root": False}
+    )
+    new = dict(base)
+    for k in ("title", "reports_to", "is_root"):
+        if k in changes:
+            new[k] = changes[k]
+
+    if same_org_cur and not moving and \
+       (same_org_cur["title"] or None) == (new["title"] or None) and \
+       same_org_cur["reports_to"] == new["reports_to"] and \
+       same_org_cur["is_root"] == new["is_root"]:
+        return f"Already current — no change. {_render_assignment_line(person, same_org_cur)}"
+
+    today = _ct_today()
+    if same_org_cur:
+        execute_write(
+            "UPDATE acos.org_assignment SET valid_to = %s WHERE assignment_id = %s",
+            (today, same_org_cur["assignment_id"]),
+        )
+    if moving:  # employer change closes the OTHER current org rows too
+        for r in cur_all:
+            if r["org"].lower() != target_org.lower():
+                execute_write(
+                    "UPDATE acos.org_assignment SET valid_to = %s WHERE assignment_id = %s",
+                    (today, r["assignment_id"]),
+                )
+    ins = execute_one(
+        "INSERT INTO acos.org_assignment "
+        "(dossier_id, org, title, reports_to, is_root, status, valid_from) "
+        "VALUES (%s, %s, %s, %s, %s, 'approved', %s) RETURNING *",
+        (dossier_id, target_org, new["title"], new["reports_to"], new["is_root"], today),
+    )
+    _audit("org_set", dossier_id, {
+        "org": target_org, "title": new["title"], "reports_to": new["reports_to"],
+        "is_root": new["is_root"], "effective": str(today),
+    })
+    return f"✅ {_render_assignment_line(person, ins)} · effective {fmt_date(today)}"
+
+
+def _render_assignment_line(person: dict, row: dict) -> str:
+    parts = [f"**{person['full_name']}**"]
+    tail = []
+    if row.get("title"):
+        tail.append(row["title"])
+    tail.append(row["org"])
+    line = parts[0] + " — " + " · ".join(tail)
+    if row.get("reports_to"):
+        mgr = get_dossier(row["reports_to"])
+        if mgr:
+            line += f" · reports to {mgr['full_name']}"
+    if row.get("is_root"):
+        line += " · org root"
+    return line
+
+
+def _chain_up(dossier_id: int, org: str) -> list[dict]:
+    """The reporting chain from a person upward, capped at depth 20 (cycle guard —
+    a self-referential edge terminates instead of hanging). Depth 1 is the person;
+    2+ are managers, root-first-encountered stopping the walk."""
+    return execute_query(
+        """
+        WITH RECURSIVE chain AS (
+            SELECT a.dossier_id, a.reports_to, a.title, a.org, a.is_root, 1 AS depth
+              FROM acos.org_assignment a
+              WHERE a.dossier_id = %s AND a.org = %s
+                AND a.valid_to IS NULL AND a.status = 'approved'
+            UNION ALL
+            SELECT a.dossier_id, a.reports_to, a.title, a.org, a.is_root, c.depth + 1
+              FROM acos.org_assignment a
+              JOIN chain c ON a.dossier_id = c.reports_to AND a.org = c.org
+              WHERE a.valid_to IS NULL AND a.status = 'approved'
+                AND c.depth < %s AND NOT c.is_root
+        )
+        SELECT c.dossier_id, c.reports_to, c.title, c.is_root, c.depth, d.full_name
+          FROM chain c JOIN acos.dossier d ON d.dossier_id = c.dossier_id
+          ORDER BY c.depth
+        """,
+        (dossier_id, org, _CHAIN_DEPTH_CAP),
+    )
+
+
+def org_person_render(d: dict) -> str:
+    did = d["dossier_id"]
+    cur = current_assignment(did)
+    if not cur:
+        return (f"I have a dossier for {d['full_name']} but no reporting line recorded. "
+                f"`dossier set {d['slug']} reports_to: <slug>` to add it.")
+    org = cur["org"]
+    title = f" — {cur['title']}" if cur.get("title") else ""
+    lines = [f"**{d['full_name']}**{title} · {org}"]
+
+    chain = _chain_up(did, org)
+    ids = [r["dossier_id"] for r in chain]
+    cycle = len(ids) != len(set(ids)) or (chain and chain[-1]["depth"] >= _CHAIN_DEPTH_CAP)
+    managers = chain[1:] if chain else []
+
+    if cur["is_root"]:
+        lines.append(f"· top of {org}")
+    elif cycle:
+        lines.append("· ⚠️ reporting cycle detected — chain not rendered; fix with `dossier set`.")
+    elif cur["reports_to"] is None:
+        lines.append(f"· reporting line not recorded above {d['full_name']}")
+    elif managers:
+        lines.append("Reports up: " + " → ".join(m["full_name"] for m in managers))
+        top = managers[-1]
+        if not top["is_root"] and top["reports_to"] is None:
+            lines.append(f"· reporting line not recorded above {top['full_name']}")
+    else:
+        # reports_to is set but the manager has no assignment in THIS org (a
+        # cross-org edge the same-org chain can't walk) — name them directly
+        # rather than silently dropping the line.
+        mgr = get_dossier(cur["reports_to"])
+        if mgr:
+            lines.append(f"Reports to: {mgr['full_name']} (different org)")
+
+    directs = execute_query(
+        "SELECT d.full_name FROM acos.org_assignment a JOIN acos.dossier d ON d.dossier_id = a.dossier_id "
+        "WHERE a.reports_to = %s AND a.org = %s AND a.valid_to IS NULL AND a.status = 'approved' "
+        "ORDER BY d.full_name",
+        (did, org),
+    )
+    if directs:
+        lines.append("Directs: " + ", ".join(x["full_name"] for x in directs))
+
+    if cur["reports_to"]:
+        peers = execute_query(
+            "SELECT d.full_name FROM acos.org_assignment a JOIN acos.dossier d ON d.dossier_id = a.dossier_id "
+            "WHERE a.reports_to = %s AND a.org = %s AND a.dossier_id <> %s "
+            "AND a.valid_to IS NULL AND a.status = 'approved' ORDER BY d.full_name",
+            (cur["reports_to"], org, did),
+        )
+        if peers:
+            lines.append("Peers: " + ", ".join(x["full_name"] for x in peers))
+    return "\n".join(lines)
+
+
+def org_org(orgname: str) -> str:
+    from collections import defaultdict
+    rows = execute_query(
+        "SELECT a.dossier_id, a.title, a.reports_to, a.is_root, d.full_name "
+        "FROM acos.org_assignment a JOIN acos.dossier d ON d.dossier_id = a.dossier_id "
+        "WHERE lower(a.org) = lower(%s) AND a.valid_to IS NULL AND a.status = 'approved' "
+        "ORDER BY d.full_name",
+        (orgname,),
+    )
+    if not rows:
+        return f"No one on file in {orgname}."
+    by_id = {r["dossier_id"]: r for r in rows}
+    children: dict = defaultdict(list)
+    roots = []
+    for r in rows:
+        if r["reports_to"] in by_id:  # edge lands inside this org's roster → nest
+            children[r["reports_to"]].append(r)
+        else:
+            roots.append(r)  # is_root, unknown, or reports outside the roster → top level
+    lines = [f"**{orgname}** — {len(rows)} on file"]
+    seen: set = set()
+
+    def render(node, depth):
+        if node["dossier_id"] in seen:  # cycle guard
+            return
+        seen.add(node["dossier_id"])
+        title = f" — {node['title']}" if node["title"] else ""
+        lines.append(f"{'  ' * depth}• {node['full_name']}{title}")
+        for c in sorted(children[node["dossier_id"]], key=lambda x: x["full_name"]):
+            render(c, depth + 1)
+
+    for r in sorted(roots, key=lambda x: x["full_name"]):
+        render(r, 0)
+    for r in rows:  # any node stranded by a cycle still lists, flat
+        if r["dossier_id"] not in seen:
+            render(r, 0)
+    return "\n".join(lines)
+
+
+def org_history(name: str) -> str:
+    kind, d = resolve_attendee(name)
+    if kind == "unknown":
+        return f"No dossier for that name. `dossier new {name}` to start one."
+    if kind == "ambiguous":
+        opts = ", ".join(f"{x['full_name']} (`{x['slug']}`)" for x in d)
+        return f"“{name}” is ambiguous — {opts}. Use the slug."
+    rows = execute_query(
+        "SELECT org, title, reports_to, valid_from, valid_to FROM acos.org_assignment "
+        "WHERE dossier_id = %s AND status = 'approved' "
+        "ORDER BY valid_from DESC, assignment_id DESC",
+        (d["dossier_id"],),
+    )
+    if not rows:
+        return f"No org history for {d['full_name']}."
+    lines = [f"\U0001f4dc Org history — {d['full_name']}"]
+    for r in rows:
+        span = f"{fmt_date(r['valid_from'])} – " + (fmt_date(r["valid_to"]) if r["valid_to"] else "present")
+        title = r["title"] or "(no title)"
+        rt = ""
+        if r["reports_to"]:
+            mgr = get_dossier(r["reports_to"])
+            if mgr:
+                rt = f", reports to {mgr['full_name']}"
+        lines.append(f"- {title}, {r['org']}{rt} ({span})")
+    return "\n".join(lines)
+
+
+def org_query(arg: str) -> str:
+    """Route an `org …` / natural-form query to person / org / history render.
+    Person slug match wins over an org of the same name (people are the common
+    case); the alternative is noted."""
+    arg = (arg or "").strip().rstrip("?").strip()
+    if not arg or arg.lower() in ("chart", "chart please", "me"):
+        return _ORG_USAGE
+    m = re.match(r"^history\s+(.+)$", arg, re.IGNORECASE)
+    if m:
+        return org_history(m.group(1).strip())
+
+    kind, d = resolve_attendee(arg)
+    org_exists = execute_query(
+        "SELECT 1 FROM acos.org_assignment WHERE lower(org) = lower(%s) "
+        "AND valid_to IS NULL AND status = 'approved' LIMIT 1",
+        (arg,),
+    )
+    if kind == "resolved":
+        reply = org_person_render(d)
+        if org_exists:
+            reply += f"\n\n_(“{arg}” is also an org — `org {arg}` for the roster.)_"
+        return reply
+    if kind == "ambiguous":
+        opts = ", ".join(f"{x['full_name']} (`{x['slug']}`)" for x in d)
+        return f"“{arg}” is ambiguous — {opts}. Use the slug."
+    if org_exists:
+        return org_org(arg)
+    return f"No dossier for that name. `dossier new {arg}` to start one."
