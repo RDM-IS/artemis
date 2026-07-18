@@ -54,6 +54,7 @@ _MIG_020 = (_REPO_ROOT / "migrations" / "020_commitments.sql").read_text()
 _MIG_024 = (_REPO_ROOT / "migrations" / "024_dossier.sql").read_text()
 _MIG_025 = (_REPO_ROOT / "migrations" / "025_dossier_approve.sql").read_text()
 _MIG_026 = (_REPO_ROOT / "migrations" / "026_org_assignment.sql").read_text()
+_MIG_027 = (_REPO_ROOT / "migrations" / "027_org_profile.sql").read_text()
 
 
 # ============================================================================
@@ -600,6 +601,7 @@ def setUpModule():
             cur.execute(_MIG_024)
             cur.execute(_MIG_025)
             cur.execute(_MIG_026)
+            cur.execute(_MIG_027)
         _LIVE = True
     except Exception as e:
         sys.stderr.write(f"[test_dossier] live PG unavailable, skipping: {e}\n")
@@ -636,7 +638,7 @@ class LiveBase(unittest.TestCase):
         dossier.execute_query, dossier.execute_one, dossier.execute_write = _q, _one, _w
         dossier.log_audit = lambda *a, **k: ""
         commitments.execute_query, commitments.execute_one, commitments.execute_write = _q, _one, _w
-        for t in ("org_assignment", "dossier_idea", "dossier_loop", "dossier_entry",
+        for t in ("org_note", "org_profile", "org_assignment", "dossier_idea", "dossier_loop", "dossier_entry",
                   "dossier_meeting_attendee", "dossier_meeting", "dossier"):
             with _CONN.cursor() as cur:
                 cur.execute(f"TRUNCATE acos.{t} RESTART IDENTITY CASCADE")
@@ -1354,6 +1356,228 @@ class TestReorgNote(LiveOrgBase):
         note = dossier._recent_reorg_note(jen["dossier_id"])
         self.assertIsNotNone(note)
         self.assertIn("recent reorg", note)
+
+
+
+# ============================================================================
+# PB-010d — Org profiles
+# ============================================================================
+
+class TestOrgSetGrammar(unittest.TestCase):
+    def test_fields(self):
+        for field in ("overview", "active_work", "opportunities", "display_name"):
+            p = dossier.parse_org_set(f"org set fca-odae {field}: some text here")
+            self.assertEqual(p["column"], field)
+            self.assertEqual(p["org"], "fca-odae")
+            self.assertEqual(p["value"], "some text here")
+
+    def test_prose_terminal_embedded_key_not_split(self):
+        p = dossier.parse_org_set(
+            "org set fca-odae overview: they run active_work: streams and opportunities: none")
+        self.assertEqual(p["column"], "overview")
+        self.assertIn("active_work: streams", p["value"])   # embedded key kept, not split
+
+    def test_missing_value_errors(self):
+        self.assertIn("error", dossier.parse_org_set("org set fca-odae overview:"))
+
+    def test_bad_field_errors(self):
+        self.assertIn("error", dossier.parse_org_set("org set fca-odae bogus: x"))
+
+
+class TestOrgSetIntent(unittest.TestCase):
+    def test_set_and_notes_route_to_org(self):
+        self.assertEqual(intent_mod.detect_dossier_intent("org set fca-odae overview: x"), "org")
+        self.assertEqual(intent_mod.detect_dossier_intent("org notes fca-odae"), "org")
+
+
+class TestOrgNoteExtraction(unittest.TestCase):
+    def _apply(self, org_notes):
+        meeting = {"meeting_id": 5, "occurred_on": date(2026, 7, 17)}
+        d = {"dossier_id": 1, "slug": "jen", "full_name": "Jennifer"}
+        inserts = []
+
+        def fake_one(sql, params=None):
+            if "INSERT INTO acos.org_note" in sql:
+                inserts.append(params)
+                return {"note_id": len(inserts)}
+            if "INSERT INTO acos.dossier_entry" in sql:
+                return {"entry_id": 1}
+            return None
+
+        with patch.object(dossier, "execute_one", side_effect=fake_one), \
+             patch.object(dossier, "execute_write", MagicMock()), \
+             patch.object(commitments, "add_commitment", MagicMock()), \
+             patch.object(dossier, "_audit", MagicMock()):
+            dossier._apply_draft(meeting, d, {"log_entry": "x", "org_notes": org_notes})
+        return inserts
+
+    def test_stated_org_fact_writes(self):
+        ins = self._apply([{"org": "fca-odae", "note_text": "migrating to Databricks next quarter",
+                            "evidence": "they're migrating to Databricks next quarter"}])
+        self.assertEqual(len(ins), 1)
+        self.assertEqual(ins[0][0], "fca-odae")             # org
+        self.assertIn("Databricks", ins[0][1])              # note_text
+
+    def test_no_evidence_skipped(self):
+        self.assertEqual(self._apply([{"org": "fca-odae", "note_text": "x", "evidence": ""}]), [])
+
+    def test_person_fact_dropped_by_critique(self):
+        # Pass 1 miscategorizes a person-fact as an org_note; pass 2 drops it.
+        def fake(system, user, max_tokens=1600):
+            if system is dossier._EXTRACT_SYSTEM:
+                return ({"log_entry": "Met.",
+                         "org_notes": [{"org": "fca-odae", "note_text": "Jennifer prefers email",
+                                        "evidence": "x"}]},
+                        {"input_tokens": 1, "output_tokens": 1})
+            return ({"log_entry": "Met.", "org_notes": []}, {"input_tokens": 1, "output_tokens": 1})
+        with patch.object(dossier, "_llm_call", side_effect=fake):
+            final, meta = dossier._extract_two_pass("notes", _ATT, "ctx", _MTG)
+        self.assertEqual(final["org_notes"], [])
+        self.assertGreaterEqual(meta["corrections"], 1)
+
+
+class TestSharedOrgOverview(unittest.TestCase):
+    def test_shared_org_yes(self):
+        with patch.object(dossier, "current_assignment", return_value={"org": "fca-odae"}), \
+             patch.object(dossier, "get_org_profile",
+                          return_value={"org": "fca-odae", "overview": "Independent regulator. More."}):
+            line = dossier._shared_org_overview([{"dossier_id": 1}, {"dossier_id": 2}])
+        self.assertEqual(line, "Independent regulator")   # first sentence only
+
+    def test_mixed_org_no(self):
+        orgs = iter([{"org": "fca-odae"}, {"org": "fdic"}])
+        with patch.object(dossier, "current_assignment", side_effect=lambda _id: next(orgs)):
+            self.assertIsNone(dossier._shared_org_overview([{"dossier_id": 1}, {"dossier_id": 2}]))
+
+    def test_empty_overview_no(self):
+        with patch.object(dossier, "current_assignment", return_value={"org": "fca-odae"}), \
+             patch.object(dossier, "get_org_profile", return_value={"org": "fca-odae", "overview": None}):
+            self.assertIsNone(dossier._shared_org_overview([{"dossier_id": 1}]))
+
+
+class TestLiveOrgProfile(LiveOrgBase):
+    def test_apply_and_render_full(self):
+        dossier.apply_org_set("fca-odae", "display_name", "FCA — ODAE")
+        dossier.apply_org_set("fca-odae", "overview", "Independent regulator.")
+        dossier.apply_org_set("fca-odae", "active_work", "Databricks migration.")
+        dossier.apply_org_set("fca-odae", "opportunities", "Take over a pipeline.")
+        row = _one("SELECT * FROM acos.org_profile WHERE org='fca-odae'")
+        self.assertEqual(row["overview"], "Independent regulator.")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        dossier.apply_assignment(jen["dossier_id"], {"org": "fca-odae"})
+        out = dossier.org_org("fca-odae")
+        for s in ("FCA — ODAE", "Overview", "Independent regulator", "Active work",
+                  "Databricks", "Opportunities", "Take over", "People"):
+            self.assertIn(s, out)
+
+    def test_partial_omits_empty_sections(self):
+        dossier.apply_org_set("fca-odae", "overview", "Just an overview.")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        dossier.apply_assignment(jen["dossier_id"], {"org": "fca-odae"})
+        out = dossier.org_org("fca-odae")
+        self.assertIn("Overview", out)
+        self.assertNotIn("Active work", out)
+        self.assertNotIn("Opportunities", out)
+
+    def test_bare_profile_roster_only(self):
+        jen = self._mk("jennifer", "Jennifer Xu")
+        dossier.apply_assignment(jen["dossier_id"], {"org": "fca-odae"})
+        dossier._ensure_org_profile("fca-odae")             # bare (no sections)
+        out = dossier.org_org("fca-odae")
+        self.assertIn("People", out)
+        self.assertNotIn("Overview", out)
+
+    def test_notes_cap_and_overflow(self):
+        dossier.apply_org_set("fca-odae", "overview", "o")
+        for i in range(7):
+            _w("INSERT INTO acos.org_note (org, note_text, status, note_date) "
+               "VALUES ('fca-odae', %s, 'approved', %s)", (f"note {i}", date(2026, 7, 10 + i)))
+        out = dossier.org_org("fca-odae")
+        self.assertIn("Recent org notes", out)
+        self.assertIn("2 more", out)                        # 7 approved → show 5, 2 more
+        full = dossier.org_notes_render("fca-odae")
+        self.assertIn("note 6", full)
+        self.assertIn("note 0", full)
+
+
+class TestLiveOrgNoteReview(LiveOrgBase):
+    def _meeting(self):
+        return _one("INSERT INTO acos.dossier_meeting (occurred_on, topic, raw_notes) "
+                    "VALUES (%s,'s','n') RETURNING *", (date(2026, 7, 17),))
+
+    def test_unknown_org_autocreates_profile_atomically(self):
+        d = self._mk("jennifer", "Jennifer Xu")
+        dossier._apply_draft(self._meeting(), d, {
+            "log_entry": "x",
+            "org_notes": [{"org": "fdic", "note_text": "FDIC is hiring examiners",
+                           "evidence": "FDIC is hiring examiners"}]})
+        self.assertIsNotNone(_one("SELECT * FROM acos.org_profile WHERE org='fdic'"))
+        self.assertIsNotNone(_one("SELECT * FROM acos.org_note WHERE org='fdic' AND status='draft'"))
+
+    def test_draft_invisible_until_approved(self):
+        dossier.apply_org_set("fca-odae", "overview", "Reg.")
+        d = self._mk("jennifer", "Jennifer Xu")
+        dossier.apply_assignment(d["dossier_id"], {"org": "fca-odae"})
+        dossier._apply_draft(self._meeting(), d, {
+            "log_entry": "x",
+            "org_notes": [{"org": "fca-odae", "note_text": "migrating to Databricks",
+                           "evidence": "they're migrating"}]})
+        self.assertNotIn("migrating to Databricks", dossier.org_org("fca-odae"))   # draft invisible
+        _r, mapping = dossier.render_review()
+        num = next(n for n, it in mapping.items() if it["type"] == "org_note")
+        dossier.approve_items([num], mapping)
+        self.assertIn("migrating to Databricks", dossier.org_org("fca-odae"))       # now visible
+
+
+class TestLiveBriefOrgHeader(LiveOrgBase):
+    def test_shared_org_overview_line(self):
+        dossier.apply_org_set("fca-odae", "overview",
+                              "Independent regulator of the Farm Credit System.")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        den = self._mk("dennis", "Dennis Rowe")
+        for x in (jen, den):
+            dossier.apply_assignment(x["dossier_id"], {"org": "fca-odae"})
+        out = dossier.brief("jennifer & dennis")
+        self.assertIn("Independent regulator of the Farm Credit System", out)
+
+    def test_mixed_org_no_line(self):
+        dossier.apply_org_set("fca-odae", "overview", "RegOverviewText.")
+        jen = self._mk("jennifer", "Jennifer Xu")
+        den = self._mk("dennis", "Dennis Rowe")
+        dossier.apply_assignment(jen["dossier_id"], {"org": "fca-odae"})
+        dossier.apply_assignment(den["dossier_id"], {"org": "fdic"})
+        self.assertNotIn("RegOverviewText", dossier.brief("jennifer & dennis"))
+
+
+class TestLiveOrgProfileSeed(unittest.TestCase):
+    def test_027_seeds_fca_odae(self):
+        if not _LIVE:
+            self.skipTest("no local Postgres")
+        admin = _admin_connect()
+        admin.autocommit = True
+        with admin.cursor() as c:
+            c.execute("DROP DATABASE IF EXISTS artemis_orgprof_seed")
+            c.execute("CREATE DATABASE artemis_orgprof_seed")
+        admin.close()
+        conn = psycopg2.connect(dbname="artemis_orgprof_seed")
+        conn.autocommit = True
+        try:
+            with conn.cursor() as c:
+                c.execute(_MIG_001)
+                c.execute(_MIG_020)     # 024 ALTERs commitments
+                c.execute(_MIG_024)     # 027 FK -> dossier_meeting
+                c.execute(_MIG_027)
+                c.execute("SELECT display_name FROM acos.org_profile WHERE org='fca-odae'")
+                row = c.fetchone()
+                self.assertIsNotNone(row)
+                self.assertIn("Office of Data Analytics", row[0])
+        finally:
+            conn.close()
+            admin = _admin_connect()
+            admin.autocommit = True
+            with admin.cursor() as c:
+                c.execute("DROP DATABASE IF EXISTS artemis_orgprof_seed")
+            admin.close()
 
 
 if __name__ == "__main__":

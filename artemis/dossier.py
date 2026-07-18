@@ -627,12 +627,18 @@ _EXTRACT_SYSTEM = (
     '  "ideas": [{"text": "...", "cross_pollinate_slug": "<another dossier slug or null>", "evidence": "<span>"}],\n'
     '  "action_items": [{"text": "concrete next step / commitment", "due_date": "YYYY-MM-DD or null", "evidence": "<span>"}],\n'
     '  "org_signals": [{"dossier_slug": "<slug the fact is ABOUT>", "field": "title|reports_to|org", '
-    '"value": "<title text | a slug for reports_to | org name>", "evidence": "<exact quote from the notes>"}]\n'
+    '"value": "<title text | a slug for reports_to | org name>", "evidence": "<exact quote from the notes>"}],\n'
+    '  "org_notes": [{"org": "<org key, e.g. fca-odae>", "note_text": "an ORG-level fact", "evidence": "<span>"}]\n'
     "}\n\n"
     "Rules:\n"
     "- If you propose ANY loops/ideas/action_items, you MUST also give a log_entry.\n"
     "- close_loops may ONLY contain loop_ids listed under Open loops for this person.\n"
     "- due_date only when the notes state or clearly imply one; else null.\n"
+    "- org_notes ONLY when the notes STATE an ORGANIZATION-level fact — about the "
+    "org itself, not a person ('they're migrating to Databricks next quarter', "
+    "'ODAE budget renews in October', 'FDIC is hiring examiners'). A person-level "
+    "fact is NEVER an org_note; an org-level fact is NEVER a log_entry/loop/idea. "
+    "Every org_note MUST carry an exact `evidence` quote; no quote → no note.\n"
     "- org_signals ONLY when the notes STATE an employment fact — who employs "
     "someone, their title, or who they report to ('Sarah joined Jennifer's team', "
     "'Tom is the new FDIC lead examiner'). NEVER infer reporting structure from a "
@@ -674,7 +680,10 @@ _CRITIQUE_SYSTEM = (
     "(b) Check tense/agency: did the notes STATE it (happened / was decided) or "
     "PLAN it or HYPOTHESIZE it? Keep plans, phrased as plans; drop pure hypotheticals.\n"
     "(c) Check Ryan's writing standards: no motive speculation or armchair "
-    "psychology; inferences marked '(inferred)'; needs-from-me quotes preserved.\n\n"
+    "psychology; inferences marked '(inferred)'; needs-from-me quotes preserved.\n"
+    "(d) Check CATEGORY FIT: a PERSON-level fact must not appear as an org_note, "
+    "and an ORG-level fact must not appear as a log_entry/loop/idea. Move or drop "
+    "miscategorized claims.\n\n"
     "Output the CORRECTED final JSON — the SAME schema as the candidate, including "
     "an `evidence` span (<=200 chars, verbatim from the notes) on every surviving "
     "item. UNSUPPORTED claims are DROPPED entirely, never reworded to survive. The "
@@ -775,6 +784,11 @@ def _claims(data: dict) -> set:
     for x in data.get("org_signals") or []:
         if isinstance(x, dict):
             out.add(("org", f"{x.get('dossier_slug')}/{x.get('field')}/{x.get('value')}".lower()))
+    for x in data.get("org_notes") or []:
+        if isinstance(x, dict):
+            t = str(x.get("note_text", "")).strip()
+            if t:
+                out.add(("org_note", f"{x.get('org')}/{t}".lower()))
     return out
 
 
@@ -850,7 +864,7 @@ def _apply_draft(meeting: dict, d: dict, extraction: dict) -> dict:
     closes a loop — closures are proposals (see migration 024's loop model)."""
     did, mid, edate = d["dossier_id"], meeting["meeting_id"], meeting["occurred_on"]
     counts = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0,
-              "todos": 0, "org": 0}
+              "todos": 0, "org": 0, "org_notes": 0}
 
     entry_id = None
     log_entry = extraction.get("log_entry")
@@ -982,6 +996,26 @@ def _apply_draft(meeting: dict, d: dict, extraction: dict) -> dict:
         )
         counts["org"] += 1
 
+    # org_notes → draft org_note rows (org-level intel; person facts never land
+    # here). Auto-create a bare profile so the FK holds (statistics act — the org
+    # exists; section authorship stays Ryan's).
+    for note in extraction.get("org_notes") or []:
+        if not isinstance(note, dict):
+            continue
+        org = str(note.get("org", "")).strip().lower()
+        note_text = str(note.get("note_text", "")).strip()
+        ev = str(note.get("evidence", "")).strip()
+        if not (org and note_text and ev):
+            continue  # org-level fact + evidence required; else skip (no inference)
+        _ensure_org_profile(org)
+        row = execute_one(
+            "INSERT INTO acos.org_note (org, note_text, meeting_id, status, note_date) "
+            "VALUES (%s, %s, %s, 'draft', %s) RETURNING note_id",
+            (org, note_text, mid, edate),
+        )
+        _remember_evidence("org_note", row["note_id"], ev)
+        counts["org_notes"] += 1
+
     _audit("draft_extraction", did, {"meeting_id": mid, **counts})
     return counts
 
@@ -1000,7 +1034,7 @@ def draft_extraction(meeting_id: int) -> str:
         (meeting_id,),
     )
     total = {"entries": 0, "closures": 0, "opens": 0, "ideas": 0, "cross": 0,
-             "todos": 0, "org": 0}
+             "todos": 0, "org": 0, "org_notes": 0}
     failed = []
     for d in attendees:
         extraction, meta = _extract_two_pass(
@@ -1042,6 +1076,8 @@ def draft_extraction(meeting_id: int) -> str:
         bits.append(f"{total['todos']} to-do{'s' if total['todos'] != 1 else ''}")
     if total["org"]:
         bits.append(f"{total['org']} org signal{'s' if total['org'] != 1 else ''}")
+    if total["org_notes"]:
+        bits.append(f"{total['org_notes']} org note{'s' if total['org_notes'] != 1 else ''}")
     if not bits:
         msg = "Drafted for review: nothing extractable from the notes."
     else:
@@ -1057,10 +1093,10 @@ def draft_extraction(meeting_id: int) -> str:
 
 # Per-person type order within the review listing.
 _TYPE_RANK = {"entry": 0, "loop_close": 1, "loop_open": 2, "idea": 3,
-              "commitment": 4, "org": 5}
+              "commitment": 4, "org": 5, "org_note": 6}
 _TYPE_LABEL = {
     "entry": "entry", "loop_close": "loop close", "loop_open": "loop open",
-    "idea": "idea", "commitment": "to-do", "org": "org",
+    "idea": "idea", "commitment": "to-do", "org": "org", "org_note": "org-note",
 }
 
 
@@ -1132,8 +1168,17 @@ def pending_items() -> list[dict]:
         items.append({"type": "org", "id": r["assignment_id"], "dossier_id": r["dossier_id"],
                       "dossier_name": r["full_name"], "text": desc, "prov": None,
                       "evidence": r["evidence"]})  # org evidence lives in the DB column
+    for r in execute_query(
+        "SELECT note_id, org, note_text FROM acos.org_note WHERE status = 'draft'"
+    ):
+        items.append({"type": "org_note", "id": r["note_id"], "dossier_id": None,
+                      "dossier_name": "Org notes", "text": r["note_text"], "prov": None,
+                      "label": f"org-note {r['org']}",
+                      "evidence": _draft_evidence.get(("org_note", r["note_id"]))})
 
-    items.sort(key=lambda it: (it["dossier_name"].lower(), _TYPE_RANK[it["type"]], it["id"]))
+    # People first (grouped by name), then org notes as their own trailing group.
+    items.sort(key=lambda it: (it["type"] == "org_note", it["dossier_name"].lower(),
+                               _TYPE_RANK[it["type"]], it["id"]))
     return items
 
 
@@ -1151,7 +1196,8 @@ def render_review() -> tuple[str, dict]:
             current = it["dossier_name"]
             lines.append(f"\n**{current}**")
         prov = f"  _({it['prov']})_" if it["prov"] else ""
-        lines.append(f"  {n}. [{_TYPE_LABEL[it['type']]}] {it['text']}{prov}")
+        label = it.get("label") or _TYPE_LABEL[it["type"]]  # org notes carry the org in the label
+        lines.append(f"  {n}. [{label}] {it['text']}{prov}")
         # EXT-1 E5: dim provenance line, only when evidence exists (no empty ↳).
         if it.get("evidence"):
             lines.append(f"       ↳ _\"{it['evidence']}\"_")
@@ -1213,6 +1259,13 @@ def _approve_item(it: dict) -> bool:
         apply_assignment(draft["dossier_id"], changes)
         execute_write("DELETE FROM acos.org_assignment WHERE assignment_id = %s AND status = 'draft'", (iid,))
         ok = True
+    elif t == "org_note":
+        execute_write(
+            "UPDATE acos.org_note SET status = 'approved', approved_at = now() "
+            "WHERE note_id = %s AND status = 'draft'", (iid,),
+        )
+        row = execute_one("SELECT status FROM acos.org_note WHERE note_id = %s", (iid,))
+        ok = bool(row and row["status"] == "approved")
     else:
         return False
     if ok:
@@ -1271,6 +1324,11 @@ def edit_item(num: int, new_text: str, mapping: dict) -> str:
     elif t == "commitment":
         commitments.update_commitment_title(iid, new_text)
         commitments.activate_commitment(iid)
+    elif t == "org_note":
+        execute_write(
+            "UPDATE acos.org_note SET note_text = %s, status = 'approved', approved_at = now() "
+            "WHERE note_id = %s AND status = 'draft'", (new_text, iid),
+        )
     elif t == "org":
         return (f"#{num} is an org signal — a structured fact, not free text. "
                 f"`approve {num}` / `drop {num}`, or set it exactly with "
@@ -1310,6 +1368,8 @@ def drop_item(num: int, mapping: dict) -> str:
         execute_write("DELETE FROM acos.commitments WHERE id = %s AND status = 'draft'", (iid,))
     elif t == "org":
         execute_write("DELETE FROM acos.org_assignment WHERE assignment_id = %s AND status = 'draft'", (iid,))
+    elif t == "org_note":
+        execute_write("DELETE FROM acos.org_note WHERE note_id = %s AND status = 'draft'", (iid,))
     _audit(f"drop_{t}", it["dossier_id"], {"id": iid})
     _draft_evidence.pop((t, iid), None)
     mapping.pop(num, None)
@@ -1451,6 +1511,10 @@ def brief(person_arg: str, topic: str | None = None) -> str:
     if topic:
         head += f" — *{topic}*"
     parts = [head]
+    # PB-010d: one-line org context when all attendees share a profiled org.
+    overview = _shared_org_overview(dossiers)
+    if overview:
+        parts.append(f"_{overview}._")
     seen: set = set()
     if len(dossiers) > 1:
         # Multi-person: group attendees under their current org.
@@ -1946,40 +2010,63 @@ def org_person_render(d: dict) -> str:
 
 def org_org(orgname: str) -> str:
     from collections import defaultdict
+    profile = get_org_profile(orgname)
+    org_key = profile["org"] if profile else orgname
     rows = execute_query(
         "SELECT a.dossier_id, a.title, a.reports_to, a.is_root, d.full_name "
         "FROM acos.org_assignment a JOIN acos.dossier d ON d.dossier_id = a.dossier_id "
         "WHERE lower(a.org) = lower(%s) AND a.valid_to IS NULL AND a.status = 'approved' "
         "ORDER BY d.full_name",
-        (orgname,),
+        (org_key,),
     )
-    if not rows:
-        return f"No one on file in {orgname}."
-    by_id = {r["dossier_id"]: r for r in rows}
-    children: dict = defaultdict(list)
-    roots = []
-    for r in rows:
-        if r["reports_to"] in by_id:  # edge lands inside this org's roster → nest
-            children[r["reports_to"]].append(r)
-        else:
-            roots.append(r)  # is_root, unknown, or reports outside the roster → top level
-    lines = [f"**{orgname}** — {len(rows)} on file"]
-    seen: set = set()
+    if not rows and not profile:
+        return f"No one on file in {orgname}, and no profile."
 
-    def render(node, depth):
-        if node["dossier_id"] in seen:  # cycle guard
-            return
-        seen.add(node["dossier_id"])
-        title = f" — {node['title']}" if node["title"] else ""
-        lines.append(f"{'  ' * depth}• {node['full_name']}{title}")
-        for c in sorted(children[node["dossier_id"]], key=lambda x: x["full_name"]):
-            render(c, depth + 1)
+    # PB-010d: profile header (display_name; overview; active work; opportunities).
+    lines = _org_profile_lines(profile)
 
-    for r in sorted(roots, key=lambda x: x["full_name"]):
-        render(r, 0)
-    for r in rows:  # any node stranded by a cycle still lists, flat
-        if r["dossier_id"] not in seen:
+    if rows:
+        by_id = {r["dossier_id"]: r for r in rows}
+        children: dict = defaultdict(list)
+        roots = []
+        for r in rows:
+            if r["reports_to"] in by_id:  # edge lands inside this org's roster → nest
+                children[r["reports_to"]].append(r)
+            else:
+                roots.append(r)  # is_root, unknown, or reports outside → top level
+        header = f"**People** — {len(rows)} on file" if profile else f"**{org_key}** — {len(rows)} on file"
+        lines.append(("\n" if lines else "") + header)
+        seen: set = set()
+
+        def render(node, depth):
+            if node["dossier_id"] in seen:  # cycle guard
+                return
+            seen.add(node["dossier_id"])
+            title = f" — {node['title']}" if node["title"] else ""
+            lines.append(f"{'  ' * depth}• {node['full_name']}{title}")
+            for c in sorted(children[node["dossier_id"]], key=lambda x: x["full_name"]):
+                render(c, depth + 1)
+
+        for r in sorted(roots, key=lambda x: x["full_name"]):
             render(r, 0)
+        for r in rows:  # any node stranded by a cycle still lists, flat
+            if r["dossier_id"] not in seen:
+                render(r, 0)
+    elif profile:
+        lines.append("\n_(no people on file yet)_")
+
+    # Approved org notes (newest first, cap 5 with an overflow line).
+    notes = _approved_notes(org_key, limit=6)
+    if notes:
+        lines.append("\n**Recent org notes**")
+        for nt in notes[:5]:
+            lines.append(f"- {fmt_date(nt['note_date'])}: {nt['note_text']}")
+        if len(notes) > 5:
+            total = execute_one(
+                "SELECT count(*) c FROM acos.org_note WHERE lower(org) = lower(%s) AND status = 'approved'",
+                (org_key,),
+            )["c"]
+            lines.append(f"…{total - 5} more — `org notes {org_key}`")
     return "\n".join(lines)
 
 
@@ -2027,6 +2114,8 @@ def org_query(arg: str) -> str:
         "SELECT 1 FROM acos.org_assignment WHERE lower(org) = lower(%s) "
         "AND valid_to IS NULL AND status = 'approved' LIMIT 1",
         (arg,),
+    ) or execute_query(
+        "SELECT 1 FROM acos.org_profile WHERE lower(org) = lower(%s) LIMIT 1", (arg,)
     )
     if kind == "resolved":
         reply = org_person_render(d)
@@ -2039,3 +2128,124 @@ def org_query(arg: str) -> str:
     if org_exists:
         return org_org(arg)
     return f"No dossier for that name. `dossier new {arg}` to start one."
+
+
+# ============================================================================
+# PB-010d — Org profiles (authored sections + append-only org notes)
+# ============================================================================
+
+_ORG_SET_COLUMNS = ("overview", "active_work", "opportunities", "display_name")
+_ORG_SET_LABEL = {
+    "overview": "Overview", "active_work": "Active work",
+    "opportunities": "Opportunities", "display_name": "Display name",
+}
+_ORG_SET_USAGE = (
+    "Usage: `org set <orgkey> <field>: <text>` — fields: `overview` · `active_work` "
+    "· `opportunities` · `display_name`. e.g. `org set fca-odae overview: …`."
+)
+
+
+def get_org_profile(org: str) -> dict | None:
+    return execute_one("SELECT * FROM acos.org_profile WHERE lower(org) = lower(%s)", (org,))
+
+
+def _ensure_org_profile(org: str) -> None:
+    """Create a bare profile (display_name = org key) if none exists. A statistics
+    act — the org exists; section authorship stays Ryan's. Idempotent."""
+    execute_write(
+        "INSERT INTO acos.org_profile (org, display_name) VALUES (%s, %s) "
+        "ON CONFLICT (org) DO NOTHING",
+        (org, org),
+    )
+
+
+def _approved_notes(org: str, limit: int | None = None) -> list[dict]:
+    sql = ("SELECT note_text, note_date FROM acos.org_note "
+           "WHERE lower(org) = lower(%s) AND status = 'approved' "
+           "ORDER BY note_date DESC, note_id DESC")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return execute_query(sql, (org,))
+
+
+def _org_profile_lines(profile: dict | None) -> list[str]:
+    """Header lines for a profile — empty sections omitted. [] if no profile."""
+    if not profile:
+        return []
+    out = [f"# {profile.get('display_name') or profile['org']}"]
+    if profile.get("overview"):
+        out.append("\n**Overview**\n" + profile["overview"])
+    if profile.get("active_work"):
+        out.append("\n**Active work**\n" + profile["active_work"])
+    if profile.get("opportunities"):
+        out.append("\n**Opportunities**\n" + profile["opportunities"])
+    return out
+
+
+def parse_org_set(text: str) -> dict:
+    """Parse `org set <orgkey> <field>: <text>`. Single field; the value runs to
+    end of message (prose is terminal — an embedded `key:` never splits it).
+    Returns {ok, org, column, label, value, preview} or {error}."""
+    m = re.match(
+        r"^org\s+set\s+(\S+)\s+(overview|active_work|opportunities|display_name)\s*:\s*(.+)$",
+        (text or "").strip(), re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return {"error": _ORG_SET_USAGE}
+    org = m.group(1).strip().lower()
+    column = m.group(2).lower()
+    value = m.group(3).strip()
+    if not value:
+        return {"error": "Nothing after the colon — give me the text to set."}
+    preview = value if len(value) <= 200 else value[:197] + "…"
+    return {"ok": True, "org": org, "column": column, "label": _ORG_SET_LABEL[column],
+            "value": value, "preview": f"{_ORG_SET_LABEL[column]} → {preview}"}
+
+
+def apply_org_set(org: str, column: str, value: str) -> str:
+    """Write a Ryan-authored profile section (only after confirm). Auto-creates a
+    bare profile row first so the org key exists. Confirms from the written row."""
+    if column not in _ORG_SET_COLUMNS:
+        return "Unknown org field."
+    _ensure_org_profile(org)
+    execute_write(
+        f"UPDATE acos.org_profile SET {column} = %s, updated_at = now() WHERE lower(org) = lower(%s)",
+        (value, org),
+    )
+    _audit("org_set_profile", None, {"org": org, "column": column})
+    row = get_org_profile(org)
+    disp = (row.get("display_name") if row else None) or org
+    return f"✅ Saved **{_ORG_SET_LABEL[column]}** for {disp}."
+
+
+def org_notes_render(org: str) -> str:
+    """`org notes <orgname>` — the full approved note list, dated newest-first."""
+    profile = get_org_profile(org)
+    org_key = profile["org"] if profile else org
+    disp = (profile.get("display_name") if profile else None) or org_key
+    notes = _approved_notes(org_key)
+    if not notes:
+        return f"No approved notes for {disp}."
+    lines = [f"\U0001f5d2️ Org notes — {disp}"]
+    for nt in notes:
+        lines.append(f"- {fmt_date(nt['note_date'])}: {nt['note_text']}")
+    return "\n".join(lines)
+
+
+def _shared_org_overview(dossiers: list[dict]) -> str | None:
+    """First sentence of the shared org's overview when ALL attendees share one org
+    with a profile+overview — a context line, not a wall. None otherwise."""
+    orgs = set()
+    for d in dossiers:
+        cur = current_assignment(d["dossier_id"])
+        orgs.add(cur["org"] if cur else None)
+    if len(orgs) != 1:
+        return None
+    org = next(iter(orgs))
+    if not org:
+        return None
+    prof = get_org_profile(org)
+    if not prof or not prof.get("overview"):
+        return None
+    first = prof["overview"].split(".")[0].strip()
+    return first or None

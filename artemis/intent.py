@@ -132,6 +132,10 @@ _DOSSIER_PATTERNS = [
     # still matches (→ usage hint in the handler, never LLM fallthrough). `\borg\b`
     # so "organize"/"organic" never trip it. Placed after the dossier prefixes,
     # before todos.
+    # PB-010d authoring/notes subroutes, ahead of the person/org dispatch (same
+    # tag; main.py distinguishes the subcommand).
+    ("org", re.compile(r"^org\s+set\b", re.IGNORECASE)),
+    ("org", re.compile(r"^org\s+notes\b", re.IGNORECASE)),
     ("org", re.compile(r"^org\b", re.IGNORECASE)),
     ("org", re.compile(
         r"\bwhere\s+does\s+\S.*\bfit\b"

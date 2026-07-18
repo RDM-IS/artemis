@@ -1100,6 +1100,17 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
             return True
         # else: fall through and re-parse as a fresh command
 
+    # Pending `org set` confirm (PB-010d org-profile authoring).
+    if pending and pending.get("type") == "org_set":
+        if ql in _CONFIRM_WORDS:
+            del _pending_confirms[channel_id]
+            say(dossier.apply_org_set(pending["org"], pending["column"], pending["value"]))
+            return True
+        if ql in _CANCEL_WORDS:
+            del _pending_confirms[channel_id]
+            say("Cancelled — nothing changed.")
+            return True
+
     tag = detect_dossier_intent(question)
     if not tag:
         return False
@@ -1157,6 +1168,25 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
         return True
 
     if tag == "org":
+        if re.match(r"^org\s+set\b", ql):
+            parsed = dossier.parse_org_set(q)
+            if parsed.get("error"):
+                say(parsed["error"])
+                return True
+            _pending_confirms[channel_id] = {
+                "type": "org_set", "org": parsed["org"], "column": parsed["column"],
+                "label": parsed["label"], "value": parsed["value"], "timestamp": time.time(),
+            }
+            say(f"\U0001f4cb Set for {parsed['org']}?\n> {parsed['preview']}\n\n"
+                f"Reply `yes` to save, `no` to cancel.")
+            return True
+        m = re.match(r"^org\s+notes\s+(.+)$", q, re.IGNORECASE)
+        if m:
+            say(dossier.org_notes_render(m.group(1).strip()))
+            return True
+        if re.match(r"^org\s+notes\b", ql):
+            say("Usage: `org notes <orgname>`")
+            return True
         say(dossier.org_query(_org_query_arg(q)))
         return True
 
