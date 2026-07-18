@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 import time
 from threading import Thread
 
@@ -11,6 +12,16 @@ import websocket
 from artemis import config
 
 logger = logging.getLogger(__name__)
+
+# STAB-1 A2: watchdog fires if no websocket event/pong arrives within this many
+# seconds (server-close → client-select-forever was the 2026-07-17 half-open death).
+WS_STALE_SECONDS = 90
+
+
+def _backoff_delay(attempt: int, base: float = 5.0, cap: float = 60.0) -> float:
+    """Exponential reconnect backoff: 5, 10, 20, 40, 60, 60, … (capped). Jitter is
+    added by the caller; this bare schedule is what the tests pin."""
+    return min(cap, base * (2 ** attempt))
 
 
 class MattermostClient:
@@ -28,6 +39,12 @@ class MattermostClient:
         self._team_id: str | None = None
         self._channel_ids: dict[str, str] = {}
         self._bot_user_id: str | None = None
+        # STAB-1 A2 websocket lifecycle state.
+        self._ws = None
+        self._ws_should_run: bool = True
+        self._last_event_ts: float = time.time()
+        self._disconnected_at: float | None = None
+        self._reconnect_attempt: int = 0
         self._mention_handler = None
 
     @property
@@ -126,8 +143,11 @@ class MattermostClient:
             always_listen_channel_id = None
 
         def on_message(ws, raw):
+            self._last_event_ts = time.time()  # A2: liveness for the watchdog
             try:
                 event = json.loads(raw)
+                # A4: every received event at DEBUG (full event-flow visibility).
+                logger.debug("ws event: %s", event.get("event"))
                 if event.get("event") != "posted":
                     return
                 post = json.loads(event["data"]["post"])
@@ -159,9 +179,28 @@ class MattermostClient:
                     except Exception:
                         return
                 if self._mention_handler:
+                    # A4: every dispatched posted event at INFO (post_id, channel,
+                    # sender, first 60 chars) — the instrument for the bare-message
+                    # routing diagnosis. Silence is never a failure mode.
+                    logger.info(
+                        "posted → dispatch: post=%s ch=%s user=%s msg=%r",
+                        post.get("id"), channel_id, post.get("user_id"),
+                        (post.get("message", "") or "")[:60],
+                    )
                     thread_id = post.get("root_id") or post["id"]
                     thread = self.get_thread_posts(thread_id)
-                    self._mention_handler(post, thread)
+                    try:
+                        self._mention_handler(post, thread)
+                    except Exception:
+                        # A4: full traceback to journal + one-line channel reply.
+                        logger.exception("mention handler raised for post %s", post.get("id"))
+                        try:
+                            self.post_to_channel_id(
+                                channel_id, "⚠️ error handling that — logged.",
+                                root_id=post.get("root_id") or post["id"],
+                            )
+                        except Exception:
+                            logger.debug("error-reply post failed", exc_info=True)
             except Exception:
                 logger.exception("Error processing websocket message")
 
@@ -170,29 +209,100 @@ class MattermostClient:
                 {"seq": 1, "action": "authentication_challenge", "data": {"token": self.token}}
             )
             ws.send(auth)
-            logger.info("Mattermost websocket connected")
+            now = time.time()
+            self._last_event_ts = now
+            if self._reconnect_attempt > 0:
+                logger.info(
+                    "Mattermost websocket reconnected (attempt %d)", self._reconnect_attempt
+                )
+                gap = now - (self._disconnected_at or now)
+                # Announce only if the outage was long enough to matter (>5 min).
+                if gap > 300:
+                    try:
+                        self.post_message(
+                            config.CHANNEL_OPS,
+                            f"✅ Artemis online — websocket reconnected after "
+                            f"{int(gap // 60)}m offline.",
+                        )
+                    except Exception:
+                        logger.debug("reconnect announce failed", exc_info=True)
+            else:
+                logger.info("Mattermost websocket connected")
+            self._reconnect_attempt = 0
+            self._disconnected_at = None
+
+        def on_pong(ws, _payload):
+            self._last_event_ts = time.time()  # A2: pong keeps the connection live
 
         def on_error(ws, error):
             logger.error("Websocket error: %s", error)
 
         def on_close(ws, code, msg):
-            logger.warning("Websocket closed (code=%s), reconnecting in 5s...", code)
-            time.sleep(5)
-            self._connect_ws(ws_url, on_message, on_open, on_error, on_close)
+            if self._disconnected_at is None:
+                self._disconnected_at = time.time()
+            logger.warning("Mattermost websocket closed (code=%s)", code)
 
+        self._ws_should_run = True
         thread = Thread(
-            target=self._connect_ws,
-            args=(ws_url, on_message, on_open, on_error, on_close),
+            target=self._run_ws_loop,
+            args=(ws_url, on_message, on_open, on_pong, on_error, on_close),
             daemon=True,
         )
         thread.start()
 
-    def _connect_ws(self, url, on_message, on_open, on_error, on_close):
-        ws = websocket.WebSocketApp(
-            url,
-            on_message=on_message,
-            on_open=on_open,
-            on_error=on_error,
-            on_close=on_close,
-        )
-        ws.run_forever(ping_interval=30, ping_timeout=10)
+    def _run_ws_loop(self, url, on_message, on_open, on_pong, on_error, on_close):
+        """Reconnect loop (STAB-1 A2). Replaces the old fixed sleep(5) + recursive
+        self-call in on_close, which leaked stack across many flaps. Exponential
+        backoff with jitter, infinite retries, until close() flips the flag."""
+        while self._ws_should_run:
+            self._ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_open=on_open,
+                on_pong=on_pong,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            try:
+                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception:
+                logger.exception("websocket run_forever crashed")
+            if not self._ws_should_run:
+                break
+            delay = _backoff_delay(self._reconnect_attempt)
+            delay += random.uniform(0, delay * 0.3)  # jitter
+            self._reconnect_attempt += 1
+            logger.warning(
+                "Mattermost websocket down — reconnect attempt %d in %.1fs",
+                self._reconnect_attempt, delay,
+            )
+            time.sleep(delay)
+
+    def watchdog_check(self) -> bool:
+        """STAB-1 A2: if no event/pong for >90s the connection is half-open —
+        force-close so the reconnect loop fires. Returns True if it force-closed.
+        Called by a 60s scheduler job."""
+        if not self._ws_should_run:
+            return False
+        stale = time.time() - self._last_event_ts
+        if stale > WS_STALE_SECONDS:
+            logger.warning(
+                "Mattermost websocket stale %.0fs (>%ds) — forcing close to reconnect",
+                stale, WS_STALE_SECONDS,
+            )
+            try:
+                if self._ws:
+                    self._ws.close()
+            except Exception:
+                logger.debug("watchdog force-close failed", exc_info=True)
+            return True
+        return False
+
+    def close(self) -> None:
+        """Stop the reconnect loop and close the socket (STAB-1 A3 shutdown)."""
+        self._ws_should_run = False
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            logger.debug("websocket close failed", exc_info=True)

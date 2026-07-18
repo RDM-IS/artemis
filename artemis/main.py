@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from threading import Event
+from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, request, jsonify
@@ -3430,98 +3430,62 @@ def _handle_mention(post: dict, thread: list[dict]):
     # Track interaction for inactivity detection
     update_last_interaction()
 
-    # Try confirmation flows first (yes/confirm/cancel for pending actions)
-    if _handle_availability_command(post, question):
-        return
-    # Duplicate-override MUST run before the calendar confirm handler so a
-    # `confirm`/`yes` can never bypass a duplicate block.
-    if _handle_duplicate_override(post, question):
-        return
-    if _handle_calendar_confirm(post, question):
-        return
-    if _handle_delete_confirm(post, question):
-        return
-    # Confirm/cancel for a pending workout capture (cardio/strength debrief).
-    # Checked among the confirm flows so a `confirm`/`yes` reply lands here.
-    if _handle_debrief_confirm(post, question):
-        return
-    # Confirm/cancel for a pending nutrition-target change or grocery-staples
-    # batch — each guards on its own durable pending payload.
-    if _handle_nutrition_confirm(post, question):
-        return
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
 
-    # ── PB-009 nutrition: build-staples, then target/log/status ──
-    # Runs BEFORE the workout conversation so an on-plan meal log ("breakfast
-    # done") isn't shadowed by the debrief/session loop's bare-"done" handling,
-    # and before _try_life_ops so the dynamic budget coach + staple generator win
-    # over the static grocery/health command stubs. detect_nutrition_intent only
-    # fires on nutrition-specific patterns, so bare "done"/RPE/morning check-ins
-    # still fall through to the training handlers untouched.
-    if _handle_grocery_staples(post, question):
-        return
-    if _handle_nutrition(post, question):
-        return
+    # A4: deterministic dispatch as a NAMED, instrumented chain. The handler that
+    # claims the message logs its name at INFO ("dispatch: <name> handled …"); a
+    # handler that raises is logged with a full traceback and answered with a
+    # one-line reply. Silence is never a failure mode — and this is the instrument
+    # for diagnosing the bare-message routing inconsistency (no speculative fix for
+    # that until these logs show the real event flow). Order is load-bearing:
+    #   * confirm flows first (a `yes`/`confirm` must reach its pending handler,
+    #     not the LLM) — duplicate_override BEFORE calendar_confirm so a confirm
+    #     can never bypass a duplicate block.
+    #   * PB-009 nutrition/health BEFORE inbox (so a bare "done" isn't shadowed)
+    #     and BEFORE the LLM router (RDS health path wins over legacy life_ops).
+    #   * rule/dossier BEFORE the inbox + LLM router (deterministic short-circuits).
+    deterministic_chain = [
+        ("availability_command", _handle_availability_command),
+        ("duplicate_override", _handle_duplicate_override),
+        ("calendar_confirm", _handle_calendar_confirm),
+        ("delete_confirm", _handle_delete_confirm),
+        ("debrief_confirm", _handle_debrief_confirm),
+        ("nutrition_confirm", _handle_nutrition_confirm),
+        ("grocery_staples", _handle_grocery_staples),
+        ("nutrition", _handle_nutrition),
+        ("health_conversation", _handle_health_conversation),
+        ("capture_propose", _handle_capture_propose),
+        ("quiet_command", _handle_quiet_command),
+        ("rule_command", _handle_rule_command),
+        ("dossier_command", _handle_dossier_command),
+        ("inbox_listing", _handle_inbox_listing),
+        ("disposition_command", _handle_disposition_command),
+        ("inbox_command", _handle_inbox_command),
+        ("action_item_command", _handle_action_item_command),
+    ]
+    for _name, _fn in deterministic_chain:
+        try:
+            if _fn(post, question):
+                logger.info("dispatch: %s handled post %s", _name, post.get("id"))
+                return
+        except Exception:
+            logger.exception("handler %s raised on post %s", _name, post.get("id"))
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id, "⚠️ error handling that — logged.", root_id=root_id
+                )
+            return
 
-    # ── PB-009: conversational workout session + training history ──
-    # Must run before inbox ('done' shadowing) and before _try_life_ops so the
-    # RDS health path always wins over the legacy life_ops SQLite handlers.
-    if _handle_health_conversation(post, question):
-        return
-
-    # ── Unified workout capture (cardio + strength debrief) ──
-    # Deterministic metrics-paste discriminator → propose-then-confirm. Runs
-    # after the live-session loop (which it never disturbs) but before inbox /
-    # _try_life_ops / the LLM router, so a cardio paste can never fall to
-    # plan-display or an "I can't write to the DB" reply.
-    if _handle_capture_propose(post, question):
-        return
-
-    # Try quiet hours session commands (goodnight, morning, override, extend)
-    if _handle_quiet_command(post, question):
-        return
-
-    # Feature #1: chat-authored playbook rules (`rules`, `rule add …`, `rule off`)
-    # plus their activation confirm. Runs before the inbox handlers so the rule
-    # commands aren't shadowed and a rule-activation `yes` is consumed here, not
-    # by the LLM (which would otherwise fabricate "rule added").
-    if _handle_rule_command(post, question):
-        return
-
-    # PB-010: dossier / meeting intelligence. Deterministic short-circuit ahead of
-    # the LLM classifier (met with / brief / remind me / dossier … / bless / to-dos).
-    # A positive match is unoverridable — the message never reaches route_intent.
-    # bless/drop/edit only fire when a review is pending for the channel.
-    if _handle_dossier_command(post, question):
-        return
-
-    # E2: index-backed numbered inbox listing. Runs BEFORE _handle_inbox_command
-    # so `inbox`/`triage`/`triage inbox`/`what's in my inbox` (+ `more`) are
-    # served from the email_index mirror instead of the old inbox_threads
-    # summary. The other inbox subcommands still fall through to the old handler.
-    if _handle_inbox_listing(post, question):
-        return
-
-    # E3: disposition commands (archive/delete/file/spam <numbers>) resolved from
-    # the E2 mapping, executed against Gmail, verified, logged. Runs before the
-    # old handler and the LLM so these requests act+verify instead of reaching the
-    # router that confabulates "On it" without touching Gmail.
-    if _handle_disposition_command(post, question):
-        return
-
-    # Try inbox commands (done, wait, snooze, noise, waiting, snoozed)
-    # NB: `inbox` is now repointed above to the index-backed listing; the
-    # cmd=="inbox" branch here is left intact but no longer reached (E5 retires).
-    if _handle_inbox_command(post, question):
-        return
-
-    # Try action item commands (approve/skip/snooze sched)
-    if _handle_action_item_command(post, question):
-        return
+    # A4: no deterministic handler claimed it — mark the fall-through so a message
+    # that ends up silent (or at the LLM) is never invisible in the journal.
+    logger.info(
+        "dispatch: no deterministic handler for post %s (msg=%r) — trying direct/LLM",
+        post.get("id"), (question or "")[:60],
+    )
 
     # Direct commands
     q_lower = question.lower().strip()
-    channel_id = post.get("channel_id", "")
-    root_id = post.get("root_id") or post["id"]
 
     if q_lower in ("version", "what version are you?", "what version", "update check"):
         reply = format_version_status()
@@ -3870,6 +3834,40 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
             logger.exception("Failed to post scope warning")
 
 
+def _shutdown_cleanup() -> None:
+    """STAB-1 A3: orchestrate a fast, bounded shutdown (no os._exit here so it's
+    unit-testable). Each step is best-effort and cannot block the caller.
+
+    Order: record last-run → time-boxed shutdown notice → scheduler.shutdown
+    (wait=False, never blocks on a running job) → close websocket → close DB pool.
+    """
+    try:
+        from artemis.quiet_hours import set_system_value
+        set_system_value("last_run_at", datetime.utcnow().isoformat())
+    except Exception:
+        logger.debug("failed to record last_run_at", exc_info=True)
+    # Time-box the shutdown notice — a hung REST post must not block exit.
+    if _mm is not None:
+        notice = Thread(target=_post_shutdown_message, args=(_mm,), daemon=True)
+        notice.start()
+        notice.join(timeout=2.0)
+    try:
+        if _sched:
+            _sched.scheduler.shutdown(wait=False)
+    except Exception:
+        logger.debug("scheduler shutdown failed", exc_info=True)
+    try:
+        if _mm:
+            _mm.close()
+    except Exception:
+        logger.debug("websocket close failed", exc_info=True)
+    try:
+        from knowledge.db import close_pool
+        close_pool()
+    except Exception:
+        logger.debug("db pool close failed", exc_info=True)
+
+
 def _post_shutdown_message(mm: MattermostClient):
     """Post shutdown notice to #artemis-ops."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3965,13 +3963,14 @@ def main():
     shutdown = Event()
 
     def signal_handler(sig, frame):
-        logger.info("Shutting down...")
-        # Record last run time for catch-up on next startup
-        from artemis.quiet_hours import set_system_value
-        set_system_value("last_run_at", datetime.utcnow().isoformat())
-        _post_shutdown_message(_mm)
-        _sched.stop()
-        shutdown.set()
+        # STAB-1 A3: fast, bounded shutdown (<5s) so systemd never has to SIGKILL
+        # at 90s. Cleanup is best-effort; os._exit guarantees a prompt exit even
+        # with Flask's blocking dev server on the main thread.
+        logger.info("Shutting down (signal %s)...", sig)
+        _shutdown_cleanup()
+        logging.shutdown()
+        import os
+        os._exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

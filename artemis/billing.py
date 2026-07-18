@@ -152,20 +152,20 @@ def ensure_billing_label(gmail_client) -> str | None:
         return None
 
     try:
-        labels = gmail_client.service.users().labels().list(userId="me").execute()
+        labels = gmail_client._exec(gmail_client.service.users().labels().list(userId="me"))
         for lbl in labels.get("labels", []):
             if lbl["name"].lower() == "@artemis/billing":
                 return lbl["id"]
 
         # Label doesn't exist — create it
-        new_label = gmail_client.service.users().labels().create(
+        new_label = gmail_client._exec(gmail_client.service.users().labels().create(
             userId="me",
             body={
                 "name": "@artemis/billing",
                 "labelListVisibility": "labelShow",
                 "messageListVisibility": "show",
             },
-        ).execute()
+        ))
         label_id = new_label["id"]
         logger.info("Created Gmail label '@artemis/billing' (id=%s)", label_id)
         return label_id
@@ -184,7 +184,7 @@ def get_billing_messages(gmail_client) -> list[dict]:
         gmail_client.authenticate()
 
         # Find the label ID for '@artemis/billing'
-        labels = gmail_client.service.users().labels().list(userId="me").execute()
+        labels = gmail_client._exec(gmail_client.service.users().labels().list(userId="me"))
         label_id = None
         for lbl in labels.get("labels", []):
             if lbl["name"].lower() == "@artemis/billing":
@@ -196,9 +196,9 @@ def get_billing_messages(gmail_client) -> list[dict]:
             return []
 
         # List messages with that label
-        results = gmail_client.service.users().messages().list(
+        results = gmail_client._exec(gmail_client.service.users().messages().list(
             userId="me", labelIds=[label_id], maxResults=20
-        ).execute()
+        ))
 
         messages = []
         for msg_ref in results.get("messages", []):
@@ -217,9 +217,9 @@ def get_message_full(gmail_client, message_id: str) -> dict | None:
     if not gmail_client.service:
         return None
     try:
-        return gmail_client.service.users().messages().get(
+        return gmail_client._exec(gmail_client.service.users().messages().get(
             userId="me", id=message_id, format="full"
-        ).execute()
+        ))
     except Exception:
         logger.exception("Failed to fetch full message %s", message_id)
         return None
@@ -242,9 +242,9 @@ def extract_attachments(gmail_client, message: dict) -> list[dict]:
             if filename and body.get("attachmentId"):
                 # Download attachment data
                 try:
-                    att = gmail_client.service.users().messages().attachments().get(
+                    att = gmail_client._exec(gmail_client.service.users().messages().attachments().get(
                         userId="me", messageId=msg_id, id=body["attachmentId"]
-                    ).execute()
+                    ))
                     data = base64.urlsafe_b64decode(att["data"])
                     attachments.append({
                         "filename": filename,
