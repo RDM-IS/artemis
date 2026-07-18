@@ -1,9 +1,9 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-07-17T21:48:48Z_
+_Generated: 2026-07-18T02:40:31Z_
 
 ## Git
 - Branch: main
-- Head: 9ffb770 fix(mattermost): websocket ping keepalive to detect half-open connections (#71)
+- Head: 58f29b9 feat(stab-1): stability + PB-010 hardening (#72)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
@@ -24,11 +24,11 @@ _Generated: 2026-07-17T21:48:48Z_
 - PB-010: Meeting Intelligence / Colleague Dossiers
 
 ## Migrations (latest 5)
-- 020_commitments.sql
 - 021_email_index.sql
 - 022_audit_log_email_corpus.sql
 - 023_playbook_rules.sql
 - 024_dossier.sql
+- 025_dossier_approve.sql
 
 ## artemis/ modules
 - __init__.py
@@ -69,6 +69,7 @@ _Generated: 2026-07-17T21:48:48Z_
 - test_dossier.py
 - test_guardrails.py
 - test_mattermost.py
+- test_stability.py
 - utils.py
 - version.py
 - voice.py
@@ -142,6 +143,6 @@ _Generated: 2026-07-17T21:48:48Z_
 - v_founder_loan_balance
 
 ### health.plan — next 3 days
-- 2026-07-17: rest_mobility
 - 2026-07-18: cardio_z2
 - 2026-07-19: cardio_z2
+- 2026-07-20: strength_a
