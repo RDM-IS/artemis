@@ -3,22 +3,22 @@
 Portable meeting-intelligence process. One dossier per person, five sections:
   1. Position & terrain      (Ryan-authored)
   2. What they need from me   (Ryan-authored)
-  3. Interaction log          (append-only, draft→bless)
+  3. Interaction log          (append-only, draft→approve)
   4. Open loops               (undated watch-items + dated commitments)
   5. Idea bank + cross-poll   (provenance-tracked)
 
 THE WALL (statistics vs semantics). Artemis extracts, connects, drafts — nothing
-becomes the record until Ryan blesses it. Every autonomous write lands in a draft/
-proposed state; a bless flips it into the record. Confirmations ALWAYS render from
+becomes the record until Ryan approves it. Every autonomous write lands in a draft/
+proposed state; an approval flips it into the record. Confirmations ALWAYS render from
 the re-read written row, never from an LLM claim (the no-fabrication gate).
 
 Lifecycle: raw capture (autonomous, immutable) → draft extraction (autonomous,
-status='draft'/'proposed') → bless (Ryan, async) → surfaces (pre-brief, to-do
+status='draft'/'proposed') → approve (Ryan, async) → surfaces (pre-brief, to-do
 queries).
 
 Canonical to-do home is acos.commitments (migration 020, extended by 024 with
 dossier_id/meeting_id + a nullable due_date). Dossier-drafted action items are
-commitments in status='draft', invisible to the reminder radar until blessed.
+commitments in status='draft', invisible to the reminder radar until approved.
 
 Data layer only touches RDS via knowledge.db with %s params (never interpolation).
 The module carries no SQLite path (RDS is the single source of truth).
@@ -56,6 +56,22 @@ def _ct_today() -> date:
     """CT-anchored 'today'. The box runs UTC (a day ahead of Central after ~19:00
     CT), so every 'today/due/overdue' comparison funnels through this one seam."""
     return datetime.now(_CT).date()
+
+
+def fmt_date(d) -> str:
+    """Render a date as a code-computed weekday label — 'Wednesday, Jul 22'
+    (STAB-1 B4). EVERY dossier/commitment/to-do date render goes through here, so
+    a later LLM-composed summary can never silently restate a stored date with the
+    wrong weekday (the 'due 2026-07-22' → 'Wednesday Jul 23' bug). Accepts a date,
+    an ISO string, or None ('')."""
+    if not d:
+        return ""
+    if isinstance(d, str):
+        try:
+            d = date.fromisoformat(d[:10])
+        except ValueError:
+            return d
+    return d.strftime("%A, %b ") + str(d.day)
 
 
 # ---------------------------------------------------------------------------
@@ -230,31 +246,115 @@ def apply_set(dossier_id: int, column: str, value: str) -> dict | None:
 # 3.1 — capture_meeting (autonomous, immutable)
 # ---------------------------------------------------------------------------
 
-def _split_directive(text: str) -> tuple[str, str]:
-    """First line is the `met with …` directive; the rest is verbatim notes."""
-    parts = (text or "").split("\n", 1)
-    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+# B2: tokens that are never attendee names. The FIRST such token in the attendee
+# segment ends it — it never becomes a person and never creates a stub.
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_DATETIME_WORDS = (
+    {"today", "yesterday", "tomorrow", "tonight", "morning", "afternoon", "evening",
+     "am", "pm", "at", "on", "cst", "cdt", "est", "edt", "pst", "pdt", "mst", "mdt",
+     "utc", "gmt", "noon", "midnight"}
+    | set(_WEEKDAYS) | set(_MONTHS)
+)
 
 
-def _parse_met_with(directive: str) -> dict | None:
-    m = re.match(r"^met\s+with\s+(.+)$", directive, re.IGNORECASE)
+def _is_name_token(tok: str) -> bool:
+    """A token that could be part of a person's name: no digits, no '@', not a
+    date/time word."""
+    t = tok.strip().strip(",").strip()
+    if not t:
+        return False
+    if "@" in t or any(ch.isdigit() for ch in t):
+        return False
+    return t.lower() not in _DATETIME_WORDS
+
+
+def _clamp_topic(raw: str) -> str | None:
+    """Topic = text after 'about', clamped at first newline, ' - ', or 80 chars."""
+    topic = (raw or "").split("\n", 1)[0]
+    topic = re.split(r"\s-\s", topic, 1)[0].strip()
+    if len(topic) > 80:
+        topic = topic[:80].rstrip()
+    return topic or None
+
+
+def _parse_stated_date(text: str) -> date | None:
+    """Parse a stated date from the attendee/topic region (B2 rule 4), CT-anchored.
+    Explicit calendar dates win over relative words; absent → None (caller uses CT
+    today). Meeting dates are in the PAST, so a bare weekday means its most recent
+    occurrence."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    today = _ct_today()
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", t)
+    if m:
+        try:
+            return date.fromisoformat(m.group(1))
+        except ValueError:
+            pass
+    m = re.search(r"\b([a-z]{3,9})\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?", t)
+    if m and m.group(1) in _MONTHS:
+        yr = int(m.group(3)) if m.group(3) else today.year
+        try:
+            return date(yr, _MONTHS[m.group(1)], int(m.group(2)))
+        except ValueError:
+            pass
+    if "yesterday" in t:
+        return today - timedelta(days=1)
+    if "tomorrow" in t:
+        return today + timedelta(days=1)
+    if "today" in t or "tonight" in t:
+        return today
+    for name, idx in _WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", t):
+            return today - timedelta(days=(today.weekday() - idx) % 7)
+    return None
+
+
+def _parse_capture_directive(first_line: str) -> dict | None:
+    """Parse the `met with …` line into {names, topic, date} (B2). Never subtracts
+    from raw_notes — this is labeling only. The attendee segment ends at the first
+    non-name token; a stated date in the attendee/topic region sets occurred_on."""
+    m = re.match(r"^met\s+with\s+(.+)$", first_line, re.IGNORECASE)
     if not m:
         return None
     rest = m.group(1).strip()
-    occurred = None
-    dm = re.search(r"\bon\s+(\d{4}-\d{2}-\d{2})\s*$", rest, re.IGNORECASE)
-    if dm:
-        try:
-            occurred = datetime.strptime(dm.group(1), "%Y-%m-%d").date()
-            rest = rest[:dm.start()].strip()
-        except ValueError:
-            occurred = None
-    topic = None
-    tm = re.search(r"\s+about\s+(.+)$", rest, re.IGNORECASE)
-    if tm:
-        topic = tm.group(1).strip()
-        rest = rest[:tm.start()].strip()
-    return {"names": _split_names(rest), "topic": topic, "date": occurred}
+
+    topic, date_region = None, rest
+    am = re.search(r"\babout\b", rest, re.IGNORECASE)
+    if am:
+        topic = _clamp_topic(rest[am.end():])
+        date_region = rest[:am.start()].strip()
+
+    # Walk the attendee segment: name tokens accumulate into attendees (separators
+    # ,/&/and delimit multiple people); the first non-name token ends the segment.
+    normalized = re.sub(r"\s*(?:,|&|\band\b)\s*", "\x00", date_region, flags=re.IGNORECASE)
+    names: list[str] = []
+    leftover: list[str] = []
+    ended = False
+    for seg in normalized.split("\x00"):
+        if ended:
+            leftover.extend(seg.split())
+            continue
+        good: list[str] = []
+        seg_words = seg.split()
+        for i, w in enumerate(seg_words):
+            if _is_name_token(w):
+                good.append(w.strip(","))
+            else:
+                ended = True
+                leftover.extend(seg_words[i:])
+                break
+        if good:
+            names.append(" ".join(good))
+
+    occurred = _parse_stated_date(" ".join(leftover))
+    return {"names": names, "topic": topic, "date": occurred}
 
 
 def _extract_attachment_text(att: dict) -> str | None:
@@ -284,8 +384,8 @@ def capture_meeting(text: str, attachments: list[dict] | None = None) -> str:
     """Capture a meeting immutably, link attendees (stubbing unknowns), then run
     draft extraction. raw_notes is stored byte-for-byte and never LLM-touched."""
     attachments = attachments or []
-    directive, notes_from_msg = _split_directive(text)
-    parsed = _parse_met_with(directive)
+    first_line = (text or "").split("\n", 1)[0].strip()
+    parsed = _parse_capture_directive(first_line)
     if not parsed or not parsed["names"]:
         return "Who did you meet with? Try `met with <names> [about <topic>]` then your notes."
 
@@ -313,10 +413,12 @@ def capture_meeting(text: str, attachments: list[dict] | None = None) -> str:
             att_texts.append(txt)
             if source_filename is None:
                 source_filename = a.get("filename")
-    raw_notes = notes_from_msg
+    # B2 rule 1 (bronze discipline): raw_notes is the ENTIRE original message,
+    # always — topic/attendee parsing labels, it never subtracts. Attachment text
+    # (a separate capture) is appended so nothing is lost.
+    raw_notes = (text or "").strip()
     if att_texts:
-        joined = "\n\n".join(att_texts)
-        raw_notes = (raw_notes + "\n\n" + joined).strip() if raw_notes else joined
+        raw_notes = (raw_notes + "\n\n" + "\n\n".join(att_texts)).strip()
 
     occurred_on = parsed["date"] or _ct_today()
     meeting = execute_one(
@@ -347,7 +449,7 @@ def capture_meeting(text: str, attachments: list[dict] | None = None) -> str:
     wc = len((m["raw_notes"] or "").split())
     topic_str = f", *{m['topic']}*" if m["topic"] else ""
     lines = [
-        f"✅ Captured meeting #{mid} — {m['occurred_on']}{topic_str}",
+        f"✅ Captured meeting #{mid} — {fmt_date(m['occurred_on'])}{topic_str}",
         "Attendees: " + ", ".join(a["full_name"] for a in att),
         f"Notes: {wc} word{'s' if wc != 1 else ''} (verbatim, immutable).",
     ]
@@ -372,7 +474,14 @@ def capture_meeting(text: str, attachments: list[dict] | None = None) -> str:
 _EXTRACT_SYSTEM = (
     "You are Artemis performing draft extraction over Ryan's verbatim meeting "
     "notes for ONE attendee. You produce DRAFTS ONLY — nothing you output becomes "
-    "the record until Ryan blesses it.\n\n"
+    "the record until Ryan approves it.\n\n"
+    "GROUND TRUTH (do not second-guess it):\n"
+    "- The meeting OCCURRED, with the listed attendees present. Never adjudicate "
+    "whether the interaction happened, and NEVER write that there was 'no "
+    "interaction' or 'no direct contact' — that contradicts the capture.\n"
+    "- Entries record what was discussed, decided, or agreed in the meeting.\n"
+    "- Future-tense notes describe PLANS MADE IN the meeting (next steps, things "
+    "agreed to do) — not evidence that the meeting didn't happen.\n\n"
     "Follow Ryan's writing standards EXACTLY:\n"
     "- Write as if the person could read it. Factual. No armchair psychology or "
     "motive speculation.\n"
@@ -399,11 +508,11 @@ _EXTRACT_SYSTEM = (
 
 
 def _build_extraction_context(d: dict) -> str:
-    """Blessed content only — the extractor sees the record, not other drafts."""
+    """Approved content only — the extractor sees the record, not other drafts."""
     did = d["dossier_id"]
     entries = execute_query(
         "SELECT entry_date, entry_text FROM acos.dossier_entry "
-        "WHERE dossier_id = %s AND status = 'blessed' ORDER BY entry_date DESC LIMIT 8",
+        "WHERE dossier_id = %s AND status = 'approved' ORDER BY entry_date DESC LIMIT 8",
         (did,),
     )
     loops = execute_query(
@@ -422,7 +531,7 @@ def _build_extraction_context(d: dict) -> str:
     if d.get("needs_from_me"):
         lines.append("### What they need from me\n" + d["needs_from_me"])
     if entries:
-        lines.append("### Recent blessed log")
+        lines.append("### Recent approved log")
         lines += [f"- {e['entry_date']}: {e['entry_text']}" for e in entries]
     if loops:
         lines.append("### Open loops (loop_id: text — you may propose closing by id)")
@@ -509,7 +618,7 @@ def _apply_draft(meeting: dict, d: dict, extraction: dict) -> dict:
         )
         if not loop:
             continue
-        # Propose closure: mark provenance, keep it open until blessed.
+        # Propose closure: mark provenance, keep it open until approved.
         execute_write(
             "UPDATE acos.dossier_loop SET closed_entry_id = %s "
             "WHERE loop_id = %s AND status = 'open' AND closed_at IS NULL",
@@ -612,7 +721,7 @@ def draft_extraction(meeting_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3.3 — review / bless (Ryan-gated)
+# 3.3 — review / approve (Ryan-gated)
 # ---------------------------------------------------------------------------
 
 # Per-person type order within the review listing.
@@ -633,7 +742,8 @@ def pending_items() -> list[dict]:
         "WHERE e.status = 'draft'"
     ):
         items.append({"type": "entry", "id": r["entry_id"], "dossier_id": r["dossier_id"],
-                      "dossier_name": r["full_name"], "text": r["entry_text"], "prov": r["entry_date"]})
+                      "dossier_name": r["full_name"], "text": r["entry_text"],
+                      "prov": f"from {fmt_date(r['entry_date'])}"})
     for r in execute_query(
         "SELECT l.loop_id, l.dossier_id, l.loop_text, d.full_name "
         "FROM acos.dossier_loop l JOIN acos.dossier d ON d.dossier_id = l.dossier_id "
@@ -664,7 +774,9 @@ def pending_items() -> list[dict]:
         "FROM acos.commitments c JOIN acos.dossier d ON d.dossier_id = c.dossier_id "
         "WHERE c.status = 'draft'"
     ):
-        prov = f"due {r['due_date']}" if r["due_date"] else "no date"
+        # B5: omit the provenance suffix entirely when there's no date — never
+        # render "(from no date)".
+        prov = f"due {fmt_date(r['due_date'])}" if r["due_date"] else None
         items.append({"type": "commitment", "id": r["id"], "dossier_id": r["dossier_id"],
                       "dossier_name": r["full_name"], "text": r["title"], "prov": prov})
 
@@ -676,7 +788,7 @@ def render_review() -> tuple[str, dict]:
     """Render the numbered review and return (reply, mapping {num: item})."""
     items = pending_items()
     if not items:
-        return ("✅ Nothing pending review — all drafts are blessed.", {})
+        return ("✅ Nothing pending review — all drafts are approved.", {})
     mapping: dict[int, dict] = {}
     lines = [f"\U0001f4cb Drafts for review ({len(items)}):"]
     current = None
@@ -685,26 +797,26 @@ def render_review() -> tuple[str, dict]:
         if it["dossier_name"] != current:
             current = it["dossier_name"]
             lines.append(f"\n**{current}**")
-        prov = f"  _(from {it['prov']})_" if it["prov"] else ""
+        prov = f"  _({it['prov']})_" if it["prov"] else ""
         lines.append(f"  {n}. [{_TYPE_LABEL[it['type']]}] {it['text']}{prov}")
     lines.append(
-        "\nBless: `bless all` · `bless 1-4` · `bless 1 & 3` · "
+        "\nApprove: `approve all` · `approve 1-4` · `approve 1 & 3` · "
         "`edit 2: <new text>` · `drop 4`"
     )
     return ("\n".join(lines), mapping)
 
 
-def _bless_item(it: dict) -> bool:
-    """Execute the bless transition for one item. Returns True iff the re-read row
+def _approve_item(it: dict) -> bool:
+    """Execute the approve transition for one item. Returns True iff the re-read row
     confirms the transition (no-fabrication gate)."""
     t, iid = it["type"], it["id"]
     if t == "entry":
         execute_write(
-            "UPDATE acos.dossier_entry SET status = 'blessed', blessed_at = now() "
+            "UPDATE acos.dossier_entry SET status = 'approved', approved_at = now() "
             "WHERE entry_id = %s AND status = 'draft'", (iid,),
         )
         row = execute_one("SELECT status FROM acos.dossier_entry WHERE entry_id = %s", (iid,))
-        ok = bool(row and row["status"] == "blessed")
+        ok = bool(row and row["status"] == "approved")
     elif t == "loop_open":
         execute_write(
             "UPDATE acos.dossier_loop SET status = 'open' WHERE loop_id = %s AND status = 'proposed'",
@@ -732,11 +844,11 @@ def _bless_item(it: dict) -> bool:
     else:
         return False
     if ok:
-        _audit(f"bless_{t}", it["dossier_id"], {"id": iid})
+        _audit(f"approve_{t}", it["dossier_id"], {"id": iid})
     return ok
 
 
-def bless_items(nums: list[int], mapping: dict) -> str:
+def approve_items(nums: list[int], mapping: dict) -> str:
     if not mapping:
         return "No review is open — say `dossier review` first."
     lines = []
@@ -745,19 +857,19 @@ def bless_items(nums: list[int], mapping: dict) -> str:
         if not it:
             lines.append(f"\U0001f6ab #{n} — not in the current review.")
             continue
-        ok = _bless_item(it)
+        ok = _approve_item(it)
         if ok:
-            lines.append(f"✅ Blessed #{n} [{_TYPE_LABEL[it['type']]}] — {it['dossier_name']}")
+            lines.append(f"✅ Approved #{n} [{_TYPE_LABEL[it['type']]}] — {it['dossier_name']}")
             mapping.pop(n, None)
         else:
-            lines.append(f"⚠️ #{n} — could not bless (already handled?).")
-    return "\n".join(lines) if lines else "Nothing to bless."
+            lines.append(f"⚠️ #{n} — could not approve (already handled?).")
+    return "\n".join(lines) if lines else "Nothing to approve."
 
 
-def bless_all(mapping: dict) -> str:
+def approve_all(mapping: dict) -> str:
     if not mapping:
         return "No review is open — say `dossier review` first."
-    return bless_items(sorted(mapping.keys()), mapping)
+    return approve_items(sorted(mapping.keys()), mapping)
 
 
 def edit_item(num: int, new_text: str, mapping: dict) -> str:
@@ -770,7 +882,7 @@ def edit_item(num: int, new_text: str, mapping: dict) -> str:
     t, iid = it["type"], it["id"]
     if t == "entry":
         execute_write(
-            "UPDATE acos.dossier_entry SET entry_text = %s, status = 'blessed', blessed_at = now() "
+            "UPDATE acos.dossier_entry SET entry_text = %s, status = 'approved', approved_at = now() "
             "WHERE entry_id = %s", (new_text, iid),
         )
     elif t == "loop_open":
@@ -787,10 +899,10 @@ def edit_item(num: int, new_text: str, mapping: dict) -> str:
         commitments.update_commitment_title(iid, new_text)
         commitments.activate_commitment(iid)
     else:  # loop_close has no editable text of its own
-        return f"#{num} is a loop closure — it has no editable text. `bless {num}` or `drop {num}`."
-    _audit(f"edit_bless_{t}", it["dossier_id"], {"id": iid})
+        return f"#{num} is a loop closure — it has no editable text. `approve {num}` or `drop {num}`."
+    _audit(f"edit_approve_{t}", it["dossier_id"], {"id": iid})
     mapping.pop(num, None)
-    return f"✅ Edited & blessed #{num} [{_TYPE_LABEL[t]}] — {it['dossier_name']}"
+    return f"✅ Edited & approved #{num} [{_TYPE_LABEL[t]}] — {it['dossier_name']}"
 
 
 def drop_item(num: int, mapping: dict) -> str:
@@ -844,7 +956,7 @@ def _open_loops_and_commitments(dossier_id: int) -> list[dict]:
         "WHERE dossier_id = %s AND status IN ('active', 'draft')",
         (dossier_id,),
     ):
-        due = f" — due {c['due_date']}" if c["due_date"] else ""
+        due = f" — due {fmt_date(c['due_date'])}" if c["due_date"] else ""
         out.append({"text": c["title"] + due, "draft": c["status"] == "draft",
                     "created_at": c["created_at"], "kind": "commitment"})
     out.sort(key=lambda x: x["created_at"] or datetime.min.replace(tzinfo=_CT))
@@ -901,14 +1013,14 @@ def _brief_one(d: dict, topic: str | None, seen: set) -> str:
 
     recent = execute_query(
         "SELECT entry_date, entry_text FROM acos.dossier_entry "
-        "WHERE dossier_id = %s AND status = 'blessed' ORDER BY entry_date DESC, entry_id DESC LIMIT 2",
+        "WHERE dossier_id = %s AND status = 'approved' ORDER BY entry_date DESC, entry_id DESC LIMIT 2",
         (did,),
     )
     if recent:
         lines.append("**Recent context**")
         for e in recent:
             one = e["entry_text"].split("\n")[0]
-            lines.append(f"  • {e['entry_date']}: {one}")
+            lines.append(f"  • {fmt_date(e['entry_date'])}: {one}")
     return "\n".join(lines)
 
 
@@ -943,7 +1055,7 @@ def brief(person_arg: str, topic: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3.5 — direct commitment (autonomous, explicit — no bless)
+# 3.5 — direct commitment (autonomous, explicit — no approve)
 # ---------------------------------------------------------------------------
 
 def _next_weekday(target: int) -> date:
@@ -1010,10 +1122,10 @@ def _detect_interaction_clause(text: str) -> str | None:
 
 
 def direct_commitment(text: str) -> str | None:
-    """`remind me to <task> <when>` → immediate commitment (explicit, no bless).
+    """`remind me to <task> <when>` → immediate commitment (explicit, no approve).
     If a known dossier name appears, attach dossier_id silently. If the phrasing
     also describes an interaction, ALSO draft a one-line log touch (inferred →
-    draft, not blessed)."""
+    draft, not approved)."""
     m = re.search(r"\bremind\s+me\b\s*(?:to\s+)?(.*)$", text or "", re.IGNORECASE | re.DOTALL)
     if not m:
         return None
@@ -1033,7 +1145,7 @@ def direct_commitment(text: str) -> str | None:
     _audit("direct_commitment", d["dossier_id"] if d else None,
            {"commitment_id": cid, "due": str(due) if due else None})
 
-    due_str = f" — due {row['due_date']}" if row and row.get("due_date") else " (no date set)"
+    due_str = f" — due {fmt_date(row['due_date'])}" if row and row.get("due_date") else " (no date set)"
     who = f" · {d['full_name']}" if d else ""
     lines = [f"✅ Reminder logged: **{row['title']}**{due_str}{who}"]
 
@@ -1048,7 +1160,7 @@ def direct_commitment(text: str) -> str | None:
             _audit("direct_touch_draft", d["dossier_id"], {"entry_id": entry["entry_id"]})
             lines.append(
                 f"\U0001f4dd Also drafted a log touch for {d['full_name']} (inferred) — "
-                f"`dossier review` to bless."
+                f"`dossier review` to approve."
             )
     return "\n".join(lines)
 
@@ -1057,12 +1169,20 @@ def direct_commitment(text: str) -> str | None:
 # 3.6 — to-do queries (read-only)
 # ---------------------------------------------------------------------------
 
+def _week_bounds(anchor: date, which: str) -> tuple[date, date]:
+    """Mon–Sun bounds of the week containing `anchor` (which='this') or the
+    following week (which='next'), CT-anchored."""
+    monday = anchor - timedelta(days=anchor.weekday())
+    if which == "next":
+        monday += timedelta(days=7)
+    return monday, monday + timedelta(days=6)
+
+
 def todos(window: str = "week") -> str:
-    """`what's on the to dos today|this week`. CT-anchored. Groups overdue → today
-    → rest of week (+ undated for the week view). Draft (pending-review) to-dos
-    are listed separately at the bottom."""
+    """CT-anchored to-do query. `window` ∈ today | week (this week) | next_week |
+    tomorrow. Draft (pending-review) to-dos are listed separately at the bottom.
+    All dates render via fmt_date (code-computed weekday) — never a model restate."""
     today = _ct_today()
-    end_of_week = today + timedelta(days=(6 - today.weekday()))  # this Sunday
     rows = execute_query(
         "SELECT c.id, c.title, c.due_date, c.status, d.full_name AS person "
         "FROM acos.commitments c LEFT JOIN acos.dossier d ON d.dossier_id = c.dossier_id "
@@ -1071,22 +1191,39 @@ def todos(window: str = "week") -> str:
     active = [r for r in rows if r["status"] == "active"]
     drafts = [r for r in rows if r["status"] == "draft"]
 
-    overdue = [r for r in active if r["due_date"] and r["due_date"] < today]
-    due_today = [r for r in active if r["due_date"] == today]
-    rest = [r for r in active if r["due_date"] and today < r["due_date"] <= end_of_week]
-    undated = [r for r in active if not r["due_date"]]
-
     def line(r):
         who = f" · {r['person']}" if r["person"] else ""
-        due = f" (due {r['due_date']})" if r["due_date"] else ""
+        due = f" (due {fmt_date(r['due_date'])})" if r["due_date"] else ""
         return f"  • {r['title']}{due}{who}"
 
-    groups = [("⏰ Overdue", overdue), ("\U0001f4c5 Today", due_today)]
-    if window != "today":
-        groups.append(("This week", rest))
-        groups.append(("No date", undated))
+    def between(lo, hi):
+        return [r for r in active if r["due_date"] and lo <= r["due_date"] <= hi]
 
-    out = [f"\U0001f5d3️ To-dos ({'today' if window == 'today' else 'this week'}):"]
+    if window == "tomorrow":
+        tmr = today + timedelta(days=1)
+        title = f"tomorrow — {fmt_date(tmr)}"
+        groups = [("Due", [r for r in active if r["due_date"] == tmr])]
+    elif window == "next_week":
+        mon, sun = _week_bounds(today, "next")
+        title = f"next week ({fmt_date(mon)} – {fmt_date(sun)})"
+        groups = [("Due", between(mon, sun))]
+    elif window == "today":
+        title = "today"
+        groups = [
+            ("⏰ Overdue", [r for r in active if r["due_date"] and r["due_date"] < today]),
+            ("\U0001f4c5 Today", [r for r in active if r["due_date"] == today]),
+        ]
+    else:  # this week (default / bare)
+        _, eow = _week_bounds(today, "this")
+        title = "this week"
+        groups = [
+            ("⏰ Overdue", [r for r in active if r["due_date"] and r["due_date"] < today]),
+            ("\U0001f4c5 Today", [r for r in active if r["due_date"] == today]),
+            ("This week", [r for r in active if r["due_date"] and today < r["due_date"] <= eow]),
+            ("No date", [r for r in active if not r["due_date"]]),
+        ]
+
+    out = [f"\U0001f5d3️ To-dos ({title}):"]
     any_shown = False
     for label, group in groups:
         if group:
@@ -1113,7 +1250,7 @@ def show(person: str, include_drafts: bool = False) -> str:
         return f"“{person}” is ambiguous — {opts}. Use the full name."
 
     did = d["dossier_id"]
-    entry_status = ("draft", "blessed") if include_drafts else ("blessed",)
+    entry_status = ("draft", "approved") if include_drafts else ("approved",)
     loop_status = ("proposed", "open") if include_drafts else ("open",)
     idea_status = ("proposed", "active") if include_drafts else ("active",)
 
@@ -1134,7 +1271,7 @@ def show(person: str, include_drafts: bool = False) -> str:
     if entries:
         for e in entries:
             tag = " [draft]" if e["status"] == "draft" else ""
-            lines.append(f"- **{e['entry_date']}**{tag}: {e['entry_text']}")
+            lines.append(f"- **{fmt_date(e['entry_date'])}**{tag}: {e['entry_text']}")
     else:
         lines.append("_(no entries)_")
 
@@ -1155,7 +1292,7 @@ def show(person: str, include_drafts: bool = False) -> str:
             lines.append(f"- {l['loop_text']}{tag}")
         for c in commits:
             tag = " [draft]" if c["status"] == "draft" else ""
-            due = f" — due {c['due_date']}" if c["due_date"] else ""
+            due = f" — due {fmt_date(c['due_date'])}" if c["due_date"] else ""
             lines.append(f"- ☑️ {c['title']}{due}{tag}")
     else:
         lines.append("_(none open)_")

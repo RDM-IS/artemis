@@ -134,9 +134,9 @@ _inbox_listing_state: dict[str, dict] = {}
 _INBOX_PAGE_SIZE = 20
 
 # PB-010 dossier review state: per-channel {display_number → pending-item dict}
-# from dossier.render_review(). `bless`/`edit`/`drop` resolve numbers against this
+# from dossier.render_review(). `approve`/`edit`/`drop` resolve numbers against this
 # (the same number→row indirection E2/E3 use for the inbox). In-memory; a fresh
-# `dossier review` rebuilds it. bless/edit/drop only fire when this is populated
+# `dossier review` rebuilds it. approve/edit/drop only fire when this is populated
 # for the channel — otherwise a bare `drop 4` falls through to the LLM.
 _dossier_review_state: dict[str, dict] = {}
 
@@ -1113,18 +1113,18 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
         return False
 
     # ── review-context commands: only when a review is pending for this channel ──
-    if tag in ("bless", "drop", "edit"):
+    if tag in ("approve", "drop", "edit"):
         mapping = _dossier_review_state.get(channel_id)
         if not mapping:
             return False  # no pending review → let it fall through to the LLM
-        if tag == "bless":
-            rest = q[len("bless"):].strip()
+        if tag == "approve":
+            rest = q[len("approve"):].strip()
             if rest.lower() in ("all", "everything"):
-                say(dossier.bless_all(mapping))
+                say(dossier.approve_all(mapping))
             else:
                 nums = _parse_numbers(rest)
-                say(dossier.bless_items(nums, mapping) if nums
-                    else "Usage: `bless all` · `bless 1-4` · `bless 1 & 3`")
+                say(dossier.approve_items(nums, mapping) if nums
+                    else "Usage: `approve all` · `approve 1-4` · `approve 1 & 3`")
         elif tag == "drop":
             nums = _parse_numbers(q[len("drop"):])
             say("\n".join(dossier.drop_item(n, mapping) for n in nums) if nums
@@ -1152,7 +1152,15 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
         return True
 
     if tag == "todos":
-        window = "today" if re.search(r"\btoday\b", ql) else "week"
+        # B4: pick the window from the phrasing (CT-anchored inside dossier.todos).
+        if re.search(r"\bnext\s+week\b", ql):
+            window = "next_week"
+        elif re.search(r"\btomorrow\b", ql):
+            window = "tomorrow"
+        elif re.search(r"\btoday\b", ql):
+            window = "today"
+        else:
+            window = "week"  # "this week" and the bare form
         say(dossier.todos(window))
         return True
 

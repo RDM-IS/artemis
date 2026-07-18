@@ -424,12 +424,12 @@ wired ahead of the LLM classifier in `main._handle_dossier_command`.
 
 **Concept.** One dossier per person, five sections: (1) Position & terrain,
 (2) What they need from me — both Ryan-authored; (3) Interaction log
-(append-only, draft→bless); (4) Open loops (undated `dossier_loop` watch-items +
+(append-only, draft→approve); (4) Open loops (undated `dossier_loop` watch-items +
 dated `acos.commitments` carrying a `dossier_id`); (5) Idea bank with
 cross-pollination provenance.
 
 **The wall.** Artemis extracts/connects/drafts (statistics); nothing enters the
-record until Ryan blesses (semantics). Every autonomous write lands in a
+record until Ryan approves (semantics). Every autonomous write lands in a
 draft/proposed state. Confirmations always render from the re-read written row
 (no-fabrication gate). Org-agnostic schema (FCA is the first tenant).
 
@@ -438,11 +438,11 @@ draft/proposed state. Confirmations always render from the re-read written row
   attachment) → immutable `dossier_meeting` capture, attendee linking (unknowns
   become inactive stubs), then autonomous draft extraction.
 - `dossier review` → numbered pending drafts grouped by person;
-  `bless all` · `bless 1-4` · `bless 1 & 3` · `edit 2: <text>` · `drop 4`.
+  `approve all` · `approve 1-4` · `approve 1 & 3` · `edit 2: <text>` · `drop 4`.
 - `brief <x> [about <y>]` / `prepare a meeting package` / `i'm meeting with <x>`
   → read-only pre-brief (open loops, needs, strongest idea, recent context;
   ⚠️ flags an empty idea bank). Multi-person packages dedupe shared loops/ideas.
-- `remind me to <task> <when>` → immediate commitment (explicit, no bless);
+- `remind me to <task> <when>` → immediate commitment (explicit, no approval);
   attaches a `dossier_id` if a known name appears; an "I emailed X …" phrasing
   also drafts a one-line log touch (inferred).
 - `what's on the to dos today | this week` → CT-anchored to-dos (overdue → today
@@ -456,7 +456,7 @@ draft/proposed state. Confirmations always render from the re-read written row
 **Coverage note.** Canonical to-do home is `acos.commitments` (migration 020),
 extended by 024 with nullable `due_date` + `dossier_id`/`meeting_id`. Dossier
 action items are `status='draft'` commitments, invisible to the reminder radar
-until blessed.
+until approved.
 
 **Deferred (PB-010b / later):** staleness nudges, calendar-triggered auto-briefs,
 Obsidian `generated/dossiers/*` projection, approval-queue web UI, pgvector

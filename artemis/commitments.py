@@ -45,7 +45,7 @@ def add_commitment(
     """Insert a commitment. Returns the new id.
 
     PB-010 extensions (all backward-compatible defaults):
-      * status — 'draft' for dossier-extracted to-dos awaiting a bless; 'active'
+      * status — 'draft' for dossier-extracted to-dos awaiting an approval; 'active'
         (default) for explicit/immediate ones. Drafts are invisible to the
         reminder radar (get_due_soon/get_start_alerts filter status='active').
       * dossier_id / meeting_id — soft provenance so a to-do attributes to the
@@ -70,7 +70,7 @@ def get_commitment(commitment_id: int) -> dict | None:
 
 
 def activate_commitment(commitment_id: int) -> dict | None:
-    """Flip a draft commitment to active (the bless transition). Returns the
+    """Flip a draft commitment to active (the approve transition). Returns the
     re-read row so the caller confirms from written state, never an LLM claim."""
     execute_write(
         "UPDATE acos.commitments SET status = 'active' WHERE id = %s AND status = 'draft'",
