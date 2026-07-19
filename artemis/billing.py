@@ -143,19 +143,28 @@ def classify_category(subject: str, sender: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def ensure_billing_label(gmail_client) -> str | None:
+def ensure_billing_label(gmail_client) -> tuple[str | None, bool]:
     """Ensure the '@artemis/billing' Gmail label exists. Creates it if missing.
 
-    Returns the label ID, or None on failure.
+    Returns (label_id, created): label_id is the id (None on failure); `created`
+    is True ONLY when this call actually created the label. Idempotent — an
+    existing label returns (id, False).
+
+    POLISH-1 investigation: the overnight "Created Gmail label artemis/billing"
+    re-announce was NOT a re-create. This function found and returned the existing
+    label; the announcement in the scheduler keyed off "the label currently has no
+    messages" (a bad proxy for "just created") and re-fired on every process
+    restart. Returning the real creation flag lets the caller announce only on an
+    actual create.
     """
     if not gmail_client.service:
-        return None
+        return None, False
 
     try:
         labels = gmail_client._exec(gmail_client.service.users().labels().list(userId="me"))
         for lbl in labels.get("labels", []):
             if lbl["name"].lower() == "@artemis/billing":
-                return lbl["id"]
+                return lbl["id"], False
 
         # Label doesn't exist — create it
         new_label = gmail_client._exec(gmail_client.service.users().labels().create(
@@ -168,10 +177,10 @@ def ensure_billing_label(gmail_client) -> str | None:
         ))
         label_id = new_label["id"]
         logger.info("Created Gmail label '@artemis/billing' (id=%s)", label_id)
-        return label_id
+        return label_id, True
     except Exception:
         logger.exception("Failed to ensure @artemis/billing label")
-        return None
+        return None, False
 
 
 def get_billing_messages(gmail_client) -> list[dict]:
