@@ -246,6 +246,19 @@ class ArtemisScheduler:
             day_of_week="mon-fri", id="follow_up_radar",
         )
 
+        # PB-011: Vault ingest — 04:00 CT daily sync (same code path as
+        # `@artemis vault sync`). Anchored explicitly to America/Chicago.
+        self.scheduler.add_job(
+            self.job_vault_sync, "cron", hour=4, minute=0,
+            id="vault_sync", timezone="America/Chicago",
+        )
+        # PB-011: Coverage monitor — weekdays 16:30 CT (calendar meetings vs
+        # dictated captures). One nudge/day, handled inside the job.
+        self.scheduler.add_job(
+            self.job_vault_coverage, "cron", hour=16, minute=30, day_of_week="mon-fri",
+            id="vault_coverage", timezone="America/Chicago",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -797,10 +810,43 @@ class ArtemisScheduler:
 
             if brief:
                 full_brief = f"\u2600\ufe0f **Good morning! Here's your brief:**\n\n{brief}\n\n\U0001f4ec **Inbox Zero:**\n{inbox_section}"
+                # PB-011: append the vault block \u2014 pending-proposals digest, yesterday's
+                # journal diff, and yesterday's coverage line. Read-only, best-effort.
+                try:
+                    from artemis import vault
+                    vault_section = vault.morning_brief_section()
+                    if vault_section:
+                        full_brief += f"\n\n{vault_section}"
+                except Exception:
+                    logger.exception("Vault morning-brief section failed")
                 self.mm.post_message(config.CHANNEL_OPS, full_brief)
 
         except Exception:
             logger.exception("Morning brief generation failed")
+
+    def job_vault_sync(self):
+        """PB-011: 04:00 CT vault ingest — fetch mirror, upsert notes, recompute
+        links, run the throttled extraction pass. Identical code path to the
+        `@artemis vault sync` command. Renders nothing (silent unless it errors)."""
+        if self._is_quiet():
+            return
+        try:
+            from artemis import vault
+            summary = vault.sync_vault()
+            logger.info("Vault sync (04:00 CT): %s", summary)
+        except Exception:
+            logger.exception("Vault sync job failed")
+
+    def job_vault_coverage(self):
+        """PB-011: weekday 16:30 CT — compare today's real calendar meetings to
+        today's dictated captures; post at most one nudge to #artemis-ryan."""
+        if self._is_quiet():
+            return
+        try:
+            from artemis import vault
+            vault.run_coverage_monitor(self.calendar, self.mm)
+        except Exception:
+            logger.exception("Vault coverage monitor failed")
 
     def job_ssl_check(self):
         """Check SSL certs and alert if expiring."""

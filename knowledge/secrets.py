@@ -137,6 +137,14 @@ def get_health_api_key() -> str:
     return secret["api_key"]
 
 
+def get_vault_repo() -> dict:
+    """Returns {clone_url, token} for the private Obsidian vault repo (PB-011).
+    Token is a fine-grained, READ-ONLY PAT (Contents: read) scoped to RDM-IS/vault.
+    Used at clone/fetch time ONLY — never written to disk or into stored git config.
+    Secret name: acos/vault-repo"""
+    return get_secret("acos/vault-repo")
+
+
 def get_openweather_api_key() -> str:
     """Returns OpenWeatherMap API key string.
     Used by artemis/weather.py for indoor/outdoor cardio decisions.

@@ -41,6 +41,7 @@ def add_commitment(
     status: str = "active",
     dossier_id: int | None = None,
     meeting_id: int | None = None,
+    context: str | None = None,
 ) -> int:
     """Insert a commitment. Returns the new id.
 
@@ -52,12 +53,24 @@ def add_commitment(
         person and the meeting it came from. Nullable; free-standing commitments
         pass neither.
       * due_date may be None (undated to-do) — migration 024 dropped the NOT NULL.
+
+    PB-011: `context` ('fca' | client tag | NULL) tags a commitment written through
+    an approved vault extraction proposal. The column is referenced in the INSERT
+    ONLY when a value is supplied (same pattern as knowledge.db.log_audit's corpus
+    columns) — so existing callers emit the exact same INSERT as before and work with
+    or without migration 028; a caller that passes `context` requires 028 (the vault
+    approval path, migrate-first).
     """
+    cols = ["title", "due_date", "effort_days", "client", "status", "dossier_id", "meeting_id"]
+    vals = [title, due_date or None, effort_days, client, status, dossier_id, meeting_id]
+    if context is not None:
+        cols.append("context")
+        vals.append(context)
+    placeholders = ", ".join(["%s"] * len(cols))
     row = execute_write(
-        "INSERT INTO acos.commitments "
-        "(title, due_date, effort_days, client, status, dossier_id, meeting_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (title, due_date or None, effort_days, client, status, dossier_id, meeting_id),
+        f"INSERT INTO acos.commitments ({', '.join(cols)}) "
+        f"VALUES ({placeholders}) RETURNING id",
+        tuple(vals),
     )
     return row["id"] if row else 0
 
