@@ -664,8 +664,8 @@ def expire_stale_proposals() -> int:
 
 def _pending_proposals(today_only: bool) -> list[dict]:
     sql = (
-        "SELECT p.id, p.capture_id, p.extraction_type, p.payload, p.context, p.created_at, "
-        "n.path, n.source "
+        "SELECT p.id, p.capture_id, p.extraction_type, p.payload, p.payload_final, "
+        "p.context, p.created_at, n.path, n.source "
         "FROM vault.extraction_proposal p JOIN vault.notes n ON n.capture_id = p.capture_id "
         "WHERE p.status = 'pending' "
     )
@@ -765,7 +765,12 @@ def _approve_proposal(p: dict) -> tuple[bool, str]:
     the row to approved and record the target ref. Returns (ok, target_ref), ok read
     back from the re-read row (no-fabrication)."""
     etype = p["extraction_type"]
-    payload = p["payload"] or {}
+    # OPS-2 edit-then-approve: an operator-edited payload (payload_final) wins over
+    # the original proposal payload when present. The original stays untouched on
+    # the row (proposed-vs-blessed training data); we only ever WRITE THROUGH the
+    # blessed version here. Mattermost `approve` never sets payload_final, so its
+    # behaviour is unchanged (payload_final IS NULL → falls back to payload).
+    payload = p.get("payload_final") or p["payload"] or {}
     note = execute_one("SELECT created_at FROM vault.notes WHERE capture_id = %s", (p["capture_id"],))
     note_created = note["created_at"] if note else None
     try:
@@ -816,6 +821,88 @@ def _reject_proposal(p: dict) -> bool:
     if ok:
         _audit("reject_proposal", {"id": p["id"], "type": p["extraction_type"]})
     return ok
+
+
+# ── OPS-2 by-id adjudication — the ops UI approval queue reuses the SAME
+#    write-through core (_approve_proposal / _reject_proposal) as the Mattermost
+#    `approve`/`reject` verbs. No second command path, no new write logic. The only
+#    addition is edit-then-approve: persist an edited payload to payload_final first,
+#    then approve from it (see _approve_proposal). ──
+
+def get_proposal(pid: int) -> dict | None:
+    """Load one proposal joined to its note (path/source), including payload_final,
+    in the same row shape _pending_proposals returns. Used by the ops UI to adjudicate
+    a single proposal by id (the Mattermost path resolves by digest number instead)."""
+    return execute_one(
+        "SELECT p.id, p.capture_id, p.extraction_type, p.payload, p.payload_final, "
+        "p.context, p.status, p.created_at, n.path, n.source "
+        "FROM vault.extraction_proposal p JOIN vault.notes n ON n.capture_id = p.capture_id "
+        "WHERE p.id = %s",
+        (pid,),
+    )
+
+
+def set_payload_final(pid: int, payload: dict) -> bool:
+    """Persist an operator-edited payload for a still-pending proposal (OPS-2
+    edit-then-approve). Only mutates a pending row; returns True if it stuck (re-read).
+    The original `payload` column is never touched."""
+    execute_write(
+        "UPDATE vault.extraction_proposal SET payload_final = %s "
+        "WHERE id = %s AND status = 'pending'",
+        (json.dumps(payload), pid),
+    )
+    row = execute_one("SELECT payload_final FROM vault.extraction_proposal WHERE id = %s", (pid,))
+    ok = bool(row and row["payload_final"] is not None)
+    if ok:
+        _audit("edit_proposal", {"id": pid})
+    return ok
+
+
+def approve_proposal_by_id(pid: int, edited_payload: dict | None = None) -> tuple[bool, str]:
+    """Approve one proposal by id, optionally with an edited payload (edit-then-approve).
+    Writes any edit to payload_final first, then delegates to _approve_proposal — the
+    exact write-through the Mattermost verb uses. Returns (ok, target_ref); ok is read
+    back from the written row (no-fabrication)."""
+    p = get_proposal(pid)
+    if not p or p.get("status") != "pending":
+        return False, ""
+    if edited_payload is not None:
+        if not set_payload_final(pid, edited_payload):
+            return False, ""
+        p = get_proposal(pid)  # re-read so _approve_proposal sees payload_final
+    return _approve_proposal(p)
+
+
+def reject_proposal_by_id(pid: int) -> bool:
+    """Reject one proposal by id via the same _reject_proposal write-through the
+    Mattermost verb uses. Returns True read back from the written row."""
+    p = get_proposal(pid)
+    if not p or p.get("status") != "pending":
+        return False
+    return _reject_proposal(p)
+
+
+def proposals_for_context(context: str | None, unscoped: bool = False) -> list[dict]:
+    """Pending proposals for the ops UI approval queue, scoped to an engagement.
+
+    context='fca'          → proposals tagged context='fca'.
+    unscoped=True          → proposals with NULL context (the engagement page's
+                             "unscoped" section + the portfolio pending badge).
+    Ordered by type rank then age, same as the Mattermost digest. Each row carries
+    payload + payload_final + note path/source so the UI renders evidence/provenance
+    from written rows (never an LLM claim)."""
+    base = (
+        "SELECT p.id, p.capture_id, p.extraction_type, p.payload, p.payload_final, "
+        "p.context, p.created_at, n.path, n.source "
+        "FROM vault.extraction_proposal p JOIN vault.notes n ON n.capture_id = p.capture_id "
+        "WHERE p.status = 'pending' "
+    )
+    if unscoped:
+        rows = execute_query(base + "AND p.context IS NULL ORDER BY p.created_at, p.id")
+    else:
+        rows = execute_query(base + "AND p.context = %s ORDER BY p.created_at, p.id", (context,))
+    rows.sort(key=lambda r: (_TYPE_RANK.get(r["extraction_type"], 9), r["created_at"] or datetime.min, r["id"]))
+    return rows
 
 
 def adjudicate(action: str, nums: list[int], mapping: dict) -> str:

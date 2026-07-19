@@ -4,9 +4,15 @@ import { useState, useEffect, useCallback } from "react";
 // Config
 // ---------------------------------------------------------------------------
 
+// PARKED (OPS-2): this legacy RDMIS dashboard is not rendered by default
+// (features.legacyPanels === false). The API key that used to be hardcoded here
+// has been removed — it was the exposure OPS-2 closed. If the legacy view is ever
+// re-enabled it must read a build-time env var, never a committed literal. NOTE:
+// the old key remains in git history and should be ROTATED by the operator.
 const API_BASE =
+  import.meta.env.VITE_LEGACY_API_BASE ||
   "https://inolj7bn99.execute-api.us-east-1.amazonaws.com/default/rdmis-crm-api";
-const API_KEY = "kBAuGh_itvJI797R1L3CKuRIbwGXIgwy2beeg1VqVxw";
+const API_KEY = import.meta.env.VITE_LEGACY_API_KEY || "";
 const REFRESH_MS = 60_000;
 const EXIT_DATE = new Date("2026-09-30");
 
@@ -731,7 +737,7 @@ function AcosHealthPanel({ data }) {
 // Main Dashboard
 // ---------------------------------------------------------------------------
 
-export default function Dashboard() {
+export default function LegacyDashboard() {
   const [data, setData] = useState(null);
   const [source, setSource] = useState(null);
   const [lastFetch, setLastFetch] = useState(null);

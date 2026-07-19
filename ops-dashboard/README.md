@@ -1,119 +1,125 @@
-# RDMIS Ops Dashboard
+# Engagement Ops
 
-Real-time operations dashboard for RDMIS, designed for always-on TV display.
-Connects to the RDMIS CRM API (Lambda + API Gateway) and renders four panels:
-**Survival**, **Pipeline**, **Action Items**, and **ACOS Health**.
+Two-level engagement operations UI (OPS-2). A Vite + React SPA (no TypeScript)
+that surfaces the ACOS approval queue, commitments, dossiers, and projects for
+each engagement.
 
-## Architecture
+## Two levels
 
 ```
-ops-dashboard/          Vite + React SPA (no TypeScript)
-  src/
-    Dashboard.jsx       Single-file dashboard component
-    App.jsx             Root component
-    main.jsx            React entry point
-  index.html            Shell with base styles
-  vercel.json           SPA rewrites for Vercel deployment
+/            Portfolio  — 30,000-foot strip: one card per engagement,
+                          global ACOS health, portfolio-wide pending badge.
+/e/:slug     Engagement — approval queue (centerpiece), commitments,
+                          dossier lookup, projects, health strip.
 ```
 
-**API Backend**: FastAPI Lambda at
-`https://inolj7bn99.execute-api.us-east-1.amazonaws.com/default/rdmis-crm-api`
+Routing is `react-router-dom`. `src/main.jsx` wraps the app in `BrowserRouter`;
+`src/App.jsx` holds the `<Routes>`.
 
-**Endpoint consumed**: `GET /dashboard/full` (requires `x-api-key` header)
+## Security — no embedded API key
 
-**Hosting target**: Vercel (ops.rdm.is)
+There is **no API key in the client**. The API sits behind **Cloudflare
+Access**; the browser carries the Access identity via cookies automatically.
+Every fetch uses `credentials: "include"` and sends **no** `x-api-key` header.
+If a request returns 401/403 (Access not passed), the UI shows a clear "Not
+authenticated — reload to sign in via Cloudflare Access" message.
 
-## Panels
+## Configuration
 
-### 1. Survival (top-left)
-- MRR vs $45K target with progress bar
-- Founder loan balance
-- Runway calculation (shows "Pre-Revenue" when MRR is zero)
-- Monthly expense breakdown: total, infrastructure, SaaS
+Single build-time variable, read in `src/api.js`:
 
-### 2. Pipeline (top-right)
-- Active deals from the CRM
-- Company name, contact, stage, deal value, status badge
-- Status colors: hot (orange), warm (gold), active (blue), cold (gray)
+```
+VITE_OPS_API_BASE=      # empty = same-origin (recommended)
+                        # or a full origin, e.g. https://ops-api.rdm.is
+```
 
-### 3. Action Items (bottom-left)
-- Up to 8 pending items from ACOS action queue
-- High-priority items highlighted with orange left border
-- Shows "All clear" when queue is empty
+See `.env.example`. Copy to `.env` to override locally. No secrets live here.
 
-### 4. ACOS Health (bottom-right)
-- System status with green/red indicator dot
-- Version, active job count, last brief timestamp, uptime percentage
+## API contract
 
-## Data Flow
+All routes are under `/api` and require Cloudflare Access (enforced at the edge,
+not in this code). Reads: `GET /api/portfolio`, `GET /api/engagements/<slug>`,
+`GET /api/dossier/search|person/<slug>|org/<org>`. Mutations (POST, JSON):
+proposal approve/reject/batch, dossier-draft approve/reject (approve/reject only
+— no edit in v1), and commitment close. After any mutation the engagement view
+re-fetches from the server so displayed state is authoritative, not optimistic.
 
-1. On mount, fetches `GET /dashboard/full` with the API key
-2. Parses combined JSON payload containing all four panel datasets
-3. If the API is unreachable, falls back to hardcoded mock data
-4. Auto-refreshes every 60 seconds
-5. Header shows **LIVE** (green) or **MOCK** (gold) badge
+## Design system
 
-## Design System
+Dark-terminal aesthetic with two reserved 70s accents. Tokens live in
+`src/theme.js`.
 
-| Token     | Hex       | Usage                     |
-|-----------|-----------|---------------------------|
-| VOID      | `#07070A` | Page background           |
-| SHADOW    | `#12121A` | Panel background          |
-| MIST      | `#2A2A35` | Borders, muted elements   |
-| SIGNAL    | `#C8521A` | Alerts, hot status        |
-| ORACLE    | `#C8922A` | Warnings, warm status     |
-| MOONSTONE | `#9FB8C8` | Labels, secondary text    |
-| ARROW     | `#EDE8E0` | Primary text              |
-| GREEN     | `#2D7A4F` | Success, online status    |
-| EMBER     | `#7A2E0A` | Reserved accent           |
+| Token        | Hex       | Usage                                             |
+|--------------|-----------|---------------------------------------------------|
+| VOID         | `#07070A` | Page background                                   |
+| SHADOW       | `#12121A` | Panel background                                  |
+| MIST         | `#2A2A35` | Borders, muted elements                           |
+| SIGNAL       | `#C8521A` | Alerts, primary accent                            |
+| ORACLE       | `#C8922A` | Warnings, secondary accent                        |
+| MOONSTONE    | `#9FB8C8` | Labels, secondary text                            |
+| ARROW        | `#EDE8E0` | Primary text                                      |
+| GREEN        | `#2D7A4F` | Success, online status                            |
+| EMBER        | `#7A2E0A` | Deep accent (badges)                              |
+| AVOCADO      | `#A9B14A` | **ONLY** approve / confirm actions                |
+| BURNT_ORANGE | `#D86E2C` | Attention: overdue, stale, pending, near hard-date|
 
-**Fonts**: Georgia (body text), Courier New (data, labels, mono values)
+**Fonts**: Georgia (body), Courier New (data / labels / mono values).
 
-**Aesthetic**: Bloomberg Terminal meets private equity war room
+**Mobile-usable**: the dossier lookup is used on a phone in a hallway; the
+approval queue on a laptop. Responsive flex/grid, wrapping rows, 44px tap
+targets, no horizontal body scroll.
 
-## Local Development
+## File layout
+
+```
+src/
+  main.jsx                  BrowserRouter entry
+  App.jsx                   <Routes>
+  theme.js                  color + font tokens
+  features.js               feature flags ({ legacyPanels: false })
+  api.js                    fetch helpers (credentials:"include", no key)
+  format.js                 date / duration display helpers
+  views/
+    Portfolio.jsx           / — portfolio strip
+    Engagement.jsx          /e/:slug — the working surface
+  components/
+    Panel.jsx               titled dark container
+    Badge.jsx               mono pill
+    States.jsx              Loading / ErrorState / EmptyLine
+    HealthStrip.jsx         <HEALTH> strip (renders nulls as —)
+    ProposalCard.jsx        approval item + inline edit + batch checkbox
+    DossierDraftCard.jsx    dossier draft (approve/reject only)
+    CommitmentRow.jsx       commitment + Close
+    DossierSearch.jsx       read-only person/org lookup + detail drawer
+  legacy/
+    LegacyDashboard.jsx     parked RDMIS survival/pipeline/revenue dashboard
+```
+
+## Parked legacy dashboard
+
+The old RDMIS survival / pipeline / revenue dashboard is **parked, not deleted**
+in `src/legacy/LegacyDashboard.jsx`. It renders nowhere by default. Flip
+`features.legacyPanels` to `true` in `src/features.js` to expose it at `/legacy`.
+
+## Local development
 
 ```bash
 cd ops-dashboard
 npm install
-npm run dev
+npm run dev        # http://localhost:5173
 ```
 
-Opens at http://localhost:5173. The dashboard will attempt to hit the
-live API; if CORS or network issues occur locally, it falls back to
-mock data automatically.
-
-## Build and Deploy
+## Build and deploy — Cloudflare Pages + Access
 
 ```bash
-npm run build     # outputs to dist/
+npm run build      # outputs to dist/
 ```
 
-### Vercel
-
-Connect the repo and set:
 - **Root Directory**: `ops-dashboard`
-- **Build Command**: `npm run build`
-- **Output Directory**: `dist`
-- **Domain**: `ops.rdm.is`
-
-The `vercel.json` handles SPA routing via catch-all rewrite.
-
-## Environment Notes
-
-- The API key is embedded in the client bundle. This is intentional
-  for an internal ops tool. The API Gateway also has IP restrictions
-  and the key only grants read access to dashboard endpoints.
-- CORS is enabled on the API (`allow_origins: ["*"]`) to support
-  both local dev and the Vercel deployment.
-- No environment variables are required; all config is in
-  `Dashboard.jsx` constants.
-
-## Extending
-
-To add a new panel:
-
-1. Add a helper function in `api/app/routers/dashboard.py` (backend)
-2. Include it in the `/dashboard/full` response
-3. Create a `<NewPanel>` component in `Dashboard.jsx`
-4. Add it to the grid in the main `Dashboard` component
+- **Build command**: `npm run build`
+- **Output directory**: `dist`
+- **SPA fallback**: `_redirects` (`/* /index.html 200`) — kept for Cloudflare
+  Pages so client-side routes like `/e/<slug>` resolve on hard reload.
+- **Access**: put the Pages project (and the API) behind a Cloudflare Access
+  application so the identity cookie is present for `credentials:"include"`
+  requests. No API key is provisioned or embedded.

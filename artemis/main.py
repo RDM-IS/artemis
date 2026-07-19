@@ -4369,6 +4369,16 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # OPS-2: register the engagement ops API (ops.rdm.is backend) on this Flask app.
+    # It runs in-process so its health panel reads the live scheduler; every route is
+    # gated by Cloudflare Access (artemis.ops_access). Best-effort — a registration
+    # failure must never stop the bot from serving.
+    try:
+        from artemis import ops_api
+        ops_api.register(app)
+    except Exception:
+        logger.exception("OPS-2 ops API registration failed — continuing without it")
+
     logger.info("Artemis is running. Press Ctrl+C to stop.")
     app.run(host="0.0.0.0", port=5001, use_reloader=False)
 
