@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { C, FONT_MONO, FONT_BODY } from "../theme";
 import Badge from "./Badge";
+import { ErrorStrip } from "./States";
 
 // ---------------------------------------------------------------------------
 // ProposalCard — one item in the approval queue.
@@ -18,6 +19,7 @@ export default function ProposalCard({
   proposal,
   busy,
   selected,
+  error, // ApiError from a failed approve/reject on this card (D2)
   onToggleSelect,
   onApprove, // (id, payloadFinal|undefined)
   onReject, // (id)
@@ -177,6 +179,9 @@ export default function ProposalCard({
             </>
           )}
         </div>
+
+        {/* D2: inline failure — the action did not go through. */}
+        {error && <ErrorStrip error={error} compact />}
       </div>
     </div>
   );

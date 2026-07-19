@@ -4,7 +4,32 @@
 
 const EM_DASH = "—";
 
+// Matches a bare calendar date with no time component: "2026-08-08".
+const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+// parseLocalDate — turn a bare `YYYY-MM-DD` string from the API into a Date at
+// LOCAL midnight.
+//
+// D1 (off-by-one): `new Date("2026-08-08")` parses as UTC midnight, so in any
+// negative-UTC-offset zone (America/Chicago) it renders/diffs a day early
+// ("Aug 7"). Splitting the components and constructing `new Date(y, m-1, d)`
+// pins the date to the local day. Use this EVERYWHERE a bare date string from
+// the API is formatted or diffed.
+//
+// Returns null for anything that is not a bare date string (empty, null, a full
+// ISO timestamp) — timestamps carry their own time/offset and must go through
+// `new Date()` unchanged.
+export function parseLocalDate(ymd) {
+  if (typeof ymd !== "string") return null;
+  const m = DATE_ONLY.exec(ymd.trim());
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return isNaN(d.getTime()) ? null : d;
+}
+
 // Relative time from an ISO timestamp, e.g. "6h ago". Returns em dash if null.
+// Only ever called with full timestamps (last_capture, last_brief, created_at),
+// which carry their own time/offset — bare dates go through parseLocalDate.
 export function relativeTime(iso) {
   if (!iso) return EM_DASH;
   const d = new Date(iso);
@@ -21,10 +46,15 @@ export function relativeTime(iso) {
 }
 
 // Absolute short date, e.g. "Jul 19". Returns em dash if null.
-export function shortDate(iso) {
-  if (!iso) return EM_DASH;
-  const d = new Date(iso);
-  if (isNaN(d)) return EM_DASH;
+//
+// Accepts both bare date strings (due dates, entry dates, hard dates) and full
+// ISO timestamps. Bare dates go through parseLocalDate so they don't shift a day
+// early (D1); timestamps fall through to `new Date()`, which honours their own
+// time/offset.
+export function shortDate(value) {
+  if (!value) return EM_DASH;
+  const d = parseLocalDate(value) || new Date(value);
+  if (isNaN(d.getTime())) return EM_DASH;
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 

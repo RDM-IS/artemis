@@ -109,6 +109,31 @@ npm install
 npm run dev        # http://localhost:5173
 ```
 
+## Tests
+
+No React test harness is wired up; the two pure modules with logic worth pinning
+have node-runnable tests (Node's built-in runner, no extra deps):
+
+```bash
+npm test           # runs test/*.test.mjs with TZ=America/Chicago
+```
+
+- `test/format.test.mjs` — D1: bare `YYYY-MM-DD` dates render on their local day
+  (`2026-08-08` → "Aug 8", not "Aug 7") in a negative-UTC-offset zone.
+- `test/api.test.mjs` — D2: the fetch wrapper classifies ok+JSON → data,
+  ok+HTML → error, !ok → error, network throw → error.
+
+The `test` script pins `TZ=America/Chicago` so the off-by-one can actually
+manifest; running bare `node --test` in a UTC environment skips the contrast
+assertion (see the test comment).
+
+## Dashboard-managed deploy state
+
+Cloudflare Access / Pages config for `ops.rdm.is` is dashboard-managed (no repo
+IaC). The required state — Access "Bypass OPTIONS", Pages custom-domain
+attachment, `VITE_*` build-time baking, build watch paths — is recorded in
+[`docs/OPS_DASHBOARD_RUNBOOK.md`](../docs/OPS_DASHBOARD_RUNBOOK.md).
+
 ## Build and deploy — Cloudflare Pages + Access
 
 ```bash

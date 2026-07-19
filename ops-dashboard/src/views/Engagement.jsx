@@ -18,7 +18,7 @@ import ProposalCard from "../components/ProposalCard";
 import DossierDraftCard from "../components/DossierDraftCard";
 import CommitmentRow from "../components/CommitmentRow";
 import DossierSearch from "../components/DossierSearch";
-import { Loading, ErrorState, EmptyLine } from "../components/States";
+import { Loading, ErrorStrip, EmptyLine } from "../components/States";
 
 // ---------------------------------------------------------------------------
 // Engagement (/e/:slug) — the working surface. Approval queue is the
@@ -35,6 +35,10 @@ export default function Engagement() {
   // ids currently mid-mutation (disabled + dimmed), and batch selection.
   const [busyIds, setBusyIds] = useState(() => new Set());
   const [selected, setSelected] = useState(() => new Set());
+  // D2: per-id mutation failures, keyed by the same composite ids as busyIds
+  // (proposal id, `c${id}`, `d${type}-${id}`). A failed mutation records its
+  // ApiError here and renders inline near the card — it is NOT silently reverted.
+  const [mutErrors, setMutErrors] = useState(() => new Map());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -52,6 +56,7 @@ export default function Engagement() {
     // Reset transient state when the slug changes.
     setSelected(new Set());
     setBusyIds(new Set());
+    setMutErrors(new Map());
     load();
   }, [load]);
 
@@ -63,19 +68,35 @@ export default function Engagement() {
       ids.forEach((i) => next.add(i));
       return next;
     });
+    // Clear any prior error for these ids — this attempt supersedes it.
+    setMutErrors((prev) => {
+      const next = new Map(prev);
+      ids.forEach((i) => next.delete(i));
+      return next;
+    });
+    let ok = false;
     try {
       await fn();
+      ok = true;
     } catch (err) {
-      // Surface at the top; the refetch below (or manual retry) reconciles.
-      setError(err);
-    } finally {
-      await load();
-      setBusyIds((prev) => {
-        const next = new Set(prev);
-        ids.forEach((i) => next.delete(i));
+      // D2: do NOT silently restore. Record the failure inline against each
+      // affected id so the operator sees the action failed, and skip the
+      // reconciling refetch (which would make it look like nothing happened).
+      setMutErrors((prev) => {
+        const next = new Map(prev);
+        ids.forEach((i) => next.set(i, err));
         return next;
       });
-      setSelected((prev) => {
+    } finally {
+      if (ok) {
+        await load();
+        setSelected((prev) => {
+          const next = new Set(prev);
+          ids.forEach((i) => next.delete(i));
+          return next;
+        });
+      }
+      setBusyIds((prev) => {
         const next = new Set(prev);
         ids.forEach((i) => next.delete(i));
         return next;
@@ -140,7 +161,7 @@ export default function Engagement() {
         {notFound ? (
           <EmptyLine>Engagement “{slug}” not found.</EmptyLine>
         ) : (
-          <ErrorState error={error} onRetry={load} />
+          <ErrorStrip error={error} onRetry={load} />
         )}
       </Shell>
     );
@@ -201,10 +222,11 @@ export default function Engagement() {
         {data && data.health && <HealthStrip health={data.health} />}
       </div>
 
-      {/* Non-fatal error banner (mutation failed but we still have data) */}
+      {/* Non-fatal read error (a refetch failed but we still have prior data).
+          Mutation failures render inline on their card, not here. */}
       {error && data && (
         <div style={{ marginBottom: 14 }}>
-          <ErrorState error={error} onRetry={load} />
+          <ErrorStrip error={error} onRetry={load} />
         </div>
       )}
 
@@ -225,6 +247,7 @@ export default function Engagement() {
                 proposal={p}
                 busy={busyIds.has(p.id)}
                 selected={selected.has(p.id)}
+                error={mutErrors.get(p.id)}
                 onToggleSelect={toggleSelect}
                 onApprove={onApprove}
                 onReject={onReject}
@@ -243,6 +266,7 @@ export default function Engagement() {
                 proposal={p}
                 busy={busyIds.has(p.id)}
                 selected={selected.has(p.id)}
+                error={mutErrors.get(p.id)}
                 onToggleSelect={toggleSelect}
                 onApprove={onApprove}
                 onReject={onReject}
@@ -260,6 +284,7 @@ export default function Engagement() {
                 key={`${d.draft_type}-${d.id}`}
                 draft={d}
                 busy={busyIds.has(`d${d.draft_type}-${d.id}`)}
+                error={mutErrors.get(`d${d.draft_type}-${d.id}`)}
                 onApprove={onApproveDraft}
                 onReject={onRejectDraft}
               />
@@ -278,6 +303,7 @@ export default function Engagement() {
               key={cm.id}
               commitment={cm}
               busy={busyIds.has(`c${cm.id}`)}
+              error={mutErrors.get(`c${cm.id}`)}
               onClose={onCloseCommitment}
             />
           ))
