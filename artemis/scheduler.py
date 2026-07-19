@@ -741,6 +741,15 @@ class ArtemisScheduler:
             brief = self.compose_morning_brief(include_monitors=True)
             if brief:
                 self.mm.post_message(config.CHANNEL_OPS, brief)
+                # OPS-2 health-panel truth: record a DURABLE last-brief timestamp
+                # (acos.system_state, same helper as last_run_at). The ops health
+                # strip reads this real value — the dashboard's old "41d ago" came
+                # from approximating the brief time off an unrelated action item.
+                try:
+                    from artemis.quiet_hours import set_system_value
+                    set_system_value("last_morning_brief_at", datetime.utcnow().isoformat())
+                except Exception:
+                    logger.debug("last_morning_brief_at write failed", exc_info=True)
         except Exception:
             logger.exception("Morning brief generation failed")
 

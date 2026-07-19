@@ -12,3 +12,4 @@ elevenlabs>=1.0.0
 PyMuPDF>=1.23.0
 python-docx>=1.0.0
 python-Levenshtein>=0.25.0
+PyJWT[crypto]>=2.8       # OPS-2: verify Cloudflare Access identity JWTs (RS256 via JWKS)
