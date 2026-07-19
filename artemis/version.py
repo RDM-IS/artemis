@@ -1,43 +1,67 @@
-"""Version tracking for Artemis."""
+"""Version tracking for Artemis.
+
+OPS-1 version truth: the running commit is resolved ONCE at import from the repo
+git HEAD (WorkingDirectory is the repo), so `VERSION` is deploy-accurate — it can
+never drift into an LLM guess. Base version + short SHA: `1.4.0+<sha7>`, or
+`1.4.0+unknown` when git is unavailable.
+"""
 
 import logging
+import os
 import subprocess
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-VERSION = "1.3.0"
-BUILD_DATE = "2026-03-17"
-COMMIT_HASH = None  # populated at runtime from git
+BASE_VERSION = "1.4.0"
+BUILD_DATE = "2026-07-18"
+
+# The repo root — this file is artemis/version.py, so two dirs up. Deliberately not
+# a hardcoded path (the old /mnt/d/Artemis constant was stale): git runs where the
+# code lives, matching the service's WorkingDirectory.
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _REPO_API = "https://api.github.com/repos/RDM-IS/artemis/commits/main"
-_ARTEMIS_DIR = "/mnt/d/Artemis"
+
+
+def _git(args: list[str]) -> str:
+    """Run a read-only git command in the repo with a tight timeout; '' on failure."""
+    return subprocess.check_output(
+        ["git", *args], cwd=_REPO_DIR, stderr=subprocess.DEVNULL, timeout=5,
+    ).decode().strip()
+
+
+def _resolve_sha() -> str:
+    """Short HEAD sha (7 chars), or 'unknown' when git can't be reached."""
+    try:
+        return _git(["rev-parse", "--short=7", "HEAD"])[:7] or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def get_commit_subject() -> str:
+    """Subject line of the running commit (git log -1 --format=%s), or ''."""
+    try:
+        return _git(["log", "-1", "--format=%s"])
+    except Exception:
+        return ""
+
+
+# Resolved once at import and cached as module constants.
+_SHA = _resolve_sha()
+VERSION = f"{BASE_VERSION}+{_SHA}"
+COMMIT_HASH = None if _SHA == "unknown" else _SHA
 
 
 def get_version() -> str:
-    """Get current version with git commit hash if available."""
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=_ARTEMIS_DIR,
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        return f"{VERSION} ({commit})"
-    except Exception:
-        return VERSION
+    """Deploy-accurate version string, e.g. `1.4.0+abc1234`."""
+    return VERSION
 
 
 def get_commit_hash() -> str:
-    """Get the current short commit hash, or empty string."""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=_ARTEMIS_DIR,
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception:
-        return ""
+    """Short commit hash, or '' when git was unavailable at startup."""
+    return "" if _SHA == "unknown" else _SHA
 
 
 def get_latest_github_version() -> tuple[str | None, str | None]:
@@ -58,7 +82,8 @@ def get_latest_github_version() -> tuple[str | None, str | None]:
 
 
 def format_version_status() -> str:
-    """Format a full version status message for @mention responses."""
+    """Format a full version status message for @mention responses (compares the
+    running commit against origin/main on GitHub)."""
     current = get_version()
     local_hash = get_commit_hash()
     latest_hash, latest_date = get_latest_github_version()

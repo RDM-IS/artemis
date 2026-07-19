@@ -283,7 +283,17 @@ Rules:
 - A PERSON-level fact is a dossier_entry, never an org_fact. An ORG-level fact is an
   org_fact, never a dossier_entry.
 - Prefer fewer, higher-signal candidates. Empty arrays are fine — most notes yield few.
-- Never invent people, orgs, dates, or commitments not present in the note."""
+- Never invent people, orgs, dates, or commitments not present in the note.
+- DEDUPLICATE across types: one underlying fact appears EXACTLY ONCE, under its single
+  best-fit type. Never emit the same fact as both an action_item and a commitment, or
+  as both a dossier_entry and an org_fact — pick the one that fits best and drop the rest.
+- COMMITMENT DIRECTION discipline: propose a commitment ONLY when a NAMED party owes a
+  concrete deliverable (direction owed-by-ryan or owed-to-ryan). A third party merely
+  "submitting a request", "getting back to you", or awaiting an answer is a waiting-on
+  action_item, NOT a commitment.
+- DECISIONS are choices MADE BY Ryan, or ones that require his ratification. A fact,
+  approval, or decision made by someone else is an org_fact or an acknowledgment —
+  never a decision_candidate."""
 
 VAULT_EXTRACT_USER = """Note source: {source}
 Note captured: {created}

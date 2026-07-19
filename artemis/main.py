@@ -76,7 +76,14 @@ from artemis.quiet_hours import (
     update_last_interaction,
 )
 from artemis.scheduler import ArtemisScheduler, get_playbook_text
-from artemis.version import format_version_status, get_commit_hash, get_latest_github_version, get_version
+from artemis.version import (
+    VERSION,
+    format_version_status,
+    get_commit_hash,
+    get_commit_subject,
+    get_latest_github_version,
+    get_version,
+)
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -1070,6 +1077,33 @@ def _handle_dossier_subcommand(post: dict, q: str, say, channel_id: str) -> bool
 
     say("Dossier commands: `dossier review` · `dossier show <name> [--drafts]` · "
         "`dossier new <name>` · `dossier set <name> position:|needs:|title:|reports_to:|org: …`")
+    return True
+
+
+def _handle_version_command(post: dict, question: str) -> bool:
+    """OPS-1 deterministic `version` — deploy-accurate version truth, never an LLM
+    guess. Replies with VERSION (`1.4.0+<sha7>`), the running commit's subject line,
+    and the service start time. Runs in the deterministic chain, ahead of LLM
+    routing. `update check` (GitHub compare) stays on the direct-command path below.
+    Returns True if handled, else False.
+    """
+    q = question.lower().strip().rstrip("?")
+    if q not in ("version", "what version", "what version are you", "which version"):
+        return False
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    subject = get_commit_subject()
+    started = (
+        datetime.fromtimestamp(_start_time).strftime("%Y-%m-%d %H:%M:%S")
+        if _start_time else "unknown"
+    )
+    lines = [
+        f"\U0001f9ed **Artemis {VERSION}**",
+        f"- Commit: {subject}" if subject else "- Commit: unknown",
+        f"- Started: {started}",
+    ]
+    if _mm:
+        _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
     return True
 
 
@@ -3600,6 +3634,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         # approve/reject of a live digest. Ahead of dossier so a vault digest's
         # approve/reject is claimed here; a bare/non-numeric approve falls through
         # to the dossier review (its own gate) or the LLM.
+        # OPS-1 version truth — deterministic, ahead of LLM routing.
+        ("version_command", _handle_version_command),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
@@ -3636,7 +3672,9 @@ def _handle_mention(post: dict, thread: list[dict]):
     # Direct commands
     q_lower = question.lower().strip()
 
-    if q_lower in ("version", "what version are you?", "what version", "update check"):
+    # `version` / `what version` are claimed by _handle_version_command (deploy
+    # truth). `update check` stays here — it compares the running commit to GitHub.
+    if q_lower in ("update check", "check for updates"):
         reply = format_version_status()
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
@@ -4030,7 +4068,7 @@ def main():
     global _mm, _gmail, _calendar, _start_time, _sched
 
     _start_time = time.time()
-    logger.info("Starting Artemis...")
+    logger.info("Starting Artemis %s...", VERSION)
 
     # All state now lives in RDS (acos.* / public.*) — no local SQLite tables to
     # create. commitments was the last SQLite module (migration 020); artemis.db

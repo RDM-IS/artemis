@@ -74,6 +74,7 @@ Capture (dumb, immutable) → Surface (synthesis surfacer detects high-surprise 
 - **Calendar guards**: dupe-detection + audit (Brad guards), anti-confabulation guard.
 - **Context-snapshot system** + `ssh rdmis` over SSM + clean branch hygiene (auto-delete on merge).
 - **SQLite→RDS migration — COMPLETE (7/7):** guardrails, life_ops workouts (+ rest-day shim), crm (deleted), inbox (018), quiet_hours (019), commitments (020). `artemis.db` deleted; `execute_query` params-hardened (killed the `%`/quote landmine); no-SQLite CI regression guards in every migrated module. CT-anchoring applied inline where each phase touched date logic.
+- **PB-011 Vault / Second Brain Ingest (v1) ✅** — schema `vault` (migration 028); sync (04:00 CT cron + on-demand `vault sync` / `digest`); one extraction pass per new note → gated proposals adjudicated with the E3 `approve`/`reject` range syntax; morning-brief digest + journal-diff coverage + undictated-meeting nudge. The vault file is canon; Postgres is a rebuildable projection.
 
 ---
 
@@ -97,6 +98,12 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **SCHEMA-DRIFT — deploy must run migrations (process).** Merging a migration doesn't apply it (016/017 were unapplied for weeks). Add `run_migrations.py` to the deploy path or a scheduled drift check (it's idempotent-safe).
 
+**VAULT-UNAPPROVE — gated `unapprove <n>` reversal (low).** A gated reversal of an approved vault proposal using its `target_ref` (`commitment:N` / `dossier_entry:N` / `org_note:N`): flip the proposal back to pending and undo/retire the written row. Human-gated (propose-then-confirm); do not build the auto-path. Deferred from OPS-1.
+
+**OPS-RUNBOOK — runbook registry expansion (low).** `artemis/opsdiag.py` seeds vault-pat-auth / vault-secret-missing / vault-clone-network / google-oauth-refresh / rds-unreachable. Add a TLS/cert-expiry class (feed the existing SSL monitor's findings through `classify`), and more classes as new failure shapes surface in the audit log (`action='failure'`, `metadata.failure_class`).
+
+**EXTRACT-DEDUPE-MONITOR — extraction dedupe monitoring (low).** The OPS-1 prompt tuning added cross-type dedupe + commitment-direction + decision-ownership discipline. Watch the proposal stream for residual duplicates (same fact under two types) and mis-directed commitments; if the prompt guidance proves insufficient, add a deterministic post-extraction dedupe pass over `vault.extraction_proposal` before proposals surface.
+
 **Papercuts.** SIGTERM-ignored shutdown (90s SIGKILL every restart — likely websocket/scheduler not closing on signal); Mattermost websocket flap (~60s reconnect loop); SSO re-auth friction (longer session or self-healing ProxyCommand); Mac-vs-EC2 prompt confusion (distinct prompt / dedicated tab).
 
 ---
@@ -110,8 +117,8 @@ Propose-then-confirm · the Brad Spaits rule (no autonomous external comms; acti
 ## 8. Why the order
 
 1. **Unified state (✅ done)** — no trustworthy analytical/cognition layer over a split-brain. Done first, correctly.
-2. **Cognition layer** — learning/self-proposal needs one coherent decision log. (HEALTH-1's confabulating stub is what happens when this is half-built and ungated — build it deliberately.)
-3. **Knowledge layer (vault)** — the semantic surface Ryan authors; the synthesis surfacer needs it populated.
-4. **Bounded autonomy** — safe only once state is trustworthy, decisions logged, meaning adjudicated, automations gated.
+2. **Knowledge layer (vault) (✅ v1 — PB-011)** — the semantic surface Ryan authors; the synthesis surfacer needs it populated. Precedes the cognition medallion (the June decision, now reality): the cognition layer reasons *over* adjudicated knowledge, so the knowledge substrate is laid first.
+3. **Cognition layer** — learning/self-proposal needs one coherent decision log. (HEALTH-1's confabulating stub is what happens when this is half-built and ungated — build it deliberately.)
+4. **Bounded autonomy** — safe only once state is trustworthy, knowledge adjudicated, decisions logged, automations gated.
 
 The migration was load-bearing foundation, now laid. The system has one source of truth; the next layers can be built on solid ground.

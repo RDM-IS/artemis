@@ -511,3 +511,39 @@ retiring individual approved notes (append-only for now).
 resolution, deterministic routing, commitment origin, CT windows, malformed-LLM
 safety) always runs; LIVE Postgres tier (migrations + real state machine) runs
 when a local PG is reachable.
+
+## PB-011: Vault / Second Brain Ingest (v1)
+
+**Module:** `artemis/vault.py` (schema `vault`, migration 028)
+
+Ryan's Obsidian vault (RDM-IS/vault, private) is the canonical human-authored
+knowledge store. Artemis ingests it into Postgres (schema `vault`), runs one
+extraction pass per new note, and surfaces everything as proposals through the
+existing approval gates. The vault FILE is canon; Postgres is a rebuildable
+projection. **THE WALL** (statistics vs semantics): Artemis parses, counts, links,
+detects, and PROPOSES; Ryan approves, names, blesses. Nothing extraction produces
+auto-writes to a system-of-record table — on approval only, a proposal is written
+through the EXISTING creation paths (commitment creation, dossier draft-approval).
+
+**Sync (one job, two triggers):** 04:00 CT cron + on-demand `vault sync` / `digest`.
+Read-only git mirror (shallow clone, fetch + reset --hard); PAT used at fetch time
+only, never on disk. Upsert notes → recompute `[[wikilinks]]` → throttled extraction
+pass → proposals.
+
+**Commands:** `vault sync` · `vault status` (note counts, proposal/queue counts, PAT
+expiry, running version footer) · `digest` / `today's digest` · `proposals` /
+`proposals expired` · adjudicate a live digest with `approve 1-3` / `approve all` /
+`reject 2`.
+
+**Morning brief:** pending-proposals digest, yesterday's journal diff (coverage),
+yesterday's capture-coverage line, and a **vault PAT expiry warning** (≤14 days →
+rotate-now block; OPS-1). **Coverage nudge:** weekday 16:30 CT, at most one post when
+real meetings outnumber captures.
+
+**OPS-1 self-diagnosis:** a failed `vault sync` renders a deterministic runbook
+(`artemis/opsdiag.py`) — the failure class, the literal error, and exact remediation
+commands — and writes an `acos.audit_log` row; unknown failures surface the raw error
+labeled `unclassified`.
+
+**Testing:** `python3.11 -m artemis.test_vault` (mocked + LIVE Postgres tiers) and
+`python3.11 -m artemis.test_opsdiag` (runbook classification + version truth).
