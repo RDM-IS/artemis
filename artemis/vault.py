@@ -1023,9 +1023,14 @@ def morning_brief_section(mirror: str | None = None) -> str:
     except Exception:
         logger.exception("vault: PAT expiry warning failed")
     try:
-        digest, _ = render_digest(today_only=False, header="Pending proposals")
+        digest, mapping = render_digest(today_only=False, header="Pending proposals")
         parts.append(digest)
-        parts.append("_Say `digest` to approve/reject these._")
+        # P9: the approve/reject prompt only makes sense with a non-empty queue.
+        # render_digest returns an empty mapping when nothing is pending, so the
+        # dangling "Say `digest` to approve/reject these" line no longer trails an
+        # empty "No pending proposals" block.
+        if mapping:
+            parts.append("_Say `digest` to approve/reject these._")
     except Exception:
         logger.exception("vault: morning digest section failed")
 

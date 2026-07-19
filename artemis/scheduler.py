@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from artemis import config
+from artemis import morning_brief
 from artemis.briefs import generate_meeting_brief, generate_morning_brief, triage_emails
 from artemis.calendar import CalendarClient
 from artemis.commitments import (
@@ -721,106 +722,25 @@ class ArtemisScheduler:
             self._record_calendar_failure(str(exc))
             logger.exception("Pre-meeting brief generation failed")
 
+    def compose_morning_brief(self, *, include_monitors: bool = True) -> str:
+        """POLISH-1 P1/P3 - the ONE deterministic composer, shared by the 04:00
+        cron (here) and the on-demand `morning brief`
+        (main._handle_morning_brief_command). `today` is CT-anchored once and
+        threaded through every date, so the header and every relative line share
+        one anchor and can't drift. No LLM - the LLM free-composition path is
+        exactly what produced the Jul-6 header."""
+        today = self._today_ct_date()
+        return morning_brief.compose(
+            today, gmail=self.gmail, calendar=self.calendar,
+            include_monitors=include_monitors,
+        )
+
     def job_morning_brief(self):
-        """Generate and post the daily morning brief."""
+        """Compose and post the daily morning brief (04:00 CT)."""
         try:
-            # Refresh calendar cache before building the brief
-            from artemis import calendar_cache
-            if self.calendar and self.calendar.service:
-                calendar_cache.refresh(self.calendar)
-
-            # Today + next 7 days
-            start = date.today() + timedelta(days=1)
-            end = date.today() + timedelta(days=7)
-            upcoming_events = calendar_cache.get_events_in_range(start, end)
-
-            # Filter to external events for brief
-            events_with_external = [
-                e for e in upcoming_events
-                if any(not a.get("self") for a in e.get("attendees", []))
-            ]
-            for e in events_with_external:
-                e["external_attendees"] = [a for a in e["attendees"] if not a.get("self")]
-
-            meetings_text = self.calendar.format_events_for_brief(events_with_external)
-            if not meetings_text:
-                # Include all events (solo) in the brief window
-                lines = []
-                for e in upcoming_events:
-                    lines.append(f"- {e['summary']} at {e['start'][:16]} (solo)")
-                meetings_text = "\n".join(lines) if lines else "No meetings in the next 7 days."
-
-            # Commitments due soon — try CRM API first, fall back to SQLite
-            commitment_lines = []
-            if self.crm.is_available():
-                try:
-                    open_commitments = self.crm.get_commitments(status="open")
-                    today = date.today()
-                    for c in open_commitments:
-                        due_str = c.get("due_date", "")
-                        if not due_str:
-                            continue
-                        try:
-                            due = date.fromisoformat(due_str[:10])
-                        except ValueError:
-                            continue
-                        days_left = (due - today).days
-                        desc = c.get("description", c.get("title", ""))
-                        client = c.get("client", c.get("contact_name", "n/a"))
-                        if days_left <= 3:
-                            commitment_lines.append(f"- **{desc}** due {due_str[:10]} (client: {client})")
-                except Exception:
-                    logger.warning("CRM API failed for morning brief commitments — falling back to SQLite")
-                    commitment_lines = []
-
-            if not commitment_lines:
-                due_soon = get_due_soon(days=3)
-                start_alerts = get_start_alerts()
-                for c in due_soon:
-                    commitment_lines.append(f"- **{c['title']}** due {c['due_date']} (client: {c['client'] or 'n/a'})")
-                for c in start_alerts:
-                    if c["id"] not in {d["id"] for d in due_soon}:
-                        commitment_lines.append(
-                            f"- **{c['title']}** due {c['due_date']} — needs {c['effort_days']}d effort, start now!"
-                        )
-            commitments_text = "\n".join(commitment_lines) if commitment_lines else "No commitments due soon."
-
-            # Top inbox items
-            messages = self.gmail.get_recent_messages(max_results=10)
-            email_text = self.gmail.format_for_claude(messages[:5]) if messages else "No recent emails."
-
-            # Monitor alerts
-            ssl_results = check_all_ssl()
-            domain_results = check_domain_expiry()
-            monitor_lines = []
-            ssl_alert = format_ssl_alerts(ssl_results)
-            domain_alert = format_domain_alerts(domain_results)
-            if ssl_alert:
-                monitor_lines.append(ssl_alert)
-            if domain_alert:
-                monitor_lines.append(domain_alert)
-            monitor_text = "\n".join(monitor_lines) if monitor_lines else "All monitors green."
-
-            # Inbox zero section
-            inbox_section = format_morning_inbox_section()
-
-            brief = generate_morning_brief(
-                meetings_text, commitments_text, email_text, monitor_text
-            )
-
+            brief = self.compose_morning_brief(include_monitors=True)
             if brief:
-                full_brief = f"\u2600\ufe0f **Good morning! Here's your brief:**\n\n{brief}\n\n\U0001f4ec **Inbox Zero:**\n{inbox_section}"
-                # PB-011: append the vault block \u2014 pending-proposals digest, yesterday's
-                # journal diff, and yesterday's coverage line. Read-only, best-effort.
-                try:
-                    from artemis import vault
-                    vault_section = vault.morning_brief_section()
-                    if vault_section:
-                        full_brief += f"\n\n{vault_section}"
-                except Exception:
-                    logger.exception("Vault morning-brief section failed")
-                self.mm.post_message(config.CHANNEL_OPS, full_brief)
-
+                self.mm.post_message(config.CHANNEL_OPS, brief)
         except Exception:
             logger.exception("Morning brief generation failed")
 
@@ -1351,26 +1271,19 @@ class ArtemisScheduler:
         if self._is_quiet():
             return
 
-        # One-time label creation check per process lifetime
+        # One-time label check per process lifetime. POLISH-1: announce ONLY on an
+        # actual creation (ensure_billing_label's `created` flag), never on the old
+        # "label has no messages" proxy — that re-fired the "Created …" message on
+        # every overnight restart even though the label already existed.
         if not self._billing_label_checked:
-            label_id = ensure_billing_label(self.gmail)
+            label_id, created = ensure_billing_label(self.gmail)
             if label_id:
-                # Check if we just created it (no messages would exist yet)
-                # by comparing to cached state — only announce once
-                if not getattr(self, "_billing_label_announced", False):
-                    try:
-                        results = self.gmail._exec(self.gmail.service.users().messages().list(
-                            userId="me", labelIds=[label_id], maxResults=1
-                        ))
-                        if not results.get("messages"):
-                            self.mm.post_message(
-                                config.CHANNEL_OPS,
-                                "\U0001f4c1 Created Gmail label **artemis/billing** — "
-                                "tag expense emails with this label for automatic intake",
-                            )
-                    except Exception:
-                        pass
-                    self._billing_label_announced = True
+                if created:
+                    self.mm.post_message(
+                        config.CHANNEL_OPS,
+                        "\U0001f4c1 Created Gmail label **artemis/billing** — "
+                        "tag expense emails with this label for automatic intake",
+                    )
                 self._billing_label_checked = True
             else:
                 logger.warning("PB-007: Could not ensure artemis/billing label")
@@ -1734,20 +1647,43 @@ class ArtemisScheduler:
             logger.debug("Override expiry check failed", exc_info=True)
 
     def job_action_item_reminders(self):
-        """Remind about pending action items and auto-expire stale ones."""
+        """Remind about pending action items, with backoff + caps, and auto-expire.
+
+        POLISH-1 P7 - the observed bug reminded one item 27-28x (~every 3h for
+        3.5 days, overnight included). The chain now escalates and caps instead of
+        nagging on a flat 2h cadence:
+
+          * quiet hours are never pinged (the early return below);
+          * at most MAX_REMINDERS_PER_DAY reminders per CT day per item;
+          * spacing backs off with each reminder: 4h -> 8h -> daily -> every 3 days
+            (REMINDER_BACKOFF_HOURS, keyed by reminders already sent);
+          * after MAX_REMINDERS ignored reminders it STOPS pinging and the item is
+            demoted to the morning brief's "Stale items" line.
+
+        The budget/cap/backoff decision is morning_brief.reminder_due(); the
+        demotion surface is morning_brief.stale_action_items() (rendered into the
+        brief). Both share the policy constants so the loop and the brief agree.
+
+        Per-item, per-day state lives in the existing acos.action_items row -
+        reminder_count / last_reminded_at plus a small counter in the metadata JSONB
+        (reminders_today / reminders_today_date). No new table.
+        """
         if self._is_quiet():
             return
         try:
+            import json as _json
             from knowledge.db import execute_query, execute_write
 
-            # Find pending items needing a reminder
+            today_iso = self._today_ct_date().isoformat()
+
+            # Fetch all live pending items; the send/skip decision (backoff, daily
+            # cap, demotion) is made per item below where the counter is visible.
             pending = execute_query("""
-                SELECT id, item_type, title, created_at, reminder_count, priority
+                SELECT id, item_type, title, created_at, reminder_count, priority,
+                       last_reminded_at, metadata
                 FROM acos.action_items
                 WHERE status = 'pending'
                   AND (snoozed_until IS NULL OR snoozed_until < now())
-                  AND (last_reminded_at IS NULL
-                       OR last_reminded_at < now() - interval '2 hours')
                 ORDER BY priority DESC, created_at ASC
             """)
 
@@ -1770,23 +1706,48 @@ class ArtemisScheduler:
                     )
                     continue
 
+                sent_count = item["reminder_count"] or 0
+                meta = item["metadata"] if isinstance(item["metadata"], dict) else \
+                    _json.loads(item["metadata"] or "{}")
+
+                # Reminders already sent on the current CT day (daily cap input).
+                reminders_today = 0
+                if meta.get("reminders_today_date") == today_iso:
+                    reminders_today = int(meta.get("reminders_today", 0) or 0)
+
+                # Budget / daily-cap / backoff decision (pure, tested in test_polish1).
+                # Demoted items (sent_count >= MAX_REMINDERS) fall out here and are
+                # surfaced instead by stale_action_items() in the morning brief.
+                last = item["last_reminded_at"]
+                if not morning_brief.reminder_due(
+                    sent_count=sent_count, reminders_today=reminders_today,
+                    last_reminded_at=last,
+                    now=(datetime.now(last.tzinfo) if last is not None else None),
+                ):
+                    continue
+
                 # Post reminder
                 age_str = f"{age.days}d {age.seconds // 3600}h" if age.days else f"{age.seconds // 3600}h"
                 priority_tag = " \U0001f534" if item["priority"] == "high" else ""
                 self.mm.post_message(
                     config.CHANNEL_OPS,
                     f"\u23f0 **Pending action{priority_tag}:** {item['title']}\n"
-                    f"Waiting since: {age_str} ago (reminded {item['reminder_count']}x)\n"
+                    f"Waiting since: {age_str} ago (reminded {sent_count}x)\n"
                     f"\u2705 `approve sched {item_id}` · "
                     f"\u274c `skip sched {item_id}` · "
                     f"\U0001f4a4 `snooze sched {item_id}`",
                 )
+                meta_update = _json.dumps({
+                    "reminders_today": reminders_today + 1,
+                    "reminders_today_date": today_iso,
+                })
                 execute_write(
                     """UPDATE acos.action_items
                        SET reminder_count = reminder_count + 1,
-                           last_reminded_at = now(), updated_at = now()
+                           last_reminded_at = now(), updated_at = now(),
+                           metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                        WHERE id = %s""",
-                    (item["id"],),
+                    (meta_update, item["id"]),
                 )
 
         except Exception:

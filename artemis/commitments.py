@@ -189,10 +189,30 @@ def close_commitment(title_query: str) -> dict:
     return {"status": "not_found", "open": open_commitments}
 
 
+def close_commitment_by_id(commitment_id: int) -> dict:
+    """Close a commitment by its numeric id (P5 — `close #6`).
+
+    Deterministic, no fuzzy matching. Returns the same result shape as
+    close_commitment:
+      {"status": "closed", "title": str, "id": int}
+      {"status": "not_found", "open": list[dict]}   # no active commitment #id
+    """
+    row = get_commitment(commitment_id)
+    if not row or row["status"] != "active":
+        return {"status": "not_found", "open": list_commitments(status="active")}
+    execute_write(
+        "UPDATE acos.commitments SET status = 'closed', closed_at = now() "
+        "WHERE id = %s AND status = 'active'",
+        (commitment_id,),
+    )
+    logger.info("Closed commitment #%d by id: %s", commitment_id, row["title"])
+    return {"status": "closed", "title": row["title"], "id": commitment_id}
+
+
 def format_close_result(result: dict) -> str:
     """Format the close_commitment result for Mattermost."""
     if result["status"] == "closed":
-        return f"✅ Commitment closed: *{result['title']}*"
+        return f"✅ Commitment closed: *{result['title']}* (#{result['id']})"
 
     if result["status"] == "ambiguous":
         lines = ["Found multiple matches — which did you mean?"]
@@ -220,7 +240,10 @@ def format_commitments_list(commitments: list[dict]) -> str:
         created = str(c.get("created_at") or "")[:10]
         client = c.get("client", "")
         client_str = f" ({client})" if client else ""
-        lines.append(f"• **{c['title']}**{client_str} — due {c['due_date']}, created {created}")
+        lines.append(
+            f"• **{c['title']}** (#{c['id']}){client_str} — due {c['due_date']}, created {created}"
+        )
+    lines.append("\n_Close one with `close #<id>` or `close <title>`._")
     return "\n".join(lines)
 
 

@@ -35,6 +35,7 @@ from artemis import commitments
 from artemis import config
 from artemis.commitments import log_claude_call
 from artemis.prompts import UNTRUSTED_PREFIX
+from artemis.utils import end_of_this_week
 from knowledge.db import execute_one, execute_query, execute_write, log_audit
 from knowledge.secrets import get_anthropic_key
 
@@ -1676,8 +1677,10 @@ def todos(window: str = "week") -> str:
 
     def line(r):
         who = f" · {r['person']}" if r["person"] else ""
+        # P2: fmt_date already carries the absolute (weekday + Mon Day); the id
+        # (P5) makes `close #<id>` reachable straight from the list.
         due = f" (due {fmt_date(r['due_date'])})" if r["due_date"] else ""
-        return f"  • {r['title']}{due}{who}"
+        return f"  • {r['title']} (#{r['id']}){due}{who}"
 
     def between(lo, hi):
         return [r for r in active if r["due_date"] and lo <= r["due_date"] <= hi]
@@ -1697,7 +1700,11 @@ def todos(window: str = "week") -> str:
             ("\U0001f4c5 Today", [r for r in active if r["due_date"] == today]),
         ]
     else:  # this week (default / bare)
-        _, eow = _week_bounds(today, "this")
+        # P4: "this week" = today through the coming Sunday (Sunday extends to the
+        # next Sunday). The old Mon–Sun `_week_bounds` put Sunday at the END of the
+        # week, so on Sun Jul 19 a Wed Jul 22 to-do fell into "next week" and never
+        # showed here. end_of_this_week is the one shared convention.
+        eow = end_of_this_week(today)
         title = "this week"
         groups = [
             ("⏰ Overdue", [r for r in active if r["due_date"] and r["due_date"] < today]),
@@ -1715,6 +1722,9 @@ def todos(window: str = "week") -> str:
             out += [line(r) for r in group]
     if not any_shown:
         out.append("Nothing on the list. \U0001f389")
+    else:
+        # P5: the close verb was undiscoverable this weekend — surface it inline.
+        out.append("\n_Done one? `close #<id>` or `close <title>`._")
     if drafts:
         out.append(f"\n_pending review ({len(drafts)}) — `dossier review`_")
     return "\n".join(out)

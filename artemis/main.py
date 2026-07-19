@@ -29,6 +29,7 @@ from artemis.calendar import CalendarClient
 from artemis.commitments import (
     add_commitment,
     close_commitment,
+    close_commitment_by_id,
     format_close_result,
     format_commitments_list,
     list_commitments,
@@ -867,6 +868,41 @@ def _format_disposition_plan(groups: list[tuple[str, list[int], str | None]]) ->
     return "\n".join(f"  • {p}" for p in out)
 
 
+def _parse_disposition_batch(
+    question: str,
+) -> tuple[list[tuple[str, list[int], str | None]], list[str]]:
+    """P6 — parse a (possibly multi-line) disposition batch line-by-line so that
+    NO line is silently dropped.
+
+    Returns (groups, unrecognized): every non-empty input line either contributes
+    one or more parsed disposition groups or is echoed back verbatim under
+    `unrecognized`. A line that itself carries several groups
+    (`archive 1-4 file 5 as x`) is parsed whole. This is what makes the batch
+    accountable — the observed bug filed 6 of 8 lines and said nothing about the
+    2 that were missing the `file` verb (`14 founder loan`)."""
+    groups: list[tuple[str, list[int], str | None]] = []
+    unrecognized: list[str] = []
+    for raw in question.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parsed_line = _parse_compound_dispositions(line)
+        if not parsed_line:
+            single = _parse_disposition_command(line)
+            parsed_line = [single] if single else None
+        if parsed_line:
+            groups.extend(parsed_line)
+        else:
+            unrecognized.append(line)
+    return groups, unrecognized
+
+
+def _format_unrecognized(lines: list[str]) -> str:
+    """Echo the literal lines the batch parser couldn't understand (P6)."""
+    body = "\n".join(f"  • `{ln}`" for ln in lines)
+    return f"⚠️ Didn't understand:\n{body}"
+
+
 def _execute_disposition_group(
     channel_id: str, mapping: dict, verb: str, numbers: list[int],
     category: str | None,
@@ -1077,6 +1113,66 @@ def _handle_dossier_subcommand(post: dict, q: str, say, channel_id: str) -> bool
 
     say("Dossier commands: `dossier review` · `dossier show <name> [--drafts]` · "
         "`dossier new <name>` · `dossier set <name> position:|needs:|title:|reports_to:|org: …`")
+    return True
+
+
+# P1/P3: the on-demand morning brief. These phrases route to the deterministic
+# composer (below) BEFORE the LLM mention path or the `log_morning_state`
+# classifier can free-compose a brief from a naive now() + stale calendar cache
+# (the Jul-6 root cause). Kept distinct from dossier's `brief <name>` meeting
+# package — none of these carry a person.
+_MORNING_BRIEF_PHRASES = frozenset({
+    "morning brief", "morning briefing", "daily brief", "my brief",
+    "brief me", "today's brief", "todays brief", "the brief",
+    "what's my day", "whats my day", "what's my day look like",
+    "whats my day look like",
+})
+
+
+def _handle_help_command(post: dict, question: str) -> bool:
+    """`help` / `commands` — render the command vocabulary from help_registry
+    (generated, never a hand-maintained string). `help <word>` filters. Returns
+    True if handled."""
+    from artemis import help_registry
+
+    q = question.strip().rstrip("?.! ")
+    # `help` / `commands`, optionally + a single filter word (`help email`). A
+    # longer phrase ("help me draft an email") is NOT a help command — fall
+    # through to the LLM.
+    m = re.match(r"^(?:help|commands)(?:\s+([\w-]+))?$", q, re.IGNORECASE)
+    if not m:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    reply = help_registry.render_help(m.group(1))
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _handle_morning_brief_command(post: dict, question: str) -> bool:
+    """P1/P3 — on-demand `morning brief`: a fresh, deterministic composition at
+    invocation (CT-anchored today, live inbox count, absolutes beside relatives),
+    NOT a replay of the 04:00 brief and never the LLM. Returns True if handled."""
+    q = question.lower().strip().rstrip("?.! ")
+    if q not in _MORNING_BRIEF_PHRASES:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    if _sched is None:
+        reply = "⚠️ Brief unavailable — scheduler not ready yet."
+    else:
+        try:
+            # include_monitors=False: the SSL/domain block is a 04:00 ops concern;
+            # on-demand stays fast and focused on the day.
+            reply = _sched.compose_morning_brief(include_monitors=False)
+        except Exception:
+            logger.exception("on-demand morning brief failed")
+            reply = "⚠️ Couldn't build the brief — check logs."
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
     return True
 
 
@@ -1366,7 +1462,9 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
 
     # ── COMPOUND batch (multiple groups, or a form the single parser missed) ──
     if not parsed:
-        compound = _parse_compound_dispositions(question)
+        # P6: parse line-by-line so every line is accounted for — parsed into the
+        # plan or echoed under "Didn't understand:". Zero silent drops.
+        compound, unrecognized = _parse_disposition_batch(question)
         if compound:
             if not mapping:
                 if _mm:
@@ -1389,22 +1487,44 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
             plan = _format_disposition_plan(compound)
             if destructive:
                 # propose-then-confirm: the parse itself is the new risky surface,
-                # and the batch deletes/spams — read it back, wait for `yes`.
+                # and the batch deletes/spams — read it back (WITH any unparsed
+                # lines echoed) and wait for `yes`.
                 if state is not None:
                     state["pending_dispositions"] = compound
+                echo = f"\n\n{_format_unrecognized(unrecognized)}" if unrecognized else ""
                 reply = (
-                    f"\U0001f4cb Parsed {len(compound)} groups ({total} items):\n{plan}\n\n"
+                    f"\U0001f4cb Parsed {len(compound)} groups ({total} items):\n{plan}{echo}\n\n"
                     f"This batch includes delete/spam. Reply `yes` to run it, `no` to cancel."
                 )
                 if _mm:
                     _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
                 return True
             # reversible-only (archive/file) → execute now, with a parse readback.
-            lines = [f"\U0001f4cb Parsed {len(compound)} groups:", plan, ""]
+            lines = [f"\U0001f4cb Parsed {len(compound)} groups:", plan]
+            if unrecognized:
+                lines += ["", _format_unrecognized(unrecognized)]
+            lines.append("")
             for verb, numbers, category in compound:
                 lines.extend(_execute_disposition_group(channel_id, mapping, verb, numbers, category))
             if _mm:
                 _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+            return True
+
+        # No group parsed, but disposition-shaped lines that ALL failed → reply
+        # with the usage summary (never a silent drop, never the LLM). Gated on an
+        # active listing + a line that actually looks like an attempt.
+        if unrecognized and mapping and any(_looks_dispositional(u) for u in unrecognized):
+            if _mm:
+                _mm.post_to_channel_id(
+                    channel_id,
+                    f"{_format_unrecognized(unrecognized)}\n\n"
+                    "Grammar:\n"
+                    "  • `archive 1-4` · `delete 2, 5` · `spam 9`\n"
+                    "  • `file 5-7, 13 as founder loans` (multi-word ok)\n"
+                    "  • batch: one action per line, or "
+                    "`archive 1-4  file 5-7 as founder loans  delete 14`",
+                    root_id=root_id,
+                )
             return True
 
     # EMAIL-ROUTING (context-aware routing): when a listing is ACTIVE in this
@@ -1470,6 +1590,76 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
     lines = _execute_disposition_group(channel_id, mapping, verb, numbers, category)
     if _mm:
         _mm.post_to_channel_id(channel_id, "\n".join(lines), root_id=root_id)
+    return True
+
+
+# A Gmail thread id is a long hex token; the short id shown in nudges is 12 hex
+# chars. A single hex token of 8+ chars is the thread-id SHAPE; anything with a
+# space, or a non-hex character, is words (a commitment title).
+_THREAD_ID_SHAPE = re.compile(r"^#?[0-9a-f]{8,}$", re.IGNORECASE)
+
+_DONE_USAGE = (
+    "`done` needs a target — I route on its shape:\n"
+    "  • `done <thread-id>` → mark an inbox email thread done "
+    "(a hex id like `18c9f0a2b3d4`)\n"
+    "  • `done <title>` → close a commitment by title (same as `close`)\n"
+    "  • `close #<id>` → close a commitment by its number"
+)
+
+
+def _classify_done_arg(arg: str) -> str:
+    """P8 — route `done <arg>` deterministically on argument SHAPE.
+
+    Returns "thread" (hex-id shape → email-thread lifecycle), "commitment"
+    (words → close_commitment), or "empty" (no argument → show both usages).
+    Pure/side-effect-free so the routing is unit-testable without Mattermost."""
+    a = arg.strip()
+    if not a:
+        return "empty"
+    if _THREAD_ID_SHAPE.match(a):
+        return "thread"
+    return "commitment"
+
+
+def _handle_done_command(post: dict, question: str) -> bool:
+    """P8 — deterministic `done` router.
+
+    Before this, the email-thread lifecycle consumed any `done <token>` and read
+    token 2 as a thread id, so `done follow up with jennifer` answered "Thread not
+    found: follow" and the commitment closer was unreachable via `done`. Now the
+    argument's shape decides: a hex-id → the thread lifecycle (resolve → mark_done);
+    words → close_commitment (identical to `close`); nothing (or a hex id that
+    matches no thread) → one reply listing both interpretations. Same precedence
+    discipline as PR #77 — deterministic shape routing, never an LLM guess.
+
+    Placed AHEAD of _handle_inbox_command (which still owns wait/snooze/noise/…)
+    and BEHIND _handle_health_conversation, so an active workout session's bare
+    `done` is still claimed by the session loop first."""
+    q = question.strip()
+    m = re.match(r"^done\b\s*(.*)$", q, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    arg = m.group(1).strip()
+    kind = _classify_done_arg(arg)
+
+    if kind == "empty":
+        reply = _DONE_USAGE
+    elif kind == "thread":
+        tid = resolve_thread_id(arg.lstrip("#"))
+        if tid:
+            mark_done(tid)
+            reply = "✅ Marked thread DONE."
+        else:
+            # Hex-shaped but no thread matched — ambiguous/no-match: show both paths.
+            reply = f"No inbox thread matches `{arg}`.\n\n{_DONE_USAGE}"
+    else:  # commitment — same fuzzy-title close as `close`
+        reply = format_close_result(close_commitment(arg))
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
     return True
 
 
@@ -3635,6 +3825,11 @@ def _handle_mention(post: dict, thread: list[dict]):
         # approve/reject is claimed here; a bare/non-numeric approve falls through
         # to the dossier review (its own gate) or the LLM.
         # OPS-1 version truth — deterministic, ahead of LLM routing.
+        # help — generated command vocabulary; deterministic, ahead of the LLM.
+        ("help_command", _handle_help_command),
+        # P1/P3 on-demand morning brief — deterministic, ahead of the LLM path and
+        # the `morning`-prefixed check-in classifier.
+        ("morning_brief_command", _handle_morning_brief_command),
         ("version_command", _handle_version_command),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
@@ -3646,6 +3841,10 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("rule_command", _handle_rule_command),
         ("inbox_listing", _handle_inbox_listing),
         ("disposition_command", _handle_disposition_command),
+        # P8: `done <hex-id>` → thread lifecycle, `done <words>` → commitment close.
+        # Ahead of inbox_command (which still owns wait/snooze/noise/inbox) so the
+        # thread lifecycle can't swallow a commitment-close phrased as `done …`.
+        ("done_command", _handle_done_command),
         ("inbox_command", _handle_inbox_command),
         ("action_item_command", _handle_action_item_command),
     ]
@@ -3802,12 +4001,20 @@ def _handle_mention(post: dict, thread: list[dict]):
         return
 
     if q_lower.startswith("close "):
-        title = parse_close_title(question)
-        if title:
-            result = close_commitment(title)
+        arg = question.strip()[len("close "):].strip()
+        # P5: `close #6` / `close 6` closes by id (deterministic); anything else
+        # keeps the fuzzy-title path.
+        id_m = re.match(r"^#?(\d+)$", arg)
+        if id_m:
+            result = close_commitment_by_id(int(id_m.group(1)))
             reply = format_close_result(result)
         else:
-            reply = 'Usage: `close commitment "Title"` or `close "Title"`'
+            title = parse_close_title(question)
+            if title:
+                result = close_commitment(title)
+                reply = format_close_result(result)
+            else:
+                reply = 'Usage: `close #<id>` · `close "<title>"` · `close commitment "<title>"`'
         if _mm:
             _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
         return
