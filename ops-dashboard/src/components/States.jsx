@@ -1,4 +1,5 @@
 import { C, FONT_MONO, FONT_BODY } from "../theme";
+import { describeError, isAuthError } from "../api";
 
 // ---------------------------------------------------------------------------
 // Shared loading / error / empty states. Never a blank screen.
@@ -19,57 +20,58 @@ export function Loading({ label = "Loading…" }) {
   );
 }
 
-// ErrorState renders a readable message + retry. If the error is a 401/403
-// (Cloudflare Access not passed), it shows the auth-specific guidance instead.
-export function ErrorState({ error, onRetry }) {
-  const status = error && error.status;
-  const isAuth = status === 401 || status === 403;
-
+// ErrorStrip — D2's visible failure surface. A burnt-orange (#D86E2C) strip
+// showing "endpoint — status" (e.g. "portfolio — 403", "approve — non-JSON
+// response"). Used for read failures at page/panel level and mutation failures
+// inline near the card. Empty-state copy is NEVER shown for a failure — only for
+// a genuinely-empty successful response. Auth (401/403) failures get a Reload
+// affordance (re-triggers the Cloudflare Access sign-in); others get Retry.
+export function ErrorStrip({ error, onRetry, compact }) {
+  if (!error) return null;
+  const auth = isAuthError(error);
   return (
     <div
       style={{
         background: C.SHADOW,
-        border: `1px solid ${C.SIGNAL}`,
+        border: `1px solid ${C.BURNT_ORANGE}`,
+        borderLeft: `4px solid ${C.BURNT_ORANGE}`,
         borderRadius: 4,
-        padding: "18px 20px",
+        padding: compact ? "8px 12px" : "12px 16px",
         display: "flex",
-        flexDirection: "column",
-        gap: 10,
-        maxWidth: 640,
+        alignItems: "center",
+        gap: 12,
+        flexWrap: "wrap",
       }}
     >
-      <div
+      <span
         style={{
           fontFamily: FONT_MONO,
-          fontSize: 11,
-          letterSpacing: 2,
-          textTransform: "uppercase",
-          color: C.SIGNAL,
+          fontSize: compact ? 11 : 12,
+          color: C.BURNT_ORANGE,
+          letterSpacing: 0.5,
         }}
       >
-        {isAuth ? "Not authenticated" : "Error"}
-      </div>
-      <div style={{ fontFamily: FONT_BODY, fontSize: 14, color: C.ARROW }}>
-        {isAuth
-          ? "Not authenticated — reload to sign in via Cloudflare Access."
-          : (error && error.message) || "Something went wrong."}
-      </div>
-      <div style={{ display: "flex", gap: 10 }}>
-        {isAuth ? (
+        {describeError(error)}
+      </span>
+      {auth ? (
+        <>
+          <span style={{ fontFamily: FONT_BODY, fontSize: 12, color: C.MOONSTONE }}>
+            Access not passed — reload to sign in.
+          </span>
           <button
             onClick={() => window.location.reload()}
-            style={btnStyle(C.SIGNAL)}
+            style={btnStyle(C.BURNT_ORANGE)}
           >
             Reload
           </button>
-        ) : (
-          onRetry && (
-            <button onClick={onRetry} style={btnStyle(C.MIST)}>
-              Retry
-            </button>
-          )
-        )}
-      </div>
+        </>
+      ) : (
+        onRetry && (
+          <button onClick={onRetry} style={btnStyle(C.BURNT_ORANGE)}>
+            Retry
+          </button>
+        )
+      )}
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { C, FONT_MONO, FONT_BODY } from "../theme";
 import Badge from "./Badge";
+import { ErrorStrip } from "./States";
 
 // ---------------------------------------------------------------------------
 // DossierDraftCard — a <DRAFT> in the approval queue. v1: approve/reject only,
@@ -7,7 +8,7 @@ import Badge from "./Badge";
 // types — the UI notes that rather than implying it was suppressed.
 // ---------------------------------------------------------------------------
 
-export default function DossierDraftCard({ draft, busy, onApprove, onReject }) {
+export default function DossierDraftCard({ draft, busy, error, onApprove, onReject }) {
   return (
     <div
       style={{
@@ -79,6 +80,9 @@ export default function DossierDraftCard({ draft, busy, onApprove, onReject }) {
           Reject
         </button>
       </div>
+
+      {/* D2: inline failure — the action did not go through. */}
+      {error && <ErrorStrip error={error} compact />}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { C, FONT_MONO, FONT_BODY } from "../theme";
+import { ErrorStrip } from "./States";
 
 // ---------------------------------------------------------------------------
 // CommitmentRow — one <COMMITMENT>. Renders (#id), title, due_label
@@ -6,11 +7,12 @@ import { C, FONT_MONO, FONT_BODY } from "../theme";
 // Overdue due_labels are burnt-orange (attention).
 // ---------------------------------------------------------------------------
 
-export default function CommitmentRow({ commitment, busy, onClose }) {
+export default function CommitmentRow({ commitment, busy, error, onClose }) {
   const overdue =
     commitment.due_label && /overdue/i.test(commitment.due_label);
 
   return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
     <div
       style={{
         display: "flex",
@@ -75,6 +77,10 @@ export default function CommitmentRow({ commitment, busy, onClose }) {
       >
         Close
       </button>
+    </div>
+
+    {/* D2: inline failure — the close did not go through. */}
+    {error && <ErrorStrip error={error} compact />}
     </div>
   );
 }

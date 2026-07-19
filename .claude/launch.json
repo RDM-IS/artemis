@@ -6,6 +6,13 @@
       "runtimeExecutable": "/opt/homebrew/bin/npx",
       "runtimeArgs": ["vite", "--port", "5173", "--root", "/Users/ryan/SourceControl/artemis-demo/frontend"],
       "port": 5173
+    },
+    {
+      "name": "ops-dashboard",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port", "5174"],
+      "port": 5174,
+      "cwd": "/Users/ryan/SourceControl/artemis/ops-dashboard"
     }
   ]
 }

@@ -2,7 +2,7 @@ import { useState, useCallback } from "react";
 import { searchDossier, getPerson, getOrg } from "../api";
 import { C, FONT_MONO, FONT_BODY } from "../theme";
 import { orDash, shortDate } from "../format";
-import { Loading, ErrorState, EmptyLine } from "./States";
+import { Loading, ErrorStrip, EmptyLine } from "./States";
 
 // ---------------------------------------------------------------------------
 // DossierSearch — read-only lookup. Search box → person/org cards. Clicking a
@@ -105,7 +105,7 @@ export default function DossierSearch() {
       </form>
 
       {searching && <Loading label="Searching…" />}
-      {error && <ErrorState error={error} onRetry={runSearch} />}
+      {error && <ErrorStrip error={error} onRetry={runSearch} />}
 
       {results && !searching && (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -144,7 +144,7 @@ export default function DossierSearch() {
           }}
         >
           {detailLoading && <Loading label="Loading dossier…" />}
-          {detailError && <ErrorState error={detailError} />}
+          {detailError && <ErrorStrip error={detailError} />}
           {detail && detail.kind === "person" && <PersonDetail p={detail.data} />}
           {detail && detail.kind === "org" && <OrgDetail o={detail.data} onPerson={openPerson} />}
           {detail && (

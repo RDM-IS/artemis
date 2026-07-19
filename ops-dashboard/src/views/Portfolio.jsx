@@ -5,7 +5,7 @@ import { C, FONT_MONO, FONT_BODY } from "../theme";
 import { relativeTime, shortDate } from "../format";
 import HealthStrip from "../components/HealthStrip";
 import Badge from "../components/Badge";
-import { Loading, ErrorState, EmptyLine } from "../components/States";
+import { Loading, ErrorStrip, EmptyLine } from "../components/States";
 
 // ---------------------------------------------------------------------------
 // Portfolio (/) — 30,000-foot strip. One card per engagement. Renders honestly:
@@ -76,7 +76,7 @@ export default function Portfolio() {
       )}
 
       {loading && <Loading label="Loading portfolio…" />}
-      {error && <ErrorState error={error} onRetry={load} />}
+      {error && <ErrorStrip error={error} onRetry={load} />}
 
       {!loading && !error && (
         <>
