@@ -234,6 +234,75 @@ class TestDigestRender(unittest.TestCase):
         self.assertIn("No pending proposals", reply)
 
 
+class TestPatExpiryParse(unittest.TestCase):
+    def test_github_header_form(self):
+        self.assertEqual(vault._parse_pat_expiry("2026-08-01 23:59:59 UTC"),
+                         date(2026, 8, 1))
+
+    def test_iso_form(self):
+        self.assertEqual(vault._parse_pat_expiry("2026-08-01T23:59:59+00:00"),
+                         date(2026, 8, 1))
+
+    def test_unknown_is_none(self):
+        self.assertIsNone(vault._parse_pat_expiry("unknown"))
+
+    def test_missing_is_none(self):
+        self.assertIsNone(vault._parse_pat_expiry(None))
+        self.assertIsNone(vault._parse_pat_expiry(""))
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(vault._parse_pat_expiry("not a date"))
+
+
+class TestPatExpiryWarning(unittest.TestCase):
+    def _warn_with_expiry(self, expiry_value):
+        def _state_get(key, default=None):
+            return expiry_value if key == "pat_expiry" else default
+        with patch.object(vault, "_state_get", side_effect=_state_get):
+            return vault._pat_expiry_warning()
+
+    def test_warns_within_14_days(self):
+        soon = (vault._ct_today() + timedelta(days=10)).isoformat() + " 23:59:59 UTC"
+        warn = self._warn_with_expiry(soon)
+        self.assertIsNotNone(warn)
+        self.assertIn("10 day", warn)
+        # reuses the vault-pat-auth runbook remediation block
+        self.assertIn("aws secretsmanager put-secret-value", warn)
+
+    def test_silent_beyond_14_days(self):
+        far = (vault._ct_today() + timedelta(days=30)).isoformat() + " 23:59:59 UTC"
+        self.assertIsNone(self._warn_with_expiry(far))
+
+    def test_expired_warns(self):
+        past = (vault._ct_today() - timedelta(days=2)).isoformat() + " 23:59:59 UTC"
+        warn = self._warn_with_expiry(past)
+        self.assertIsNotNone(warn)
+        self.assertIn("expired", warn.lower())
+
+    def test_unknown_is_silent(self):
+        self.assertIsNone(self._warn_with_expiry("unknown"))
+        self.assertIsNone(self._warn_with_expiry(None))
+
+
+class TestExtractionPromptTuning(unittest.TestCase):
+    """The OPS-1 PB-011 follow-up added explicit dedupe / commitment-direction /
+    decision-ownership guidance to the extraction system prompt."""
+
+    def test_dedupe_instruction_present(self):
+        from artemis.prompts import VAULT_EXTRACT_SYSTEM
+        self.assertIn("DEDUPLICATE", VAULT_EXTRACT_SYSTEM)
+
+    def test_commitment_direction_instruction_present(self):
+        from artemis.prompts import VAULT_EXTRACT_SYSTEM
+        self.assertIn("COMMITMENT DIRECTION", VAULT_EXTRACT_SYSTEM)
+        self.assertIn("waiting-on", VAULT_EXTRACT_SYSTEM)
+        self.assertIn("NOT a commitment", VAULT_EXTRACT_SYSTEM)
+
+    def test_decision_ownership_instruction_present(self):
+        from artemis.prompts import VAULT_EXTRACT_SYSTEM
+        self.assertIn("DECISIONS are choices MADE BY Ryan", VAULT_EXTRACT_SYSTEM)
+
+
 # ============================================================================
 # LIVE Postgres integration (skipped unless a local PG is reachable)
 # ============================================================================

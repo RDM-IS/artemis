@@ -34,6 +34,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import requests
+
 from artemis import config
 from knowledge.db import execute_one, execute_query, execute_write, log_audit
 from knowledge.secrets import get_vault_repo
@@ -170,6 +172,82 @@ def _sync_mirror() -> str:
             _run_git(["reset", "--hard", "origin/main"], cwd=mirror, env=env)
             _run_git(["clean", "-fd"], cwd=mirror, env=env)
         return _run_git(["rev-parse", "HEAD"], cwd=mirror, env=env).stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# PAT expiry watch (OPS-1) — proactive rotation warning
+# ---------------------------------------------------------------------------
+
+_PAT_WARN_DAYS = 14
+
+
+def _check_pat_expiry() -> None:
+    """Best-effort: read the fine-grained PAT's expiration from GitHub's
+    `github-authentication-token-expiration` response header (one lightweight
+    authenticated GET to the repo endpoint) and store it in ingest_state under
+    `pat_expiry`. Header absent → store 'unknown' and never guess a date. Only a
+    network/HTTP failure leaves the value untouched (so it retries next sync)."""
+    repo = get_vault_repo()
+    token = repo.get("token")
+    if not token:
+        return
+    r = requests.get(
+        "https://api.github.com/repos/RDM-IS/vault",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=10,
+    )
+    expiry = (r.headers.get("github-authentication-token-expiration") or "").strip()
+    _state_set("pat_expiry", expiry or "unknown")
+
+
+def _maybe_check_pat_expiry() -> None:
+    """Throttle the expiry check to once per CT day — `digest` inline-syncs often, and
+    the header doesn't change intra-day. Never raises into the sync pipeline."""
+    today = _ct_today().isoformat()
+    if _state_get("pat_expiry_checked_date") == today:
+        return
+    try:
+        _check_pat_expiry()
+        _state_set("pat_expiry_checked_date", today)  # only after a real check
+    except Exception:
+        logger.debug("vault: PAT expiry check failed", exc_info=True)
+
+
+def _parse_pat_expiry(raw) -> date | None:
+    """Parse the stored PAT expiry (GitHub sends e.g. `2026-08-01 23:59:59 UTC` or
+    ISO 8601) to a date, or None for 'unknown'/missing/unparseable — never guess."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if s.lower() in ("unknown", "none", ""):
+        return None
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+    if not m:
+        return None
+    try:
+        return date.fromisoformat(m.group(1))
+    except ValueError:
+        return None
+
+
+def _pat_expiry_warning() -> str | None:
+    """A morning-brief warning when the PAT expires within _PAT_WARN_DAYS — reuses the
+    vault-pat-auth runbook's remediation block. Silent when expiry is unknown."""
+    exp = _parse_pat_expiry(_state_get("pat_expiry"))
+    if exp is None:
+        return None
+    days = (exp - _ct_today()).days
+    if days > _PAT_WARN_DAYS:
+        return None
+    from artemis import opsdiag
+    rb = opsdiag.runbook_for("vault-pat-auth")
+    when = "expired" if days < 0 else f"expires in {days} day{'s' if days != 1 else ''}"
+    head = f"⚠️ **Vault PAT {when}** ({exp.isoformat()}) — rotate now:"
+    return f"{head}\n{rb.remediation}" if rb else head
 
 
 def _enumerate_notes(mirror: str) -> list[str]:
@@ -391,6 +469,7 @@ def sync_vault() -> dict:
     counts = {"new": 0, "changed": 0, "unchanged": 0, "skipped": 0,
               "deleted": 0, "reappeared": 0, "proposals": 0, "extracted": 0}
     sha = _sync_mirror()
+    _maybe_check_pat_expiry()  # mirror sync proved the token works — read its expiry
     last_sha = _state_get("last_sha")
 
     if sha == last_sha:
@@ -691,6 +770,16 @@ def _approve_proposal(p: dict) -> tuple[bool, str]:
     note_created = note["created_at"] if note else None
     try:
         if etype in ("action_item", "commitment"):
+            # OPS-1 action-item routing decision (deliberate v1 mapping): an
+            # `action_item` proposal is approved through the SAME commitment creation
+            # path as a `commitment`, landing in acos.commitments with target_ref
+            # `commitment:N`. Investigated acos.action_items — its only creation paths
+            # are inline raw SQL in the scheduler (scheduling_request items with a
+            # bespoke metadata/due_at shape) and the reminder loop; there is NO
+            # sanctioned general-purpose create_action_item() helper, and building one
+            # is out of scope here. So both types route to add_commitment. Reporting
+            # over vault approvals must therefore account for action_item proposals
+            # appearing in acos.commitments, not acos.action_items.
             target = _approve_commitment(payload, p.get("context"))
         elif etype == "dossier_entry":
             target = _approve_dossier_entry(payload, note_created)
@@ -767,9 +856,14 @@ def cmd_sync() -> str:
     row counts actually written."""
     try:
         s = sync_vault()
-    except Exception:
+    except Exception as exc:
         logger.exception("vault sync failed")
-        return "⚠️ Vault sync failed — check logs. Nothing was written from a failed run."
+        # OPS-1: deterministic self-diagnosis — a known failure class renders its
+        # runbook (what failed + literal error + exact fix) and writes an audit row;
+        # an unknown one surfaces the raw error labeled unclassified. Nothing was
+        # written from a failed run (sync_vault records last_sha only on success).
+        from artemis import opsdiag
+        return opsdiag.report_failure(exc, {"stage": "vault sync"}, agent="vault")
     sha7 = (s["sha"] or "")[:7]
     if s.get("no_change"):
         return f"Vault already synced to `{sha7}` — no changes."
@@ -816,6 +910,14 @@ def cmd_status() -> str:
         lines.append(f"    · {r['source']}: {r['c']}")
     lines.append(f"- Proposals: {pending} pending, {expired} expired")
     lines.append(f"- Extraction queue: {queue} note{'s' if queue != 1 else ''} awaiting a pass")
+
+    exp = _parse_pat_expiry(_state_get("pat_expiry"))
+    if exp is not None:
+        days = (exp - _ct_today()).days
+        lines.append(f"- Vault PAT: expires {exp.isoformat()} ({days}d)")
+
+    from artemis.version import VERSION
+    lines.append(f"\n_Artemis {VERSION}_")
     return "\n".join(lines)
 
 
@@ -914,6 +1016,12 @@ def morning_brief_section(mirror: str | None = None) -> str:
     (read-only, capped at 10), yesterday's journal diff, and yesterday's coverage
     line. Read-only — writes nothing. Best-effort; never raises into the brief."""
     parts: list[str] = ["\U0001f5c4️ **Vault**"]
+    try:
+        warn = _pat_expiry_warning()
+        if warn:
+            parts.append(warn)
+    except Exception:
+        logger.exception("vault: PAT expiry warning failed")
     try:
         digest, _ = render_digest(today_only=False, header="Pending proposals")
         parts.append(digest)

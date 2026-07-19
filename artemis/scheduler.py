@@ -834,8 +834,20 @@ class ArtemisScheduler:
             from artemis import vault
             summary = vault.sync_vault()
             logger.info("Vault sync (04:00 CT): %s", summary)
-        except Exception:
+        except Exception as exc:
             logger.exception("Vault sync job failed")
+            # OPS-1: a nightly sync failure is otherwise silent-until-morning — classify
+            # it and post the runbook (or the raw error, if unclassified) to ops so the
+            # remediation is on hand. report_failure also writes the audit row.
+            try:
+                from artemis import opsdiag
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    "\U0001f5c4️ **Vault sync (04:00 CT) failed**\n"
+                    + opsdiag.report_failure(exc, {"stage": "vault sync (cron)"}, agent="vault"),
+                )
+            except Exception:
+                logger.exception("Vault sync failure report failed")
 
     def job_vault_coverage(self):
         """PB-011: weekday 16:30 CT — compare today's real calendar meetings to
