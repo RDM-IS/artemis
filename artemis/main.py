@@ -140,6 +140,14 @@ _INBOX_PAGE_SIZE = 20
 # for the channel — otherwise a bare `drop 4` falls through to the LLM.
 _dossier_review_state: dict[str, dict] = {}
 
+# PB-011 vault digest state: per-channel {display_number → extraction_proposal row}
+# from vault.render_digest(). `approve`/`reject` resolve numbers against this (same
+# indirection as the dossier review + E3 inbox). In-memory; a fresh `digest` /
+# `proposals` rebuilds it. approve/reject only fire when this is populated for the
+# channel — otherwise `approve 1` with no vault digest falls through (to the dossier
+# review or the LLM).
+_vault_digest_state: dict[str, dict] = {}
+
 # Phrases that open a fresh numbered inbox listing (E2). `more` pages an existing
 # listing. These are repointed away from the old inbox_threads summary in
 # _handle_inbox_command to the index-backed _handle_inbox_listing.
@@ -1063,6 +1071,81 @@ def _handle_dossier_subcommand(post: dict, q: str, say, channel_id: str) -> bool
     say("Dossier commands: `dossier review` · `dossier show <name> [--drafts]` · "
         "`dossier new <name>` · `dossier set <name> position:|needs:|title:|reports_to:|org: …`")
     return True
+
+
+def _handle_vault_command(post: dict, question: str) -> bool:
+    """PB-011 deterministic vault router — evaluated BEFORE the LLM classifier and
+    ahead of the dossier router in the chain. Handles `vault sync|status`, `digest`
+    (also `today's digest` / `vault digest`), `proposals[ expired]`, and the
+    `approve`/`reject` adjudication of a live digest. Every reply renders from written
+    rows (no-fabrication gate). Returns True if handled, else False (falls through).
+
+    `approve`/`reject` are claimed ONLY when a vault digest is live for this channel
+    AND the message carries listing numbers (or `approve all`) — so a bare `approve`
+    with no digest, or a non-numeric `approve sched …`, falls through untouched to
+    the dossier review / scheduling handlers.
+    """
+    from artemis import vault
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    def say(text: str) -> None:
+        if _mm:
+            _mm.post_to_channel_id(channel_id, text, root_id=root_id)
+
+    q = question.strip()
+    ql = q.lower()
+
+    # ── Adjudication (gated on a live digest + parseable numbers) ──
+    state = _vault_digest_state.get(channel_id)
+    if state:
+        if re.match(r"^approve\b", ql):
+            rest = q[len("approve"):].strip()
+            nums = sorted(state) if rest.lower() in ("all", "everything") else _parse_numbers(rest)
+            if nums:
+                say(vault.adjudicate("approve", nums, state))
+                if not state:
+                    _vault_digest_state.pop(channel_id, None)
+                return True
+            # non-numeric approve (e.g. `approve sched …`) — not ours, fall through.
+        if re.match(r"^reject\b", ql):
+            nums = _parse_numbers(q[len("reject"):])
+            if nums:
+                say(vault.adjudicate("reject", nums, state))
+                if not state:
+                    _vault_digest_state.pop(channel_id, None)
+                return True
+
+    # ── Commands ──
+    if re.match(r"^vault\s+sync\b", ql):
+        say(vault.cmd_sync())
+        return True
+    if re.match(r"^vault\s+status\b", ql):
+        say(vault.cmd_status())
+        return True
+    if re.match(r"^proposals\s+expired\b", ql):
+        reply, _ = vault.cmd_proposals(expired=True)
+        say(reply)
+        return True
+    if re.match(r"^proposals\b", ql):
+        reply, mapping = vault.cmd_proposals(expired=False)
+        if mapping:
+            _vault_digest_state[channel_id] = mapping
+        else:
+            _vault_digest_state.pop(channel_id, None)
+        say(reply)
+        return True
+    if re.match(r"^(?:vault\s+digest|today'?s\s+digest|digest)\b", ql):
+        reply, mapping = vault.cmd_digest()
+        if mapping:
+            _vault_digest_state[channel_id] = mapping
+        else:
+            _vault_digest_state.pop(channel_id, None)
+        say(reply)
+        return True
+
+    return False
 
 
 def _handle_dossier_command(post: dict, question: str) -> bool:
@@ -3513,6 +3596,11 @@ def _handle_mention(post: dict, thread: list[dict]):
         # matching. Placed AHEAD of the nutrition/health matchers so meeting notes
         # that happen to contain weekday/plan words can't be claimed by
         # health_conversation (the HEALTH-1 principle — deterministic intent wins).
+        # PB-011 vault: `vault sync|status`, `digest`, `proposals`, and the
+        # approve/reject of a live digest. Ahead of dossier so a vault digest's
+        # approve/reject is claimed here; a bare/non-numeric approve falls through
+        # to the dossier review (its own gate) or the LLM.
+        ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
         ("nutrition", _handle_nutrition),
