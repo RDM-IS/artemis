@@ -13,17 +13,18 @@ from knowledge.secrets import get_anthropic_key
 
 logger = logging.getLogger(__name__)
 
+# HEALTH-1 A1/A2: add_note and the training intents (log_morning_state,
+# log_workout_debrief, trainer_override, modality_swap) are NOT classifier
+# actions. Training is caught deterministically BEFORE this classifier runs;
+# add_note is a confabulation vector with no honest backing store. Anything the
+# LLM emits outside this set is coerced to general_reply.
 VALID_ACTIONS = {
     "add_contacts",
     "query_crm",
-    "add_note",
     "schedule",
     "pipeline_update",
     "financial_summary",
     "log_interaction",
-    "log_morning_state",
-    "log_workout_debrief",
-    "trainer_override",
     "general_reply",
 }
 
@@ -33,7 +34,7 @@ _ROUTER_SYSTEM = (
     "Determine what they want done. Return ONLY valid JSON matching "
     "this schema, no other text:\n"
     "{\n"
-    '  "primary_action": one of ["add_contacts", "query_crm", "add_note", '
+    '  "primary_action": one of ["add_contacts", "query_crm", '
     '"schedule", "pipeline_update", "financial_summary", "log_interaction", '
     '"general_reply"],\n'
     '  "secondary_actions": [...],\n'
@@ -73,30 +74,14 @@ _ROUTER_SYSTEM = (
     '"meeting with", "just finished", "debrief", "follow up from", '
     '"spoke to", "met with"\n'
     "   -> primary_action: log_interaction\n\n"
-    "8. NOTE TAKING:\n"
-    '   Keywords: "remember", "note", "keep track", "jot down"\n'
-    "   -> primary_action: add_note\n\n"
-    "9. MORNING CHECK-IN (training):\n"
-    '   Triggers: message starts with "morning", "checkin", '
-    '"@artemis morning", or contains "slept" / "sleep"\n'
-    '   Examples: "slept 6.5 energy 3", "morning. RHR 58, legs sore"\n'
-    "   -> primary_action: log_morning_state\n\n"
-    "10. WORKOUT DEBRIEF (training):\n"
-    '   Triggers: "done", "debrief", "workout done", "@artemis done", '
-    'or contains "RPE" + exercise names\n'
-    '   Examples: "done. squats 10 @ 35 RPE 7", '
-    '"burpees 15 reps RPE 10 HR peak 159"\n'
-    "   -> primary_action: log_workout_debrief\n\n"
-    "11. TRAINER OVERRIDE (bike indoor/outdoor for next cardio day):\n"
-    '   Triggers: "trainer set indoor", "trainer set outdoor"\n'
-    "   -> primary_action: trainer_override\n\n"
-    "12. Everything else -> primary_action: general_reply\n\n"
+    # NOTE: training intents (morning check-in, workout debrief, trainer
+    # override, modality swap) and note-taking are handled DETERMINISTICALLY
+    # before this classifier runs (HEALTH-1). Do NOT classify them here.
+    "8. Everything else -> primary_action: general_reply\n\n"
     "SECONDARY ACTIONS: Include secondary_actions when the message implies "
     "multiple things should happen. Examples:\n"
     '  "Add Greg Weddle as a lead for Dover" -> primary: add_contacts, '
     "secondary: [pipeline_update]\n"
-    '  "Note that Brian called and schedule a follow-up" -> primary: add_note, '
-    "secondary: [schedule]\n"
     "If only one thing is needed, secondary_actions should be [].\n"
 )
 
