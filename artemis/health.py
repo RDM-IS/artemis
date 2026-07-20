@@ -3751,7 +3751,12 @@ _SWAP_REVERT_RE = re.compile(
 _UNSUPPORTED_CHANGE_RE = re.compile(
     r"^\s*(?:@?artemis\s+)?-?\s*"
     r"(?:swap|switch|change|move|reschedule|convert|make)\b"
-    r"[^\n]*\b(?:workout|cardio|session|run|training|lift(?:ing)?|strength|plan|leg\s+day)\b",
+    r"[^\n]*\b(?:workout|cardio|session|run|training|lift(?:ing)?|strength|plan|"
+    # cardio modalities/machines we do NOT support as swap targets — a swap-shaped
+    # request naming one refuses honestly instead of reaching the LLM. (Supported
+    # targets — rower/bike/walking pad — are handled by detect_modality_swap and
+    # never reach here.)
+    r"treadmill|elliptical|stair\s?master|spin\s+class|erg|swim|pool|leg\s+day)\b",
     re.IGNORECASE,
 )
 
@@ -4172,6 +4177,17 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
     target = payload.get("target")
     session_type = payload.get("session_type")
     reason = reason_override or payload.get("reason")
+
+    # Hard guard: an unsupported/unknown target NEVER reaches a write, an audit
+    # row, or a confirmation. detect_modality_swap only ever yields a valid
+    # target, so this fires only on a stale or hand-crafted pending payload —
+    # but it must refuse honestly rather than confabulate a swap.
+    if target not in _SWAP_TARGETS:
+        clear_swap_pending(channel_id)
+        logger.error("Swap commit refused: unsupported target %r", target)
+        return ("⚠️ Unsupported swap target — nothing changed. I only swap to a "
+                "rower, bike, or walking pad.")
+
     try:
         plan_date = date.fromisoformat(payload["plan_date"])
     except (KeyError, ValueError):
@@ -4209,10 +4225,12 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
         logger.exception("Swap commit write failed")
         return "⚠️ Couldn't write the swap — check DB. Nothing changed."
 
-    # VERIFY-FROM-REREAD: confirm ONLY from what the row actually shows.
+    # VERIFY-FROM-REREAD: the swap is only real if the RE-READ row shows it. The
+    # confirmation and the ledger are rendered from `verified_name` (the value
+    # the DB actually returned), never from the intent-derived `new_name`.
     written_blocks = _coerce_blocks((written or {}).get("blocks"))
-    if not written or written_blocks.get("display_name") != new_name \
-            or "swap" not in written_blocks:
+    verified_name = written_blocks.get("display_name")
+    if not written or verified_name != new_name or "swap" not in written_blocks:
         logger.error("Swap verify-from-reread failed for plan_id=%s", plan_id)
         return "⚠️ Swap did not persist — re-read shows no change. Nothing confirmed."
 
@@ -4231,7 +4249,7 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
                 "plan_id": plan_id,
                 "plan_date": plan_date.isoformat(),
                 "from": {"display_name": old_name, "session_type": session_type},
-                "to": {"display_name": new_name, "modality": target},
+                "to": {"display_name": verified_name, "modality": target},
                 "reason": reason,
                 "context": context,
             },
@@ -4241,7 +4259,7 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
 
     reason_str = f" ({reason})" if reason else ""
     return (
-        f"✅ Swapped to **{new_name}**{reason_str}.\n"
+        f"✅ Swapped to **{verified_name}**{reason_str}.\n"
         f"Same stimulus — RPE, HR zone, and interval timing unchanged. "
         f"`swap revert` to undo.\ngym.rdm.is is up to date."
     )
@@ -4278,7 +4296,6 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
     if restored is None:
         clear_swap_pending(channel_id)
         return "That session isn't swapped — nothing to revert."
-    to_name = restored.get("display_name") or _session_pretty_name(session_type or "?")
 
     context = _swap_weather_context()
     try:
@@ -4287,10 +4304,15 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
         logger.exception("Revert commit write failed")
         return "⚠️ Couldn't write the revert — check DB. Nothing changed."
 
+    # VERIFY-FROM-REREAD: a revert is only real if the RE-READ row no longer
+    # carries swap/pre_swap. The confirmation + ledger use `verified_to_name`
+    # (from the DB re-read), never the intent-derived `to_name`.
     written_blocks = _coerce_blocks((written or {}).get("blocks"))
     if not written or "swap" in written_blocks or "pre_swap" in written_blocks:
         logger.error("Revert verify-from-reread failed for plan_id=%s", plan_id)
         return "⚠️ Revert did not persist — re-read still shows a swap. Nothing confirmed."
+    verified_to_name = written_blocks.get("display_name") or _session_pretty_name(
+        (written or {}).get("session_type") or session_type or "?")
 
     clear_swap_pending(channel_id)
 
@@ -4305,7 +4327,7 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
                 "plan_id": plan_id,
                 "plan_date": plan_date.isoformat(),
                 "from": {"display_name": from_name, "session_type": session_type},
-                "to": {"display_name": to_name, "modality": None},
+                "to": {"display_name": verified_to_name, "modality": None},
                 "reason": reason,
                 "context": context,
             },
@@ -4314,7 +4336,7 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
         logger.exception("Revert audit-log write failed (revert itself persisted)")
 
     return (
-        f"✅ Reverted to **{to_name}**. gym.rdm.is is up to date."
+        f"✅ Reverted to **{verified_to_name}**. gym.rdm.is is up to date."
     )
 
 
