@@ -3538,7 +3538,7 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
             detect_health_intent,
             detect_modality_swap,
             detect_swap_revert,
-            format_health_help,
+            format_unsupported_change,
             get_plan_detail,
             get_plan_lookup,
             handle_fix_intent,
@@ -3584,16 +3584,17 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
                         reply = build_and_store_proposal(question, channel_id)
                     else:
                         reply = handle_workout_session(question)
+            elif looks_like_unsupported_workout_change(question):
+                # Honest refusal for an imperative workout-change we don't support
+                # (reschedule / move / to a strength day / rest-recovery-mobility /
+                # an unsupported machine). Pure-regex, DB-independent, and NEVER
+                # handed to the LLM to confabulate.
+                reply = format_unsupported_change(question)
             else:
                 # Read-intent (history Q&A) first, then the session loop.
                 reply = handle_plan_query(question)
                 if reply is None:
                     reply = handle_workout_session(question)
-                # Honest fallback: an imperative workout-change we don't support
-                # (reschedule / move / change to a strength day) is answered with
-                # the real command list — NEVER handed to the LLM to confabulate.
-                if reply is None and looks_like_unsupported_workout_change(question):
-                    reply = format_health_help()
     except Exception:
         logger.exception("Health conversation handler failed")
         return False
@@ -4181,6 +4182,38 @@ def _handle_mention(post: dict, thread: list[dict]):
     if response and _mm:
         channel_id = post.get("channel_id", "")
         root_id = post.get("root_id") or post["id"]
+
+        # ── Output-side no-fabrication gate (HEALTH-1 complement) ──
+        # Reaching this free-text path means NO deterministic handler executed an
+        # action (they post and return earlier). So any action-success claim in
+        # the LLM draft is a fabrication: suppress it, answer honestly, and log
+        # the suppressed text to acos.guardrail_violations. Real confirmations
+        # come from the deterministic handlers and never reach here. Runs BEFORE
+        # calendar/commitment processing so a fabricated draft has no side effect.
+        try:
+            from artemis.health import claims_unverified_action, format_no_handler_reply
+            claim = claims_unverified_action(response)
+        except Exception:
+            logger.exception("action-claim gate failed")
+            claim = None
+        if claim:
+            logger.error(
+                "Suppressed fabricated action-claim (%r) in LLM reply to post %s",
+                claim, post.get("id"),
+            )
+            try:
+                from knowledge.db import log_guardrail_violation
+                log_guardrail_violation(
+                    guardrail_type="fabricated_action_claim",
+                    event_summary=response[:2000],
+                    outcome="suppressed",
+                    agent="artemis",
+                    metadata={"matched_claim": claim, "question": question[:500]},
+                )
+            except Exception:
+                logger.exception("Failed to log fabricated-action guardrail violation")
+            _mm.post_to_channel_id(channel_id, format_no_handler_reply(), root_id=root_id)
+            return
 
         # Check if Claude's response contains a calendar event to create
         response = _process_calendar_events(response, channel_id=channel_id)
