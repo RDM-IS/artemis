@@ -530,5 +530,66 @@ class TestConfirmationOnlyFromReread(_LifecycleBase):
         self.assertFalse(self._audit.called)
 
 
+class TestRestDayRefusal(unittest.TestCase):
+    """rest / recovery / mobility / off-day changes are not modality swaps and
+    aren't supported — they refuse honestly, never confirm."""
+
+    def test_swap_to_rest_is_not_a_swap(self):
+        for msg in ("swap to rest", "change today to a rest day",
+                    "make today recovery", "switch to mobility",
+                    "move me to an off day"):
+            with self.subTest(msg=msg):
+                self.assertIsNone(health.detect_modality_swap(msg))
+                self.assertTrue(health.looks_like_unsupported_workout_change(msg))
+
+    def test_rest_refusal_message_is_specific(self):
+        reply = health.format_unsupported_change("swap to rest")
+        self.assertNotIn("✅", reply)
+        self.assertIn("rest", reply.lower())
+        self.assertIn("aren't supported yet", reply)
+
+    def test_non_rest_unsupported_change_uses_command_list(self):
+        reply = health.format_unsupported_change("reschedule my run to Friday")
+        self.assertNotIn("✅", reply)
+        self.assertIn("handler", reply.lower())  # format_health_help
+
+
+class TestActionClaimGate(unittest.TestCase):
+    """Output-side no-fabrication gate: the deterministic filter that makes the
+    LLM path structurally unable to CLAIM an action happened."""
+
+    def test_flags_action_success_claims(self):
+        for txt in (
+            "✅ Swapped to Indoor Row.",
+            "Logged 3 rows to session_log.",
+            "Archived and marked DONE.",
+            "Filed under Receipts.",
+            "Sent the follow-up email.",
+            "Reverted to the outdoor plan.",
+            "I've updated your plan.",
+            "gym.rdm.is is up to date.",
+            "Got it — I've learned that Z2 means easy.",
+        ):
+            with self.subTest(txt=txt):
+                self.assertIsNotNone(health.claims_unverified_action(txt),
+                                     f"should flag: {txt!r}")
+
+    def test_passes_benign_replies(self):
+        for txt in (
+            "Zone 2 keeps your HR around 130 — conversational pace.",
+            "Here's what today's session looks like: 6 rounds of intervals.",
+            "Your next cardio day is Thursday.",
+            "",
+        ):
+            with self.subTest(txt=txt):
+                self.assertIsNone(health.claims_unverified_action(txt),
+                                  f"should NOT flag: {txt!r}")
+
+    def test_no_handler_reply_is_honest(self):
+        reply = health.format_no_handler_reply()
+        self.assertIn("nothing was changed", reply.lower())
+        self.assertNotIn("✅", reply)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

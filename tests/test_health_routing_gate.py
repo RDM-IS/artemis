@@ -123,5 +123,67 @@ class TestNoConfabulationRoutes(_Base):
         routed.assert_called_once()
 
 
+class TestSwapToRestRefusal(_Base):
+    """The verbatim failing message 'swap to rest' → honest refusal, zero plan
+    writes, zero audit rows, LLM never called."""
+
+    def test_swap_to_rest_refuses_without_writes_or_llm(self):
+        import knowledge.db as kdb
+        with patch.object(intent, "route_intent") as route, \
+             patch.object(main, "_handle_intent_routed") as routed, \
+             patch.object(kdb, "execute_write") as ew, \
+             patch.object(kdb, "log_audit") as la:
+            main._handle_mention(_post("swap to rest"), [])
+        route.assert_not_called()          # classifier never called
+        routed.assert_not_called()
+        ew.assert_not_called()             # zero DB writes to the plan
+        la.assert_not_called()             # zero audit rows
+        reply = self._last_post()
+        self.assertNotIn("✅", reply)
+        self.assertIn("rest", reply.lower())
+        self.assertIn("aren't supported yet", reply)
+
+
+class TestFabricationGate(_Base):
+    """Output-side complement: an LLM draft claiming an action is suppressed and
+    logged; a real deterministic-handler confirmation passes through untouched."""
+
+    def test_fabricated_swap_claim_is_suppressed_and_logged(self):
+        import knowledge.db as kdb
+        fake = "✅ Swapped today's run to indoor rowing. gym.rdm.is is up to date."
+        with patch.object(main, "handle_mention", return_value=fake), \
+             patch.object(main, "_build_mention_context", return_value=""), \
+             patch.object(main, "_try_life_ops", return_value=None), \
+             patch.object(main, "_handle_intent_routed", return_value=None), \
+             patch.object(kdb, "log_guardrail_violation") as glog:
+            # A neutral question that falls through to the free-text LLM path;
+            # the gate acts on the RESPONSE, not the question.
+            main._handle_mention(_post("tell me something interesting"), [])
+        posted = self._last_post()
+        # The fabricated confirmation is NOT posted…
+        self.assertNotIn("✅", posted)
+        self.assertNotEqual(posted, fake)
+        # …the honest reply is…
+        self.assertIn("nothing was changed", posted.lower())
+        # …and the suppressed text was logged as a guardrail violation.
+        glog.assert_called_once()
+        kwargs = glog.call_args.kwargs
+        self.assertEqual(kwargs.get("guardrail_type"), "fabricated_action_claim")
+        self.assertIn("Swapped", kwargs.get("event_summary", ""))
+
+    def test_real_handler_confirmation_passes_through(self):
+        # A deterministic handler that returns a "✅ Swapped" confirmation posts
+        # it verbatim; the free-text gate never runs, nothing is logged.
+        import knowledge.db as kdb
+        real = "✅ Swapped to **Indoor Row — Z2 Intervals**. gym.rdm.is is up to date."
+        with patch.object(health, "propose_modality_swap", return_value=real), \
+             patch.object(main, "handle_mention") as llm, \
+             patch.object(kdb, "log_guardrail_violation") as glog:
+            main._handle_mention(_post("swap today to indoor rower"), [])
+        self.assertEqual(self._last_post(), real)  # verbatim, untouched
+        llm.assert_not_called()                    # never reached the LLM path
+        glog.assert_not_called()                   # nothing suppressed/logged
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

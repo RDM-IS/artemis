@@ -3756,7 +3756,17 @@ _UNSUPPORTED_CHANGE_RE = re.compile(
     # request naming one refuses honestly instead of reaching the LLM. (Supported
     # targets — rower/bike/walking pad — are handled by detect_modality_swap and
     # never reach here.)
-    r"treadmill|elliptical|stair\s?master|spin\s+class|erg|swim|pool|leg\s+day)\b",
+    r"treadmill|elliptical|stair\s?master|spin\s+class|erg|swim|pool|leg\s+day|"
+    # rest / recovery / mobility / off-day changes are NOT modality swaps and are
+    # not supported yet — refuse honestly rather than confabulate.
+    r"rest(?:\s+day)?|recovery|mobility|off\s+day)\b",
+    re.IGNORECASE,
+)
+
+# Distinguishes a rest/recovery/mobility/off-day change (its own refusal message)
+# from other unsupported changes (reschedule / unsupported machine → command list).
+_REST_CHANGE_RE = re.compile(
+    r"\b(?:rest(?:\s+day)?|recovery|mobility|off\s+day)\b",
     re.IGNORECASE,
 )
 
@@ -4357,4 +4367,58 @@ def format_health_help() -> str:
         "• **Bike setup** — `trainer set indoor` / `trainer set outdoor`\n"
         "• **See the plan** — `what's today's workout` · `next 3 days` · `this week`\n"
         "_I can't reschedule sessions or change the session type — those aren't built._"
+    )
+
+
+def format_unsupported_change(message: str) -> str:
+    """Honest refusal for an imperative workout-change we don't support.
+
+    A rest / recovery / mobility / off-day change gets its own message (it isn't
+    a modality swap and isn't built yet); every other unsupported change
+    (reschedule, move, an unsupported machine) gets the command list. Never a
+    fabricated confirmation.
+    """
+    if _REST_CHANGE_RE.search(message or ""):
+        return (
+            "Changing a day to rest / recovery / mobility isn't a modality swap, "
+            "and rest-day changes aren't supported yet — nothing was changed.\n\n"
+            + format_health_help()
+        )
+    return format_health_help()
+
+
+# ============================================================================
+# Output-side no-fabrication gate (HEALTH-1 complement)
+#
+# The free-text LLM reply path executes NO handler action (real actions are
+# performed and confirmed by the deterministic handlers, which return before the
+# LLM path is ever reached). So ANY action-success claim in LLM-generated text is
+# a fabrication. This deterministic filter makes the LLM path structurally unable
+# to CLAIM an action happened — the output-side complement to Part A's
+# input-side deterministic short-circuit.
+# ============================================================================
+
+_ACTION_CLAIM_RE = re.compile(
+    r"✅"
+    r"|\bswapped\b|\blogged\b|\barchived\b|\bfiled\b|\bsent\b|\breverted\b|\bupdated\b"
+    r"|gym\.rdm\.is\s+is\s+up\s+to\s+date"
+    r"|i'?ve\s+learned",
+    re.IGNORECASE,
+)
+
+
+def claims_unverified_action(text: str) -> str | None:
+    """Return the matched action-success phrase if `text` asserts an action the
+    free-text LLM path could not have performed, else None."""
+    if not text:
+        return None
+    m = _ACTION_CLAIM_RE.search(text)
+    return m.group(0) if m else None
+
+
+def format_no_handler_reply() -> str:
+    """Honest reply posted in place of a suppressed fabricated action-claim."""
+    return (
+        "I don't have a handler that does that — nothing was changed.\n\n"
+        + format_health_help()
     )
