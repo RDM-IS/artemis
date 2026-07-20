@@ -120,6 +120,17 @@ class TestModalitySwapRegex(unittest.TestCase):
         self.assertEqual(health.detect_health_intent("trainer set indoor"),
                          health.INTENT_TRAINER_OVERRIDE)
 
+    def test_unsupported_machine_is_not_a_swap_but_is_a_refusal(self):
+        # A swap-shaped request naming an unsupported machine must NOT parse as a
+        # swap (no confirmation possible) AND must route to the honest refusal,
+        # never to the LLM.
+        for msg in ("swap today to indoor elliptical",
+                    "switch my workout to the treadmill",
+                    "change today's cardio to a swim"):
+            with self.subTest(msg=msg):
+                self.assertIsNone(health.detect_modality_swap(msg))
+                self.assertTrue(health.looks_like_unsupported_workout_change(msg))
+
 
 # ============================================================================
 # B3 — translation: round-trip, structural + stimulus preservation
@@ -406,6 +417,117 @@ class TestRevertLifecycle(_LifecycleBase):
             reply = health.propose_swap_revert("chan1")
         self.assertIn("isn't swapped", reply)
         self.assertIsNone(health.load_swap_pending("chan1"))
+
+
+class TestUnsupportedTargetRefusal(_LifecycleBase):
+    """An unknown/unsupported target must produce an honest refusal — never a
+    confirmation — with ZERO plan writes and ZERO audit rows."""
+
+    def test_unknown_target_at_parse_time_refuses_no_writes(self):
+        # An unsupported modality isn't recognized as a swap at all → the
+        # proposer returns the honest command list, writes nothing, audits
+        # nothing, and stages no pending.
+        self.assertIsNone(health.detect_modality_swap("swap today to indoor elliptical"))
+        with patch.object(health, "_fetch_swap_plan_row",
+                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
+            reply = health.propose_modality_swap(
+                "swap today to indoor elliptical", "chanX")
+        self.assertNotIn("✅", reply)
+        self.assertIn("handler", reply.lower())          # format_health_help
+        self.assertNotIn("blocks", self._written)        # no plan UPDATE
+        self.assertFalse(self._audit.called)             # no audit row
+        self.assertIsNone(health.load_swap_pending("chanX"))
+
+    def test_commit_guard_rejects_stale_bad_target(self):
+        # Defense in depth: a stale/hand-crafted pending with an unsupported
+        # target must be refused at commit — no write, no audit, no "✅".
+        health.store_swap_pending("chanX", {
+            "kind": "swap", "target": "elliptical", "reason": None,
+            "plan_id": 42, "plan_date": date.today().isoformat(),
+            "session_type": "cardio_z2",
+            "created_at": _dt.datetime.now(health.CT).isoformat(),
+        })
+        reply = health.commit_modality_swap("chanX")
+        self.assertIn("Unsupported swap target", reply)
+        self.assertNotIn("✅", reply)
+        self.assertNotIn("blocks", self._written)        # no plan UPDATE
+        self.assertFalse(self._audit.called)             # no audit row
+        self.assertIsNone(health.load_swap_pending("chanX"))  # pending discarded
+
+
+class TestConfirmationOnlyFromReread(_LifecycleBase):
+    """Every success confirmation ('✅ Swapped' / '✅ Reverted') must be rendered
+    from the RE-READ row — no code path may emit success without a verified
+    persist, and the name shown must be the value the DB actually returned."""
+
+    def _stage_swap(self):
+        with patch.object(health, "_fetch_swap_plan_row",
+                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
+            health.propose_modality_swap("swap today to indoor rower", "chan1")
+
+    def test_swap_success_name_comes_from_reread_not_intent(self):
+        # The re-read returns a DELIBERATELY different display_name than intent.
+        # Because the verify guard compares re-read vs intent, a mismatch must
+        # FAIL — proving the confirmation is gated on the actual written row and
+        # never synthesized from intent.
+        self._stage_swap()
+        self._reread = {"plan_id": 42, "plan_date": date.today(),
+                        "session_type": "cardio_z2",
+                        "blocks": {"display_name": "Something Else", "swap": {}}}
+        with patch.object(health, "_fetch_swap_plan_row",
+                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
+            reply = health.commit_modality_swap("chan1")
+        self.assertNotIn("✅", reply)
+        self.assertIn("did not persist", reply)
+        self.assertFalse(self._audit.called)
+
+    def test_swap_success_only_when_reread_shows_swap_key(self):
+        # Re-read reflects the write but the persisted blocks lack the swap key
+        # (as if a trigger stripped it) → NO success, NO audit.
+        self._stage_swap()
+
+        def strip_swap_write(sql, params):
+            if "UPDATE health.plan" in sql:
+                b = json.loads(params[0])
+                b.pop("swap", None)
+                self._written["blocks"] = b
+                self._written["plan_id"] = params[1]
+
+        with patch.object(health, "_fetch_swap_plan_row",
+                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")), \
+             patch("knowledge.db.execute_write", side_effect=strip_swap_write):
+            reply = health.commit_modality_swap("chan1")
+        self.assertNotIn("✅", reply)
+        self.assertFalse(self._audit.called)
+
+    def test_swap_success_uses_verified_display_name(self):
+        # Happy path: the '✅ Swapped to **X**' name is exactly the re-read
+        # display_name (rower → 'Indoor Row — Z2 Intervals').
+        self._stage_swap()
+        with patch.object(health, "_fetch_swap_plan_row",
+                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
+            reply = health.commit_modality_swap("chan1")
+        self.assertIn("✅ Swapped to **Indoor Row — Z2 Intervals**", reply)
+        self.assertEqual(self._audit.call_args.kwargs["metadata"]["to"]["display_name"],
+                         self._written["blocks"]["display_name"])
+
+    def test_revert_success_only_when_reread_clears_swap(self):
+        # Re-read still shows a swap key (revert didn't persist) → NO success.
+        swapped = health.apply_modality_swap(
+            _Z2_BLOCKS, "rower", session_type="cardio_z2",
+            swap_meta={"reason": None, "requested_via": "mattermost"})
+        row = _plan_row(swapped, "cardio_z2")
+        with patch.object(health, "_fetch_swap_plan_row", return_value=row):
+            health.propose_swap_revert("chan1")
+        # Write is a no-op so the re-read still carries swap/pre_swap.
+        with patch.object(health, "_fetch_swap_plan_row", return_value=row), \
+             patch("knowledge.db.execute_write", side_effect=lambda *a, **k: None), \
+             patch("knowledge.db.execute_one",
+                   side_effect=lambda *a, **k: {"plan_id": 42, "blocks": swapped}):
+            reply = health.commit_swap_revert("chan1")
+        self.assertNotIn("✅", reply)
+        self.assertIn("did not persist", reply)
+        self.assertFalse(self._audit.called)
 
 
 if __name__ == "__main__":
