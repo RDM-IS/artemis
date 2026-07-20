@@ -3443,76 +3443,17 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             logger.exception("Interaction logging failed")
             return "\u26a0\ufe0f Failed to log interaction \u2014 check DB connection."
 
-    # ── log_morning_state (training) ──
-    if intent.primary_action == "log_morning_state":
-        from artemis.health import handle_morning_intent
-        try:
-            return handle_morning_intent(question, message_id=post.get("id"))
-        except Exception:
-            logger.exception("Morning check-in handler failed")
-            return "\u26a0\ufe0f Couldn\u2019t save morning check-in \u2014 check DB."
-
-    # ── log_workout_debrief (training) ──
-    if intent.primary_action == "log_workout_debrief":
-        from artemis.health import build_and_store_proposal, handle_fix_intent
-        # First check if this is a "fix <exercise> rpe <N>" edit
-        fix_result = handle_fix_intent(question)
-        if fix_result is not None:
-            return fix_result
-        try:
-            # Unified capture: propose-then-confirm, never an immediate write.
-            # Belt-and-suspenders for debriefs the regex discriminator missed;
-            # most pastes are caught earlier by _handle_capture_propose.
-            return build_and_store_proposal(question, post.get("channel_id", ""))
-        except Exception:
-            logger.exception("Workout debrief propose failed")
-            return "\u26a0\ufe0f Couldn\u2019t parse that debrief \u2014 try again."
-
-    # ── trainer_override (training, T4) ──
-    if intent.primary_action == "trainer_override":
-        from artemis.health import handle_trainer_override
-        try:
-            return handle_trainer_override(question, message_id=post.get("id"))
-        except Exception:
-            logger.exception("Trainer override handler failed")
-            return "\u26a0\ufe0f Couldn\u2019t save trainer override \u2014 check DB."
-
-    # ── add_note ──
-    if intent.primary_action == "add_note":
-        from knowledge.db import execute_write as db_write
-
-        # Find entity to attach the note to
-        entity_id = None
-        entity_name = None
-        if intent.entities:
-            from artemis.crm_writer import _find_entity_by_name, _find_entity_by_name_fuzzy
-            for name in intent.entities:
-                ent = _find_entity_by_name(name) or _find_entity_by_name_fuzzy(name)
-                if ent:
-                    entity_id = str(ent["id"])
-                    entity_name = ent["name"]
-                    break
-
-        if entity_id:
-            db_write(
-                """INSERT INTO acos.data_vault_satellites
-                   (entity_id, satellite_type, content, layer, metadata)
-                   VALUES (%s, 'business_context', %s, 'silver', '{}')""",
-                (entity_id, question),
-            )
-            return f"\U0001f4dd Noted on **{entity_name}**: _{question[:200]}_"
-        else:
-            # No entity found — store as a general note on a generic entity
-            db_write(
-                """INSERT INTO acos.data_vault_satellites
-                   (entity_id, satellite_type, content, layer, metadata)
-                   VALUES (
-                       (SELECT id FROM acos.entities WHERE name = 'RDMIS' AND entity_type = 'Organization' LIMIT 1),
-                       'business_context', %s, 'silver', '{}'
-                   )""",
-                (question,),
-            )
-            return f"\U0001f4dd Noted: _{question[:200]}_"
+    # ── training intents (log_morning_state / log_workout_debrief /
+    #    trainer_override / modality_swap) are NOT routed here. Every one is
+    #    caught deterministically in _handle_health_conversation BEFORE the
+    #    classifier (HEALTH-1: a positive deterministic match is final; the LLM
+    #    must never see, route, or re-route these). A stray LLM label on one is
+    #    dropped to general_reply by VALID_ACTIONS coercion — no confabulated
+    #    confirmation.
+    #
+    # ── add_note removed (HEALTH-1 A2): a route that can claim "noted"/"I've
+    #    learned…" is a confabulation vector with no honest backing store. The
+    #    handler body and the correction re-route are gone from live routing.
 
     # ── financial_summary ──
     if intent.primary_action == "financial_summary":
@@ -3592,26 +3533,67 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
         from artemis.health import (
             INTENT_PLAN_DETAIL,
             INTENT_PLAN_LOOKUP,
+            INTENT_TRAINER_OVERRIDE,
+            build_and_store_proposal,
             detect_health_intent,
+            detect_modality_swap,
+            detect_swap_revert,
+            format_health_help,
             get_plan_detail,
             get_plan_lookup,
+            handle_fix_intent,
+            handle_morning_intent,
             handle_plan_query,
+            handle_trainer_override,
             handle_workout_session,
+            is_capture_paste,
+            looks_like_unsupported_workout_change,
+            propose_modality_swap,
+            propose_swap_revert,
         )
-        # plan_detail (single-day depth) and plan_lookup (multi-day breadth) are
-        # RDS read-intents that win outright and NEVER fall through to
-        # general_reply: each always returns a string (real plan or the exact
-        # "No plan seeded for <date>." guard), which we post here.
-        intent = detect_health_intent(question)
-        if intent == INTENT_PLAN_DETAIL:
-            reply = get_plan_detail(question)
-        elif intent == INTENT_PLAN_LOOKUP:
-            reply = get_plan_lookup(question)
+        # HEALTH-1: EVERY deterministic health detector short-circuits the LLM
+        # classifier here — a positive match is FINAL, the classifier never sees
+        # the message, and no correction re-route can touch it. SWAP-2's modality
+        # swap/revert are checked FIRST (most specific), then the shared
+        # detect_health_intent covers plan reads, the morning check-in, the
+        # debrief, and the trainer override.
+        if detect_swap_revert(question):
+            reply = propose_swap_revert(channel_id)
+        elif detect_modality_swap(question):
+            reply = propose_modality_swap(question, channel_id)
         else:
-            # Read-intent (history Q&A) first, then the session loop.
-            reply = handle_plan_query(question)
-            if reply is None:
-                reply = handle_workout_session(question)
+            intent = detect_health_intent(question)
+            if intent == INTENT_PLAN_DETAIL:
+                # RDS read-intent — always a string (real plan or the exact
+                # "No plan seeded for <date>." guard); never general_reply.
+                reply = get_plan_detail(question)
+            elif intent == INTENT_PLAN_LOOKUP:
+                reply = get_plan_lookup(question)
+            elif intent == "log_morning_state":
+                reply = handle_morning_intent(question, message_id=post.get("id"))
+            elif intent == INTENT_TRAINER_OVERRIDE:
+                reply = handle_trainer_override(question, message_id=post.get("id"))
+            elif intent == "log_workout_debrief":
+                # "fix <exercise> rpe <N>" edit first; a real metrics paste goes
+                # to propose-then-confirm capture; a bare "done"/set line stays
+                # with the live-session loop (and falls through if there's no
+                # active session, so `done <thread-id>` still reaches the inbox).
+                reply = handle_fix_intent(question)
+                if reply is None:
+                    if is_capture_paste(question):
+                        reply = build_and_store_proposal(question, channel_id)
+                    else:
+                        reply = handle_workout_session(question)
+            else:
+                # Read-intent (history Q&A) first, then the session loop.
+                reply = handle_plan_query(question)
+                if reply is None:
+                    reply = handle_workout_session(question)
+                # Honest fallback: an imperative workout-change we don't support
+                # (reschedule / move / change to a strength day) is answered with
+                # the real command list — NEVER handed to the LLM to confabulate.
+                if reply is None and looks_like_unsupported_workout_change(question):
+                    reply = format_health_help()
     except Exception:
         logger.exception("Health conversation handler failed")
         return False
@@ -3671,6 +3653,54 @@ def _handle_debrief_confirm(post: dict, question: str) -> bool:
         reply = commit_capture(channel_id)
     elif q in _CANCEL_WORDS:
         reply = cancel_capture(channel_id)
+    else:
+        return False
+
+    root_id = post.get("root_id") or post["id"]
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+_SWAP_YES_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?(?:yes|confirm|approved?|go|do\s+it|send\s+it)\b[\s:,.\-]*(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+_SWAP_NO_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?(?:no|cancel|discard|deny|nope)\b",
+    re.IGNORECASE,
+)
+
+
+def _handle_swap_confirm(post: dict, question: str) -> bool:
+    """Confirm/cancel leg for a pending modality swap OR revert (SWAP-2).
+
+    Guards on the durable swap-pending payload for this channel, so a bare
+    `yes`/`no` only acts when a swap/revert is actually staged. `yes <reason>`
+    captures the reason into the audit ledger. Returns True if handled.
+    """
+    from artemis.health import (
+        cancel_modality_swap,
+        commit_modality_swap,
+        commit_swap_revert,
+        load_swap_pending,
+    )
+
+    channel_id = post.get("channel_id", "")
+    pending = load_swap_pending(channel_id)
+    if pending is None:
+        return False
+
+    m_yes = _SWAP_YES_RE.match(question)
+    if m_yes:
+        reason = (m_yes.group("reason") or "").strip() or None
+        if pending.get("kind") == "revert":
+            reply = commit_swap_revert(channel_id, reason_override=reason)
+        else:
+            reply = commit_modality_swap(
+                channel_id, reason_override=reason, message_id=post.get("id"))
+    elif _SWAP_NO_RE.match(question):
+        reply = cancel_modality_swap(channel_id)
     else:
         return False
 
@@ -3814,6 +3844,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("calendar_confirm", _handle_calendar_confirm),
         ("delete_confirm", _handle_delete_confirm),
         ("debrief_confirm", _handle_debrief_confirm),
+        # SWAP-2: a pending modality swap/revert consumes its `yes <reason>`/`no`
+        # here, ahead of any content router — a confirm must never reach the LLM.
+        ("swap_confirm", _handle_swap_confirm),
         ("nutrition_confirm", _handle_nutrition_confirm),
         # PB-010 dossier/org: an explicit capture/authoring verb (met with /
         # dossier / brief / org / remind / review-context) outranks topical keyword
@@ -4082,11 +4115,11 @@ def _handle_mention(post: dict, thread: list[dict]):
         _mm.post_to_channel_id(channel_id, life_ops_response, root_id=root_id)
         return
 
-    # ── Correction / feedback detection ──
-    correction_response = _handle_correction(post, question, thread)
-    if correction_response:
-        _mm.post_to_channel_id(channel_id, correction_response, root_id=root_id)
-        return
+    # ── Correction / feedback detection (HEALTH-1 A2: removed from live routing) ──
+    # The "I've learned…" correction re-route is a confabulation vector — it
+    # claimed a cognition/learning layer that does not exist and could re-route a
+    # message the deterministic detectors already own. _handle_correction remains
+    # (tests reference it) but no route reaches it.
 
     # ── Confirm backstop ──
     # If a pending action is still open for this channel and the user sent a

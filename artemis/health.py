@@ -3684,3 +3684,655 @@ def detect_nutrition_intent(message: str) -> str | None:
     if _match_onplan_slot(msg) or _NUT_LOG_RE.search(msg):
         return INTENT_LOG_NUTRITION
     return None
+
+
+# ============================================================================
+# SWAP-2 — gated session-modality swap (rower / bike / walking pad)
+#
+# A modality swap changes the TOOL, never the training stimulus: session_type,
+# target_rpe, HR zone, rounds, and interval timing carry over unchanged. The
+# swap is deterministic (matched BEFORE the LLM classifier — the HEALTH-1
+# principle), propose-then-confirm (E3 pattern, durable KV so it survives a
+# restart between propose and confirm), and verify-from-reread (the confirmation
+# is rendered from the written row, never from intent — the create_rule pattern).
+# History is captured to acos.audit_log; there is no new table.
+#
+# Non-goals (dead, not deferred): no rescheduling / date moves (SCH-1), no
+# session_type changes, no strength-day swaps, no autonomous/auto-proposed swaps.
+# ============================================================================
+
+INTENT_MODALITY_SWAP = "modality_swap"
+INTENT_SWAP_REVERT = "swap_revert"
+
+# Swap-eligible session types. Strength days refuse; rest/no-plan falls forward
+# to the next cardio session.
+_SWAP_ELIGIBLE = ("cardio_z2", "cardio_intervals", "walk")
+
+# The three modalities a session can be swapped to.
+_SWAP_TARGETS = ("rower", "bike", "walking_pad")
+
+# Primary swap grammar. Tolerant of a leading "@artemis" and a leading dash.
+# (?P<target>…) is normalized by _normalize_swap_target; (?P<reason>…) is optional.
+_MODALITY_SWAP_RE = re.compile(
+    r"(?:@?artemis\s+)?-?\s*"
+    r"(?:update|change|swap|switch|make)\s+"
+    r"(?:(?:today'?s?|the|my)\s+)?"
+    r"(?:outdoor\s+)?(?:workout|cardio|run|session)?\s*"
+    r"(?:to|for)\s+(?:an?\s+)?(?:indoor\s+)?"
+    r"(?P<target>rower?|rowing|bike|cycling|trainer|walk(?:ing)?(?:\s+pad)?)"
+    r"(?:\s+(?:because|due\s+to|—|-)\s+(?P<reason>.+))?",
+    re.IGNORECASE,
+)
+
+# Bare form: "indoor bike today", "indoor rower". The "indoor" qualifier is what
+# distinguishes a modality-swap command from an incidental equipment mention.
+_MODALITY_SWAP_BARE_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?-?\s*"
+    r"indoor\s+"
+    r"(?P<target>rower?|rowing|bike|cycling|trainer|walk(?:ing)?(?:\s+pad)?)"
+    r"(?:\s+today)?"
+    r"(?:\s+(?:because|due\s+to|—|-)\s+(?P<reason>.+))?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+# Revert intent: "swap revert", "undo swap", "revert swap".
+_SWAP_REVERT_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?-?\s*"
+    r"(?:swap\s+revert|revert\s+(?:the\s+)?swap|undo\s+(?:the\s+)?swap)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+# Imperative workout-change commands we do NOT support (reschedule / move to a
+# date / change to a strength day). These are honestly refused with the command
+# list rather than handed to the LLM (which would confabulate a confirmation —
+# the exact HEALTH-1 failure class).
+_UNSUPPORTED_CHANGE_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?-?\s*"
+    r"(?:swap|switch|change|move|reschedule|convert|make)\b"
+    r"[^\n]*\b(?:workout|cardio|session|run|training|lift(?:ing)?|strength|plan|leg\s+day)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_swap_target(raw: str | None) -> str | None:
+    """Map a captured target token to one of rower | bike | walking_pad."""
+    if not raw:
+        return None
+    t = raw.strip().lower()
+    if t.startswith("row"):
+        return "rower"
+    if t in ("bike", "cycling", "trainer"):
+        return "bike"
+    if t.startswith("walk"):
+        return "walking_pad"
+    return None
+
+
+def detect_swap_revert(text: str) -> bool:
+    """True if the message is a swap-revert command ('swap revert', 'undo swap')."""
+    return bool(_SWAP_REVERT_RE.match(text or ""))
+
+
+def detect_modality_swap(text: str) -> dict | None:
+    """Deterministic modality-swap detector, checked BEFORE the LLM classifier.
+
+    Returns {"target": rower|bike|walking_pad, "reason": str|None} on a positive
+    match, else None. A revert command is NOT a swap (handled separately), and a
+    'trainer set indoor/outdoor' override is NOT a swap (no leading swap verb).
+    """
+    msg = text or ""
+    if detect_swap_revert(msg):
+        return None
+    for rx in (_MODALITY_SWAP_RE, _MODALITY_SWAP_BARE_RE):
+        m = rx.search(msg)
+        if not m:
+            continue
+        target = _normalize_swap_target(m.group("target"))
+        if not target:
+            continue
+        reason = (m.group("reason") or "").strip() or None
+        return {"target": target, "reason": reason}
+    return None
+
+
+def looks_like_unsupported_workout_change(text: str) -> bool:
+    """True for imperative workout-change commands we don't support (so the
+    handler answers honestly instead of confabulating). detect_modality_swap
+    positives are handled first, so only unsupported changes reach here."""
+    return bool(_UNSUPPORTED_CHANGE_RE.search(text or ""))
+
+
+# ── Modality translation (pure — no I/O) ────────────────────────────────────
+
+# Per-modality settings. work/rest settings live inside intervals_template;
+# warmup/cooldown settings are top-level. equipment/display_name are top-level.
+_MODALITY_SPEC = {
+    "rower": {
+        "equipment": ["water rower"],
+        "work_settings": "moderate row",
+        "rest_settings": "easy row",
+        "wc_settings": "easy row",
+        "modality_word": "row",
+    },
+    "bike": {
+        "equipment": ["bike on trainer"],
+        "work_settings": "moderate spin",
+        "rest_settings": "easy spin",
+        "wc_settings": "easy spin",
+        "modality_word": "bike",
+    },
+    "walking_pad": {
+        "equipment": ["walking pad"],
+        "work_settings": "brisk walk",
+        "rest_settings": "easy walk",
+        "wc_settings": "easy walk",
+        "modality_word": "walk",
+    },
+}
+
+
+def _swap_display_name(target: str, session_type: str | None) -> str:
+    """Display name for the swapped session. cardio_intervals rowers read
+    'Indoor Row — Intervals'; everything else uses the Z2 form."""
+    if target == "rower":
+        if session_type == "cardio_intervals":
+            return "Indoor Row — Intervals"
+        return "Indoor Row — Z2 Intervals"
+    if target == "bike":
+        return "Indoor Bike — Z2"
+    return "Indoor Walk — Z2"
+
+
+def _rewrite_setup_notes(setup_notes, target: str, reason: str | None) -> list[str]:
+    """Rewrite the first setup-notes line to describe the new modality (prefixing
+    the reason when given). Remaining lines carry over unchanged."""
+    spec = _MODALITY_SPEC[target]
+    word = spec["modality_word"]
+    head = f"Indoor {word}"
+    if reason:
+        head += f" ({reason})"
+    notes = list(setup_notes) if isinstance(setup_notes, (list, tuple)) else []
+    tail = [str(n) for n in notes[1:]]
+    return [head] + tail
+
+
+def _deep_copy_blocks(blocks: dict) -> dict:
+    """JSON round-trip deep copy (blocks are JSONB-safe)."""
+    return json.loads(json.dumps(blocks))
+
+
+def translate_blocks(blocks: dict, target: str, *, session_type: str | None = None,
+                     reason: str | None = None) -> dict:
+    """Translate a plan's blocks to a new modality (pure — no I/O).
+
+    Preserves every structural key a renderer depends on (type, rounds,
+    warmup_sec, cooldown_sec, and the intervals_template work_sec/rest_sec shape)
+    and every stimulus key (intensity, target_range_min, finisher). Only the tool
+    changes: equipment, the work/rest/warmup/cooldown *settings* labels, the
+    display_name, and the first setup-notes line. Any pre-existing swap/pre_swap
+    bookkeeping is stripped — the lifecycle re-adds it deliberately.
+    """
+    if target not in _MODALITY_SPEC:
+        raise ValueError(f"Unknown swap target: {target!r}")
+    b = _coerce_blocks(blocks)
+    out = _deep_copy_blocks(b)
+    out.pop("swap", None)
+    out.pop("pre_swap", None)
+
+    spec = _MODALITY_SPEC[target]
+    out["equipment"] = list(spec["equipment"])
+
+    it = out.get("intervals_template")
+    if isinstance(it, dict):
+        # Preserve work_sec/rest_sec; relabel only the settings.
+        it["work_settings"] = spec["work_settings"]
+        it["rest_settings"] = spec["rest_settings"]
+
+    if "warmup_sec" in out or "warmup_settings" in out:
+        out["warmup_settings"] = spec["wc_settings"]
+    if "cooldown_sec" in out or "cooldown_settings" in out:
+        out["cooldown_settings"] = spec["wc_settings"]
+
+    out["display_name"] = _swap_display_name(target, session_type)
+    out["setup_notes"] = _rewrite_setup_notes(out.get("setup_notes"), target, reason)
+    return out
+
+
+def apply_modality_swap(old_blocks: dict, target: str, *, session_type: str | None = None,
+                        reason: str | None = None, swap_meta: dict | None = None) -> dict:
+    """Build the new blocks for a swap: translate + stash the ORIGINAL under
+    pre_swap + record the swap metadata.
+
+    Double-swap safety: if old_blocks already carries a pre_swap, that ORIGINAL
+    is carried forward unchanged (never nested), so a revert always restores the
+    true original rather than an intermediate swap.
+    """
+    old = _coerce_blocks(old_blocks)
+    new = translate_blocks(old, target, session_type=session_type, reason=reason)
+    if "pre_swap" in old and isinstance(old["pre_swap"], dict):
+        new["pre_swap"] = _deep_copy_blocks(old["pre_swap"])
+    else:
+        original = {k: v for k, v in _deep_copy_blocks(old).items() if k != "swap"}
+        new["pre_swap"] = original
+    new["swap"] = swap_meta or {}
+    return new
+
+
+def revert_modality_swap(current_blocks: dict) -> dict | None:
+    """Restore pre_swap as the live blocks (dropping swap + pre_swap). Returns
+    None if the row carries no pre_swap (nothing to revert)."""
+    cur = _coerce_blocks(current_blocks)
+    pre = cur.get("pre_swap")
+    if not isinstance(pre, dict):
+        return None
+    restored = _deep_copy_blocks(pre)
+    restored.pop("swap", None)
+    restored.pop("pre_swap", None)
+    return restored
+
+
+# ── Target-date resolution (CT-anchored) ────────────────────────────────────
+
+def _fetch_swap_plan_row(d: date) -> dict | None:
+    """Fetch the columns the swap needs (plan_id + blocks) for a plan date."""
+    from knowledge.db import execute_one
+    return execute_one(
+        """SELECT plan_id, plan_date, session_type, target_rpe, blocks
+           FROM health.plan WHERE plan_date = %s""",
+        (d,),
+    )
+
+
+def resolve_swap_target(today: date | None = None) -> tuple[date | None, dict | None, str | None]:
+    """Resolve which plan row a swap targets (CT-anchored).
+
+    Returns (target_date, plan_row, refusal_message):
+      - today's session is cardio/walk        → (today, row, None)
+      - today's session is a strength day      → (None, row, refusal)  [refuse]
+      - today is rest / no plan                → (next_cardio_date, row, None)
+    The day-ahead bug is impossible here: today_ct is CT-anchored, never UTC.
+    """
+    base = today or datetime.now(CT).date()
+    row = _fetch_swap_plan_row(base)
+    st = (row or {}).get("session_type")
+    if st in _SWAP_ELIGIBLE:
+        return base, row, None
+    if st and st.startswith("strength"):
+        return None, row, (
+            "Today is a strength day — modality swaps only apply to cardio or "
+            "walk sessions. Nothing changed."
+        )
+    # Rest day or no plan today → the next cardio session.
+    nxt = _next_cardio_date(base)
+    return nxt, _fetch_swap_plan_row(nxt), None
+
+
+# ── Weather context for the history ledger (best-effort) ────────────────────
+
+def _swap_weather_context() -> dict | None:
+    """Snapshot current conditions for the audit ledger. BEST-EFFORT: any
+    failure returns None so the swap is never blocked by weather."""
+    try:
+        from artemis import weather
+        w = weather.get_current_conditions()
+        ctx = {
+            "weather": {
+                "temp_f": w.get("temp_f"),
+                "precip_next_90min": w.get("precip_next_90min"),
+            },
+            "captured_at": datetime.now(CT).isoformat(),
+        }
+        return ctx
+    except Exception:
+        logger.warning("Swap weather context fetch failed — recording null", exc_info=True)
+        return None
+
+
+# ── Durable pending payload (system_state KV — same store E3/capture use) ────
+
+def _swap_pending_key(channel_id: str) -> str:
+    return f"modality_swap_pending:{channel_id}"
+
+
+def store_swap_pending(channel_id: str, payload: dict) -> None:
+    from artemis.quiet_hours import set_system_value
+    set_system_value(_swap_pending_key(channel_id), json.dumps(payload))
+
+
+def load_swap_pending(channel_id: str, max_age_sec: int = 600) -> dict | None:
+    """Return the pending swap/revert payload if present and unexpired."""
+    from artemis.quiet_hours import get_system_value
+    raw = get_system_value(_swap_pending_key(channel_id))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    created = payload.get("created_at")
+    if created:
+        try:
+            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            if age > max_age_sec:
+                return None
+        except (ValueError, TypeError):
+            pass
+    return payload
+
+
+def clear_swap_pending(channel_id: str) -> None:
+    from artemis.quiet_hours import set_system_value
+    set_system_value(_swap_pending_key(channel_id), "")
+
+
+# ── Proposal rendering ──────────────────────────────────────────────────────
+
+def _session_summary_line(row: dict) -> str:
+    """One-line current-session summary for the proposal."""
+    blocks = _coerce_blocks(row.get("blocks"))
+    name = blocks.get("display_name") or _session_pretty_name(row.get("session_type", "?"))
+    equip = blocks.get("equipment") or []
+    where = ", ".join(str(e) for e in equip) if equip else "outdoor / as scheduled"
+    return f"{name} ({where})"
+
+
+def _format_swap_proposal(target_date: date, row: dict, target: str,
+                          reason: str | None) -> str:
+    today = datetime.now(CT).date()
+    day = _relative_day_label(target_date, today)
+    old_blocks = _coerce_blocks(row.get("blocks"))
+    new_blocks = translate_blocks(
+        old_blocks, target, session_type=row.get("session_type"), reason=reason,
+    )
+    new_name = new_blocks.get("display_name")
+    new_equip = ", ".join(str(e) for e in (new_blocks.get("equipment") or []))
+    lines = [
+        f"**Swap {day}'s session:**",
+        f"• From: {_session_summary_line(row)}",
+        f"• To:   {new_name} ({new_equip})",
+        "_Same stimulus — intensity, RPE, HR zone, rounds, and interval timing "
+        "are unchanged._",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}")
+        lines.append("\nReply `yes` to confirm, `no` to cancel.")
+    else:
+        lines.append("\nReason? Reply `yes <reason>` or just `yes`. `no` cancels.")
+    return "\n".join(lines)
+
+
+# ── Orchestration: propose / commit / cancel ────────────────────────────────
+
+def propose_modality_swap(message: str, channel_id: str) -> str:
+    """Parse a modality-swap command, resolve the CT target date, store the
+    durable pending payload, and return the proposal text. Writes NOTHING to
+    health.plan (that happens only on confirm)."""
+    parsed = detect_modality_swap(message)
+    if not parsed:
+        return format_health_help()
+    target = parsed["target"]
+    reason = parsed["reason"]
+
+    try:
+        target_date, row, refusal = resolve_swap_target()
+    except Exception:
+        logger.exception("Swap target resolution failed")
+        return "⚠️ Couldn't read your plan — check DB. Nothing changed."
+    if refusal:
+        return refusal
+    if target_date is None or row is None:
+        return _no_plan_message(target_date or datetime.now(CT).date())
+
+    payload = {
+        "kind": "swap",
+        "target": target,
+        "reason": reason,
+        "plan_id": row.get("plan_id"),
+        "plan_date": target_date.isoformat(),
+        "session_type": row.get("session_type"),
+        "created_at": datetime.now(CT).isoformat(),
+    }
+    try:
+        store_swap_pending(channel_id, payload)
+    except Exception:
+        logger.exception("Failed to store pending swap")
+        return "⚠️ Couldn't stage the swap — check DB. Nothing changed."
+    return _format_swap_proposal(target_date, row, target, reason)
+
+
+def propose_swap_revert(channel_id: str) -> str:
+    """Stage a revert of the current swap on the target plan row (today if it's a
+    swap-eligible session, else the next cardio date). Refuses cleanly if the
+    target row has no pre_swap."""
+    try:
+        target_date, row, refusal = resolve_swap_target()
+    except Exception:
+        logger.exception("Swap revert resolution failed")
+        return "⚠️ Couldn't read your plan — check DB. Nothing changed."
+    if target_date is None or row is None:
+        return "No swapped session to revert."
+    blocks = _coerce_blocks(row.get("blocks"))
+    if not isinstance(blocks.get("pre_swap"), dict):
+        day = _relative_day_label(target_date, datetime.now(CT).date())
+        return f"{day}'s session isn't swapped — nothing to revert."
+
+    restored = revert_modality_swap(blocks)
+    restored_name = (restored or {}).get("display_name") or _session_pretty_name(
+        row.get("session_type", "?"))
+    payload = {
+        "kind": "revert",
+        "reason": None,
+        "plan_id": row.get("plan_id"),
+        "plan_date": target_date.isoformat(),
+        "session_type": row.get("session_type"),
+        "created_at": datetime.now(CT).isoformat(),
+    }
+    try:
+        store_swap_pending(channel_id, payload)
+    except Exception:
+        logger.exception("Failed to store pending revert")
+        return "⚠️ Couldn't stage the revert — check DB. Nothing changed."
+    day = _relative_day_label(target_date, datetime.now(CT).date())
+    cur_name = blocks.get("display_name") or "current swap"
+    return (
+        f"**Revert {day}'s swap:**\n"
+        f"• From: {cur_name}\n"
+        f"• Back to: {restored_name}\n"
+        "\nReply `yes` to confirm, `no` to cancel."
+    )
+
+
+def _write_swap_and_verify(plan_id: int, plan_date: date, new_blocks: dict) -> dict | None:
+    """UPDATE the plan row's blocks, then re-SELECT and return the written row.
+    The caller renders confirmation ONLY from this re-read (verify-from-reread)."""
+    from knowledge.db import execute_write, execute_one
+    execute_write(
+        "UPDATE health.plan SET blocks = %s::jsonb WHERE plan_id = %s",
+        (json.dumps(new_blocks), plan_id),
+    )
+    return execute_one(
+        "SELECT plan_id, plan_date, session_type, target_rpe, blocks "
+        "FROM health.plan WHERE plan_id = %s",
+        (plan_id,),
+    )
+
+
+def commit_modality_swap(channel_id: str, reason_override: str | None = None,
+                         message_id: str | None = None) -> str:
+    """Apply a pending swap in one UPDATE, verify from a re-read, and write the
+    history ledger. Confirmation text comes ONLY from the re-read — never intent.
+    """
+    payload = load_swap_pending(channel_id)
+    if payload is None or payload.get("kind") != "swap":
+        return "Nothing pending to swap (it may have expired). Re-send the request."
+
+    plan_id = payload.get("plan_id")
+    target = payload.get("target")
+    session_type = payload.get("session_type")
+    reason = reason_override or payload.get("reason")
+    try:
+        plan_date = date.fromisoformat(payload["plan_date"])
+    except (KeyError, ValueError):
+        clear_swap_pending(channel_id)
+        return "⚠️ Pending swap was malformed — discarded. Re-send the request."
+
+    # Re-read the CURRENT row so a double-swap carries the true original forward.
+    try:
+        row = _fetch_swap_plan_row(plan_date)
+    except Exception:
+        logger.exception("Swap commit re-fetch failed")
+        return "⚠️ Couldn't read the plan row — check DB. Nothing changed."
+    if not row:
+        clear_swap_pending(channel_id)
+        return _no_plan_message(plan_date)
+
+    old_blocks = _coerce_blocks(row.get("blocks"))
+    old_name = old_blocks.get("display_name") or _session_pretty_name(session_type or "?")
+
+    context = _swap_weather_context()
+    swap_meta = {
+        "reason": reason,
+        "requested_via": "mattermost",
+        "at": datetime.now(CT).isoformat(),
+        "message_id": message_id,
+    }
+    new_blocks = apply_modality_swap(
+        old_blocks, target, session_type=session_type, reason=reason, swap_meta=swap_meta,
+    )
+    new_name = new_blocks.get("display_name")
+
+    try:
+        written = _write_swap_and_verify(plan_id, plan_date, new_blocks)
+    except Exception:
+        logger.exception("Swap commit write failed")
+        return "⚠️ Couldn't write the swap — check DB. Nothing changed."
+
+    # VERIFY-FROM-REREAD: confirm ONLY from what the row actually shows.
+    written_blocks = _coerce_blocks((written or {}).get("blocks"))
+    if not written or written_blocks.get("display_name") != new_name \
+            or "swap" not in written_blocks:
+        logger.error("Swap verify-from-reread failed for plan_id=%s", plan_id)
+        return "⚠️ Swap did not persist — re-read shows no change. Nothing confirmed."
+
+    clear_swap_pending(channel_id)
+
+    # History ledger (no new table). Best-effort — a ledger failure never
+    # unwinds a persisted swap; it's logged.
+    try:
+        from knowledge.db import log_audit
+        log_audit(
+            agent="artemis",
+            action="plan_modality_swap",
+            domain="health",
+            outcome="applied",
+            metadata={
+                "plan_id": plan_id,
+                "plan_date": plan_date.isoformat(),
+                "from": {"display_name": old_name, "session_type": session_type},
+                "to": {"display_name": new_name, "modality": target},
+                "reason": reason,
+                "context": context,
+            },
+        )
+    except Exception:
+        logger.exception("Swap audit-log write failed (swap itself persisted)")
+
+    reason_str = f" ({reason})" if reason else ""
+    return (
+        f"✅ Swapped to **{new_name}**{reason_str}.\n"
+        f"Same stimulus — RPE, HR zone, and interval timing unchanged. "
+        f"`swap revert` to undo.\ngym.rdm.is is up to date."
+    )
+
+
+def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> str:
+    """Apply a pending revert in one UPDATE, verify from a re-read, and log the
+    revert to the ledger (swap-then-revert is signal)."""
+    payload = load_swap_pending(channel_id)
+    if payload is None or payload.get("kind") != "revert":
+        return "Nothing pending to revert (it may have expired). Re-send the request."
+
+    plan_id = payload.get("plan_id")
+    session_type = payload.get("session_type")
+    reason = reason_override or payload.get("reason")
+    try:
+        plan_date = date.fromisoformat(payload["plan_date"])
+    except (KeyError, ValueError):
+        clear_swap_pending(channel_id)
+        return "⚠️ Pending revert was malformed — discarded. Re-send the request."
+
+    try:
+        row = _fetch_swap_plan_row(plan_date)
+    except Exception:
+        logger.exception("Revert commit re-fetch failed")
+        return "⚠️ Couldn't read the plan row — check DB. Nothing changed."
+    if not row:
+        clear_swap_pending(channel_id)
+        return _no_plan_message(plan_date)
+
+    cur_blocks = _coerce_blocks(row.get("blocks"))
+    from_name = cur_blocks.get("display_name") or _session_pretty_name(session_type or "?")
+    restored = revert_modality_swap(cur_blocks)
+    if restored is None:
+        clear_swap_pending(channel_id)
+        return "That session isn't swapped — nothing to revert."
+    to_name = restored.get("display_name") or _session_pretty_name(session_type or "?")
+
+    context = _swap_weather_context()
+    try:
+        written = _write_swap_and_verify(plan_id, plan_date, restored)
+    except Exception:
+        logger.exception("Revert commit write failed")
+        return "⚠️ Couldn't write the revert — check DB. Nothing changed."
+
+    written_blocks = _coerce_blocks((written or {}).get("blocks"))
+    if not written or "swap" in written_blocks or "pre_swap" in written_blocks:
+        logger.error("Revert verify-from-reread failed for plan_id=%s", plan_id)
+        return "⚠️ Revert did not persist — re-read still shows a swap. Nothing confirmed."
+
+    clear_swap_pending(channel_id)
+
+    try:
+        from knowledge.db import log_audit
+        log_audit(
+            agent="artemis",
+            action="plan_modality_swap_revert",
+            domain="health",
+            outcome="reverted",
+            metadata={
+                "plan_id": plan_id,
+                "plan_date": plan_date.isoformat(),
+                "from": {"display_name": from_name, "session_type": session_type},
+                "to": {"display_name": to_name, "modality": None},
+                "reason": reason,
+                "context": context,
+            },
+        )
+    except Exception:
+        logger.exception("Revert audit-log write failed (revert itself persisted)")
+
+    return (
+        f"✅ Reverted to **{to_name}**. gym.rdm.is is up to date."
+    )
+
+
+def cancel_modality_swap(channel_id: str) -> str:
+    clear_swap_pending(channel_id)
+    return "Cancelled — nothing changed."
+
+
+def format_health_help() -> str:
+    """Honest capability list for a health-shaped request we have no handler for.
+    Never a fabricated confirmation, never a claim of any action or learning."""
+    return (
+        "I don't have a handler for that. Here's what I can do with training:\n"
+        "• **Swap the tool** — `swap today to indoor rower` (or bike / walking pad); "
+        "reply `yes` to confirm. `swap revert` to undo.\n"
+        "• **Morning check-in** — `slept 6.5 energy 3 legs sore 3`\n"
+        "• **Log a workout** — paste your metrics; I echo them and confirm before writing\n"
+        "• **Bike setup** — `trainer set indoor` / `trainer set outdoor`\n"
+        "• **See the plan** — `what's today's workout` · `next 3 days` · `this week`\n"
+        "_I can't reschedule sessions or change the session type — those aren't built._"
+    )
