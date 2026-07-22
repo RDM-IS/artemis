@@ -402,11 +402,121 @@ def run(rows: dict[date, dict], start: date, end: date) -> int:
     return 0 if not fails else 1
 
 
+# ---------------------------------------------------------------------------
+# Ramp mode (feat/health-ramp) — validate the weeks 1-7 ramp schedule. The
+# expected schedule + builders are the single source in artemis.health_ramp, so
+# this checks the LIVE rows against exactly what the seeder writes (no second copy
+# of the program to drift).
+# ---------------------------------------------------------------------------
+
+def _load_ramp_live() -> dict:
+    """All live health.plan rows on/after the ramp start (so stragglers past the
+    hard stop are caught too). {plan_date: {session_type, week_num, blocks}}."""
+    import artemis.health_ramp as hr
+    _load_dotenv()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT plan_date, session_type, week_num, blocks FROM health.plan "
+            "WHERE plan_date >= %s ORDER BY plan_date", (hr.RAMP_START,))
+        rows = {d: {"session_type": st, "week_num": wk, "blocks": _coerce_blocks(b)}
+                for d, st, wk, b in cur.fetchall()}
+        conn.rollback()
+        return rows
+
+
+def run_ramp(live: dict) -> int:
+    """Assert the live ramp rows match the canonical weeks 1-7 schedule exactly:
+    35 rows, right session_type / block-type / display_name / week_num per date,
+    and NOTHING on/after RAMP_START that isn't in the schedule (hard stop)."""
+    import artemis.health_ramp as hr
+    expected_rows = hr.build_rows(hr.build_initial_schedule())
+    expected = {r["plan_date"]: r for r in expected_rows}
+
+    results: list[dict] = []
+
+    def add(d, cat, ok, reason=""):
+        results.append({"date": d, "category": cat, "ok": ok, "reason": reason})
+
+    # Every expected date present + correct.
+    for d, exp in sorted(expected.items()):
+        row = live.get(d)
+        if row is None:
+            add(d, "PRESENT", False, "missing ramp row for this date")
+            continue
+        add(d, "PRESENT", True)
+        add(d, "SESSION_TYPE", row["session_type"] == exp["session_type"],
+            f"session_type={row['session_type']!r}, expected {exp['session_type']!r}")
+        add(d, "WEEK_NUM", row["week_num"] == exp["week_num"],
+            f"week_num={row['week_num']}, expected {exp['week_num']}")
+        b = _coerce_blocks(row["blocks"])
+        add(d, "BLOCK_TYPE", b.get("type") == exp["blocks"]["type"],
+            f"blocks.type={b.get('type')!r}, expected {exp['blocks']['type']!r}")
+        add(d, "DISPLAY_NAME", b.get("display_name") == exp["blocks"]["display_name"],
+            f"display_name={b.get('display_name')!r}, expected {exp['blocks']['display_name']!r}")
+
+    # Nothing off-schedule on/after RAMP_START (hard stop after RAMP_END included).
+    for d in sorted(live):
+        if d not in expected:
+            add(d, "HARD_STOP", False,
+                f"unexpected row at {d.isoformat()} (no ramp session on this date; "
+                f"weeks 1-7 end {hr.RAMP_END.isoformat()})")
+
+    print(f"Ramp plan validation — weeks 1-7 ({hr.RAMP_START.isoformat()} .. "
+          f"{hr.RAMP_END.isoformat()})\n")
+    categories = []
+    for r in results:
+        if r["category"] not in categories:
+            categories.append(r["category"])
+    for cat in categories:
+        subset = [r for r in results if r["category"] == cat]
+        fails = [r for r in subset if not r["ok"]]
+        print(f"  [{'PASS' if not fails else 'FAIL'}] {cat:<14} "
+              f"{len(subset) - len(fails)}/{len(subset)}"
+              + (f"   ({len(fails)} fail)" if fails else ""))
+
+    fails = [r for r in results if not r["ok"]]
+    print("\n" + "=" * 70)
+    if fails:
+        print("FAILURES:")
+        for r in sorted(fails, key=lambda x: (x["date"], x["category"])):
+            print(f"  {r['date'].isoformat()} {r['category']:<14} {r['reason']}")
+    n_expected = len(expected)
+    n_present = sum(1 for d in expected if d in live)
+    print(f"\nSummary: rows_present={n_present}/{n_expected}  "
+          f"assertions_pass={len(results) - len(fails)}  assertions_fail={len(fails)}")
+    print(f"RESULT: {'PASS' if not fails else 'FAIL'}")
+    return 0 if not fails else 1
+
+
+def _run_ramp_selftest(fault: bool) -> int:
+    """No DB. Build the live set from the ramp builders (optionally fault it)."""
+    import artemis.health_ramp as hr
+    rows = hr.build_rows(hr.build_initial_schedule())
+    live = {r["plan_date"]: {"session_type": r["session_type"], "week_num": r["week_num"],
+                             "blocks": r["blocks"]} for r in rows}
+    if fault:
+        # a) drift a session_type; b) inject a stray row past the hard stop.
+        first = min(live)
+        live[first]["session_type"] = "rest_mobility"
+        live[hr.RAMP_END + timedelta(days=7)] = {
+            "session_type": "cardio_z2", "week_num": 8,
+            "blocks": {"type": "steady", "display_name": "Phantom Week 8"}}
+    return run_ramp(live)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Validate health.plan against the locked program (READ-ONLY).")
     ap.add_argument("--self-test", action="store_true", help="No DB. Build 28 days from the reseed builders.")
     ap.add_argument("--fault", action="store_true", help="With --self-test: inject faults to prove the FAIL path.")
+    ap.add_argument("--ramp", action="store_true",
+                    help="feat/health-ramp: validate the weeks 1-7 ramp schedule instead.")
     args = ap.parse_args()
+
+    if args.ramp:
+        if args.self_test:
+            sys.exit(_run_ramp_selftest(fault=args.fault))
+        sys.exit(run_ramp(_load_ramp_live()))
 
     today = datetime.now(CT).date()
     start, end = today, today + timedelta(days=WINDOW_DAYS - 1)

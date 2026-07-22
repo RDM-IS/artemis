@@ -46,6 +46,15 @@ Run (no fragile shell sourcing — the script loads .env itself):
     python scripts/reseed_health_plan_v2.py --commit      # read+compute+WRITE
     python scripts/reseed_health_plan_v2.py --self-test   # no DB; synthetic preview
 
+Ramp mode (feat/health-ramp) — the weeks 1-7 reintroduction schedule. This mode
+REPLACES every row on/after 2026-07-25 with the 35 explicit dated ramp rows and
+hard-stops after 2026-09-11 (no week 8+). The schedule + block builders live in
+artemis.health_ramp (shared with the runtime slide/tier engine); this CLI is the
+seeder entry point:
+    python scripts/reseed_health_plan_v2.py --ramp             # DRY-RUN (default)
+    python scripts/reseed_health_plan_v2.py --ramp --commit    # delete-forward + WRITE
+    python scripts/reseed_health_plan_v2.py --ramp --self-test # no DB; schedule preview
+
 Connection: uses $DATABASE_URL if set (parsed from .env if present); otherwise
 falls back to knowledge.db.get_connection() (RDS_HOST + Secrets Manager, as on
 EC2). The live RDS is in a private VPC, so this must be run from inside the VPC
@@ -520,17 +529,86 @@ def reseed(dry_run: bool) -> int:
         return len(rows)
 
 
+# ---------------------------------------------------------------------------
+# Ramp mode (feat/health-ramp) — delegates the schedule + builders to
+# artemis.health_ramp; this file owns the connection + dry-run/commit discipline.
+# ---------------------------------------------------------------------------
+
+def _ramp_self_test() -> None:
+    import artemis.health_ramp as hr
+    print("RAMP SELF-TEST (no DB) — weeks 1-7 schedule\n")
+    rows = hr.build_rows(hr.build_initial_schedule())
+    hr.validate_ramp_rows(rows)
+    print(f"{'DATE':<12}{'WD':<5}{'WK':<4}{'SESSION_TYPE':<18}SESSION")
+    print("-" * 70)
+    for r in rows:
+        d = r["plan_date"]
+        print(f"{d.isoformat():<12}{d.strftime('%a'):<5}{r['week_num']:<4}"
+              f"{r['session_type']:<18}{r['blocks']['display_name']}")
+    print("-" * 70)
+    print(f"{len(rows)} rows, {hr.RAMP_START.isoformat()} .. "
+          f"{max(r['plan_date'] for r in rows).isoformat()} "
+          f"(hard stop {hr.RAMP_END.isoformat()})")
+    assert len(rows) == 35, f"expected 35 rows, got {len(rows)}"
+    assert max(r["plan_date"] for r in rows) == hr.RAMP_END, "rows escaped week 7"
+    print("Ramp self-test OK.")
+
+
+def reseed_ramp(dry_run: bool) -> int:
+    import artemis.health_ramp as hr
+    _load_dotenv()
+    rows = hr.build_rows(hr.build_initial_schedule())
+    hr.validate_ramp_rows(rows)
+    with _connect() as conn:
+        cur = conn.cursor()
+        ok, msg = _preflight(cur)
+        print(f"[preflight] {msg}")
+        if not ok and not dry_run:
+            conn.rollback()
+            raise SystemExit(f"[ABORT] {msg}")
+
+        cur.execute("SELECT count(*) FROM health.plan WHERE plan_date >= %s", (hr.RAMP_START,))
+        to_replace = cur.fetchone()[0]
+        print(f"\nRamp reseed: {to_replace} existing row(s) >= {hr.RAMP_START.isoformat()} "
+              f"will be REPLACED by {len(rows)} ramp rows "
+              f"({hr.RAMP_START.isoformat()} .. {hr.RAMP_END.isoformat()}, weeks 1-7).")
+
+        if dry_run:
+            conn.rollback()
+            print("[DRY-RUN] (default) No rows written. Re-run with --ramp --commit to write.")
+            return 0
+
+        try:
+            hr.write_rows(cur, rows, hr.RAMP_START)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        print(f"[OK] Replaced future rows with {len(rows)} ramp rows "
+              f"(generated_by='{GENERATED_BY_DB}').")
+        return len(rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reseed health.plan in place (v2 program).")
     # Dry-run is the DEFAULT (safety). Writing requires an explicit --commit.
     ap.add_argument("--commit", action="store_true",
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true",
-                    help="No DB. Synthesize 14 days and print preview + sample blocks.")
+                    help="No DB. Synthesize days and print preview + sample blocks.")
+    ap.add_argument("--ramp", action="store_true",
+                    help="feat/health-ramp: seed the weeks 1-7 ramp schedule "
+                         "(delete-forward from 2026-07-25, hard stop 2026-09-11).")
     args = ap.parse_args()
 
+    if args.ramp and args.self_test:
+        _ramp_self_test()
+        return
     if args.self_test:
         _self_test()
+        return
+    if args.ramp:
+        reseed_ramp(dry_run=not args.commit)
         return
     reseed(dry_run=not args.commit)
 

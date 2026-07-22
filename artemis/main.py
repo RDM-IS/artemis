@@ -3195,8 +3195,11 @@ def classify_correction(
         "The user is correcting an AI assistant called Artemis. "
         "Given the original message, Artemis's response, and the user's correction, determine:\n"
         "1. What action Artemis incorrectly took (original_intent)\n"
+        # HEALTH-1: `add_note` is gone from the live action vocabulary — the
+        # "learning"/note confabulation stub was removed from routing, and this
+        # (already caller-less) prompt no longer offers it either.
         "2. What action it should have taken (correct_intent, must be one of: "
-        "add_contacts, query_crm, add_note, schedule, pipeline_update, general_reply)\n"
+        "add_contacts, query_crm, schedule, pipeline_update, general_reply)\n"
         "3. A short rule to remember for next time (under 100 chars)\n"
         "Return ONLY JSON: {\"original_intent\": \"...\", \"correct_intent\": \"...\", "
         "\"learned_rule\": \"...\", \"confidence\": 0.0-1.0}"
@@ -3711,6 +3714,40 @@ def _handle_swap_confirm(post: dict, question: str) -> bool:
     return True
 
 
+def _handle_ramp_confirm(post: dict, question: str) -> bool:
+    """Confirm/cancel leg for a pending ramp repeat/restart proposal (feat/health-
+    ramp). The nightly job posts the proposal and stores a durable pending payload
+    keyed by this channel; a bare `yes`/`no` only acts when one is actually staged,
+    so it can never reach the LLM. On confirm the regenerated rows are written in
+    one transaction and the confirmation is rendered from the WRITTEN rows.
+    Returns True if handled."""
+    from artemis.health_ramp import (
+        cancel_ramp_proposal, commit_ramp_proposal, load_ramp_pending,
+    )
+
+    channel_id = post.get("channel_id", "")
+    pending = load_ramp_pending(channel_id)
+    if pending is None:
+        return False
+    # Channel-scoped: only act in the channel the proposal was posted to (the ops
+    # channel). If the payload didn't capture a channel, fall through to matching.
+    if pending.get("channel_id") and pending["channel_id"] != channel_id:
+        return False
+
+    q = question.lower().strip()
+    if q in _CONFIRM_WORDS:
+        reply = commit_ramp_proposal(channel_id)
+    elif q in _CANCEL_WORDS:
+        reply = cancel_ramp_proposal(channel_id)
+    else:
+        return False
+
+    root_id = post.get("root_id") or post["id"]
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_nutrition_confirm(post: dict, question: str) -> bool:
     """Confirm/cancel leg for the two confirmed nutrition writes:
     a pending nutrition-target change, or a pending grocery-staples batch.
@@ -3848,6 +3885,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # SWAP-2: a pending modality swap/revert consumes its `yes <reason>`/`no`
         # here, ahead of any content router — a confirm must never reach the LLM.
         ("swap_confirm", _handle_swap_confirm),
+        # feat/health-ramp: a pending repeat/restart proposal consumes its `yes`/`no`
+        # here, ahead of any content router — a confirm must never reach the LLM.
+        ("ramp_confirm", _handle_ramp_confirm),
         ("nutrition_confirm", _handle_nutrition_confirm),
         # PB-010 dossier/org: an explicit capture/authoring verb (met with /
         # dossier / brief / org / remind / review-context) outranks topical keyword

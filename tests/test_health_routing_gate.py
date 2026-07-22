@@ -123,6 +123,48 @@ class TestNoConfabulationRoutes(_Base):
         routed.assert_called_once()
 
 
+class TestMorningStateWritten(_Base):
+    """HEALTH-1 (a): the failing check-in doesn't just ROUTE to the morning
+    handler — the handler actually UPSERTs health.daily_state, CT-dated. Here the
+    handler runs for real (only the LLM parse + the DB write are stubbed)."""
+
+    def test_checkin_writes_daily_state_with_ct_date(self):
+        import knowledge.db as kdb
+        from datetime import datetime
+        from artemis.health import CT, MorningState
+
+        state = MorningState(sleep_hrs=7.0, energy=5, soreness={"legs": 3})
+        with patch.object(health, "parse_morning_checkin", return_value=state), \
+             patch.object(kdb, "execute_write") as ew:
+            reply = health.handle_morning_intent("sleep 7 energy 5 legs sore 3")
+
+        ew.assert_called_once()
+        sql, params = ew.call_args[0][0], ew.call_args[0][1]
+        self.assertIn("health.daily_state", sql)
+        self.assertEqual(params[0], datetime.now(CT).date())   # state_date = CT today
+        self.assertIn("Logged", reply)
+
+
+class TestGeneralReplyCannotReroute(_Base):
+    """HEALTH-1 (c): even if the LLM classifier WOULD label a detected health
+    message `general_reply`, it can never re-route it — the deterministic gate
+    claims the message first and the classifier is never consulted."""
+
+    def test_general_reply_cannot_reroute_detected_health_message(self):
+        general_reply = MagicMock(name="general_reply_classification")
+        with patch.object(intent, "route_intent", return_value=general_reply) as route, \
+             patch.object(main, "_handle_intent_routed") as routed, \
+             patch.object(health, "handle_morning_intent",
+                          return_value="Logged: 7h sleep, energy 5/5.") as handler:
+            main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
+        # The classifier (which would have said general_reply) is never reached…
+        route.assert_not_called()
+        routed.assert_not_called()
+        # …and the deterministic morning handler owns the message.
+        handler.assert_called_once()
+        self.assertEqual(self._last_post(), "Logged: 7h sleep, energy 5/5.")
+
+
 class TestSwapToRestRefusal(_Base):
     """The verbatim failing message 'swap to rest' → honest refusal, zero plan
     writes, zero audit rows, LLM never called."""
