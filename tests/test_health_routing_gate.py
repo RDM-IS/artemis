@@ -227,5 +227,113 @@ class TestFabricationGate(_Base):
         glog.assert_not_called()                   # nothing suppressed/logged
 
 
+class TestRampConfirmArbitration(_Base):
+    """feat/health-ramp: the ramp proposal is confirmed ONLY by the qualified
+    `yes ramp` / `no ramp`. A BARE yes/no must never be consumed by ramp_confirm —
+    so a bare confirm meant for a coexisting (never-expiring alongside) rule-add
+    proposal reaches the rule handler, and the ramp plan is never silently rewritten.
+    """
+
+    import time as _time
+
+    _RULE_PENDING = {
+        "type": "playbook_rule",
+        "name": "file BigCo mail",
+        "spec": {"action": "label", "action_label": "BigCo",
+                 "match_sender": "@big.co", "match_subject": "", "match_body": ""},
+        "timestamp": _time.time(),
+    }
+
+    def _arb_patches(self, ramp_pending: bool):
+        """Neutralize DB-touching confirm loaders + unrelated content routers so the
+        CONFIRM arbitration (ramp vs rule) runs for real, DB-free. Returns the list
+        of active patchers (caller stops them)."""
+        import artemis.life_ops as life_ops
+        ramp_val = {"proposal_id": "p1", "outcome": "repeat"} if ramp_pending else None
+        patchers = [
+            patch.object(health, "load_capture_pending", lambda *a, **k: None),
+            patch.object(health, "load_swap_pending", lambda *a, **k: None),
+            patch.object(health, "load_nutrition_target_pending", lambda *a, **k: None),
+            patch.object(life_ops, "load_staples_pending", lambda *a, **k: None),
+            patch("artemis.health_ramp.load_ramp_pending", lambda *a, **k: ramp_val),
+            # unrelated content routers must not grab a bare word during the test
+            patch.object(main, "_handle_availability_command", lambda *a, **k: False),
+            patch.object(main, "_handle_dossier_command", lambda *a, **k: False),
+            patch.object(main, "_handle_grocery_staples", lambda *a, **k: False),
+            patch.object(main, "_handle_nutrition", lambda *a, **k: False),
+            patch.object(main, "_handle_health_conversation", lambda *a, **k: False),
+        ]
+        for p in patchers:
+            p.start()
+        # ops channel == the post channel so the ramp channel-scope gate passes.
+        self._mm.get_channel_id.return_value = "chanA"
+        return patchers
+
+    def test_a_bare_yes_lets_rule_win_ramp_untouched(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms["chanA"] = dict(self._RULE_PENDING)
+        try:
+            with patch("artemis.health_ramp.commit_ramp_proposal") as commit, \
+                 patch("artemis.playbook_rules.create_rule",
+                       return_value={"id": 7}) as create, \
+                 patch("artemis.playbook_rules.describe_rule", return_value="label @big.co"):
+                main._handle_mention(_post("yes"), [])
+            commit.assert_not_called()                       # ramp untouched
+            create.assert_called_once()                      # rule won the bare yes
+            self.assertNotIn("chanA", main._pending_confirms)  # rule pending consumed
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_b_yes_ramp_applies_with_both_pending(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms["chanA"] = dict(self._RULE_PENDING)
+        try:
+            with patch("artemis.health_ramp.commit_ramp_proposal",
+                       return_value="✅ Applied. Wrote 35 plan rows.") as commit, \
+                 patch("artemis.playbook_rules.create_rule") as create:
+                main._handle_mention(_post("yes ramp"), [])
+            commit.assert_called_once()                      # ramp applied
+            create.assert_not_called()                       # rule untouched
+            self.assertIn("chanA", main._pending_confirms)   # rule pending still staged
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_c_no_ramp_cancels(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        try:
+            with patch("artemis.health_ramp.cancel_ramp_proposal",
+                       return_value="Kept the current plan — nothing changed.") as cancel, \
+                 patch("artemis.health_ramp.commit_ramp_proposal") as commit:
+                main._handle_mention(_post("no ramp"), [])
+            cancel.assert_called_once()
+            commit.assert_not_called()
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_d_bare_yes_only_ramp_pending_falls_through(self):
+        # Intended behavior: with ONLY a ramp proposal open, a bare `yes` is NOT
+        # consumed by ramp_confirm — it flows on down the chain untouched. (The user
+        # must type `yes ramp`.) Documented as deliberate.
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms.clear()
+        try:
+            # Direct: the handler yields a bare yes even with a live ramp pending.
+            self.assertFalse(_handle := main._handle_ramp_confirm(_post("yes"), "yes"))
+            # Chain: nothing ramp-side fires on the bare yes.
+            with patch("artemis.health_ramp.commit_ramp_proposal") as commit, \
+                 patch("artemis.health_ramp.cancel_ramp_proposal") as cancel, \
+                 patch.object(main, "_handle_intent_routed", return_value="ok") as routed:
+                main._handle_mention(_post("yes"), [])
+            commit.assert_not_called()
+            cancel.assert_not_called()
+            routed.assert_called_once()                      # fell through to the router
+        finally:
+            for p in patchers:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

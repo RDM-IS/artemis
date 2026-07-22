@@ -88,6 +88,22 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **HEALTH-1 (high) — morning check-in misroute + confabulation loop.** A health check-in ("sleep 7 energy 5 …") is not logged. `detect_health_intent` correctly returns `log_morning_state` and `handle_morning_intent` works (verified: writes `health.daily_state`, returns "Logged: …"). But the LLM classifier returns `general_reply` (0.95), a "Correction re-route" sends it to a confabulating `add_note` path that "learns" fake rules (including rules about its own errors) and captures the wrong message as the note. **Root causes:** (a) deterministic health intent not short-circuiting the LLM classifier; (b) a premature `add_note`/"learning" stub live in routing with no backing store. **Fix:** make positive `detect_health_intent` unoverridable → `handle_morning_intent`; disable/gate the `add_note` stub out of live routing. Verify by re-sending the check-in via Mattermost.
 
+**CONFIRM-ARB — confirm-handler arbitration / bare-`yes` disambiguation (medium; own future branch off `main` after feat/health-ramp merges).** Multiple flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its *own* pending-state, and those states are **independent** — several can be live at once. A bare control word is then resolved by fixed `deterministic_chain` order (first-match-wins), which is deterministic but **not** intent-aware: a `yes` meant for flow A can silently execute flow B.
+
+- **Pending stores (independent; nothing clears the others):**
+  | flow | store | expiry |
+  |---|---|---|
+  | calendar create / delete / dupe-override, `rule add`, dossier/org set | in-mem `_pending_confirms[channel]` (single value → these are mutually exclusive *with each other*) | 600s (calendar) / none (rule, dossier) |
+  | debrief capture | `acos.system_state` `debrief_pending:{ch}` | 600s |
+  | modality swap | `acos.system_state` `modality_swap_pending:{ch}` | 600s |
+  | nutrition target / grocery staples | `acos.system_state` keys | 900s / 1800s |
+  | **ramp repeat/restart** | `health.ramp_state.pending_payload` | **none** |
+  | inbox disposition batch | `_inbox_listing_state[ch]` | none |
+- **Chain trace (bare `yes`, ramp + `rule add` both live):** duplicate_override→no · calendar/delete_confirm→no (wrong type) · debrief/swap→no pending · **ramp_confirm→WOULD match (index before rule_command)** · rule_command never reached. The confirm backstop only re-runs the in-memory calendar handlers, so it doesn't help.
+- **Worst case:** the ramp pending **never expires**, so it can coexist for days with a just-created `rule add`/dossier pending; the user types `yes` to activate the rule and (pre-fix) the ramp repeat/restart fires instead.
+- **Interim (shipped on feat/health-ramp):** `ramp_confirm` matches **only** the qualified `yes ramp`/`no ramp` and never a bare control word — it removes ramp from the bare-`yes` contention entirely. The *general* race (debrief↔swap↔nutrition↔rule↔disposition ordering) remains.
+- **Fix (this item):** a shared `_count_open_pendings(channel_id)` helper over all stores; when **>1** pending is open and a bare control word arrives, reply with a disambiguation prompt (`reply `yes ramp` or `yes rule``) and consume the word safely instead of first-match-wins; teach each confirm handler to also accept its qualified form. Keep first-match-wins when exactly one pending is open.
+
 **CRM-2 / COMMIT-1 — two-store seams (medium).** Two contact stores: `public.contacts`/`organizations` (CRM API) vs `public.persons`/`companies` (Write Guard, PB-008). Two commitment stores: `acos.commitments` (personal tracker) vs `public.commitments` (CRM contact/deal-scoped). Both intentional/legitimate, but the boundaries need documenting before the cognition layer reasons over them. `crm status` reads only the `contacts`/`public.commitments` side.
 
 **CRM-1 — `leads` has no real meaning (low).** No lead-status concept in RDS (`leads` returns same as `contacts`). Lead-status probably belongs on `deals`/pipeline, not contacts. Future schema decision, not a bug.

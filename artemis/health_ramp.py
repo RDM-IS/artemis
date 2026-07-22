@@ -761,7 +761,9 @@ def build_proposal(outcome: str, week_num: int, closed_end: date,
               f"**{verb}** from {start_sunday.isoformat()}.\n"
               f"Travel weeks stay pinned (8/18-21, 9/8-11).\n\n"
               f"```\n{'date':<15}{'current':>28}     new\n" + "\n".join(diff_lines) + "\n```")
-    footer = "\nReply `yes` to apply, `no` to keep the current plan. Nothing changes until you confirm."
+    footer = ("\nReply `yes ramp` to apply, `no ramp` to keep the current plan. "
+              "(Qualified on purpose — a bare `yes` won't touch the plan.) "
+              "Nothing changes until you confirm.")
 
     return {
         "proposal_id": pid,
