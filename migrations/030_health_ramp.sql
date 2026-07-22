@@ -54,10 +54,11 @@ END$$;
 --                            survives a restart (week_num repeats; end dates don't).
 --   pending_proposal_id:     the open repeat/restart proposal's id (NULL when none);
 --                            the engine never stacks a second proposal on top of one.
---   pending_proposal:        the FULL proposal payload (regenerated rows + diff) as
+--   pending_payload:         the FULL proposal payload (regenerated rows + diff) as
 --                            jsonb. Kept in THIS row — same table, same transaction as
 --                            the id/flag — so the gate flag and the data it needs can
---                            never diverge (no cross-store wedge). NULL when none.
+--                            never diverge (no cross-store wedge). NULL when none. The
+--                            engine self-heals a flag-set/payload-null row (clears it).
 --   revisit_prompted:        set true when the one-time week-2 ramp-revisit prompt has
 --                            fired, so it never re-fires; a restart commit re-arms it.
 --   ramp_complete:           set true once two consecutive successful weeks land.
@@ -68,14 +69,14 @@ CREATE TABLE IF NOT EXISTS health.ramp_state (
     consecutive_nonsuccess_count  int NOT NULL DEFAULT 0,
     last_evaluated_end_date       date,
     pending_proposal_id           text,
-    pending_proposal              jsonb,
+    pending_payload               jsonb,
     revisit_prompted              boolean NOT NULL DEFAULT false,
     ramp_complete                 boolean NOT NULL DEFAULT false,
     updated_at                    timestamptz NOT NULL DEFAULT now()
 );
 
 -- If the table pre-existed an earlier cut of this migration, add the newer columns.
-ALTER TABLE health.ramp_state ADD COLUMN IF NOT EXISTS pending_proposal jsonb;
+ALTER TABLE health.ramp_state ADD COLUMN IF NOT EXISTS pending_payload jsonb;
 ALTER TABLE health.ramp_state ADD COLUMN IF NOT EXISTS revisit_prompted boolean NOT NULL DEFAULT false;
 
 -- Seed the singleton. ON CONFLICT DO NOTHING keeps re-runs safe and never resets

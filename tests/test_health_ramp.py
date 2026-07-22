@@ -30,13 +30,14 @@ class FakePlanDB:
     def __init__(self):
         self.plan: dict[int, dict] = {}          # plan_id -> row
         self.logs: list[dict] = []               # {plan_id, logged_via, ct_date}
+        self.audit: list[dict] = []              # acos.audit_log rows written in-tx
         self._next_id = 1
         self.ramp_state = {
             "consecutive_success_count": 0,
             "consecutive_nonsuccess_count": 0,
             "last_evaluated_end_date": None,
             "pending_proposal_id": None,
-            "pending_proposal": None,
+            "pending_payload": None,
             "revisit_prompted": False,
             "ramp_complete": False,
         }
@@ -114,16 +115,21 @@ class FakeCursor:
         if s.startswith("SELECT consecutive_success_count"):
             self.description = [(c,) for c in ("consecutive_success_count",
                                                "consecutive_nonsuccess_count", "last_evaluated_end_date",
-                                               "pending_proposal_id", "revisit_prompted", "ramp_complete")]
+                                               "pending_proposal_id", "pending_payload",
+                                               "revisit_prompted", "ramp_complete")]
             st = self.db.ramp_state
             self._rows = [(st["consecutive_success_count"], st["consecutive_nonsuccess_count"],
                            st["last_evaluated_end_date"], st["pending_proposal_id"],
-                           st["revisit_prompted"], st["ramp_complete"])]
+                           st["pending_payload"], st["revisit_prompted"], st["ramp_complete"])]
             return
 
-        if s.startswith("SELECT pending_proposal FROM health.ramp_state"):
-            self.description = [("pending_proposal",)]
-            self._rows = [(self.db.ramp_state["pending_proposal"],)]
+        if s.startswith("SELECT pending_payload FROM health.ramp_state"):
+            self.description = [("pending_payload",)]
+            self._rows = [(self.db.ramp_state["pending_payload"],)]
+            return
+
+        if s.startswith("INSERT INTO acos.audit_log"):
+            self.db.audit.append({"action": p[2], "outcome": p[5], "metadata": p[8]})
             return
 
         if s.startswith("UPDATE health.plan SET status = %s, plan_date = %s"):
@@ -158,14 +164,14 @@ class FakeCursor:
             self.db.ramp_state.update({
                 "consecutive_success_count": sc, "consecutive_nonsuccess_count": nsc,
                 "last_evaluated_end_date": end, "pending_proposal_id": pending_id,
-                "pending_proposal": pending_json, "revisit_prompted": revisit_flag,
+                "pending_payload": pending_json, "revisit_prompted": revisit_flag,
                 "ramp_complete": ramp_complete})
             return
 
         if s.startswith("UPDATE health.ramp_state SET pending_proposal_id = NULL"):
-            # Covers commit (restart/repeat) and cancel clears.
+            # Covers commit (restart/repeat), cancel, and self-heal clears.
             self.db.ramp_state["pending_proposal_id"] = None
-            self.db.ramp_state["pending_proposal"] = None
+            self.db.ramp_state["pending_payload"] = None
             if "consecutive_success_count = 0" in s:
                 self.db.ramp_state["consecutive_success_count"] = 0
                 self.db.ramp_state["consecutive_nonsuccess_count"] = 0
@@ -217,11 +223,11 @@ class FakeMM:
 
 @contextlib.contextmanager
 def engine_env(db):
-    """Patch the engine's DB + audit surface for a run_nightly test. The pending
-    proposal is persisted atomically into db.ramp_state['pending_proposal'] by the
-    FakeCursor (no separate store), so tests assert against ramp_state directly."""
-    with mock.patch("knowledge.db.get_connection", fake_get_connection(db)), \
-         mock.patch.object(hr, "_audit", lambda *a, **k: "audit-id"):
+    """Patch the engine's DB for a run_nightly test. Audit rows are written in-tx
+    through the held cursor (captured by the FakeCursor into db.audit); the pending
+    proposal is persisted atomically into db.ramp_state['pending_payload']. Tests
+    assert against ramp_state / db.audit directly."""
+    with mock.patch("knowledge.db.get_connection", fake_get_connection(db)):
         yield db.ramp_state
 
 
@@ -461,7 +467,7 @@ class TestEvaluation(unittest.TestCase):
             summary = hr.run_nightly(mm=FakeMM(), today=date(2026, 8, 9))   # after window close
         self.assertEqual(summary["outcome"], "success")
         self.assertIsNone(summary["proposal"])
-        self.assertIsNone(db.ramp_state["pending_proposal"])   # nothing staged
+        self.assertIsNone(db.ramp_state["pending_payload"])   # nothing staged
         self.assertIsNone(db.ramp_state["pending_proposal_id"])
         self.assertEqual(db.ramp_state["consecutive_success_count"], 1)
 
@@ -476,9 +482,8 @@ class TestEvaluation(unittest.TestCase):
         self.assertIn("repeat this week", summary["proposal"])
         # Pending proposal was staged atomically in ramp_state (flag + payload).
         self.assertTrue(db.ramp_state["pending_proposal_id"])
-        self.assertIsNotNone(db.ramp_state["pending_proposal"])
-        payload = json.loads(db.ramp_state["pending_proposal"])
-        self.assertEqual(payload["channel_id"], "chan-artemis-ryan")   # channel-scoped
+        self.assertIsNotNone(db.ramp_state["pending_payload"])
+        payload = json.loads(db.ramp_state["pending_payload"])
         # Travel stays pinned in the staged rows.
         new = {date.fromisoformat(r["plan_date"]): r for r in payload["rows"]}
         self.assertEqual(new[date(2026, 8, 18)]["session_type"], "strength_c")
@@ -523,10 +528,24 @@ class TestEvaluation(unittest.TestCase):
     def test_open_proposal_holds_further_evaluation(self):
         db = FakePlanDB()
         db.ramp_state["pending_proposal_id"] = "ramp_repeat_wk1_2026-08-02"
+        db.ramp_state["pending_payload"] = json.dumps({"proposal_id": "x"})  # real pending
         self._seed_week_with_completions(db, ["SUN", "MON"])            # would be restart
         with engine_env(db):
             summary = hr.run_nightly(mm=FakeMM(), today=date(2026, 8, 9))
         self.assertIsNone(summary["evaluated"])                        # held
+
+    def test_self_heal_clears_flag_with_null_payload(self):
+        # F1 self-heal: flag set but payload NULL (legacy/corruption) must not wedge
+        # — the nightly clears it, audits it, and proceeds to evaluate.
+        db = FakePlanDB()
+        db.ramp_state["pending_proposal_id"] = "orphan_flag"
+        db.ramp_state["pending_payload"] = None
+        self._seed_week_with_completions(db, ["SUN", "MON", "TUE", "THU", "FRI"])
+        with engine_env(db):
+            summary = hr.run_nightly(mm=FakeMM(), today=date(2026, 8, 9))
+        self.assertIsNone(db.ramp_state["pending_proposal_id"])        # healed
+        self.assertTrue(any(a["action"] == "ramp_pending_self_heal" for a in db.audit))
+        self.assertIsNotNone(summary["evaluated"])                     # not wedged
 
 
 class TestConfirmPath(unittest.TestCase):
@@ -536,17 +555,16 @@ class TestConfirmPath(unittest.TestCase):
         _standard_week(db, week_num=3, sunday=date(2026, 8, 9))
         current = hr.build_rows(hr.build_initial_schedule())
         proposal = hr.build_proposal("repeat", week_num=3, closed_end=date(2026, 8, 8),
-                                     current_future_rows=current, channel_id="chan")
+                                     current_future_rows=current)
         # Stage it in ramp_state, as the nightly would.
         db.ramp_state["pending_proposal_id"] = proposal["proposal_id"]
-        db.ramp_state["pending_proposal"] = json.dumps(proposal)
+        db.ramp_state["pending_payload"] = json.dumps(proposal)
         db.ramp_state["consecutive_nonsuccess_count"] = 1
 
         with mock.patch("knowledge.db.get_connection", fake_get_connection(db)), \
-             mock.patch.object(hr, "_audit", lambda *a, **k: "aid"), \
              mock.patch.object(hr, "load_ramp_pending",
-                               lambda c=None: json.loads(db.ramp_state["pending_proposal"])
-                               if db.ramp_state["pending_proposal"] else None):
+                               lambda c=None: json.loads(db.ramp_state["pending_payload"])
+                               if db.ramp_state["pending_payload"] else None):
             reply = hr.commit_ramp_proposal("chan")
 
         # Rendered from the written rows (real count + date span), not the proposal.
@@ -555,8 +573,10 @@ class TestConfirmPath(unittest.TestCase):
         self.assertIn(str(n_written), reply)
         # Pending cleared and counters reset atomically (no restart loop).
         self.assertIsNone(db.ramp_state["pending_proposal_id"])
-        self.assertIsNone(db.ramp_state["pending_proposal"])
+        self.assertIsNone(db.ramp_state["pending_payload"])
         self.assertEqual(db.ramp_state["consecutive_nonsuccess_count"], 0)
+        # Commit audited transactionally.
+        self.assertTrue(any(a["action"] == "ramp_proposal_commit" for a in db.audit))
         # Travel still pinned in what actually landed.
         landed = {r["plan_date"]: r for r in db.plan.values()}
         self.assertEqual(landed[date(2026, 8, 18)]["session_type"], "strength_c")
@@ -566,6 +586,37 @@ class TestConfirmPath(unittest.TestCase):
         with mock.patch.object(hr, "load_ramp_pending", lambda c: None):
             reply = hr.commit_ramp_proposal("chan")
         self.assertIn("Nothing pending", reply)
+
+    def test_restart_confirmed_then_4of5_does_not_re_restart(self):
+        # F2: nsc=2 → restart confirmed (resets counters) → the fresh week scores
+        # 4/5 → classify sees nsc=0 → repeat, NOT another restart.
+        db = FakePlanDB()
+        db.ramp_state["consecutive_nonsuccess_count"] = 2
+        # Stage + commit a restart from Sun 8/23 (regenerated week 1 lands there).
+        current = hr.build_rows(hr.build_initial_schedule())
+        proposal = hr.build_proposal("restart", week_num=5, closed_end=date(2026, 8, 22),
+                                     current_future_rows=current)
+        db.ramp_state["pending_proposal_id"] = proposal["proposal_id"]
+        db.ramp_state["pending_payload"] = json.dumps(proposal)
+        with mock.patch("knowledge.db.get_connection", fake_get_connection(db)), \
+             mock.patch.object(hr, "load_ramp_pending",
+                               lambda c=None: json.loads(db.ramp_state["pending_payload"])
+                               if db.ramp_state["pending_payload"] else None):
+            hr.commit_ramp_proposal("chan")
+        self.assertEqual(db.ramp_state["consecutive_nonsuccess_count"], 0)   # clean slate
+
+        # The regenerated week 1 (Sun 8/23 start) scores 4/5; evaluate after close.
+        anchor = date(2026, 8, 23)
+        # Mark 4 of the regenerated week-1 rows completed via logs.
+        wk1 = sorted((r for r in db.plan.values()
+                      if hr._week_anchor(r["plan_date"]) == anchor), key=lambda r: r["plan_date"])
+        for r in wk1[:4]:
+            r["status"] = "completed"
+            db.add_log(r["plan_id"], ct_date=r["plan_date"])
+        with engine_env(db):
+            summary = hr.run_nightly(mm=FakeMM(), today=date(2026, 8, 30))
+        self.assertEqual(summary["evaluated"]["completed"], 4)
+        self.assertEqual(summary["outcome"], "repeat")    # not "restart"
 
 
 if __name__ == "__main__":

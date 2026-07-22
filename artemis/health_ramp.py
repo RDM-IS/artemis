@@ -62,10 +62,11 @@ TRAVEL_ANCHORS = {date(2026, 8, 16), date(2026, 9, 6)}
 # The one-time Sat-for-Sun swap: week 1's long Z2 lands on Sat 7/25, not Sun 7/26.
 _WEEK1_SUN_OVERRIDE = date(2026, 7, 25)
 
-# The durable pending-proposal payload lives in health.ramp_state.pending_proposal
+# The durable pending-proposal payload lives in health.ramp_state.pending_payload
 # (jsonb) — the SAME row and transaction as pending_proposal_id, so the gate flag
 # and the data needed to apply it can never diverge (no cross-store wedge). The
-# proposal carries the ops channel_id so the confirm handler stays channel-scoped.
+# confirm handler scopes to the ops channel (resolved at read time), so nothing
+# channel-specific is stored in the payload.
 
 
 # ============================================================================
@@ -419,6 +420,57 @@ def seed_initial(cur) -> list[dict]:
     return rows
 
 
+# pg_constraint.confdeltype codes → human labels.
+_FK_DELTYPE = {"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE",
+               "n": "SET NULL", "d": "SET DEFAULT"}
+
+
+def fk_delete_preflight(cur, delete_from: date):
+    """Inspect the health.session_log → health.plan FK before a delete-forward.
+
+    Returns (ok, report_text). NOT ok — the caller must abort — when any
+    session_log row references a plan row in the delete-set, OR the FK is ON DELETE
+    CASCADE (either would destroy real log data). Read-only; safe in dry-run and
+    re-run in commit mode."""
+    cur.execute(
+        "SELECT c.conname, pg_get_constraintdef(c.oid), c.confdeltype "
+        "FROM pg_constraint c "
+        "JOIN pg_class t ON t.oid = c.conrelid "
+        "JOIN pg_namespace n ON n.oid = t.relnamespace "
+        "WHERE n.nspname = 'health' AND t.relname = 'session_log' AND c.contype = 'f' "
+        "AND c.confrelid = 'health.plan'::regclass")
+    fks = cur.fetchall()
+
+    cur.execute("SELECT count(*) FROM health.plan WHERE plan_date >= %s", (delete_from,))
+    delete_count = cur.fetchone()[0]
+    cur.execute(
+        "SELECT count(*) FROM health.session_log sl "
+        "JOIN health.plan p ON sl.plan_id = p.plan_id "
+        "WHERE p.plan_date >= %s", (delete_from,))
+    ref_count = cur.fetchone()[0]
+
+    cascade = any(row[2] == "c" for row in fks)
+    lines = [f"[fk-preflight] delete health.plan WHERE plan_date >= {delete_from.isoformat()}:"]
+    for name, defn, deltype in fks:
+        lines.append(f"  session_log FK {name}: {defn} "
+                     f"(on_delete={_FK_DELTYPE.get(deltype, deltype)})")
+    if not fks:
+        lines.append("  (no session_log→plan FK found)")
+    lines.append(f"  delete-set rows:              {delete_count}")
+    lines.append(f"  referencing session_log rows: {ref_count}")
+
+    ok = ref_count == 0 and not cascade
+    if cascade:
+        lines.append("  ABORT: FK is ON DELETE CASCADE — a delete-forward would cascade "
+                     "session_log rows.")
+    if ref_count > 0:
+        lines.append(f"  ABORT: {ref_count} session_log row(s) reference the delete-set — "
+                     "refusing to delete real log data.")
+    if ok:
+        lines.append("  OK: no logged sessions in the delete-set; FK is not CASCADE.")
+    return ok, "\n".join(lines)
+
+
 # ============================================================================
 # Week windows (CT calendar). Grouping is date-based, so it is robust across a
 # restart (where week_num repeats).
@@ -608,36 +660,44 @@ def _regen_sequence(outcome: str, week_num: int) -> list[int]:
 
 
 # ============================================================================
-# Durable pending proposal (system_state KV) + audit
+# Durable pending proposal (health.ramp_state.pending_payload) + audit
 # ============================================================================
 
-def _audit(action: str, outcome: str, metadata: dict) -> str:
-    try:
-        from knowledge.db import log_audit
-        return log_audit(agent="health_ramp", action=action, domain="health",
-                         outcome=outcome, metadata=metadata)
-    except Exception:
-        logger.exception("ramp audit write failed (%s/%s)", action, outcome)
-        return ""
+# Column order mirrors knowledge.db.log_audit's base INSERT exactly, so writing a
+# row through a held cursor (transactional) produces the same shape as the helper.
+_AUDIT_COLUMNS = ("agent", "persona", "action", "domain", "confidence",
+                  "outcome", "token_count", "api_cost_usd", "metadata")
+
+
+def _audit_tx(cur, action: str, outcome: str, metadata: dict) -> None:
+    """Write an acos.audit_log row through the CALLER's cursor, so the audit lands
+    in the SAME transaction as the change it records (the 'every slide writes
+    audit_log' invariant). Mirrors knowledge.db.log_audit's base columns."""
+    cur.execute(
+        f"INSERT INTO acos.audit_log ({', '.join(_AUDIT_COLUMNS)}) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+        ("health_ramp", None, action, "health", None, outcome, 0, 0.0,
+         json.dumps(metadata or {})),
+    )
 
 
 def load_ramp_pending(channel_id: str | None = None) -> dict | None:
-    """Read the open proposal payload from health.ramp_state (singleton). The
-    channel_id arg is advisory (the confirm handler passes the reply channel); the
-    payload itself carries the ops channel_id the handler matches against.
+    """Read the open proposal payload from health.ramp_state.pending_payload
+    (singleton). channel_id is unused — the confirm handler scopes on the ops
+    channel resolved at read time, not on anything in the payload.
 
     Defensive: this runs on EVERY inbound message (the confirm handler gates on it),
     so a DB read failure must never propagate — it degrades to 'no pending' and the
     handler falls through rather than crashing the router."""
     from knowledge.db import execute_one
     try:
-        row = execute_one("SELECT pending_proposal FROM health.ramp_state WHERE id = 1")
+        row = execute_one("SELECT pending_payload FROM health.ramp_state WHERE id = 1")
     except Exception:
-        logger.debug("ramp: could not read pending proposal", exc_info=True)
+        logger.debug("ramp: could not read pending payload", exc_info=True)
         return None
     if not row:
         return None
-    payload = row.get("pending_proposal")
+    payload = row.get("pending_payload")
     if not payload:
         return None
     if isinstance(payload, str):
@@ -671,10 +731,11 @@ def _proposal_id(outcome: str, week_num: int, start_sunday: date) -> str:
 
 
 def build_proposal(outcome: str, week_num: int, closed_end: date,
-                   current_future_rows: list[dict], channel_id: str | None = None) -> dict:
+                   current_future_rows: list[dict]) -> dict:
     """Build a repeat/restart proposal: the regenerated rows, the delete cutoff,
-    and a human diff table (old → new by date). Writes NOTHING. channel_id (the ops
-    channel) is stored in the payload so the confirm handler stays channel-scoped."""
+    and a human diff table (old → new by date). Writes NOTHING. The confirm handler
+    scopes to the ops channel resolved at read time, so nothing channel-specific is
+    stored in the payload."""
     start_sunday = closed_end + timedelta(days=1)  # the following calendar week
     seq = _regen_sequence(outcome, week_num)
     new_specs = build_regenerated_schedule(seq, start_sunday)
@@ -710,7 +771,6 @@ def build_proposal(outcome: str, week_num: int, closed_end: date,
         "delete_from": start_sunday.isoformat(),
         "rows": _serialize_rows(new_rows),
         "text": header + footer,
-        "channel_id": channel_id,
         "created_at": datetime.now(CT).isoformat(),
     }
 
@@ -726,7 +786,7 @@ def commit_ramp_proposal(channel_id: str) -> str:
     rows = _deserialize_rows(payload.get("rows", []))
     delete_from = date.fromisoformat(payload["delete_from"])
     outcome = payload.get("outcome")
-    # Applying a proposal is a clean slate: reset the tier counters (so a fresh
+    # Applying a proposal is a clean slate: reset BOTH tier counters (so a fresh
     # imperfect week after a restart/repeat can't immediately re-restart). A
     # RESTART re-arms the one-time week-2 revisit prompt (a restart is a new ramp).
     from knowledge.db import get_connection
@@ -737,29 +797,29 @@ def commit_ramp_proposal(channel_id: str) -> str:
                 if outcome == "restart":
                     cur.execute(
                         "UPDATE health.ramp_state SET pending_proposal_id = NULL, "
-                        "pending_proposal = NULL, consecutive_success_count = 0, "
+                        "pending_payload = NULL, consecutive_success_count = 0, "
                         "consecutive_nonsuccess_count = 0, revisit_prompted = false, "
                         "updated_at = now() WHERE id = 1")
                 else:
                     cur.execute(
                         "UPDATE health.ramp_state SET pending_proposal_id = NULL, "
-                        "pending_proposal = NULL, consecutive_success_count = 0, "
+                        "pending_payload = NULL, consecutive_success_count = 0, "
                         "consecutive_nonsuccess_count = 0, updated_at = now() WHERE id = 1")
                 # Re-read what was actually written for the confirmation.
                 cur.execute(
                     "SELECT plan_date, week_num, blocks FROM health.plan "
                     "WHERE plan_date >= %s ORDER BY plan_date", (delete_from,))
                 written = cur.fetchall()
+                # Audit in the SAME transaction as the reseed it records.
+                _audit_tx(cur, "ramp_proposal_commit", "executed", {
+                    "proposal_id": payload.get("proposal_id"),
+                    "outcome": outcome,
+                    "delete_from": payload["delete_from"],
+                    "rows_written": len(written),
+                })
     except Exception:
         logger.exception("ramp proposal commit failed")
         return "⚠️ Couldn't apply the ramp change — nothing was written. Check DB."
-
-    _audit("ramp_proposal_commit", "executed", {
-        "proposal_id": payload.get("proposal_id"),
-        "outcome": payload.get("outcome"),
-        "delete_from": payload["delete_from"],
-        "rows_written": len(written),
-    })
 
     n = len(written)
     first = written[0][0].isoformat() if written else "?"
@@ -770,15 +830,18 @@ def commit_ramp_proposal(channel_id: str) -> str:
 
 def cancel_ramp_proposal(channel_id: str) -> str:
     payload = load_ramp_pending(channel_id)
+    from knowledge.db import get_connection
     try:
-        from knowledge.db import execute_write
-        execute_write("UPDATE health.ramp_state SET pending_proposal_id = NULL, "
-                      "pending_proposal = NULL, updated_at = now() WHERE id = 1")
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE health.ramp_state SET pending_proposal_id = NULL, "
+                    "pending_payload = NULL, updated_at = now() WHERE id = 1")
+                _audit_tx(cur, "ramp_proposal_cancel", "cancelled",
+                          {"proposal_id": (payload or {}).get("proposal_id")})
     except Exception:
         logger.exception("ramp cancel: failed to clear pending marker")
         return "⚠️ Couldn't clear the pending proposal — check DB."
-    _audit("ramp_proposal_cancel", "cancelled",
-           {"proposal_id": (payload or {}).get("proposal_id")})
     return "Kept the current plan — nothing changed."
 
 
@@ -789,14 +852,14 @@ def cancel_ramp_proposal(channel_id: str) -> str:
 def _read_ramp_state(cur) -> dict:
     cur.execute(
         "SELECT consecutive_success_count, consecutive_nonsuccess_count, "
-        "last_evaluated_end_date, pending_proposal_id, revisit_prompted, ramp_complete "
-        "FROM health.ramp_state WHERE id = 1")
+        "last_evaluated_end_date, pending_proposal_id, pending_payload, "
+        "revisit_prompted, ramp_complete FROM health.ramp_state WHERE id = 1")
     row = cur.fetchone()
     if row is None:
         cur.execute("INSERT INTO health.ramp_state (id) VALUES (1) ON CONFLICT DO NOTHING")
         return {"consecutive_success_count": 0, "consecutive_nonsuccess_count": 0,
                 "last_evaluated_end_date": None, "pending_proposal_id": None,
-                "revisit_prompted": False, "ramp_complete": False}
+                "pending_payload": None, "revisit_prompted": False, "ramp_complete": False}
     cols = [c[0] for c in cur.description]
     return dict(zip(cols, row))
 
@@ -811,28 +874,19 @@ def run_nightly(mm=None, *, today: date | None = None, dry_run: bool = False) ->
     proposal to #artemis-ryan. Slides auto-apply (audited); repeat/restart only
     ever PROPOSE. Returns a summary dict (also the test surface).
 
-    All health.plan / ramp_state writes land in ONE transaction. Side-effects
-    (audit rows, the durable pending KV, Mattermost posts) are flushed AFTER that
-    transaction commits, so nothing is audited or staged for a change that didn't
-    persist — and no second pool connection is taken while the first is held."""
+    All health.plan / ramp_state writes AND their audit rows land in ONE
+    transaction (slide/eval/propose audits go through the held cursor via
+    _audit_tx), so nothing is audited for a change that didn't persist and the
+    audit invariant holds. Only the Mattermost posts are flushed best-effort after
+    commit. The pending proposal (flag + payload) is written atomically into
+    health.ramp_state, so a confirm can always find it — no cross-store wedge."""
     from knowledge.db import get_connection
     import artemis.config as config
 
     today = today or _ct_today()
     summary: dict = {"today": today.isoformat(), "completed": [], "slides": [],
                      "evaluated": None, "outcome": None, "notices": [], "proposal": None}
-    audit_events: list[tuple[str, str, dict]] = []
     pending_payload: dict | None = None
-
-    # Resolve the ops channel up front so the proposal payload can carry it (the
-    # confirm handler scopes on it). Best-effort — a proposal can still be staged
-    # and applied without it (it just isn't channel-scoped).
-    channel_id = None
-    if mm is not None:
-        try:
-            channel_id = mm.get_channel_id(config.CHANNEL_OPS)
-        except Exception:
-            logger.exception("ramp nightly: could not resolve #artemis-ryan channel id")
 
     try:
         with get_connection() as conn:
@@ -843,6 +897,21 @@ def run_nightly(mm=None, *, today: date | None = None, dry_run: bool = False) ->
                 raise _DryRunRollback()  # nothing to do — release without writing
 
             state = _read_ramp_state(cur)
+
+            # Self-heal: a flag set with a NULL payload (a legacy row, or a crash in
+            # an older cross-store build) would wedge the engine forever — every
+            # nightly would hold evaluation and no confirm could find the payload.
+            # Clear the flag, audit it, and proceed as if nothing were pending.
+            if state.get("pending_proposal_id") and not state.get("pending_payload"):
+                logger.warning("ramp nightly: pending_proposal_id set with NULL "
+                               "pending_payload — self-healing (clearing flag)")
+                cur.execute("UPDATE health.ramp_state SET pending_proposal_id = NULL, "
+                            "pending_payload = NULL, updated_at = now() WHERE id = 1")
+                _audit_tx(cur, "ramp_pending_self_heal", "cleared",
+                          {"stale_proposal_id": state.get("pending_proposal_id")})
+                summary["notices"].append(
+                    "⚠️ Cleared a stale ramp proposal marker (no payload found).")
+                state["pending_proposal_id"] = None
 
             # 1) completions, 2) slides
             newly_completed = mark_completions(cur, rows, today)
@@ -860,9 +929,10 @@ def run_nightly(mm=None, *, today: date | None = None, dry_run: bool = False) ->
                 else:
                     note = f"✗ **{label}** ({a['from'].isoformat()}) missed — no makeup slot left this week."
                 summary["notices"].append(note)
-                audit_events.append(("ramp_slide", a["action"],
-                                     {"session": label, "from": a["from"].isoformat(),
-                                      "to": a["to"].isoformat() if a["to"] else None}))
+                # Transactional: every slide's audit row commits with the slide.
+                _audit_tx(cur, "ramp_slide", a["action"],
+                          {"session": label, "from": a["from"].isoformat(),
+                           "to": a["to"].isoformat() if a["to"] else None})
 
             # 3) evaluate the earliest closed, not-yet-evaluated week (unless a
             #    proposal is already open — never stack two).
@@ -906,29 +976,29 @@ def run_nightly(mm=None, *, today: date | None = None, dry_run: bool = False) ->
                     summary["notices"].append(
                         f"✅ Week {week_num}: 5/5 completed. Nice — that's a successful week.")
                 else:
-                    proposal = build_proposal(outcome, week_num, end, rows, channel_id=channel_id)
+                    proposal = build_proposal(outcome, week_num, end, rows)
                     pending_id = proposal["proposal_id"]
                     pending_payload = proposal
                     summary["proposal"] = proposal["text"]
                     summary["notices"].append(proposal["text"])
-                    audit_events.append(("ramp_propose", outcome,
-                                         {"proposal_id": pending_id, "week_num": week_num,
-                                          "completed": completed}))
+                    _audit_tx(cur, "ramp_propose", outcome,
+                              {"proposal_id": pending_id, "week_num": week_num,
+                               "completed": completed})
 
-                audit_events.append(("ramp_evaluate", outcome,
-                                     {"week_num": week_num, "completed": completed,
-                                      "consecutive_success": sc, "consecutive_nonsuccess": nsc}))
+                _audit_tx(cur, "ramp_evaluate", outcome,
+                          {"week_num": week_num, "completed": completed,
+                           "consecutive_success": sc, "consecutive_nonsuccess": nsc})
 
                 # Fire the one-time week-2 revisit prompt at most once per ramp.
                 revisit_now = (week_num == 2 and not state.get("revisit_prompted"))
                 revisit_flag = bool(state.get("revisit_prompted")) or revisit_now
 
                 # Atomic: the gate flag AND the payload it needs land together — no
-                # cross-store wedge. pending_proposal is NULL when there is no proposal.
+                # cross-store wedge. pending_payload is NULL when there is no proposal.
                 cur.execute(
                     "UPDATE health.ramp_state SET consecutive_success_count = %s, "
                     "consecutive_nonsuccess_count = %s, last_evaluated_end_date = %s, "
-                    "pending_proposal_id = %s, pending_proposal = %s::jsonb, "
+                    "pending_proposal_id = %s, pending_payload = %s::jsonb, "
                     "revisit_prompted = %s, ramp_complete = %s, updated_at = now() "
                     "WHERE id = 1",
                     (sc, nsc, end, pending_id,
@@ -957,12 +1027,8 @@ def run_nightly(mm=None, *, today: date | None = None, dry_run: bool = False) ->
     if dry_run:
         return summary  # no side-effects on a dry run
 
-    # ── Side-effects AFTER the atomic write: audit ledger + Mattermost. The
-    #    pending proposal was already persisted atomically inside the transaction
-    #    (health.ramp_state.pending_proposal), so there is nothing to stage here. ──
-    for action, outcome, meta in audit_events:
-        _audit(action, outcome, meta)
-
+    # ── Only Mattermost is flushed after commit. Audit rows and the pending
+    #    proposal (flag + payload) were already written inside the transaction. ──
     if mm is not None:
         for note in summary["notices"]:
             try:

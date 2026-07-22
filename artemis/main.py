@@ -3716,22 +3716,27 @@ def _handle_swap_confirm(post: dict, question: str) -> bool:
 
 def _handle_ramp_confirm(post: dict, question: str) -> bool:
     """Confirm/cancel leg for a pending ramp repeat/restart proposal (feat/health-
-    ramp). The nightly job posts the proposal and stores a durable pending payload
-    keyed by this channel; a bare `yes`/`no` only acts when one is actually staged,
-    so it can never reach the LLM. On confirm the regenerated rows are written in
-    one transaction and the confirmation is rendered from the WRITTEN rows.
-    Returns True if handled."""
+    ramp). The nightly job stages the proposal (flag + payload) atomically in
+    health.ramp_state and posts it to the ops channel; a bare `yes`/`no` only acts
+    when one is actually staged AND the reply is in the ops channel, so it can never
+    reach the LLM or be triggered from another channel. On confirm the regenerated
+    rows are written in one transaction and the confirmation is rendered from the
+    WRITTEN rows. Returns True if handled."""
     from artemis.health_ramp import (
         cancel_ramp_proposal, commit_ramp_proposal, load_ramp_pending,
     )
+    import artemis.config as config
 
     channel_id = post.get("channel_id", "")
-    pending = load_ramp_pending(channel_id)
-    if pending is None:
+    if load_ramp_pending(channel_id) is None:
         return False
-    # Channel-scoped: only act in the channel the proposal was posted to (the ops
-    # channel). If the payload didn't capture a channel, fall through to matching.
-    if pending.get("channel_id") and pending["channel_id"] != channel_id:
+    # Channel-scoped: only act in the ops channel (#artemis-ryan), resolved at read
+    # time. The proposal is only ever posted there.
+    try:
+        ops_channel_id = _mm.get_channel_id(config.CHANNEL_OPS) if _mm else None
+    except Exception:
+        ops_channel_id = None
+    if ops_channel_id is not None and channel_id != ops_channel_id:
         return False
 
     q = question.lower().strip()

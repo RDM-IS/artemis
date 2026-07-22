@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.11
 """Validate health.plan against the locked PB-009 program — READ-ONLY.
 
 This script NEVER writes and makes NO LLM calls. It reads the next 28 days of
@@ -23,10 +24,17 @@ Run (the script loads .env itself; live RDS must be reached from inside the VPC)
     python scripts/validate_health_plan.py --self-test --fault  # inject faults; expect FAIL/exit 1
 """
 
+import sys
+
+# Pre-import version guard (see reseed_health_plan_v2.py). Parses under 3.9; the
+# 3.11-only artemis.health_ramp is imported lazily inside the --ramp path.
+if sys.version_info < (3, 11):
+    sys.exit("validate_health_plan.py requires Python 3.11+ "
+             "(run: /usr/bin/python3.11 scripts/validate_health_plan.py ...).")
+
 import argparse
 import json
 import os
-import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path

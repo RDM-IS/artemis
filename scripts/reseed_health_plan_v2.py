@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.11
 """Reseed health.plan in place (idempotent) — PB-009 program v2.
 
 Updates EVERY existing row in health.plan via INSERT ... ON CONFLICT (plan_date)
@@ -61,15 +62,27 @@ EC2). The live RDS is in a private VPC, so this must be run from inside the VPC
 (the EC2 host), not a laptop.
 """
 
+import sys
+
+# Pre-import version guard. The runtime + this tooling target Python 3.11 (the box
+# runs acos under python3.11 and the deploy invokes /usr/bin/python3.11). The
+# module parses under 3.9 (typing.Optional, no `X | Y` unions), so a stray
+# `python3 scripts/reseed_health_plan_v2.py` on the box (default python3 = 3.9)
+# fails fast with a clear message instead of a cryptic annotation TypeError once it
+# reaches the 3.11-only artemis.health_ramp import.
+if sys.version_info < (3, 11):
+    sys.exit("reseed_health_plan_v2.py requires Python 3.11+ "
+             "(run: /usr/bin/python3.11 scripts/reseed_health_plan_v2.py ...).")
+
 import argparse
 import copy
 import json
 import os
 import re
-import sys
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -87,7 +100,7 @@ RESEED_TAG = "reseed_v2"
 _RESEED_TAG_RE = re.compile(r"\s*\|?\s*reseed_v2\b[^|]*", re.IGNORECASE)
 
 
-def _compose_notes(existing_notes: str | None, program_label: str, run_iso: str) -> str:
+def _compose_notes(existing_notes: Optional[str], program_label: str, run_iso: str) -> str:
     """Append a 'reseed_v2 <ISO-date>' provenance tag to a row's notes.
 
     Keeps any existing notes content (append, don't overwrite); falls back to the
@@ -293,7 +306,7 @@ _BUILDERS = {
 
 
 def build_row(plan_date: date, phase: int, week_num: int,
-              existing_notes: str | None = None, run_date: date | None = None) -> dict:
+              existing_notes: Optional[str] = None, run_date: Optional[date] = None) -> dict:
     """Build the full reseed payload for one existing plan row.
 
     phase and week_num come from the EXISTING row and are passed through
@@ -573,12 +586,26 @@ def reseed_ramp(dry_run: bool) -> int:
               f"will be REPLACED by {len(rows)} ramp rows "
               f"({hr.RAMP_START.isoformat()} .. {hr.RAMP_END.isoformat()}, weeks 1-7).")
 
+        # FK-aware delete-forward preflight: never silently drop or cascade real
+        # session_log rows. Runs here (dry-run) and is re-checked before the commit.
+        ok, report = hr.fk_delete_preflight(cur, hr.RAMP_START)
+        print(report)
+        if not ok:
+            conn.rollback()
+            raise SystemExit("[ABORT] FK preflight failed — refusing the delete-forward.")
+
         if dry_run:
             conn.rollback()
             print("[DRY-RUN] (default) No rows written. Re-run with --ramp --commit to write.")
             return 0
 
         try:
+            # Re-check immediately before writing (state could have changed).
+            ok2, report2 = hr.fk_delete_preflight(cur, hr.RAMP_START)
+            if not ok2:
+                conn.rollback()
+                print(report2)
+                raise SystemExit("[ABORT] FK preflight failed at commit — nothing written.")
             hr.write_rows(cur, rows, hr.RAMP_START)
             conn.commit()
         except Exception:
