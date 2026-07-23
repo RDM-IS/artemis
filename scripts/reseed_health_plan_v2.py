@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.11
 """Reseed health.plan in place (idempotent) — PB-009 program v2.
 
 Updates EVERY existing row in health.plan via INSERT ... ON CONFLICT (plan_date)
@@ -46,21 +47,42 @@ Run (no fragile shell sourcing — the script loads .env itself):
     python scripts/reseed_health_plan_v2.py --commit      # read+compute+WRITE
     python scripts/reseed_health_plan_v2.py --self-test   # no DB; synthetic preview
 
+Ramp mode (feat/health-ramp) — the weeks 1-7 reintroduction schedule. This mode
+REPLACES every row on/after 2026-07-25 with the 35 explicit dated ramp rows and
+hard-stops after 2026-09-11 (no week 8+). The schedule + block builders live in
+artemis.health_ramp (shared with the runtime slide/tier engine); this CLI is the
+seeder entry point:
+    python scripts/reseed_health_plan_v2.py --ramp             # DRY-RUN (default)
+    python scripts/reseed_health_plan_v2.py --ramp --commit    # delete-forward + WRITE
+    python scripts/reseed_health_plan_v2.py --ramp --self-test # no DB; schedule preview
+
 Connection: uses $DATABASE_URL if set (parsed from .env if present); otherwise
 falls back to knowledge.db.get_connection() (RDS_HOST + Secrets Manager, as on
 EC2). The live RDS is in a private VPC, so this must be run from inside the VPC
 (the EC2 host), not a laptop.
 """
 
+import sys
+
+# Pre-import version guard. The runtime + this tooling target Python 3.11 (the box
+# runs acos under python3.11 and the deploy invokes /usr/bin/python3.11). The
+# module parses under 3.9 (typing.Optional, no `X | Y` unions), so a stray
+# `python3 scripts/reseed_health_plan_v2.py` on the box (default python3 = 3.9)
+# fails fast with a clear message instead of a cryptic annotation TypeError once it
+# reaches the 3.11-only artemis.health_ramp import.
+if sys.version_info < (3, 11):
+    sys.exit("reseed_health_plan_v2.py requires Python 3.11+ "
+             "(run: /usr/bin/python3.11 scripts/reseed_health_plan_v2.py ...).")
+
 import argparse
 import copy
 import json
 import os
 import re
-import sys
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -78,7 +100,7 @@ RESEED_TAG = "reseed_v2"
 _RESEED_TAG_RE = re.compile(r"\s*\|?\s*reseed_v2\b[^|]*", re.IGNORECASE)
 
 
-def _compose_notes(existing_notes: str | None, program_label: str, run_iso: str) -> str:
+def _compose_notes(existing_notes: Optional[str], program_label: str, run_iso: str) -> str:
     """Append a 'reseed_v2 <ISO-date>' provenance tag to a row's notes.
 
     Keeps any existing notes content (append, don't overwrite); falls back to the
@@ -284,7 +306,7 @@ _BUILDERS = {
 
 
 def build_row(plan_date: date, phase: int, week_num: int,
-              existing_notes: str | None = None, run_date: date | None = None) -> dict:
+              existing_notes: Optional[str] = None, run_date: Optional[date] = None) -> dict:
     """Build the full reseed payload for one existing plan row.
 
     phase and week_num come from the EXISTING row and are passed through
@@ -520,17 +542,100 @@ def reseed(dry_run: bool) -> int:
         return len(rows)
 
 
+# ---------------------------------------------------------------------------
+# Ramp mode (feat/health-ramp) — delegates the schedule + builders to
+# artemis.health_ramp; this file owns the connection + dry-run/commit discipline.
+# ---------------------------------------------------------------------------
+
+def _ramp_self_test() -> None:
+    import artemis.health_ramp as hr
+    print("RAMP SELF-TEST (no DB) — weeks 1-7 schedule\n")
+    rows = hr.build_rows(hr.build_initial_schedule())
+    hr.validate_ramp_rows(rows)
+    print(f"{'DATE':<12}{'WD':<5}{'WK':<4}{'SESSION_TYPE':<18}SESSION")
+    print("-" * 70)
+    for r in rows:
+        d = r["plan_date"]
+        print(f"{d.isoformat():<12}{d.strftime('%a'):<5}{r['week_num']:<4}"
+              f"{r['session_type']:<18}{r['blocks']['display_name']}")
+    print("-" * 70)
+    print(f"{len(rows)} rows, {hr.RAMP_START.isoformat()} .. "
+          f"{max(r['plan_date'] for r in rows).isoformat()} "
+          f"(hard stop {hr.RAMP_END.isoformat()})")
+    assert len(rows) == 35, f"expected 35 rows, got {len(rows)}"
+    assert max(r["plan_date"] for r in rows) == hr.RAMP_END, "rows escaped week 7"
+    print("Ramp self-test OK.")
+
+
+def reseed_ramp(dry_run: bool) -> int:
+    import artemis.health_ramp as hr
+    _load_dotenv()
+    rows = hr.build_rows(hr.build_initial_schedule())
+    hr.validate_ramp_rows(rows)
+    with _connect() as conn:
+        cur = conn.cursor()
+        ok, msg = _preflight(cur)
+        print(f"[preflight] {msg}")
+        if not ok and not dry_run:
+            conn.rollback()
+            raise SystemExit(f"[ABORT] {msg}")
+
+        cur.execute("SELECT count(*) FROM health.plan WHERE plan_date >= %s", (hr.RAMP_START,))
+        to_replace = cur.fetchone()[0]
+        print(f"\nRamp reseed: {to_replace} existing row(s) >= {hr.RAMP_START.isoformat()} "
+              f"will be REPLACED by {len(rows)} ramp rows "
+              f"({hr.RAMP_START.isoformat()} .. {hr.RAMP_END.isoformat()}, weeks 1-7).")
+
+        # FK-aware delete-forward preflight: never silently drop or cascade real
+        # session_log rows. Runs here (dry-run) and is re-checked before the commit.
+        ok, report = hr.fk_delete_preflight(cur, hr.RAMP_START)
+        print(report)
+        if not ok:
+            conn.rollback()
+            raise SystemExit("[ABORT] FK preflight failed — refusing the delete-forward.")
+
+        if dry_run:
+            conn.rollback()
+            print("[DRY-RUN] (default) No rows written. Re-run with --ramp --commit to write.")
+            return 0
+
+        try:
+            # Re-check immediately before writing (state could have changed).
+            ok2, report2 = hr.fk_delete_preflight(cur, hr.RAMP_START)
+            if not ok2:
+                conn.rollback()
+                print(report2)
+                raise SystemExit("[ABORT] FK preflight failed at commit — nothing written.")
+            hr.write_rows(cur, rows, hr.RAMP_START)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        print(f"[OK] Replaced future rows with {len(rows)} ramp rows "
+              f"(generated_by='{GENERATED_BY_DB}').")
+        return len(rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reseed health.plan in place (v2 program).")
     # Dry-run is the DEFAULT (safety). Writing requires an explicit --commit.
     ap.add_argument("--commit", action="store_true",
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true",
-                    help="No DB. Synthesize 14 days and print preview + sample blocks.")
+                    help="No DB. Synthesize days and print preview + sample blocks.")
+    ap.add_argument("--ramp", action="store_true",
+                    help="feat/health-ramp: seed the weeks 1-7 ramp schedule "
+                         "(delete-forward from 2026-07-25, hard stop 2026-09-11).")
     args = ap.parse_args()
 
+    if args.ramp and args.self_test:
+        _ramp_self_test()
+        return
     if args.self_test:
         _self_test()
+        return
+    if args.ramp:
+        reseed_ramp(dry_run=not args.commit)
         return
     reseed(dry_run=not args.commit)
 

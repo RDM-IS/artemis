@@ -123,5 +123,217 @@ class TestNoConfabulationRoutes(_Base):
         routed.assert_called_once()
 
 
+class TestMorningStateWritten(_Base):
+    """HEALTH-1 (a): the failing check-in doesn't just ROUTE to the morning
+    handler — the handler actually UPSERTs health.daily_state, CT-dated. Here the
+    handler runs for real (only the LLM parse + the DB write are stubbed)."""
+
+    def test_checkin_writes_daily_state_with_ct_date(self):
+        import knowledge.db as kdb
+        from datetime import datetime
+        from artemis.health import CT, MorningState
+
+        state = MorningState(sleep_hrs=7.0, energy=5, soreness={"legs": 3})
+        with patch.object(health, "parse_morning_checkin", return_value=state), \
+             patch.object(kdb, "execute_write") as ew:
+            reply = health.handle_morning_intent("sleep 7 energy 5 legs sore 3")
+
+        ew.assert_called_once()
+        sql, params = ew.call_args[0][0], ew.call_args[0][1]
+        self.assertIn("health.daily_state", sql)
+        self.assertEqual(params[0], datetime.now(CT).date())   # state_date = CT today
+        self.assertIn("Logged", reply)
+
+
+class TestGeneralReplyCannotReroute(_Base):
+    """HEALTH-1 (c): even if the LLM classifier WOULD label a detected health
+    message `general_reply`, it can never re-route it — the deterministic gate
+    claims the message first and the classifier is never consulted."""
+
+    def test_general_reply_cannot_reroute_detected_health_message(self):
+        general_reply = MagicMock(name="general_reply_classification")
+        with patch.object(intent, "route_intent", return_value=general_reply) as route, \
+             patch.object(main, "_handle_intent_routed") as routed, \
+             patch.object(health, "handle_morning_intent",
+                          return_value="Logged: 7h sleep, energy 5/5.") as handler:
+            main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
+        # The classifier (which would have said general_reply) is never reached…
+        route.assert_not_called()
+        routed.assert_not_called()
+        # …and the deterministic morning handler owns the message.
+        handler.assert_called_once()
+        self.assertEqual(self._last_post(), "Logged: 7h sleep, energy 5/5.")
+
+
+class TestSwapToRestRefusal(_Base):
+    """The verbatim failing message 'swap to rest' → honest refusal, zero plan
+    writes, zero audit rows, LLM never called."""
+
+    def test_swap_to_rest_refuses_without_writes_or_llm(self):
+        import knowledge.db as kdb
+        with patch.object(intent, "route_intent") as route, \
+             patch.object(main, "_handle_intent_routed") as routed, \
+             patch.object(kdb, "execute_write") as ew, \
+             patch.object(kdb, "log_audit") as la:
+            main._handle_mention(_post("swap to rest"), [])
+        route.assert_not_called()          # classifier never called
+        routed.assert_not_called()
+        ew.assert_not_called()             # zero DB writes to the plan
+        la.assert_not_called()             # zero audit rows
+        reply = self._last_post()
+        self.assertNotIn("✅", reply)
+        self.assertIn("rest", reply.lower())
+        self.assertIn("aren't supported yet", reply)
+
+
+class TestFabricationGate(_Base):
+    """Output-side complement: an LLM draft claiming an action is suppressed and
+    logged; a real deterministic-handler confirmation passes through untouched."""
+
+    def test_fabricated_swap_claim_is_suppressed_and_logged(self):
+        import knowledge.db as kdb
+        fake = "✅ Swapped today's run to indoor rowing. gym.rdm.is is up to date."
+        with patch.object(main, "handle_mention", return_value=fake), \
+             patch.object(main, "_build_mention_context", return_value=""), \
+             patch.object(main, "_try_life_ops", return_value=None), \
+             patch.object(main, "_handle_intent_routed", return_value=None), \
+             patch.object(kdb, "log_guardrail_violation") as glog:
+            # A neutral question that falls through to the free-text LLM path;
+            # the gate acts on the RESPONSE, not the question.
+            main._handle_mention(_post("tell me something interesting"), [])
+        posted = self._last_post()
+        # The fabricated confirmation is NOT posted…
+        self.assertNotIn("✅", posted)
+        self.assertNotEqual(posted, fake)
+        # …the honest reply is…
+        self.assertIn("nothing was changed", posted.lower())
+        # …and the suppressed text was logged as a guardrail violation.
+        glog.assert_called_once()
+        kwargs = glog.call_args.kwargs
+        self.assertEqual(kwargs.get("guardrail_type"), "fabricated_action_claim")
+        self.assertIn("Swapped", kwargs.get("event_summary", ""))
+
+    def test_real_handler_confirmation_passes_through(self):
+        # A deterministic handler that returns a "✅ Swapped" confirmation posts
+        # it verbatim; the free-text gate never runs, nothing is logged.
+        import knowledge.db as kdb
+        real = "✅ Swapped to **Indoor Row — Z2 Intervals**. gym.rdm.is is up to date."
+        with patch.object(health, "propose_modality_swap", return_value=real), \
+             patch.object(main, "handle_mention") as llm, \
+             patch.object(kdb, "log_guardrail_violation") as glog:
+            main._handle_mention(_post("swap today to indoor rower"), [])
+        self.assertEqual(self._last_post(), real)  # verbatim, untouched
+        llm.assert_not_called()                    # never reached the LLM path
+        glog.assert_not_called()                   # nothing suppressed/logged
+
+
+class TestRampConfirmArbitration(_Base):
+    """feat/health-ramp: the ramp proposal is confirmed ONLY by the qualified
+    `yes ramp` / `no ramp`. A BARE yes/no must never be consumed by ramp_confirm —
+    so a bare confirm meant for a coexisting (never-expiring alongside) rule-add
+    proposal reaches the rule handler, and the ramp plan is never silently rewritten.
+    """
+
+    import time as _time
+
+    _RULE_PENDING = {
+        "type": "playbook_rule",
+        "name": "file BigCo mail",
+        "spec": {"action": "label", "action_label": "BigCo",
+                 "match_sender": "@big.co", "match_subject": "", "match_body": ""},
+        "timestamp": _time.time(),
+    }
+
+    def _arb_patches(self, ramp_pending: bool):
+        """Neutralize DB-touching confirm loaders + unrelated content routers so the
+        CONFIRM arbitration (ramp vs rule) runs for real, DB-free. Returns the list
+        of active patchers (caller stops them)."""
+        import artemis.life_ops as life_ops
+        ramp_val = {"proposal_id": "p1", "outcome": "repeat"} if ramp_pending else None
+        patchers = [
+            patch.object(health, "load_capture_pending", lambda *a, **k: None),
+            patch.object(health, "load_swap_pending", lambda *a, **k: None),
+            patch.object(health, "load_nutrition_target_pending", lambda *a, **k: None),
+            patch.object(life_ops, "load_staples_pending", lambda *a, **k: None),
+            patch("artemis.health_ramp.load_ramp_pending", lambda *a, **k: ramp_val),
+            # unrelated content routers must not grab a bare word during the test
+            patch.object(main, "_handle_availability_command", lambda *a, **k: False),
+            patch.object(main, "_handle_dossier_command", lambda *a, **k: False),
+            patch.object(main, "_handle_grocery_staples", lambda *a, **k: False),
+            patch.object(main, "_handle_nutrition", lambda *a, **k: False),
+            patch.object(main, "_handle_health_conversation", lambda *a, **k: False),
+        ]
+        for p in patchers:
+            p.start()
+        # ops channel == the post channel so the ramp channel-scope gate passes.
+        self._mm.get_channel_id.return_value = "chanA"
+        return patchers
+
+    def test_a_bare_yes_lets_rule_win_ramp_untouched(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms["chanA"] = dict(self._RULE_PENDING)
+        try:
+            with patch("artemis.health_ramp.commit_ramp_proposal") as commit, \
+                 patch("artemis.playbook_rules.create_rule",
+                       return_value={"id": 7}) as create, \
+                 patch("artemis.playbook_rules.describe_rule", return_value="label @big.co"):
+                main._handle_mention(_post("yes"), [])
+            commit.assert_not_called()                       # ramp untouched
+            create.assert_called_once()                      # rule won the bare yes
+            self.assertNotIn("chanA", main._pending_confirms)  # rule pending consumed
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_b_yes_ramp_applies_with_both_pending(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms["chanA"] = dict(self._RULE_PENDING)
+        try:
+            with patch("artemis.health_ramp.commit_ramp_proposal",
+                       return_value="✅ Applied. Wrote 35 plan rows.") as commit, \
+                 patch("artemis.playbook_rules.create_rule") as create:
+                main._handle_mention(_post("yes ramp"), [])
+            commit.assert_called_once()                      # ramp applied
+            create.assert_not_called()                       # rule untouched
+            self.assertIn("chanA", main._pending_confirms)   # rule pending still staged
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_c_no_ramp_cancels(self):
+        patchers = self._arb_patches(ramp_pending=True)
+        try:
+            with patch("artemis.health_ramp.cancel_ramp_proposal",
+                       return_value="Kept the current plan — nothing changed.") as cancel, \
+                 patch("artemis.health_ramp.commit_ramp_proposal") as commit:
+                main._handle_mention(_post("no ramp"), [])
+            cancel.assert_called_once()
+            commit.assert_not_called()
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_d_bare_yes_only_ramp_pending_falls_through(self):
+        # Intended behavior: with ONLY a ramp proposal open, a bare `yes` is NOT
+        # consumed by ramp_confirm — it flows on down the chain untouched. (The user
+        # must type `yes ramp`.) Documented as deliberate.
+        patchers = self._arb_patches(ramp_pending=True)
+        main._pending_confirms.clear()
+        try:
+            # Direct: the handler yields a bare yes even with a live ramp pending.
+            self.assertFalse(_handle := main._handle_ramp_confirm(_post("yes"), "yes"))
+            # Chain: nothing ramp-side fires on the bare yes.
+            with patch("artemis.health_ramp.commit_ramp_proposal") as commit, \
+                 patch("artemis.health_ramp.cancel_ramp_proposal") as cancel, \
+                 patch.object(main, "_handle_intent_routed", return_value="ok") as routed:
+                main._handle_mention(_post("yes"), [])
+            commit.assert_not_called()
+            cancel.assert_not_called()
+            routed.assert_called_once()                      # fell through to the router
+        finally:
+            for p in patchers:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

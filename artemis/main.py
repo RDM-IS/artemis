@@ -3195,8 +3195,11 @@ def classify_correction(
         "The user is correcting an AI assistant called Artemis. "
         "Given the original message, Artemis's response, and the user's correction, determine:\n"
         "1. What action Artemis incorrectly took (original_intent)\n"
+        # HEALTH-1: `add_note` is gone from the live action vocabulary — the
+        # "learning"/note confabulation stub was removed from routing, and this
+        # (already caller-less) prompt no longer offers it either.
         "2. What action it should have taken (correct_intent, must be one of: "
-        "add_contacts, query_crm, add_note, schedule, pipeline_update, general_reply)\n"
+        "add_contacts, query_crm, schedule, pipeline_update, general_reply)\n"
         "3. A short rule to remember for next time (under 100 chars)\n"
         "Return ONLY JSON: {\"original_intent\": \"...\", \"correct_intent\": \"...\", "
         "\"learned_rule\": \"...\", \"confidence\": 0.0-1.0}"
@@ -3538,7 +3541,7 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
             detect_health_intent,
             detect_modality_swap,
             detect_swap_revert,
-            format_health_help,
+            format_unsupported_change,
             get_plan_detail,
             get_plan_lookup,
             handle_fix_intent,
@@ -3584,16 +3587,17 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
                         reply = build_and_store_proposal(question, channel_id)
                     else:
                         reply = handle_workout_session(question)
+            elif looks_like_unsupported_workout_change(question):
+                # Honest refusal for an imperative workout-change we don't support
+                # (reschedule / move / to a strength day / rest-recovery-mobility /
+                # an unsupported machine). Pure-regex, DB-independent, and NEVER
+                # handed to the LLM to confabulate.
+                reply = format_unsupported_change(question)
             else:
                 # Read-intent (history Q&A) first, then the session loop.
                 reply = handle_plan_query(question)
                 if reply is None:
                     reply = handle_workout_session(question)
-                # Honest fallback: an imperative workout-change we don't support
-                # (reschedule / move / change to a strength day) is answered with
-                # the real command list — NEVER handed to the LLM to confabulate.
-                if reply is None and looks_like_unsupported_workout_change(question):
-                    reply = format_health_help()
     except Exception:
         logger.exception("Health conversation handler failed")
         return False
@@ -3704,6 +3708,60 @@ def _handle_swap_confirm(post: dict, question: str) -> bool:
     else:
         return False
 
+    root_id = post.get("root_id") or post["id"]
+    if reply and _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
+# feat/health-ramp: the ramp proposal is confirmed ONLY by a QUALIFIED control
+# phrase — `yes ramp` / `no ramp` (with `ramp yes`, `confirm ramp`, `cancel ramp`
+# as synonyms). A bare `yes`/`no`/`confirm`/`cancel` is deliberately NOT matched, so
+# it flows on down the chain untouched. Rationale: the ramp pending never expires
+# and can coexist for days with a rule-add / dossier / swap proposal in the same
+# channel; a bare confirm must resolve to those flows (or the LLM), never silently
+# apply a ramp repeat/restart. Disambiguation is mandatory, not first-match-wins.
+_RAMP_CONFIRM_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?(?:(?:yes|confirm)\s+ramp|ramp\s+(?:yes|confirm))\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+_RAMP_CANCEL_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?(?:(?:no|cancel)\s+ramp|ramp\s+(?:no|cancel))\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _handle_ramp_confirm(post: dict, question: str) -> bool:
+    """Confirm/cancel leg for a pending ramp repeat/restart proposal (feat/health-
+    ramp). Matches ONLY the qualified `yes ramp` / `no ramp` (+ `ramp yes`,
+    `confirm ramp`, `cancel ramp`) — a bare `yes`/`no` is never consumed here and
+    falls through the chain untouched. On a qualified confirm, with a proposal
+    actually staged in health.ramp_state AND the reply in the ops channel, the
+    regenerated rows are written in one transaction and the confirmation is rendered
+    from the WRITTEN rows. Returns True only when it acts."""
+    is_confirm = bool(_RAMP_CONFIRM_RE.match(question))
+    is_cancel = bool(_RAMP_CANCEL_RE.match(question))
+    if not (is_confirm or is_cancel):
+        return False  # bare / unqualified control words are not ours — flow on
+
+    from artemis.health_ramp import (
+        cancel_ramp_proposal, commit_ramp_proposal, load_ramp_pending,
+    )
+    import artemis.config as config
+
+    channel_id = post.get("channel_id", "")
+    if load_ramp_pending(channel_id) is None:
+        return False
+    # Channel-scoped: only act in the ops channel (#artemis-ryan), resolved at read
+    # time. The proposal is only ever posted there.
+    try:
+        ops_channel_id = _mm.get_channel_id(config.CHANNEL_OPS) if _mm else None
+    except Exception:
+        ops_channel_id = None
+    if ops_channel_id is not None and channel_id != ops_channel_id:
+        return False
+
+    reply = commit_ramp_proposal(channel_id) if is_confirm else cancel_ramp_proposal(channel_id)
     root_id = post.get("root_id") or post["id"]
     if reply and _mm:
         _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
@@ -3843,6 +3901,12 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("duplicate_override", _handle_duplicate_override),
         ("calendar_confirm", _handle_calendar_confirm),
         ("delete_confirm", _handle_delete_confirm),
+        # feat/health-ramp: a ramp repeat/restart proposal is confirmed ONLY by the
+        # qualified `yes ramp` / `no ramp` (never a bare yes/no) — the ramp pending
+        # never expires, so a bare confirm meant for a coexisting rule/dossier/swap
+        # proposal must not trigger a plan rewrite. Placed ahead of swap_confirm so
+        # the qualified form isn't swallowed by swap's greedy `yes <reason>` matcher.
+        ("ramp_confirm", _handle_ramp_confirm),
         ("debrief_confirm", _handle_debrief_confirm),
         # SWAP-2: a pending modality swap/revert consumes its `yes <reason>`/`no`
         # here, ahead of any content router — a confirm must never reach the LLM.
@@ -4181,6 +4245,38 @@ def _handle_mention(post: dict, thread: list[dict]):
     if response and _mm:
         channel_id = post.get("channel_id", "")
         root_id = post.get("root_id") or post["id"]
+
+        # ── Output-side no-fabrication gate (HEALTH-1 complement) ──
+        # Reaching this free-text path means NO deterministic handler executed an
+        # action (they post and return earlier). So any action-success claim in
+        # the LLM draft is a fabrication: suppress it, answer honestly, and log
+        # the suppressed text to acos.guardrail_violations. Real confirmations
+        # come from the deterministic handlers and never reach here. Runs BEFORE
+        # calendar/commitment processing so a fabricated draft has no side effect.
+        try:
+            from artemis.health import claims_unverified_action, format_no_handler_reply
+            claim = claims_unverified_action(response)
+        except Exception:
+            logger.exception("action-claim gate failed")
+            claim = None
+        if claim:
+            logger.error(
+                "Suppressed fabricated action-claim (%r) in LLM reply to post %s",
+                claim, post.get("id"),
+            )
+            try:
+                from knowledge.db import log_guardrail_violation
+                log_guardrail_violation(
+                    guardrail_type="fabricated_action_claim",
+                    event_summary=response[:2000],
+                    outcome="suppressed",
+                    agent="artemis",
+                    metadata={"matched_claim": claim, "question": question[:500]},
+                )
+            except Exception:
+                logger.exception("Failed to log fabricated-action guardrail violation")
+            _mm.post_to_channel_id(channel_id, format_no_handler_reply(), root_id=root_id)
+            return
 
         # Check if Claude's response contains a calendar event to create
         response = _process_calendar_events(response, channel_id=channel_id)

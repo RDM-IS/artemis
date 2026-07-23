@@ -260,6 +260,15 @@ class ArtemisScheduler:
             id="vault_coverage", timezone="America/Chicago",
         )
 
+        # feat/health-ramp: nightly reconcile → slide → evaluate at 00:15 CT.
+        # Deliberately NOT quiet-gated — it runs inside quiet hours by design (just
+        # after the day rolls over) and posts only slide notices / propose-then-
+        # confirm proposals, never a nag.
+        self.scheduler.add_job(
+            self.job_health_ramp, "cron", hour=0, minute=15,
+            id="health_ramp", timezone="America/Chicago",
+        )
+
         # Load playbooks at startup
         load_playbooks()
 
@@ -788,6 +797,34 @@ class ArtemisScheduler:
             vault.run_coverage_monitor(self.calendar, self.mm)
         except Exception:
             logger.exception("Vault coverage monitor failed")
+
+    def job_health_ramp(self):
+        """feat/health-ramp: 00:15 CT nightly. Reconcile yesterday's ramp rows
+        against session_log, auto-slide (audited) sessions that weren't completed,
+        and — when a week window closes — evaluate it and post a notice or a
+        propose-then-confirm repeat/restart proposal to #artemis-ryan. NOT quiet-
+        gated (00:15 is inside quiet hours by design). Renders nothing unless there
+        is a slide, a completed week, or a proposal."""
+        try:
+            from artemis import health_ramp
+            summary = health_ramp.run_nightly(self.mm)
+            logger.info(
+                "Ramp nightly: completed=%d slides=%d evaluated=%s outcome=%s",
+                len(summary.get("completed", [])), len(summary.get("slides", [])),
+                summary.get("evaluated"), summary.get("outcome"),
+            )
+        except Exception as exc:
+            logger.exception("Ramp nightly job failed")
+            try:
+                from artemis import opsdiag
+                self.mm.post_message(
+                    config.CHANNEL_OPS,
+                    "\U0001f3cb️ **Ramp nightly (00:15 CT) failed**\n"
+                    + opsdiag.report_failure(exc, {"stage": "ramp nightly (cron)"},
+                                             agent="health_ramp"),
+                )
+            except Exception:
+                logger.exception("Ramp nightly failure report failed")
 
     def job_ssl_check(self):
         """Check SSL certs and alert if expiring."""
