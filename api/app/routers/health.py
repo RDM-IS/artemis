@@ -817,6 +817,9 @@ class LastLoggedEntry(BaseModel):
     distance_m: Optional[float] = None
     hr_avg: Optional[int] = None
     hr_peak: Optional[int] = None
+    # Per-set notes of that row — gym-display parses `setting=<n>` from it to
+    # prefill the machine seat/pin field.
+    notes: Optional[str] = None
 
 
 class LastLoggedResponse(BaseModel):
@@ -847,7 +850,7 @@ def get_last_logged(
                 sl.exercise,
                 sl.weight_lbs, sl.reps_done, sl.rpe_actual,
                 sl.duration_sec, sl.distance_m, sl.hr_avg, sl.hr_peak,
-                p.plan_date
+                sl.notes, p.plan_date
             FROM health.session_log sl
             JOIN health.plan p ON p.plan_id = sl.plan_id
             WHERE sl.exercise = ANY(:names)
@@ -869,6 +872,7 @@ def get_last_logged(
             distance_m=float(r["distance_m"]) if r["distance_m"] is not None else None,
             hr_avg=r["hr_avg"],
             hr_peak=r["hr_peak"],
+            notes=r["notes"],
         )
     return LastLoggedResponse(by_exercise=out)
 
