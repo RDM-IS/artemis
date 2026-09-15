@@ -219,6 +219,8 @@ class TestRenders(unittest.TestCase):
                 "blocks": row["blocks"]}
         resolved = health.resolve_equipment_and_location(row["session_type"], blocks=row["blocks"])
         post = health.build_calibrated_plan_post(plan, resolved, state=None)
+        self.assertIn("Today: **Office Strength A** —", post)
+        self.assertNotIn("Push/Legs", post)
         self.assertIn("Where: office gym", post)
         self.assertIn("First lift: Leg press", post)
         self.assertIn("Warmup: 5 min elliptical, easy", post)

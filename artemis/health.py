@@ -1394,6 +1394,13 @@ def _session_pretty_name(session_type: str) -> str:
     }.get(session_type, session_type)
 
 
+def _plan_session_name(plan: dict) -> str:
+    """Canonical session name for a plan row: blocks.display_name, falling back
+    to the legacy session_type label."""
+    blocks = _coerce_blocks(plan.get("blocks"))
+    return blocks.get("display_name") or _session_pretty_name(plan.get("session_type", "?"))
+
+
 _SURVEY_QUESTIONS = (
     "Reply with: sleep hrs, energy 1-5, soreness (region 1-5), weight if you weighed, RHR if you took it.\n"
     "Example: `slept 6.5 energy 3 legs sore 3 weight 271 RHR 58`"
@@ -1406,7 +1413,7 @@ def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
     workout_am: full survey + heads-up that the calibrated plan arrives in 15 min.
     logging_only: just the survey; the workout is later in the day.
     """
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1427,7 +1434,7 @@ def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
 
 def build_evening_prompt(plan: dict, resolved: dict) -> str:
     """Build the evening pre-workout prompt for Wed/Sat 16:30."""
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1448,7 +1455,7 @@ def build_evening_prompt(plan: dict, resolved: dict) -> str:
 def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -> str:
     """Build the trainer-voice calibrated plan post that follows morning survey
     by ~15 minutes."""
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1457,7 +1464,7 @@ def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -
         lines.append(f"Bring: {', '.join(resolved['equipment'])}")
     if resolved.get("first_lift"):
         lines.append(f"First lift: {resolved['first_lift']}")
-    blocks = plan.get("blocks") or {}
+    blocks = _coerce_blocks(plan.get("blocks"))
     if blocks.get("warmup"):
         lines.append(f"Warmup: {blocks['warmup']}")
     if resolved.get("notes"):
