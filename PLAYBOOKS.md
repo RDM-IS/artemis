@@ -234,9 +234,9 @@ crm_write_guard(entity_type, data, confidence, source_pb,
 **Trigger:** Multiple — see below. All routing isolated to channel
 `#artemis-ryan` (DM only, never broadcast).
 
-**Module:** `artemis/health.py` (intent handlers), `artemis/scheduler.py`
-(cron jobs), `app/routers/health.py` (read API consumed by gym-display
-at `gym.rdm.is`).
+**Module:** `artemis/health.py` (intent handlers), `artemis/health_office.py`
+(office gym inventory + program builders), `artemis/scheduler.py` (cron jobs),
+`api/app/routers/health.py` (read API consumed by gym-display at `gym.rdm.is`).
 
 **Database:** `health` schema (migration 013) — `health.plan`,
 `health.session_log`, `health.daily_state`, `health.adjustments`,
@@ -248,7 +248,10 @@ or `acos` writes.
 All scheduled jobs guard with `self._is_quiet()` at the top. Quiet
 hours 22:00-04:00 CT.
 
-**`job_morning_prompt`** — daily morning survey + workout calibration:
+**`job_morning_prompt`** — daily morning survey + workout calibration.
+> TODO (HEALTH-2): these times assume the old home-gym mornings. They depend on
+> Ryan's office arrival time, which is not yet confirmed — revisit once it is.
+
 - Tue 04:01 CT — strength_a workout day, AM only
 - Wed 07:00 CT — logging-only (no workout calibration; PM workout)
 - Thu 04:01 CT — workout day, PM allowed
@@ -261,7 +264,8 @@ Posts the morning survey questions (sleep hrs, energy 1-5, soreness
 by region, weight, resting HR). User replies with answers via existing
 `log_morning_state` intent. After `daily_state` row writes, post the
 calibrated workout plan reply (~15 min after first prompt) including
-session_type, equipment list, and location (downstairs gym vs outside).
+session_type, equipment list, and location (`Where: office gym` — read from the
+plan row's `blocks.location`).
 
 **`job_evening_prompt`** — Wed/Sat at 16:30 CT — same shape as morning
 prompt but for the PM workout.
@@ -291,44 +295,60 @@ intent classifier (rules 9-11 in `artemis/intent.py`):
 - **Edit grammar** (`fix burpees rpe 9`) → `handle_fix_intent` updates
   the most recent matching `session_log` row via LIKE search; falls
   through to debrief handler if no match
-- **Bike configuration override** (prior evening: "trainer set indoor"
-  or "trainer set outdoor") → stored on tomorrow's `daily_state`
-  pre-fill so morning prompt skips the weather-based suggestion
+- **Modality swap** ("swap today to elliptical") → propose-then-confirm swap
+  of a cardio/walk session to another office machine: treadmill, elliptical,
+  upright bike, recumbent bike, or stepmill. Same stimulus; `swap revert` undoes.
+- **Retired: bike trainer override** (`trainer set indoor` / `trainer set
+  outdoor`) — HEALTH-2 retired the home bike. The phrase is still matched
+  deterministically and gets an honest "retired — nothing changed" reply; it
+  never reaches a bike handler or the LLM.
 
 ### Equipment & location mapping
 
-Static map by `session_type` until autoregulator (separate ticket)
-adds explicit `health.plan.location` and `health.plan.equipment`
-columns:
+**Location is plan data (HEALTH-2).** Each `health.plan` row carries
+`blocks.location` and `blocks.equipment`; `resolve_equipment_and_location`
+prefers them. The static `_EQUIPMENT_MAP` (built from
+`artemis/health_office.py`) is the fallback for a row that lacks them. The home
+gym still exists — a row that trains there says so in `blocks.location`.
+
+Office gym inventory (all Precor): pulldown/seated row, rear delt/pec fly, leg
+extension/leg curl, leg press/calf extension, abdominal/back extension machines;
+S3.23 functional trainer (rope + handles); Icarian Smith machine; hex DBs,
+Olympic bar + plates, 2 flat benches, 1 adjustable bench; captain's chair/dip
+tower, 45° back extension; treadmills, ellipticals, upright bike, recumbent bike,
+stepmill, Stretch Trainer; stability balls, mats. The rower and outdoor bike are
+retired from the plan.
+
+Fallback map:
 
 ```
-strength_a / strength_b / strength_c
-  -> location: downstairs gym
-  -> equipment: PowerBlock dumbbells, flat bench, curl bar +
-     plates (2x 10#, 2x 25#), TRX, resistance bands, exercise ball
-
-cardio_intervals
-  -> location: downstairs gym
-  -> equipment: water rower OR bike on trainer
-
-cardio_z2
-  -> location: downstairs gym (Z2 pace, low impact)
-  -> equipment: bike on trainer (default)
-
-walk
-  -> location: outside (or treadmill/indoor walk if weather forces)
-  -> equipment: shoes
-
-rest_mobility
-  -> location: anywhere
-  -> equipment: yoga mat, resistance bands (light)
+strength_a       -> office gym: leg press, DBs + flat bench, pulldown, leg curl,
+                    functional trainer (rope), captain's chair   (first lift: Leg press)
+strength_b       -> office gym: DBs, seated row, adjustable bench, leg extension,
+                    rear delt fly, functional trainer, 45° back ext (first: DB goblet squat)
+strength_c       -> office gym: DBs, pec fly, functional trainer, adjustable bench,
+                    calf press, ab machine                        (first: DB Romanian deadlift)
+cardio_z2        -> office gym: treadmill / elliptical / recumbent / upright bike
+cardio_intervals -> office gym: stepmill / upright bike
+walk             -> outside: walking shoes (rain or <40°F -> indoor walk)
+rest_mobility    -> office gym: mat / Stretch Trainer
 ```
 
-Bike indoor/outdoor decision: weather at prompt time decides (rain
-or sub-40°F = indoor) UNLESS the user posted a `trainer set
-indoor`/`trainer set outdoor` override message the prior evening. The
-trainer setup at 04:00 is fixed — Artemis never asks the user to
-change tires mid-morning.
+Weather is consulted for `walk` only. There is no bike indoor/outdoor decision
+and no `trainer set` override any more.
+
+**Office program (seeded 2026-09-16 → 2026-11-08)** —
+`scripts/reseed_health_plan_v2.py --office` (dry-run default, `--commit` to
+write), validated by `scripts/validate_health_plan.py`. Ramp-up 9/16-9/20
+(Z2 20 min, Strength A 2 sets, Z2 20 min, recovery walk, rest), then weeks 1-7
+(phase 1): Mon A · Tue Z2 · Wed rest · Thu B · Fri C · Sat rest · Sun walk.
+Sets/RPE/Z2: wk1-2 2/6/20 min · wk3-4 3/7/30 · wk5-6 3/7.5/35-40 (Fri C
+stepmill/upright-bike finisher 6×30s/90s) · wk7 deload 2/6/30. Warmup 5 min
+elliptical, cooldown 5 min Stretch Trainer; loads null weeks 1-2; week 1
+machine exercises note "log seat + pin setting".
+
+The feat/health-ramp nightly slide/evaluate job and its `--ramp` reseed are
+retired (their 7/25-9/11 window passed undeployed and would overwrite this plan).
 
 ### Trainer voice
 
@@ -389,13 +409,12 @@ debrief intent will fire normally and log against the original plan.
   based on rolling RPE / recovery signal. Will write to
   `health.adjustments` audit table.
 - **Workout creation/editing from chat** — only logging is supported.
-  Plan rows are seeded for 2026-05-06 → 2026-09-19; future plan
-  modifications go through the autoregulator or direct DB update.
+  The office program is seeded 2026-09-16 → 2026-11-08; future plan
+  modifications go through the autoregulator or a reviewed reseed.
 - **Wake word ("Hey Artemis" voice mode)** — Picovoice Porcupine
   planned, not built.
-- **Explicit `location` and `equipment` columns** on `health.plan`
-  — added when autoregulator lands and needs to swap (rain day ->
-  indoor walk -> bike).
+- **Explicit `location` and `equipment` columns** on `health.plan` — not
+  needed for now: both live in `blocks` (HEALTH-2).
 
 ### Frontend consumer
 
@@ -409,8 +428,11 @@ Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
 - `python3.11 tests/test_health_seed.py` — 13 tests, validates 137
   baseline plan rows, phase distribution 28/42/42/25, day-of-week
   mapping
-- `python3.11 tests/test_health_intents.py` — 21 tests, intent
-  detection + handlers + nag logic, all DB and Claude calls mocked
+- `python3.11 tests/test_health_intents.py` — intent detection +
+  handlers + nag logic, all DB and Claude calls mocked
+- `python3.11 tests/test_health_office.py` — office schedule/ramp, location
+  from blocks, retired bike/trainer/ramp, regression: no row from 2026-09-21
+  onward references a rower or bike on trainer
 - API: 12 tests in `tests/api/test_health.py` (auth envelopes, CORS,
   no_plan envelope, JSONB serialization)
 

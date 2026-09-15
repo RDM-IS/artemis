@@ -260,14 +260,9 @@ class ArtemisScheduler:
             id="vault_coverage", timezone="America/Chicago",
         )
 
-        # feat/health-ramp: nightly reconcile → slide → evaluate at 00:15 CT.
-        # Deliberately NOT quiet-gated — it runs inside quiet hours by design (just
-        # after the day rolls over) and posts only slide notices / propose-then-
-        # confirm proposals, never a nag.
-        self.scheduler.add_job(
-            self.job_health_ramp, "cron", hour=0, minute=15,
-            id="health_ramp", timezone="America/Chicago",
-        )
+        # HEALTH-2: the feat/health-ramp nightly job (00:15 CT) is retired — its
+        # weeks 1-7 window (7/25-9/11) passed undeployed, and it would slide and
+        # re-propose over the office plan (9/16+). Do not re-register it.
 
         # Load playbooks at startup
         load_playbooks()
@@ -797,34 +792,6 @@ class ArtemisScheduler:
             vault.run_coverage_monitor(self.calendar, self.mm)
         except Exception:
             logger.exception("Vault coverage monitor failed")
-
-    def job_health_ramp(self):
-        """feat/health-ramp: 00:15 CT nightly. Reconcile yesterday's ramp rows
-        against session_log, auto-slide (audited) sessions that weren't completed,
-        and — when a week window closes — evaluate it and post a notice or a
-        propose-then-confirm repeat/restart proposal to #artemis-ryan. NOT quiet-
-        gated (00:15 is inside quiet hours by design). Renders nothing unless there
-        is a slide, a completed week, or a proposal."""
-        try:
-            from artemis import health_ramp
-            summary = health_ramp.run_nightly(self.mm)
-            logger.info(
-                "Ramp nightly: completed=%d slides=%d evaluated=%s outcome=%s",
-                len(summary.get("completed", [])), len(summary.get("slides", [])),
-                summary.get("evaluated"), summary.get("outcome"),
-            )
-        except Exception as exc:
-            logger.exception("Ramp nightly job failed")
-            try:
-                from artemis import opsdiag
-                self.mm.post_message(
-                    config.CHANNEL_OPS,
-                    "\U0001f3cb️ **Ramp nightly (00:15 CT) failed**\n"
-                    + opsdiag.report_failure(exc, {"stage": "ramp nightly (cron)"},
-                                             agent="health_ramp"),
-                )
-            except Exception:
-                logger.exception("Ramp nightly failure report failed")
 
     def job_ssl_check(self):
         """Check SSL certs and alert if expiring."""
@@ -1481,8 +1448,8 @@ class ArtemisScheduler:
             logger.exception("Health morning prompt failed")
 
     def job_health_calibration_followup(self):
-        """Read morning state + today's plan + override, post the calibrated
-        plan with equipment + location. Fires once, ~15 min after the morning
+        """Read morning state + today's plan, post the calibrated plan with
+        equipment + location (from the plan row's blocks). Fires once, ~15 min after the morning
         survey prompt on workout days.
 
         Idempotent per day via system_state KV.
@@ -1492,8 +1459,8 @@ class ArtemisScheduler:
         try:
             from artemis.health import (
                 already_prompted_today, build_calibrated_plan_post,
-                get_today_plan, get_today_state, is_bike_session, mark_prompted,
-                read_bike_override, resolve_equipment_and_location,
+                get_today_plan, get_today_state, mark_prompted,
+                resolve_equipment_and_location,
             )
             from artemis.weather import get_current_conditions
 
@@ -1508,16 +1475,12 @@ class ArtemisScheduler:
                 return
 
             session_type = plan.get("session_type", "")
-            # Gate bike override + weather on the ACTUAL session (blocks), not just
-            # session_type: Sat & Sun both map to cardio_z2 but only Sat is a bike
-            # ride; Sunday run-walk must not pull weather/indoor-outdoor handling.
-            is_bike = is_bike_session(plan)
-            override = read_bike_override(today) if is_bike else None
-            weather = get_current_conditions() if is_bike and not override else None
+            # HEALTH-2: weather only matters for an outdoor walk; cardio is at the
+            # office gym and location comes from the plan row's blocks.
+            weather = get_current_conditions() if session_type == "walk" else None
 
             resolved = resolve_equipment_and_location(
-                session_type, weather=weather, user_override=override,
-                blocks=plan.get("blocks"),
+                session_type, weather=weather, blocks=plan.get("blocks"),
             )
 
             state = get_today_state()
@@ -1538,8 +1501,7 @@ class ArtemisScheduler:
         try:
             from artemis.health import (
                 already_prompted_today, build_evening_prompt,
-                get_today_plan, is_bike_session, mark_prompted, read_bike_override,
-                resolve_equipment_and_location,
+                get_today_plan, mark_prompted, resolve_equipment_and_location,
             )
             from artemis.weather import get_current_conditions
 
@@ -1553,15 +1515,12 @@ class ArtemisScheduler:
                 return
 
             session_type = plan.get("session_type", "")
-            # Gate bike override + weather on the ACTUAL session (blocks): only a
-            # real bike ride gets indoor/outdoor weather handling (run-walk won't).
-            is_bike = is_bike_session(plan)
-            override = read_bike_override(today) if is_bike else None
-            weather = get_current_conditions() if is_bike and not override else None
+            # HEALTH-2: weather only matters for an outdoor walk; cardio is at the
+            # office gym and location comes from the plan row's blocks.
+            weather = get_current_conditions() if session_type == "walk" else None
 
             resolved = resolve_equipment_and_location(
-                session_type, weather=weather, user_override=override,
-                blocks=plan.get("blocks"),
+                session_type, weather=weather, blocks=plan.get("blocks"),
             )
             text = build_evening_prompt(plan, resolved)
             self.mm.post_message(config.CHANNEL_OPS, text)

@@ -14,7 +14,7 @@ from knowledge.secrets import get_anthropic_key
 logger = logging.getLogger(__name__)
 
 # HEALTH-1 A1/A2: add_note and the training intents (log_morning_state,
-# log_workout_debrief, trainer_override, modality_swap) are NOT classifier
+# log_workout_debrief, trainer_retired, modality_swap) are NOT classifier
 # actions. Training is caught deterministically BEFORE this classifier runs;
 # add_note is a confabulation vector with no honest backing store. Anything the
 # LLM emits outside this set is coerced to general_reply.

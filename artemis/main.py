@@ -3447,7 +3447,7 @@ def _handle_intent_routed(post: dict, question: str, thread: list[dict]) -> str 
             return "\u26a0\ufe0f Failed to log interaction \u2014 check DB connection."
 
     # ── training intents (log_morning_state / log_workout_debrief /
-    #    trainer_override / modality_swap) are NOT routed here. Every one is
+    #    trainer_retired / modality_swap) are NOT routed here. Every one is
     #    caught deterministically in _handle_health_conversation BEFORE the
     #    classifier (HEALTH-1: a positive deterministic match is final; the LLM
     #    must never see, route, or re-route these). A stray LLM label on one is
@@ -3536,18 +3536,18 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
         from artemis.health import (
             INTENT_PLAN_DETAIL,
             INTENT_PLAN_LOOKUP,
-            INTENT_TRAINER_OVERRIDE,
+            INTENT_TRAINER_RETIRED,
             build_and_store_proposal,
             detect_health_intent,
             detect_modality_swap,
             detect_swap_revert,
+            format_trainer_retired,
             format_unsupported_change,
             get_plan_detail,
             get_plan_lookup,
             handle_fix_intent,
             handle_morning_intent,
             handle_plan_query,
-            handle_trainer_override,
             handle_workout_session,
             is_capture_paste,
             looks_like_unsupported_workout_change,
@@ -3559,7 +3559,7 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
         # the message, and no correction re-route can touch it. SWAP-2's modality
         # swap/revert are checked FIRST (most specific), then the shared
         # detect_health_intent covers plan reads, the morning check-in, the
-        # debrief, and the trainer override.
+        # debrief, and the retired bike-trainer command.
         if detect_swap_revert(question):
             reply = propose_swap_revert(channel_id)
         elif detect_modality_swap(question):
@@ -3574,8 +3574,8 @@ def _handle_health_conversation(post: dict, question: str) -> bool:
                 reply = get_plan_lookup(question)
             elif intent == "log_morning_state":
                 reply = handle_morning_intent(question, message_id=post.get("id"))
-            elif intent == INTENT_TRAINER_OVERRIDE:
-                reply = handle_trainer_override(question, message_id=post.get("id"))
+            elif intent == INTENT_TRAINER_RETIRED:
+                reply = format_trainer_retired()
             elif intent == "log_workout_debrief":
                 # "fix <exercise> rpe <N>" edit first; a real metrics paste goes
                 # to propose-then-confirm capture; a bare "done"/set line stays
