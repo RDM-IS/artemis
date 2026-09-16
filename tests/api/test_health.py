@@ -890,6 +890,14 @@ class TestSessionsEndpoint(unittest.TestCase):
         # planned=3, logged=3 → NOT incomplete
         self.assertFalse(d["outliers"]["incomplete"])
 
+    def test_structured_pain_note_is_a_pain_outlier(self):
+        # PAIN-1: gym-display's pain chip writes `pain=<region>:<n>`; the
+        # Status page detector must keep flagging it.
+        from api.app.routers.health import _contains_pain_keyword
+        self.assertTrue(_contains_pain_keyword("pain=shoulder:2"))
+        self.assertTrue(_contains_pain_keyword("setting=7; pain=low back:3; felt off"))
+        self.assertFalse(_contains_pain_keyword("setting=7; felt off"))
+
     def test_incomplete_when_logged_lt_planned(self):
         from datetime import date as date_cls, datetime as datetime_cls
         today = date_cls.today()

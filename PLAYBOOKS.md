@@ -240,7 +240,8 @@ crm_write_guard(entity_type, data, confidence, source_pb,
 
 **Database:** `health` schema (migration 013) — `health.plan`,
 `health.session_log`, `health.daily_state`, `health.adjustments`,
-`health.training_rules`, `health.phase_config`. Isolated; no `public`
+`health.training_rules`, `health.phase_config`; `health.pain_pattern` and
+`health.reflection` (migration 031). Isolated; no `public`
 or `acos` writes.
 
 ### Triggers — proactive (scheduled jobs)
@@ -291,21 +292,43 @@ and pain. Sleep stays in hours.
   rather than soreness — only the region they're attached to. Stored as
   `soreness.pain = {region: score}`.
 
-**Rules** (in order; they never add volume, load or RPE; high energy or long
-sleep never adds work — progression belongs to the program):
+**Rules — the pain ladder (PAIN-1).** Highest priority first. A **day-level**
+rule (1–4) ends the ladder; the region rules (5–8) apply to whatever exercises
+are left, then recovery (9). Nothing adds volume, load or RPE; high energy or
+long sleep never adds work — progression belongs to the program.
 
 | # | When | Change |
 |---|---|---|
-| 1 | 2+ **soreness** regions at 4–5 | Day swap → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility. **Pain never swaps the day.** |
-| 2 | soreness 4–5 **or** pain 4–5 in a region | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, 45° back extension, Pallof press), avoiding every affected region, no duplicates. When the pool runs out the reply says how many slots stayed empty. A weeks 5–6 finisher that uses the region is dropped. |
-| 3 | soreness 2–3 | Exercises with that **primary** region: −1 set (min 1), RPE cap −1. |
-| 4 | pain 1–3 | Exercises with that **primary** region: load −20%; a 5 min mobility block for the region is added. |
-| 5 | sleep < 6 or energy ≤ 2 | RPE cap −1 on everything (stacks with rule 3, floor 1), sets capped at 2, Z2 duration −25%. |
-| 6 | soreness 0–1, or nothing qualifying | No change: "Check-in logged — run Session X as written." |
+| 1 | **pain 4–5** in any region | **Day off**: the row becomes `rest_mobility`, blocks `{type: mobility, display_name: "Day off", duration_min: 0}`, no RPE, 0 min. No nudge. |
+| 2 | **rising pain** (below) | **Day off**, same as 1. The reply names the trend. |
+| 3 | **pain 3** in a region used (primary **or** secondary) by **≥ 50%** of today's exercises (a Z2/walk block counts as one) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). |
+| 4 | 2+ **soreness** regions at 4–5 | Day swap → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility. |
+| 5 | **pain 3** (under 50%) | Every exercise using the region (primary or secondary) is removed and replaced by a **mobility block** for it: `mobility_focus`, `mobility_min` (10 min for one region, 15 for several), `mobility_notes` from the region→mobility map in `health_regions.py`; Stretch Trainer + mat added to equipment. **No refill.** A finisher using the region is dropped. |
+| 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, 45° back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
+| 7 | **pain 2** | Exercises with that **primary** region get a lighter target: `target_load_lbs` = 80% of the **last logged load** (top set of the exercise's most recent earlier session; skipped and inferred rows ignored), rounded **down** to a load the office can make (DBs 5–45 by 5; machines/cables by 10; Smith/bar = bar + 2 × a subset of 45/35/25/10/5 per side), never above the last load; `load_from` records it. No history → target stays null and the exercise notes say "go lighter than last time". Bodyweight work is left alone. |
+| 8 | **soreness 2–3** | Exercises with that **primary** region: −1 set (min 1), RPE cap −1. |
+| 9 | sleep < 6 or energy ≤ 2 | RPE cap −1 on everything (stacks with rule 8, floor 1), sets capped at 2, Z2 duration −25%. |
+| — | **pain 0–1**, soreness 0–1, or nothing qualifying | No change. Pain is stored and noted: "Pain shoulder 1/5 — noted." then "Check-in logged — run Session X as written." Pain 2 with no primary exercise to lighten is noted the same way. |
 
-Rest and walk days are never adjusted. A second check-in the same day
-recomputes from `blocks.original` (never stacks); an all-clear second check-in
-restores the plan as written.
+Overall priority: pain day off > rising day off > pain whole-day mobility >
+soreness day swap > pain-3 region mobility > soreness replace > pain-2 lighter >
+soreness lighten > recovery. FRIDAY-1's "pain 4–5 replaces" and "pain 1–3:
+load −20% + mobility" rules are gone.
+
+**Rising pain.** Fires for a region when the morning check-ins on **D−2, D−1
+and today** (three consecutive local days) show strictly increasing pain and
+today is ≥ 1 — `1→2→3` fires; `1→2`, `2→2→3` and `3→2→1` don't. A missing day
+breaks the chain (only the last three consecutive days count). Only morning
+check-ins (`health.daily_state`) count — in-session notes never do. On a
+check-in day that doesn't mention the region its pain counts as 0 (so
+`none→1→2` fires); a region named without a number breaks the chain. Reply:
+
+> Pain shoulder 1→2→3 (rising) → day off. Reply `original` to undo.
+
+Rest days are never adjusted. A walk day only yields to the day-off rules
+(1–2). A second check-in the same day recomputes from `blocks.original` (never
+stacks); a second check-in that no longer warrants a change restores the plan
+as written.
 
 **Storage and undo.** Only when `CHECKIN_ADJUST` is on (set explicitly to `1`
 in the box `.env`): the adjusted blocks are written to today's `health.plan`
@@ -321,6 +344,63 @@ With the flag off the check-in is stored and the would-be change is audited as
 
 > Shoulder 4/5 → removed DB goblet squat, seated cable row, incline DB press, rear delt fly. Added leg press, seated leg curl, calf press, captain's chair knee raise.
 > Reply `original` to undo.
+
+> Pain shoulder 4/5 → day off. Reply `original` to undo.
+
+> Pain low back 3/5 → removed DB goblet squat and 45° back extension. Added 10 min low back mobility (Stretch Trainer + mat).
+> Reply `original` to undo.
+
+> Pain shoulder 2/5 → incline DB press 20 lb (last 25); rear delt fly: go lighter than last time.
+> Reply `original` to undo.
+
+### In-session pain (gym-display chip)
+
+The logger's quick flags include **Pain**: it opens a region picker (the
+check-in vocabulary above) and a 0–5 chip row — no keyboard. Each pick adds
+`pain=<region>:<n>` to that set's `session_log.notes`; several are allowed,
+`;`-separated (`setting=7; pain=shoulder:2; felt off`). The Status page's pain
+detector (`/api/health/sessions` → `outliers.pain_notes`, keyword "pain") still
+flags them. Artemis reads `pain=` notes **only** for pattern surfacing — never
+for today's rules.
+
+### Pain patterns and the Sunday review (PAIN-1)
+
+`artemis/health_patterns.py`, tables `health.pain_pattern` and
+`health.reflection` (migration 031). It counts and reports; it never states a
+cause and never changes a plan.
+
+- **Exposure:** exercise E logged on day D (a non-skipped set, or a set with a
+  pain note).
+- **Hit:** an in-session `pain=` note on E with any region ≥ 2 (counts for that
+  region, with or without a check-in), **or** the D+1 morning check-in has pain
+  ≥ 2 in a region E uses (primary or secondary, families included). At most one
+  hit per exposure per region.
+- **Candidate:** E × region with **≥ 3 hits and ≥ 60%** of exposures over the
+  last **8 weeks**, reported as hits/exposures. Other exercises logged on the
+  hit days that use the same region are named ("also that day") — co-occurrence
+  only.
+
+| When | What |
+|---|---|
+| 21:55 daily | `job_pain_pattern_recompute` — silent; refreshes `health.pain_pattern`. New rows are written only for candidates; existing rows are kept current (`qualifies` can go false). |
+| Sun 08:00 | `job_health_review` (health tier, OPEN phase only) — one post per open candidate that is **new or changed** since it was last posted (`surfaced_hits/_exposures`); nothing when nothing changed. |
+| on the check-in | The check-in whose pain completes a candidate (it qualifies now, didn't before, and yesterday is one of its hit days) gets **one extra line**, once ever (`mentioned_at`). |
+
+> Pattern: shoulder pain ≥2 after **incline DB press** — 3 of 4 sessions (also that day: rear delt fly). What do you notice?
+
+**Replies in a pattern thread** (`pattern_thread` handler, after `morning_flow`):
+
+- anything → stored **verbatim** in `health.reflection` (linked to the pattern
+  when the thread is about exactly one; redelivered posts are no-ops), reply
+  "Noted.", **no plan change**. If it asks for a workout change, it is stored
+  and then handed to the existing swap flow (propose → confirm).
+- `dismiss` → hidden until the pattern gains **2 more hits**.
+- `resolved` → closed; it reopens only when new data (a hit after the
+  resolution) re-qualifies it.
+
+Sunday posts are threads of their own (`post_ids`). For the check-in mention,
+the next unclaimed reply in that morning thread **the same day** is the
+reflection (one-shot, `pain_pattern_thread:<root>` in `acos.system_state`).
 
 **Plan-claim guard.** Any LLM text about workouts is checked by
 `artemis/health_guard.py`: an exercise not in the plan window (±7 days,
@@ -477,7 +557,7 @@ Example debrief confirm-back:
 ### Recovery override (retired)
 
 The old "Recovery override" line in the timed calibrated post never changed the
-plan and is gone with that post. Recovery is now rule 4 of the check-in
+plan and is gone with that post. Recovery is now rule 9 of the check-in
 adjustment above, and it does change `health.plan` (and therefore gym-display).
 
 ### Out of scope (deferred to future tickets)
@@ -514,8 +594,12 @@ Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
 - `python3.11 tests/test_health_office.py` — office schedule/ramp, location
   from blocks, retired bike/trainer/ramp, regression: no row from 2026-09-21
   onward references a rower or bike on trainer
-- API: 12 tests in `tests/api/test_health.py` (auth envelopes, CORS,
-  no_plan envelope, JSONB serialization)
+- `python3.11 tests/test_checkin_adjust.py` — FRIDAY-1 parser, rules, flows,
+  routing, claim guard (FakeDB, no RDS)
+- `python3.11 tests/test_pain_ladder.py` — PAIN-1 ladder, rising pain, `pain=`
+  notes, pattern tally/recompute/lifecycle, reflections, jobs
+- API: `tests/api/test_health.py` (auth envelopes, CORS, no_plan envelope,
+  JSONB serialization, pain-note outliers)
 
 ---
 

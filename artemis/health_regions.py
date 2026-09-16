@@ -1,4 +1,4 @@
-"""Body regions for check-in-driven adjustments (FRIDAY-1).
+"""Body regions for check-in-driven adjustments (FRIDAY-1, PAIN-1).
 
 The ONE place that knows which muscles an exercise uses. The adjustment rules in
 artemis.health_checkin read only from here; nothing is inferred by an LLM.
@@ -102,6 +102,96 @@ SUBSTITUTION_POOL = (
     "45° back extension",
     "Cable Pallof press",
 )
+
+
+# ── PAIN-1: region -> mobility work (Stretch Trainer + mat) ──
+# Used when pain 3 replaces a region's exercises with a mobility block.
+MOBILITY = {
+    "shoulder": "shoulder CARs, band pull-aparts, Stretch Trainer shoulder/chest opener",
+    "chest": "doorway pec stretch, Stretch Trainer chest opener",
+    "back": "cat-cow, thread-the-needle, Stretch Trainer lat stretch",
+    "low back": "cat-cow, child's pose, supine knee-to-chest",
+    "arms": "wrist/forearm stretches, Stretch Trainer triceps stretch",
+    "biceps": "wall biceps stretch, wrist/forearm stretches",
+    "triceps": "overhead triceps stretch, Stretch Trainer triceps stretch",
+    "legs": "Stretch Trainer hamstring/quad/calf series",
+    "quads": "half-kneeling quad stretch, Stretch Trainer quad stretch",
+    "hamstrings": "Stretch Trainer hamstring stretch, supine hamstring floss",
+    "calves": "Stretch Trainer calf stretch, ankle circles",
+    "core": "cat-cow, supine twist, child's pose",
+    "knee": "heel slides, Stretch Trainer quad/hamstring (pain-free range)",
+    "hip": "90/90 hip switches, figure-4 stretch, Stretch Trainer hip series",
+    "neck": "chin tucks, gentle neck side-bends, upper-trap stretch",
+}
+MOBILITY_EQUIPMENT = ["Stretch Trainer", "mat"]
+
+
+def mobility_minutes(regions) -> int:
+    """10 min for one region, 15 for several."""
+    return 10 if len(list(regions)) <= 1 else 15
+
+
+# ── PAIN-1: reachable loads (a port of gym-display src/lib/equipment.ts) ──
+PLATES_PER_SIDE = (45, 35, 25, 10, 5)
+OLYMPIC_BAR_LBS = 45
+SMITH_BAR_LBS = 0          # TODO(office): Icarian Smith effective bar weight
+DB_MIN, DB_MAX, DB_STEP = 5, 45, 5
+STACK_STEP = 10            # machines + functional trainer, until measured
+
+_EXACT_CLASS = {"seated cable row": "machine"}
+_CLASS_RULES = (
+    ("smith", ("smith",)),
+    ("bodyweight", ("captain's chair", "captains chair", "back extension", "plank",
+                    "push-up", "pushup", "dead bug", "bird dog", "hollow",
+                    "mountain climber", "glute bridge")),
+    ("cable", ("cable", "rope", "pallof", "face pull")),
+    ("dumbbell", ("db ", "dumbbell", "goblet")),
+    ("barbell", ("barbell", "back squat", "front squat")),
+    ("machine", ("leg press", "pulldown", "row", "leg curl", "leg extension", "pec fly",
+                 "rear delt", "calf press", "ab crunch", "ab machine")),
+)
+
+
+def equipment_class(name: str) -> str:
+    n = (name or "").lower().strip()
+    if n in _EXACT_CLASS:
+        return _EXACT_CLASS[n]
+    for cls, keys in _CLASS_RULES:
+        if any(k in n for k in keys):
+            return cls
+    return "dumbbell"
+
+
+def _reachable_totals(bar: int) -> list[int]:
+    sums = {0}
+    for p in PLATES_PER_SIDE:
+        sums |= {s + p for s in sums}
+    return sorted(bar + 2 * s for s in sums)
+
+
+def lighter_load(name: str, last: float) -> float | None:
+    """80% of `last`, rounded DOWN to a load the office can actually make.
+
+    Never returns `last` or more: if the rounding lands there, the next lower
+    reachable load is used; at the bottom of the range the minimum stays.
+    None for bodyweight work (no load to lighten).
+    """
+    cls = equipment_class(name)
+    if cls == "bodyweight" or last is None or last <= 0:
+        return None
+    goal = float(last) * 0.8
+    if cls == "dumbbell":
+        options = list(range(DB_MIN, DB_MAX + 1, DB_STEP))
+    elif cls in ("machine", "cable"):
+        top = int(max(last, STACK_STEP))
+        options = list(range(STACK_STEP, top + STACK_STEP, STACK_STEP))
+    else:
+        options = [t for t in _reachable_totals(OLYMPIC_BAR_LBS if cls == "barbell" else SMITH_BAR_LBS)
+                   if t > 0]
+    below = [o for o in options if o <= goal and o < last]
+    if below:
+        return float(below[-1])
+    return float(options[0])
 
 
 def canonical_region(word: str) -> str | None:

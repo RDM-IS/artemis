@@ -120,6 +120,8 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **FRIDAY-1 — check-in-driven morning (2026-09-17).** The fixed 04:45 calibration post is retired. The 04:30 wake post is plan-exact and opens the check-in; the reply is parsed deterministically and adjusts today's `health.plan` row by fixed rules (`blocks.original` + `blocks.adjustment`, `original` to undo), with a 05:15 nudge if nothing arrives. Short morning replies are answered from the DB, and the LLM fallback gets no business data outside the OPEN phase. A plan-claim guard rejects invented exercises, loads, or "last session" figures. Flag: `CHECKIN_ADJUST`. See PB-009.
 
+**PAIN-1 — pain ladder + pattern surfacing (`feat/pain-ladder`, gym-display `feat/pain-chip`; target live before 04:30 Mon 2026-09-21).** Pain gets its own ladder ahead of the soreness rules: pain 4–5 or rising pain (1→2→3 over three consecutive check-in days) → day off; pain 3 → the region's exercises become a mobility block (whole day Mobility / Yoga when ≥ 50% of the session is affected); pain 2 → 80% of the last logged load, rounded down to a reachable load; pain 0–1 → noted. gym-display adds a Pain chip (`pain=<region>:<n>` in set notes). A nightly 21:55 recompute finds exercise × region patterns (≥ 3 hits, ≥ 60%, 8 weeks); the Sunday 08:00 health review posts new/changed ones, the completing check-in mentions it once, and thread replies are stored verbatim as reflections (`dismiss` / `resolved`). Migration 031 (`health.pain_pattern`, `health.reflection`, energy CHECK 0–5). See PB-009.
+
 ---
 
 ## 6. Backlog (prioritized)
@@ -165,6 +167,13 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 **Papercuts.** SIGTERM-ignored shutdown (90s SIGKILL every restart — likely websocket/scheduler not closing on signal); Mattermost websocket flap (~60s reconnect loop); SSO re-auth friction (longer session or self-healing ProxyCommand); Mac-vs-EC2 prompt confusion (distinct prompt / dedicated tab).
 
 ---
+
+**PAIN-1 follow-ups (open).**
+- **Rising-pain assumption** — a check-in day that doesn't mention a region counts as pain 0 for it, so `none→1→2` is a rise. Revisit if it fires on days Ryan simply didn't report the region.
+- **Load rounding is a Python port** of gym-display `equipment.ts` (`health_regions.lighter_load`); the office `TODO(office)` values (stack step, Smith bar) live in both places until they're measured.
+- **Check-in mention thread** — the reflection link for a check-in mention is one-shot for the same local day (`acos.system_state`); Sunday posts link permanently via `pain_pattern.post_ids`.
+- **Pattern reflections aren't read by anything yet** — stored for Ryan; no summarization or LLM use.
+- **`test_health_office`** has 5 assertion failures identical on `main` (date-window checks); not from PAIN-1.
 
 **HARDEN-1 follow-ups (open).**
 - **Office equipment unconfirmed** — Precor pin-stack step (default 10 lb), Icarian Smith bar weight, and the hex dumbbell range are guesses; `TODO(office)` in gym-display `src/lib/equipment.ts`.
