@@ -71,6 +71,7 @@ SESSION_EQUIPMENT: dict[str, list[str]] = {
     "cardio_intervals": [EQ_STEPMILL, EQ_UPRIGHT],
     "walk": ["walking shoes"],
     "rest_mobility": [EQ_MAT, EQ_STRETCH],
+    "recovery_flow": [EQ_MAT, EQ_STRETCH],
 }
 
 FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
@@ -121,11 +122,14 @@ _DISPLAY = {
     "cardio_z2": "Zone 2 Cardio",
     "walk": "Walk",
     "rest_mobility": "Rest / Mobility",
+    "recovery_flow": "Recovery Flow",
 }
 
-# Mon=0 .. Sun=6. Rest Thu + Sat; no two strength days adjacent.
+# Mon=0 .. Sun=6. Recovery Flow Thu (office) + Sat (home) — YOGA-1; no two
+# strength days adjacent.
 WEEKLY_PATTERN = {0: "strength_c", 1: "cardio_z2", 2: "strength_a",
-                  3: "rest_mobility", 4: "strength_b", 5: "rest_mobility", 6: "walk"}
+                  3: "recovery_flow", 4: "strength_b", 5: "recovery_flow", 6: "walk"}
+FLOW_LOCATION = {3: LOCATION, 5: "home"}   # weekday -> blocks.location
 
 # week_num -> (sets, target_rpe, z2 minutes (lo, hi))
 RAMP = {
@@ -231,7 +235,151 @@ def _rest(week_num: int):
     return blocks, None, None, 20
 
 
-def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: bool = False):
+# ── Recovery Flow (YOGA-1) ──────────────────────────────────────────────────
+# (step, name, side, hold s, mirror_group, side label, cue, easier option)
+# Holds are round 1. Round 2 repeats every step and doubles steps 10-16.
+# Cues are our own wording.
+FLOW_STEPS = [
+    ("1", "Child's pose", None, 30, None, None,
+     "Knees wide, hips back toward your heels, arms long.", None),
+    ("2", "Cobra", None, 30, None, None,
+     "Hips stay down; press through the palms and lift the chest gently.", None),
+    ("3", "Downward dog", None, 60, None, None,
+     "Hips high, heels reaching down, long spine.", "Dolphin — forearms down"),
+    ("4", "Standing forward bend", None, 30, None, None,
+     "Soft knees, let your head hang heavy.", None),
+    ("5", "High lunge", "R", 30, "lunge-unit", "Right leg forward",
+     "Front knee over ankle, back heel lifted, arms up.", "Knee down"),
+    ("6", "Crescent lunge", "R", 30, "lunge-unit", "Right leg forward",
+     "Square the hips, sink a little deeper, reach up.", "Knee down"),
+    ("7", "Extended puppy", None, 30, None, None,
+     "From hands and knees, walk the hands forward, chest toward the mat.", None),
+    ("8", "High lunge", "L", 30, "lunge-unit", "Left leg forward",
+     "Front knee over ankle, back heel lifted, arms up.", "Knee down"),
+    ("9", "Crescent lunge", "L", 30, "lunge-unit", "Left leg forward",
+     "Square the hips, sink a little deeper, reach up.", "Knee down"),
+    ("10", "Bridge", None, 30, None, None,
+     "Feet hip-width, press through the heels, lift the hips.", None),
+    ("11a", "Supine twist", "R", 30, "twist-supine", "Right side",
+     "Knees drop to one side, both shoulders stay down.", None),
+    ("11b", "Supine twist", "L", 30, "twist-supine", "Left side",
+     "Knees drop to one side, both shoulders stay down.", None),
+    ("12a", "Wind release", "R", 30, "wind", "Right knee",
+     "Hug one knee to the chest, the other leg long.", None),
+    ("12b", "Wind release", "L", 30, "wind", "Left knee",
+     "Hug one knee to the chest, the other leg long.", None),
+    ("13a", "Seated side bend", "L", 30, "side-bend", "Lean left",
+     "Sit tall, reach the opposite arm overhead and lean.", None),
+    ("13b", "Seated side bend", "R", 30, "side-bend", "Lean right",
+     "Sit tall, reach the opposite arm overhead and lean.", None),
+    ("14a", "Seated twist", "L", 30, "twist-seated", "Twist left",
+     "Lengthen up first, then turn from the ribs.", None),
+    ("14b", "Seated twist", "R", 30, "twist-seated", "Twist right",
+     "Lengthen up first, then turn from the ribs.", None),
+    ("15", "Seated mountain", None, 30, None, None,
+     "Sit tall, arms overhead, slow breaths.", None),
+    ("16", "Easy pose", None, 30, None, None,
+     "Cross-legged, hands on knees, breathe slowly.", None),
+]
+FLOW_ROUNDS = 2
+FLOW_DOUBLE_ROUND = 2            # round whose holds double …
+FLOW_DOUBLE_STEPS = (10, 16)     # … on steps 10-16 (by step number)
+FLOW_CLOSE = {"name": "Easy pose breathing", "side": None, "duration_sec": 180,
+              "cue": "Easy pose. Slow, even breaths."}
+FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
+                        "cue": "Follow the 8 placard stretches"}
+FLOW_PREVIEW_SEC = 5
+FLOW_TARGET_RPE = 2.0
+
+
+def _step_no(step: str) -> int:
+    return int("".join(ch for ch in step if ch.isdigit()))
+
+
+def flow_step_holds(blocks: dict, round_num: int) -> list[int]:
+    """Hold seconds for every flow step in `round_num` (1-based)."""
+    lo, hi = blocks.get("double_steps") or FLOW_DOUBLE_STEPS
+    dbl = blocks.get("double_round", FLOW_DOUBLE_ROUND)
+    return [s["duration_sec"] * (2 if round_num == dbl and lo <= _step_no(s["step"]) <= hi else 1)
+            for s in blocks["flow"]]
+
+
+def flow_total_sec(blocks: dict) -> int:
+    pre = sum(p["duration_sec"] for p in blocks.get("pre") or [])
+    rounds = sum(sum(flow_step_holds(blocks, r)) for r in range(1, int(blocks["rounds"]) + 1))
+    close = (blocks.get("close") or {}).get("duration_sec", 0)
+    return pre + rounds + close
+
+
+class FlowError(ValueError):
+    """A recovery flow that fails the side validator."""
+
+
+def validate_flow(blocks: dict) -> None:
+    """Every mirror_group needs R and L entries with equal total hold, in every
+    round. Groups compare as a whole (a lunge unit is high + crescent lunge)."""
+    flow = blocks.get("flow") or []
+    if not flow:
+        raise FlowError("flow has no steps")
+    groups: dict[str, list[int]] = {}
+    for i, st in enumerate(flow):
+        g = st.get("mirror_group")
+        if g is None:
+            if st.get("side") is not None:
+                raise FlowError(f"step {st.get('step')} has a side but no mirror_group")
+            continue
+        if st.get("side") not in ("R", "L"):
+            raise FlowError(f"step {st.get('step')} in {g} needs side R or L")
+        groups.setdefault(g, []).append(i)
+    for r in range(1, int(blocks.get("rounds") or 1) + 1):
+        holds = flow_step_holds(blocks, r)
+        for g, idx in groups.items():
+            sides = {"R": 0, "L": 0}
+            seen = set()
+            for i in idx:
+                sides[flow[i]["side"]] += holds[i]
+                seen.add(flow[i]["side"])
+            if seen != {"R", "L"}:
+                raise FlowError(f"{g}: missing side {sorted({'R', 'L'} - seen)[0]}")
+            if sides["R"] != sides["L"]:
+                raise FlowError(f"{g}: R {sides['R']}s ≠ L {sides['L']}s (round {r})")
+
+
+def _flow_step(spec) -> dict:
+    step, name, side, hold, group, label, cue, easier = spec
+    return {"step": step, "name": name, "side": side, "side_label": label,
+            "duration_sec": hold, "mirror_group": group, "cue": cue, "easier": easier}
+
+
+def _recovery_flow(weekday: int):
+    location = FLOW_LOCATION.get(weekday, LOCATION)
+    office = location == LOCATION
+    blocks = {
+        "type": "recovery_flow",
+        "display_name": _DISPLAY["recovery_flow"],
+        "location": location,
+        "rounds": FLOW_ROUNDS,
+        "double_round": FLOW_DOUBLE_ROUND,
+        "double_steps": list(FLOW_DOUBLE_STEPS),
+        "preview_sec": FLOW_PREVIEW_SEC,
+        "pre": [dict(FLOW_STRETCH_TRAINER)] if office else [],
+        "flow": [_flow_step(s) for s in FLOW_STEPS],
+        "close": dict(FLOW_CLOSE),
+        "equipment": [EQ_MAT, EQ_STRETCH] if office else [EQ_MAT],
+    }
+    total = flow_total_sec(blocks)
+    blocks["total_sec"] = total
+    blocks["notes"] = (("8 min Stretch Trainer, then " if office else "")
+                       + f"2 rounds of {len({_step_no(s[0]) for s in FLOW_STEPS})} poses (round 2 holds 2× from bridge on), "
+                       + "3 min easy-pose breathing")
+    validate_flow(blocks)
+    return blocks, FLOW_TARGET_RPE, None, -(-total // 60)
+
+
+def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: bool = False,
+           weekday: int | None = None):
+    if session_type == "recovery_flow":
+        return _recovery_flow(weekday if weekday is not None else 3)
     if session_type.startswith("strength"):
         return _strength(session_type, week_num, wk0=wk0)
     if session_type == "cardio_z2":
@@ -266,7 +414,8 @@ def build_row(spec: dict) -> dict:
     week_num = spec["week_num"]
     session_type = spec["session_type"]
     blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0,
-                                    recovery=wk0 and session_type == "walk")
+                                    recovery=wk0 and session_type == "walk",
+                                    weekday=spec["plan_date"].weekday())
     blocks = copy.deepcopy(blocks)
     tag = "office wk0 ramp-up" if wk0 else f"office wk{week_num}"
     return {
@@ -292,7 +441,7 @@ def build_rows() -> list[dict]:
 # ============================================================================
 
 LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_intervals",
-                       "cardio_z2", "walk", "rest_mobility"}
+                       "cardio_z2", "walk", "rest_mobility", "recovery_flow"}
 
 
 def forbidden_hits(blocks) -> list[str]:
@@ -312,12 +461,15 @@ def validate_rows(rows: list[dict]) -> None:
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
         assert 1 <= r["week_num"] <= 7, r["week_num"]
         assert b.get("display_name"), "blocks must carry a display_name"
-        assert b["type"] in ("circuit", "steady", "mobility"), b["type"]
+        assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
         if r["session_type"].startswith("strength"):
             assert b.get("location") == LOCATION
             assert b.get("warmup") == WARMUP and b.get("cooldown") == COOLDOWN
             assert b["exercises"] and all("name" in e and "format" in e for e in b["exercises"])
+        if r["session_type"] == "recovery_flow":
+            assert b["type"] == "recovery_flow"
+            validate_flow(b)
 
 
 # ============================================================================

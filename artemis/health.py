@@ -1148,6 +1148,11 @@ def handle_fix_intent(message: str) -> str | None:
 # Nag job — runs at 23:00 CT
 # ============================================================================
 
+# No debrief nag and no inferred "missed" summary on these days. A Recovery
+# Flow logs itself from gym-display (YOGA-1); a missed one is never a miss.
+_NO_FOLLOWUP_SESSIONS = ("rest_mobility", "walk", "recovery_flow")
+
+
 def run_nag_check() -> Optional[str]:
     """Check whether today's session has a debrief logged.
 
@@ -1168,7 +1173,7 @@ def run_nag_check() -> Optional[str]:
         # No plan for today — nothing to nag about.
         return None
 
-    if plan["is_skipped"] or plan["session_type"] in ("rest_mobility", "walk"):
+    if plan["is_skipped"] or plan["session_type"] in _NO_FOLLOWUP_SESSIONS:
         return None
 
     # Check for any session_log rows tied to this plan_id
@@ -1203,7 +1208,7 @@ def insert_inferred_summary() -> bool:
         (today,),
     )
 
-    if not plan or plan["is_skipped"] or plan["session_type"] in ("rest_mobility", "walk"):
+    if not plan or plan["is_skipped"] or plan["session_type"] in _NO_FOLLOWUP_SESSIONS:
         return False
 
     existing = execute_one(
@@ -1278,6 +1283,11 @@ _EQUIPMENT_MAP: dict[str, dict] = {
     "rest_mobility": {
         "location": "office gym",
         "equipment": _office.SESSION_EQUIPMENT["rest_mobility"],
+        "first_lift": None,
+    },
+    "recovery_flow": {
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["recovery_flow"],
         "first_lift": None,
     },
 }
@@ -1392,6 +1402,7 @@ def _session_pretty_name(session_type: str) -> str:
         "cardio_z2":        "Cardio Zone 2",
         "walk":             "Walk + mobility",
         "rest_mobility":    "Rest / Mobility",
+        "recovery_flow":    "Recovery Flow",
     }.get(session_type, session_type)
 
 
@@ -1493,7 +1504,7 @@ def get_today_state() -> dict | None:
 # ============================================================================
 
 # Session-types that are NOT loggable lifting sessions (no conversational loop).
-_NON_WORKOUT_SESSIONS = ("rest_mobility", "walk")
+_NON_WORKOUT_SESSIONS = ("rest_mobility", "walk", "recovery_flow")
 
 
 # ----------------------------------------------------------------------------
@@ -2303,7 +2314,7 @@ def _query_next_workout() -> str:
     row = execute_one(
         """SELECT * FROM health.plan
            WHERE plan_date >= %s AND is_skipped = FALSE
-             AND session_type NOT IN ('rest_mobility', 'walk')
+             AND session_type NOT IN ('rest_mobility', 'walk', 'recovery_flow')
            ORDER BY plan_date LIMIT 1""",
         (today,),
     )

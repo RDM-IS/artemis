@@ -45,6 +45,14 @@ def office_row(d: date, plan_id: int = 105) -> dict:
             "blocks": copy.deepcopy(r["blocks"]), "is_skipped": False}
 
 
+def rest_row(d: date, plan_id: int = 104) -> dict:
+    """A plain rest_mobility day (YOGA-1 made Thu/Sat Recovery Flow days)."""
+    blocks, rpe, zone, est = office._rest(1)
+    return {"plan_id": plan_id, "plan_date": d, "phase": 1, "week_num": 1,
+            "session_type": "rest_mobility", "target_rpe": rpe, "target_hr_zone": zone,
+            "est_duration_min": est, "blocks": copy.deepcopy(blocks), "is_skipped": False}
+
+
 # ----------------------------------------------------------------------------
 # In-memory DB speaking exactly the SQL health_checkin uses
 # ----------------------------------------------------------------------------
@@ -390,8 +398,9 @@ class TestSessionBScenarios(unittest.TestCase):
 
     def test_nudge_skips_rest_and_walk_days(self):
         from artemis.scheduler import ArtemisScheduler
-        for d, pid in ((date(2026, 9, 17), 104), (date(2026, 9, 20), 107)):
-            db = FakeDB(office_row(d, plan_id=pid))
+        for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),
+                       (date(2026, 9, 20), office_row(date(2026, 9, 20), plan_id=107))):
+            db = FakeDB(row)
 
             @contextmanager
             def conn(db=db):
@@ -463,7 +472,7 @@ class TestSessionBScenarios(unittest.TestCase):
 
     def test_rest_day_no_adjustment(self):
         thu = date(2026, 9, 17)
-        db = FakeDB(office_row(thu, plan_id=104))
+        db = FakeDB(rest_row(thu))
         reply = hc.process_checkin(db.cursor(), "sore shoulder 5", thu, checkin_id="x")
         self.assertEqual(reply, "Check-in logged — rest day as planned.")
         self.assertNotIn("adjustment", db.plan[thu]["blocks"])
@@ -507,7 +516,9 @@ class TestFlows(unittest.TestCase):
 
     def test_nudge_text(self):
         self.assertEqual(hc.nudge_text(office_row(FRI)), "No check-in yet — run Session B as written.")
-        self.assertIsNone(hc.nudge_text(office_row(date(2026, 9, 17))))   # rest day
+        self.assertIsNone(hc.nudge_text(rest_row(date(2026, 9, 17))))     # rest day
+        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 17))),     # YOGA-1 flow day
+                         "No check-in yet — run Recovery Flow as written.")
         self.assertIsNone(hc.nudge_text(None))
 
 

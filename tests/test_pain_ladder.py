@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from test_checkin_adjust import B_NAMES, FRI, FakeDB, names, office_row  # noqa: E402
+from test_checkin_adjust import B_NAMES, FRI, FakeDB, names, office_row, rest_row  # noqa: E402
 
 from artemis import health_checkin as hc  # noqa: E402
 from artemis import health_patterns as hp  # noqa: E402
@@ -120,7 +120,7 @@ class TestLadder(Base):
 
     def test_rest_day_pain_changes_nothing(self):
         thu = date(2026, 9, 17)
-        self.db = FakeDB(office_row(thu, plan_id=104))
+        self.db = FakeDB(rest_row(thu))
         self.cur = self.db.cursor()
         self.assertEqual(self.checkin("shoulder pain 5", day=thu),
                          "Check-in logged — rest day as planned.")

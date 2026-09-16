@@ -505,10 +505,69 @@ Week windows run **Wed–Tue** from 2026-09-16 (week 1 = 9/16–9/22 … week 7 
 
 | Wed | Thu | Fri | Sat | Sun | Mon | Tue |
 |---|---|---|---|---|---|---|
-| Strength A | rest | Strength B | rest | walk | Strength C | Z2 |
+| Strength A | Recovery Flow (office) | Strength B | Recovery Flow (home) | walk | Strength C | Z2 |
 
-Rest is Thu + Sat, so no two strength days are adjacent and every training day
-falls on a weekday, when the office gym is open.
+Thu and Sat are Recovery Flow days (YOGA-1, `session_type = recovery_flow`,
+replacing `rest_mobility`), so no two strength days are adjacent and every
+strength day falls on a weekday, when the office gym is open.
+
+### Recovery Flow (YOGA-1)
+
+A guided, hands-free mobility flow. `blocks.type = recovery_flow`, `target_rpe`
+2, built by `health_office._recovery_flow`.
+
+| # | Pose | Side | Hold (round 1) | Mirror group |
+|---|---|---|---|---|
+| 1 | Child's pose | — | 30 s | |
+| 2 | Cobra | — | 30 s | |
+| 3 | Downward dog (easier: dolphin) | — | 60 s | |
+| 4 | Standing forward bend | — | 30 s | |
+| 5 | High lunge (easier: knee down) | R | 30 s | lunge-unit |
+| 6 | Crescent lunge (easier: knee down) | R | 30 s | lunge-unit |
+| 7 | Extended puppy | — | 30 s | (transition) |
+| 8 | High lunge | L | 30 s | lunge-unit |
+| 9 | Crescent lunge | L | 30 s | lunge-unit |
+| 10 | Bridge | — | 30 s | |
+| 11a/b | Supine twist | R / L | 30 / 30 s | twist-supine |
+| 12a/b | Wind release | R / L | 30 / 30 s | wind |
+| 13a/b | Seated side bend | lean L / lean R | 30 / 30 s | side-bend |
+| 14a/b | Seated twist | L / R | 30 / 30 s | twist-seated |
+| 15 | Seated mountain | — | 30 s | |
+| 16 | Easy pose | — | 30 s | |
+
+- **Rounds:** 2 full rounds of every step; round 2 doubles the holds of steps
+  10–16. Then 3 min easy-pose breathing.
+- **Thursday (office)** starts with an 8 min Stretch Trainer block ("Follow the
+  8 placard stretches"); **Saturday (home)** doesn't.
+- **Totals:** office 37:30 (`est_duration_min` 38), home 29:30 (30). Round 1
+  10:30, round 2 16:00.
+- **Step fields:** `step`, `name`, `side` (null/R/L), `side_label` ("Right leg
+  forward", "Lean left"…), `duration_sec`, `mirror_group`, `cue` (our own
+  wording), `easier`. No external links.
+- **Side validator** (`health_office.validate_flow`, run on every seed): each
+  mirror group needs R and L entries with equal total hold in every round. A
+  lunge unit compares as a group (high + crescent), not pose by pose.
+- **Check-in rules:** only the day-off rules apply — pain 4–5 or rising pain
+  turns the flow into a day off (`original` restores it). Pain 2–3 changes
+  nothing (it's already mobility); soreness and sleep/energy rules don't apply.
+  Reply: "Check-in logged — Recovery Flow as planned."
+- **Nudge:** the 05:15 check-in nudge applies. No 16:30 debrief nag and no
+  21:50 inferred summary on flow days — gym-display logs the flow itself, and a
+  missed flow is never a missed session.
+- **Ramp:** flows are excluded from progression and slides
+  (`health_ramp.RAMP_EXCLUDED_TYPES`).
+- **Wake post:** plan-exact — the Stretch Trainer block, every round-1 step with
+  side and hold, the round-2 doubling, the close and the total. The check-in
+  prompt has no "workout is later" wording.
+- **gym-display:** one Start tap, then hands-free — every step auto-advances
+  with a 5 s "next" preview and chime, a large "Switch sides" screen and
+  distinct tone between R and L, round progress (1/2, 2/2), and on-device voice
+  cues (`speechSynthesis`, mute toggle). Tap to pause/resume, swipe to skip.
+  Completion is logged automatically as a `session_summary`
+  (`notes = "recovery_flow: complete …"`); closing or backgrounding mid-flow
+  logs `recovery_flow: partial <n> of <m> min`, which counts as done.
+- **Reseed:** `reseed_health_plan_v2.py --office --flow-days --from <date>`
+  rewrites only the flow days (needs migration 033; refuses logged dates).
 
 | Weeks | Sets | RPE | Z2 | Notes |
 |---|---|---|---|---|
