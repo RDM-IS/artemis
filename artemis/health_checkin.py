@@ -16,20 +16,39 @@ taken as is; a bare number above 5 is refused ("Ratings are 0–5.") and
 nothing is stored. "sore 0" is stored as {"overall": 0}. A region named
 without a number is stored unscored (null) and changes nothing.
 
-Rules, in order — they never add volume, load or RPE:
+Rules, highest priority first (PAIN-1). A day-level rule ends the ladder;
+region rules apply to whatever exercises are left. They never add volume,
+load or RPE:
 
-  1. Day swap   2+ SORENESS regions at 4-5 -> Recovery Z2 (20-30 min,
-                recumbent) + mobility. Pain never swaps the day.
-  2. Replace    soreness 4-5 or pain 4-5 in a region -> remove every exercise
-                with it as primary or secondary; refill to the same count from
-                the pool, avoiding every affected region, no duplicates.
-  3. Lighten    soreness 2-3 -> exercises with it as PRIMARY: -1 set (min 1),
-                RPE cap -1.
-  4. Lighten    pain 1-3 -> exercises with it as PRIMARY: load -20%, plus a
-                mobility block for the region.
-  5. Recovery   sleep < 6 or energy <= 2 -> RPE cap -1 everywhere (stacks with
-                rule 3, floor 1), sets capped at 2, Z2 duration -25%.
-  6. Otherwise  no change. High energy or long sleep never adds work.
+  1. Pain day off        pain 4-5 anywhere -> Day off (rest, zero effort).
+  2. Rising day off      pain in a region rose over 3 consecutive check-in
+                         days, each giving that region a number, starting at
+                         >= 1 (1->2->3) -> Day off. A rise from 0 (0->1->2)
+                         is not a day off: the normal pain rules apply plus a
+                         one-line "rising: <region> 0→1→2" note.
+  3. Pain mobility day   pain 3 in the PRIMARY region of >= 50% of today's
+                         exercises -> Mobility / Yoga, 30 min.
+  4. Soreness day swap   2+ SORENESS regions at 4-5 -> Recovery Z2 (20-30 min,
+                         recumbent) + mobility.
+  5. Pain 3 mobility     pain 3 -> exercises using the region (primary or
+                         secondary) are replaced by a 10-15 min mobility block
+                         for it (Stretch Trainer + mat). No refill.
+  6. Soreness replace    soreness 4-5 -> remove every exercise with it as
+                         primary or secondary; refill to the same count from
+                         the pool, avoiding every affected region.
+  7. Pain 2 lighter      pain 2 -> PRIMARY exercises: target load = 80% of the
+                         last logged load, rounded down to a reachable load
+                         (no history: target stays null, "go lighter than last
+                         time").
+  8. Soreness lighten    soreness 2-3 -> PRIMARY exercises: -1 set (min 1),
+                         RPE cap -1.
+  9. Recovery            sleep < 6 or energy <= 2 -> RPE cap -1 everywhere
+                         (floor 1), sets capped at 2, Z2 duration -25%.
+     Otherwise           no change. Pain 0-1 is stored and noted. High energy
+                         or long sleep never adds work.
+
+In-session `pain=` notes from gym-display feed pattern surfacing only
+(artemis.health_patterns) — never these rules.
 
 The adjusted blocks are written to TODAY'S health.plan row with
 blocks.original (the untouched blocks + row fields) and blocks.adjustment
@@ -330,6 +349,7 @@ class Adjustment:
     added: list = field(default_factory=list)
     eased: list = field(default_factory=list)
     reason: str = ""
+    notes: list = field(default_factory=list)      # pain that changed nothing
 
 
 def _fmt(scores: dict, regions, word: str = "") -> str:
@@ -347,13 +367,60 @@ def _scored(d: dict) -> dict:
     return {r: v for r, v in d.items() if r in hr.REGIONS and isinstance(v, int)}
 
 
-def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
+def _fmt_pain(pain: dict, regions) -> str:
+    """"Pain shoulder 4/5" / "Pain shoulder 4/5 + legs 5/5"."""
+    return "Pain " + " + ".join(f"{r} {pain[r]}/5" for r in regions)
+
+
+DAY_OFF_BLOCKS = {
+    "type": "mobility",
+    "display_name": "Day off",
+    "intensity": "none",
+    "duration_min": 0,
+    "notes": "Day off — no training.",
+}
+MOBILITY_DAY_MIN = 30
+DAY_OFF_RULES = ("pain_day_off", "rising_day_off")
+
+
+def _day_off(adj: Adjustment, rule: str, line: str) -> Adjustment:
+    adj.rules_fired.append(rule)
+    adj.session_type = "rest_mobility"
+    adj.target_rpe = None
+    adj.est_duration_min = 0
+    adj.blocks = copy.deepcopy(DAY_OFF_BLOCKS)
+    adj.lines.append(line)
+    adj.changed = True
+    adj.reason = " ".join(adj.lines)
+    return adj
+
+
+def _units(blocks: dict) -> list[str]:
+    """What today's work is made of, for the >= 50% test: the exercises, or the
+    steady block itself (its display name is in the region map)."""
+    if blocks.get("exercises"):
+        return [e["name"] for e in blocks["exercises"]]
+    if blocks.get("type") == "steady":
+        return [blocks.get("display_name") or "Zone 2 Cardio"]
+    return []
+
+
+def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
+                       last_loads: dict | None = None) -> Adjustment:
     """Pure: today's plan row + a parsed check-in -> the adjusted plan.
 
     `plan` needs session_type, blocks, target_rpe, est_duration_min, week_num.
     Blocks are taken from blocks.original when present, so a second check-in
     recomputes from the plan as written instead of stacking.
+
+    `rising`     {region: [d-2, d-1, today]} for regions whose pain rose over
+                 three consecutive check-in days (see rising_pain()). A chain
+                 starting at >= 1 is a day off; one starting at 0 only adds a
+                 "rising:" note.
+    `last_loads` {exercise: top-set lb of its most recent prior session, or None}.
     """
+    rising = rising or {}
+    last_loads = last_loads or {}
     live = coerce_blocks(plan.get("blocks"))
     orig_row = (live.get("original") or {}) if isinstance(live.get("original"), dict) else {}
     base = copy.deepcopy(orig_row.get("blocks") or {k: v for k, v in live.items()
@@ -366,24 +433,69 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
 
     adj = Adjustment(changed=False, blocks=copy.deepcopy(base), session_type=session_type,
                      target_rpe=base_rpe, est_duration_min=base_dur)
-    if session_type in LIGHT_TYPES:
+    if session_type == "rest_mobility":
         return adj
 
     sore = _scored(ci.soreness)
     pain = _scored(ci.pain)
     # Regions keep the order Ryan wrote them in.
     sore_heavy = [r for r, v in sore.items() if v >= 4]
-    pain_heavy = [r for r, v in pain.items() if v >= 4]
     sore_mid = [r for r, v in sore.items() if 2 <= v <= 3]
-    pain_mid = [r for r, v in pain.items() if 1 <= v <= 3]
-    replace_regions = sore_heavy + [r for r in pain_heavy if r not in sore_heavy]
-    # Every region with something going on — substitutes must avoid them all.
-    affected = set(replace_regions) | set(sore_mid) | set(pain_mid)
-    recovery = (ci.sleep_hrs is not None and ci.sleep_hrs < 6) or \
-               (ci.energy is not None and ci.energy <= 2)
+    pain_off = [r for r, v in pain.items() if v >= 4]
+    pain_3 = [r for r, v in pain.items() if v == 3]
+    pain_2 = [r for r, v in pain.items() if v == 2]
+    pain_low = [r for r, v in pain.items() if v <= 1]
+
+    # ── 1. Pain 4-5 -> day off ──────────────────────────────────────────────
+    if pain_off:
+        return _day_off(adj, "pain_day_off", f"{_fmt_pain(pain, pain_off)} → day off.")
+
+    # ── 2. Rising pain -> day off (only when the chain starts at >= 1) ──────
+    rising_off = {r: seq for r, seq in rising.items() if seq[0] >= 1}
+    if rising_off:
+        return _day_off(adj, "rising_day_off", f"Pain {_trend(rising_off)} (rising) → day off.")
+    rising_notes = [f"rising: {_trend({r: seq})}" for r, seq in rising.items()]
+
+    if session_type in LIGHT_TYPES:
+        # A walk only yields to the day-off rules.
+        adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3) + rising_notes
+        return adj
+
     blocks = adj.blocks
 
-    # ── Rule 1: day swap — soreness only ────────────────────────────────────
+    # ── 3. Pain 3 as the PRIMARY region of >= half of today's work ──────────
+    units = _units(blocks)
+    hit = [u for u in units if pain_3 and hr.uses_any(u, pain_3, primary_only=True)]
+    if units and hit and 2 * len(hit) >= len(units):
+        adj.rules_fired.append("pain_mobility_day")
+        adj.session_type = "rest_mobility"
+        adj.target_rpe = None
+        adj.est_duration_min = MOBILITY_DAY_MIN
+        adj.blocks = {
+            "type": "mobility",
+            "display_name": "Mobility / Yoga",
+            "intensity": "gentle",
+            "duration_min": MOBILITY_DAY_MIN,
+            "equipment": list(hr.MOBILITY_EQUIPMENT),
+            "mobility_focus": list(pain_3),
+            "notes": f"{MOBILITY_DAY_MIN} min mobility / yoga (Stretch Trainer + mat): "
+                     + "; ".join(hr.MOBILITY[r] for r in pain_3 if r in hr.MOBILITY),
+        }
+        if base.get("location"):
+            adj.blocks["location"] = base["location"]
+        adj.lines.append(f"{_fmt_pain(pain, pain_3)} → today is Mobility / Yoga: "
+                         f"{MOBILITY_DAY_MIN} min, Stretch Trainer + mat.")
+        adj.notes = _pain_notes(pain, pain_low) + rising_notes
+        adj.changed = True
+        adj.reason = " ".join(adj.lines)
+        return adj
+
+    # Every region with something going on — substitutes must avoid them all.
+    affected = set(sore_heavy) | set(sore_mid) | set(pain_3) | set(pain_2)
+    recovery = (ci.sleep_hrs is not None and ci.sleep_hrs < 6) or \
+               (ci.energy is not None and ci.energy <= 2)
+
+    # ── 4. Soreness day swap ────────────────────────────────────────────────
     if len(sore_heavy) >= 2:
         from artemis import health_office as office
         z2_hi = office.RAMP.get(week_num, office.RAMP[1])[2][1]
@@ -411,13 +523,40 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
     exercises = blocks.get("exercises") or []
     swapped = "day_swap" in adj.rules_fired
 
-    # ── Rule 2: replace (soreness 4-5 or pain 4-5) ──────────────────────────
-    if replace_regions and not swapped and exercises:
-        present = {e["name"] for e in exercises}
+    # ── 5. Pain 3 -> the region's exercises become a mobility block ─────────
+    if pain_3 and not swapped and exercises:
+        removed = [e["name"] for e in exercises if hr.uses_any(e["name"], pain_3)]
+        if removed:
+            blocks["exercises"] = exercises = [e for e in exercises if e["name"] not in removed]
+            focus = list(dict.fromkeys(list(blocks.get("mobility_focus") or []) + pain_3))
+            blocks["mobility_focus"] = focus
+            blocks["mobility_min"] = hr.mobility_minutes(focus)
+            blocks["mobility_notes"] = "; ".join(hr.MOBILITY[r] for r in focus if r in hr.MOBILITY)
+            eq = list(blocks.get("equipment") or [])
+            for item in hr.MOBILITY_EQUIPMENT:
+                if item not in eq:
+                    eq.append(item)
+            blocks["equipment"] = eq
+            if adj.est_duration_min:
+                sets = int(blocks.get("rounds") or 1)
+                adj.est_duration_min = max(
+                    blocks["mobility_min"],
+                    int(adj.est_duration_min) - round(sets * len(removed) * 2.5)
+                    + blocks["mobility_min"])
+            adj.rules_fired.append("pain_mobility")
+            adj.removed += removed
+            adj.lines.append(
+                f"{_fmt_pain(pain, pain_3)} → removed {_join(removed)}. Added "
+                f"{blocks['mobility_min']} min {', '.join(focus)} mobility (Stretch Trainer + mat).")
+        _drop_finisher(adj, blocks, pain_3)
+
+    # ── 6. Soreness 4-5 -> replace from the pool ────────────────────────────
+    if sore_heavy and not swapped and exercises:
+        present = {e["name"] for e in exercises} | set(adj.removed)
         pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected)]
         out_list, removed, added = [], [], []
         for ex in exercises:
-            if hr.uses_any(ex["name"], replace_regions):
+            if hr.uses_any(ex["name"], sore_heavy):
                 removed.append(ex["name"])
                 sub = next((x for x in pool if x not in present), None)
                 if sub is not None:
@@ -433,23 +572,47 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
             blocks["exercises"] = exercises = out_list
             blocks["equipment"] = _equipment_for(exercises, blocks.get("equipment") or [])
             adj.rules_fired.append("replace")
-            adj.removed, adj.added = removed, added
-            who = " + ".join(filter(None, [_fmt(sore, sore_heavy), _fmt(pain, pain_heavy, "pain")]))
-            line = f"{who} → removed {_join(removed)}."
+            adj.removed += removed
+            adj.added += added
+            line = f"{_fmt(sore, sore_heavy)} → removed {_join(removed)}."
             if added:
                 line += f" Added {_join(added)}."
             if len(added) < len(removed):
                 n = len(removed) - len(added)
                 line += f" No substitute left for {n} slot{'s' if n != 1 else ''}."
             adj.lines.append(line)
-        fin = blocks.get("finisher")
-        if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), replace_regions)
-                                         for e in fin.get("exercises") or []):
-            blocks.pop("finisher")
-            adj.rules_fired.append("drop_finisher")
-            adj.lines.append("Conditioning finisher removed.")
+        _drop_finisher(adj, blocks, sore_heavy)
 
-    # ── Rule 3: lighten, soreness 2-3 (primary) ─────────────────────────────
+    # ── 7. Pain 2 -> lighter load on PRIMARY exercises ──────────────────────
+    lightened_pain = []
+    if pain_2 and exercises and not swapped:
+        parts = []
+        for ex in exercises:
+            name = ex["name"]
+            if ex.get("added_by") == "checkin" or not hr.uses_any(name, pain_2, primary_only=True):
+                continue
+            if hr.equipment_class(name) == "bodyweight":
+                continue
+            last = last_loads.get(name)
+            if last is None:
+                ex["target_load_lbs"] = None
+                ex["load_note"] = LIGHTER_NOTE
+                if LIGHTER_NOTE not in (ex.get("notes") or ""):
+                    ex["notes"] = f"{ex['notes']}; {LIGHTER_NOTE}" if ex.get("notes") else LIGHTER_NOTE
+                parts.append(f"{_join([name])}: {LIGHTER_NOTE}")
+            else:
+                target = hr.lighter_load(name, float(last))
+                ex["target_load_lbs"] = target
+                ex["load_from"] = float(last)
+                parts.append(f"{_join([name])} {_n(target)} lb (last {_n(last)})")
+            lightened_pain.append(name)
+            if name not in adj.eased:
+                adj.eased.append(name)
+        if parts:
+            adj.rules_fired.append("pain_lighter")
+            adj.lines.append(f"{_fmt_pain(pain, pain_2)} → {'; '.join(parts)}.")
+
+    # ── 8. Soreness 2-3 -> lighten PRIMARY exercises ────────────────────────
     if sore_mid and exercises and not swapped:
         names = []
         for ex in exercises:
@@ -462,30 +625,14 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
                 names.append(ex["name"])
         if names:
             adj.rules_fired.append("lighten_sore")
-            adj.eased += names
+            adj.eased += [n for n in names if n not in adj.eased]
             first = _by_name(exercises, names[0])
             n_sets = exercise_sets(first, blocks)
             cap = f", RPE ≤{_n(first['rpe_cap'])}" if first.get("rpe_cap") is not None else ""
             adj.lines.append(f"{_fmt(sore, sore_mid)} → {_join(names)}: "
                              f"{n_sets} set{'s' if n_sets != 1 else ''}{cap}.")
 
-    # ── Rule 4: lighten, pain 1-3 (primary): load −20% + mobility ───────────
-    if pain_mid and not swapped:
-        names = []
-        for ex in exercises:
-            if ex.get("added_by") != "checkin" and hr.uses_any(ex["name"], pain_mid, primary_only=True):
-                ex["load_pct"] = 80
-                names.append(ex["name"])
-                if ex["name"] not in adj.eased:
-                    adj.eased.append(ex["name"])
-        blocks["mobility_focus"] = sorted(set(blocks.get("mobility_focus") or []) | set(pain_mid))
-        blocks["mobility_min"] = 5 * len(blocks["mobility_focus"])
-        adj.rules_fired.append("lighten_pain")
-        what = f"{_join(names)}: load −20%. " if names else ""
-        adj.lines.append(f"{_fmt(pain, pain_mid, 'pain')} → {what}"
-                         f"Added {blocks['mobility_min']} min {', '.join(blocks['mobility_focus'])} mobility.")
-
-    # ── Rule 5: global recovery ─────────────────────────────────────────────
+    # ── 9. Global recovery ──────────────────────────────────────────────────
     if recovery:
         adj.rules_fired.append("recovery")
         why = []
@@ -524,9 +671,34 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
         if ex.get("rpe_cap") is not None:
             ex["rpe_cap"] = max(1.0, float(ex["rpe_cap"]))
 
+    # Pain that changed nothing is stored and noted — pain 0-1 always, pain 2
+    # when no primary exercise could be lightened (e.g. knee 2 on Session B).
+    quiet = pain_low + [r for r in pain_2 if not lightened_pain]
+    adj.notes = _pain_notes(pain, quiet) + rising_notes
     adj.changed = bool(adj.rules_fired)
     adj.reason = " ".join(adj.lines)
     return adj
+
+
+LIGHTER_NOTE = "go lighter than last time"
+
+
+def _trend(seqs: dict) -> str:
+    return " + ".join(f"{r} {'→'.join(str(v) for v in seq)}" for r, seq in seqs.items())
+
+
+def _pain_notes(pain: dict, regions) -> list[str]:
+    regions = [r for r in pain if r in regions]
+    return [f"{_fmt_pain(pain, regions)} — noted."] if regions else []
+
+
+def _drop_finisher(adj: Adjustment, blocks: dict, regions) -> None:
+    fin = blocks.get("finisher")
+    if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), regions)
+                                     for e in fin.get("exercises") or []):
+        blocks.pop("finisher")
+        adj.rules_fired.append("drop_finisher")
+        adj.lines.append("Conditioning finisher removed.")
 
 
 def _by_name(exercises, name):
@@ -707,47 +879,141 @@ def checkin_key(day: date) -> str:
     return f"checkin_open:{day.isoformat()}"
 
 
+def rising_pain(cur, day: date, ci: CheckIn) -> dict:
+    """{region: [d-2, d-1, today]} where pain rose strictly over three
+    consecutive local days of morning check-ins.
+
+    Only health.daily_state (morning check-ins) counts. Each of the three
+    check-ins must give the region an explicit pain number — a missing day,
+    a check-in that doesn't mention the region, or a region named without a
+    number breaks the chain. compute_adjustment decides what a chain means:
+    starting at >= 1 is a day off, starting at 0 is a note.
+    """
+    today = _scored(ci.pain)
+    if not today:
+        return {}
+    d2, d1 = day - timedelta(days=2), day - timedelta(days=1)
+    cur.execute(
+        "SELECT state_date, soreness FROM health.daily_state "
+        "WHERE state_date IN (%s, %s)",
+        (d2, d1))
+    by_day = {}
+    for d, sore in cur.fetchall():
+        sore = sore if isinstance(sore, dict) else (json.loads(sore) if sore else {})
+        by_day[d] = (sore or {}).get("pain") or {}
+    if d2 not in by_day or d1 not in by_day:
+        return {}
+    out = {}
+    for region, now_v in today.items():
+        seq = [by_day[d2].get(region), by_day[d1].get(region), now_v]
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in seq):
+            continue
+        if seq[0] < seq[1] < seq[2]:
+            out[region] = seq
+    return out
+
+
+def last_loads(cur, names, day: date) -> dict:
+    """{exercise: top-set lb of its most recent session before `day`}, None
+    when it has never been logged with a load."""
+    out = {}
+    for name in names:
+        cur.execute(
+            "SELECT sl.weight_lbs FROM health.session_log sl "
+            "JOIN health.plan p ON p.plan_id = sl.plan_id "
+            "WHERE sl.exercise = %s AND sl.log_type = 'strength_set' "
+            "AND sl.weight_lbs IS NOT NULL AND sl.weight_lbs > 0 "
+            "AND sl.logged_via <> 'inferred' AND NOT COALESCE(sl.is_skipped, FALSE) "
+            "AND p.plan_date < %s "
+            "ORDER BY p.plan_date DESC, sl.weight_lbs DESC LIMIT 1",
+            (name, day))
+        row = cur.fetchone()
+        out[name] = float(row[0]) if row else None
+    return out
+
+
+def _written(plan: dict) -> tuple[str, dict]:
+    """(session_type, blocks) as written — before any check-in adjustment."""
+    orig = plan["blocks"].get("original")
+    if isinstance(orig, dict):
+        return orig.get("session_type") or plan["session_type"], orig.get("blocks") or {}
+    return plan["session_type"], plan["blocks"]
+
+
+def _pain_primary_names(plan: dict, ci: CheckIn) -> list[str]:
+    regions = [r for r, v in _scored(ci.pain).items() if v == 2]
+    if not regions:
+        return []
+    _, blocks = _written(plan)
+    return [e["name"] for e in blocks.get("exercises") or []
+            if hr.uses_any(e["name"], regions, primary_only=True)]
+
+
 def process_checkin(cur, text: str, day: date, *, checkin_id: str,
                     now: datetime | None = None, adjust: bool | None = None) -> str:
     """Store a check-in and (maybe) adjust today's plan. Returns the reply."""
+    return process_checkin_full(cur, text, day, checkin_id=checkin_id, now=now,
+                                adjust=adjust)[0]
+
+
+def process_checkin_full(cur, text: str, day: date, *, checkin_id: str,
+                         now: datetime | None = None,
+                         adjust: bool | None = None) -> tuple[str, list[int]]:
+    """(reply, ids of pain patterns this check-in completed and mentioned)."""
     now = now or datetime.now(timezone.utc)
     adjust = config.CHECKIN_ADJUST if adjust is None else adjust
     ci = parse_checkin(text)
     if ci.rating_error:
-        return RATINGS_ERROR
+        return RATINGS_ERROR, []
     if not ci.has_data:
         return ("I couldn't read a check-in there. Try: "
-                "`slept 7 energy 4 sore 0 weight 283`.")
+                "`slept 7 energy 4 sore 0 weight 283`."), []
     store_checkin(cur, day, ci)
 
-    plan = load_plan(cur, day)
     notes = []
     if ci.unknown_regions:
         notes.append("Didn't recognize region " + ", ".join(sorted(ci.unknown_regions))
                      + " — logged, no change for it.")
+    reply = _checkin_reply(cur, ci, day, checkin_id, now, adjust, notes)
+
+    # PAIN-1 §4: one line when this check-in completes a pain pattern.
+    mentioned: list[int] = []
+    if _scored(ci.pain):
+        from artemis import health_patterns as hp
+        mentioned, lines = hp.mention_on_checkin(cur, day, now)
+        if lines:
+            reply = "\n".join([reply] + lines)
+    return reply, mentioned
+
+
+def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
+                   adjust: bool, notes: list) -> str:
+    plan = load_plan(cur, day)
     if plan is None:
         return "\n".join(["Check-in logged — no plan today."] + notes)
 
-    label = session_label(plan["session_type"], plan["blocks"])
+    written_type, written_blocks = _written(plan)
+    label = session_label(written_type, written_blocks)
     if logged_set_count(cur, plan["plan_id"]) > 0:
         audit(cur, "checkin_logged", "no_adjust_sets_logged", {"plan_id": plan["plan_id"]})
         return "\n".join(["Logged."] + notes)
 
-    if plan["session_type"] in LIGHT_TYPES:
-        what = "rest day" if plan["session_type"] == "rest_mobility" else "walk"
-        return "\n".join([f"Check-in logged — {what} as planned."] + notes)
+    if written_type == "rest_mobility":
+        return "\n".join(["Check-in logged — rest day as planned."] + notes)
 
-    adj = compute_adjustment(plan, ci)
+    adj = compute_adjustment(plan, ci, rising=rising_pain(cur, day, ci),
+                             last_loads=last_loads(cur, _pain_primary_names(plan, ci), day))
     if not adj.changed or not adjust:
         if adj.changed and not adjust:
             logger.info("CHECKIN_ADJUST=0 — would have applied: %s", adj.reason)
             audit(cur, "checkin_adjust_suppressed", "flag_off",
                   {"plan_id": plan["plan_id"], "rules": adj.rules_fired})
+        what = "walk as planned" if written_type == "walk" else f"run {label} as written"
         if "adjustment" in plan["blocks"] and adjust:
             # A newer check-in that no longer warrants changes: back to as-written.
             restore_original(cur, plan)
-            return "\n".join([f"Check-in logged — back to {label} as written."] + notes)
-        return "\n".join([f"Check-in logged — run {label} as written."] + notes)
+            what = f"back to {label} as written"
+        return "\n".join(adj.notes + [f"Check-in logged — {what}."] + notes)
 
     blocks = apply_to_blocks(adj, plan, checkin_id, now)
     write_plan(cur, plan["plan_id"], blocks, adj.session_type, adj.target_rpe,
@@ -756,7 +1022,9 @@ def process_checkin(cur, text: str, day: date, *, checkin_id: str,
           {"plan_id": plan["plan_id"], "checkin_id": checkin_id, "removed": adj.removed,
            "added": adj.added, "eased": adj.eased})
     # Plan-exact diff only — no advice, no health text.
-    return "\n".join(adj.lines + notes + ["Reply `original` to undo."])
+    if adj.rules_fired[0] in DAY_OFF_RULES and not notes:
+        return f"{adj.lines[0]} Reply `original` to undo."
+    return "\n".join(adj.lines + adj.notes + notes + ["Reply `original` to undo."])
 
 
 def restore_original(cur, plan: dict) -> bool:
@@ -803,6 +1071,8 @@ def process_ack(cur, day: date) -> str:
         return "Got it."
     label = session_label(plan["session_type"], plan["blocks"])
     if "adjustment" in plan["blocks"]:
+        if plan["session_type"] == "rest_mobility":
+            return f"Got it — {label} today. Reply `original` to go back."
         return f"Got it — run the adjusted {label}. Reply `original` to go back."
     if plan["session_type"] in LIGHT_TYPES:
         return "Got it."

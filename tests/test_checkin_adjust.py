@@ -55,6 +55,16 @@ class FakeDB:
         self.logs: list[dict] = []
         self.daily: dict[date, dict] = {}
         self.audit: list[tuple] = []
+        self.patterns: list[dict] = []          # health.pain_pattern
+        self.reflections: list[dict] = []       # health.reflection
+        self.plan_dates: dict[int, date] = {}   # plan_id -> date for history-only rows
+        self._savepoint = None
+
+    def date_of(self, plan_id):
+        for r in self.plan.values():
+            if r["plan_id"] == plan_id:
+                return r["plan_date"]
+        return self.plan_dates.get(plan_id)
 
     def cursor(self):
         return FakeCursor(self)
@@ -101,8 +111,78 @@ class FakeCursor:
         elif s.startswith("SELECT exercise, log_type FROM health.session_log"):
             self._rows = [(l["exercise"], l["log_type"]) for l in self.db.logs
                           if l["plan_id"] == params[0] and l["logged_via"] != "inferred"]
+        # ── PAIN-1 ──
+        elif s.startswith("SELECT state_date, soreness FROM health.daily_state WHERE state_date IN"):
+            self._rows = [(d, json.dumps(v["soreness"]) if v["soreness"] is not None else None)
+                          for d, v in self.db.daily.items() if d in params]
+        elif s.startswith("SELECT state_date, soreness FROM health.daily_state WHERE state_date BETWEEN"):
+            self._rows = [(d, v["soreness"]) for d, v in sorted(self.db.daily.items())
+                          if params[0] <= d <= params[1]]
+        elif s.startswith("SELECT sl.weight_lbs FROM health.session_log sl"):
+            name, day = params
+            cands = [(self.db.date_of(l["plan_id"]), l["weight_lbs"]) for l in self.db.logs
+                     if l["exercise"] == name and l["log_type"] == "strength_set"
+                     and l.get("weight_lbs") and l["logged_via"] != "inferred"
+                     and not l.get("is_skipped") and self.db.date_of(l["plan_id"]) < day]
+            cands.sort(reverse=True)
+            self._rows = [(cands[0][1],)] if cands else []
+        elif s.startswith("SELECT p.plan_date, sl.exercise, sl.notes"):
+            lo, hi = params
+            self._rows = [(self.db.date_of(l["plan_id"]), l["exercise"], l.get("notes"),
+                           bool(l.get("is_skipped")))
+                          for l in self.db.logs
+                          if l["log_type"] == "strength_set" and l["logged_via"] != "inferred"
+                          and lo <= self.db.date_of(l["plan_id"]) <= hi]
+        elif s.startswith("SELECT id, exercise, region, hits"):
+            from artemis.health_patterns import _COLS
+            self._rows = [tuple(copy.deepcopy(p[c]) for c in _COLS) for p in self.db.patterns]
+        elif s.startswith("INSERT INTO health.pain_pattern"):
+            (ex, region, hits, exposures, qual, first, last, status, dah, ev, now) = params
+            row = next((p for p in self.db.patterns
+                        if (p["exercise"], p["region"]) == (ex, region)), None)
+            if row is None:
+                row = {"id": len(self.db.patterns) + 1, "exercise": ex, "region": region,
+                       "first_seen": None, "last_seen": None, "last_surfaced": None,
+                       "surfaced_hits": None, "surfaced_exposures": None,
+                       "mentioned_at": None, "post_ids": [], "resolved_at": None,
+                       "resolved_at_hits": None}
+                self.db.patterns.append(row)
+            row.update(hits=hits, exposures=exposures, qualifies=qual, status=status,
+                       dismissed_at_hits=dah, evidence=json.loads(ev))
+            row["first_seen"] = first or row["first_seen"]
+            row["last_seen"] = last or row["last_seen"]
+        elif s.startswith("UPDATE health.pain_pattern SET mentioned_at"):
+            self._pattern(params[1])["mentioned_at"] = params[0]
+        elif s.startswith("UPDATE health.pain_pattern SET last_surfaced"):
+            now, h, e, pid, _, rid = params
+            row = self._pattern(rid)
+            row.update(last_surfaced=now, surfaced_hits=h, surfaced_exposures=e)
+            if pid is not None:
+                row["post_ids"].append(pid)
+        elif s.startswith("UPDATE health.pain_pattern SET status = 'dismissed'"):
+            row = self._pattern(params[1])
+            row.update(status="dismissed", dismissed_at_hits=row["hits"])
+        elif s.startswith("UPDATE health.pain_pattern SET status = 'resolved'"):
+            row = self._pattern(params[2])
+            row.update(status="resolved", resolved_at=params[0], resolved_at_hits=row["hits"])
+        elif s.startswith("SELECT id FROM health.pain_pattern WHERE %s = ANY(post_ids)"):
+            self._rows = [(p["id"],) for p in self.db.patterns if params[0] in p["post_ids"]]
+        elif s.startswith("INSERT INTO health.reflection"):
+            pid, text, post_id, src = params
+            if not any(r["source_post_id"] == src for r in self.db.reflections if src):
+                self.db.reflections.append({"pattern_id": pid, "text": text,
+                                            "post_id": post_id, "source_post_id": src})
+        elif s == "SAVEPOINT pain_patterns":
+            self.db._savepoint = copy.deepcopy(self.db.patterns)
+        elif s == "RELEASE SAVEPOINT pain_patterns":
+            self.db._savepoint = None
+        elif s == "ROLLBACK TO SAVEPOINT pain_patterns":
+            self.db.patterns = self.db._savepoint
         else:
             raise AssertionError(f"unhandled SQL: {s[:90]}")
+
+    def _pattern(self, pid):
+        return next(p for p in self.db.patterns if p["id"] == pid)
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -212,41 +292,8 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertIn("Recovery Z2 + Mobility", reply)
         self.assertEqual(b["adjustment"]["rules_fired"], ["day_swap"])
 
-    def test_06_pain_5_in_two_regions_replaces_never_swaps(self):
-        reply = self.checkin("shoulder pain 5 plus legs pain 5")
-        row = self.db.plan[FRI]
-        self.assertEqual(row["session_type"], "strength_b")
-        b = row["blocks"]
-        self.assertEqual(b["type"], "circuit")
-        self.assertNotIn("day_swap", b["adjustment"]["rules_fired"])
-        self.assertIn("replace", b["adjustment"]["rules_fired"])
-        got = names(self.db)
-        for gone in ("DB goblet squat", "Seated cable row", "Incline DB press",
-                     "Rear delt fly", "Leg extension"):
-            self.assertNotIn(gone, got)
-        for ex in b["exercises"]:
-            self.assertFalse(regions.uses_any(ex["name"], ["shoulder", "legs"]), ex["name"])
-        self.assertEqual(len(set(got)), len(got))
-        self.assertTrue(reply.startswith("Shoulder pain 5/5 + Legs pain 5/5 → removed"), reply)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"pain": {"shoulder": 5, "legs": 5}})
-
-    def test_07_shoulder_pain_2_lighter_load_plus_mobility_no_advice(self):
-        reply = self.checkin("shoulder pain 2")
-        by = self.by_name()
-        self.assertEqual(names(self.db), B_NAMES)
-        for n in ("Incline DB press", "Rear delt fly"):          # shoulder-PRIMARY
-            self.assertEqual(by[n]["load_pct"], 80, n)
-        for n in ("DB goblet squat", "Seated cable row", "Leg extension"):
-            self.assertNotIn("load_pct", by[n], n)                # secondary / unrelated
-        for ex in by.values():
-            self.assertNotIn("rpe_cap", ex)
-            self.assertNotIn("sets", ex)
-        b = self.db.plan[FRI]["blocks"]
-        self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["shoulder"], 5))
-        self.assertEqual(reply, "Shoulder pain 2/5 → incline DB press and rear delt fly: load −20%. "
-                                "Added 5 min shoulder mobility.\nReply `original` to undo.")
-        self.assertNotRegex(reply.lower(),
-            r"\b(ice|rest it|see a|doctor|physio|advice|careful|stop if|listen to|consult)\b")
+    # FRIDAY-1 tests 06 (pain 4-5 replaces) and 07 (pain 1-3: load −20% +
+    # mobility) were retired by PAIN-1 — see tests/test_pain_ladder.py.
 
     def test_08_rating_above_5_refused_nothing_stored(self):
         before = copy.deepcopy(self.db.plan[FRI])
@@ -398,12 +445,14 @@ class TestSessionBScenarios(unittest.TestCase):
     def test_rules_never_add_volume_load_or_rpe(self):
         for text in ("sore shoulder 4", "legs sore 3", "slept 5 energy 2", "shoulder pain 2",
                      "sore shoulder 4 and legs 5", "shoulder pain 5 plus legs pain 5",
+                     "shoulder pain 3", "legs pain 3", "knee pain 1",
                      "slept 9 energy 5 sore 0"):
             db = FakeDB(office_row(FRI))
             hc.process_checkin(db.cursor(), text, FRI, checkin_id="x", now=self.now, adjust=True)
             b = db.plan[FRI]["blocks"]
             base = office_row(FRI)
-            self.assertLessEqual(db.plan[FRI]["target_rpe"], base["target_rpe"], text)
+            # A day off / mobility day has no RPE at all.
+            self.assertLessEqual(db.plan[FRI]["target_rpe"] or 0, base["target_rpe"], text)
             for ex in b.get("exercises") or []:
                 self.assertLessEqual(hc.exercise_sets(ex, b), 2, text)
                 self.assertLessEqual(ex.get("rpe_cap", 6.0), 6.0, text)

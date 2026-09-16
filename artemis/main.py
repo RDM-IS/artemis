@@ -3688,7 +3688,7 @@ def _handle_morning_flow(post: dict, question: str) -> bool:
     Deterministic end to end: a claimed message never reaches an LLM or Gmail.
     """
     from artemis.health_checkin import (
-        classify, process_ack, process_checkin, process_done, process_original,
+        classify, process_ack, process_checkin_full, process_done, process_original,
     )
     from artemis.quiet_hours import local_today
     from knowledge.db import get_connection
@@ -3700,10 +3700,12 @@ def _handle_morning_flow(post: dict, question: str) -> bool:
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
     today = local_today()
+    mentioned: list[int] = []
     with get_connection() as conn:
         cur = conn.cursor()
         if kind == "checkin":
-            reply = process_checkin(cur, question, today, checkin_id=post.get("id") or "")
+            reply, mentioned = process_checkin_full(cur, question, today,
+                                                    checkin_id=post.get("id") or "")
         elif kind == "original":
             reply = process_original(cur, today)
         elif kind == "done":
@@ -3712,6 +3714,80 @@ def _handle_morning_flow(post: dict, question: str) -> bool:
             reply = process_ack(cur, today)
     if _mm:
         _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    if mentioned:
+        # PAIN-1: the next unclaimed reply in this thread today is a reflection.
+        import json as _json
+        from artemis.health_patterns import checkin_thread_key
+        from artemis.quiet_hours import set_system_value
+        set_system_value(checkin_thread_key(root_id),
+                         _json.dumps({"ids": mentioned, "date": today.isoformat()}))
+    return True
+
+
+def _handle_pattern_thread(post: dict, question: str) -> bool:
+    """PAIN-1 — replies in a pain-pattern thread.
+
+    `dismiss` / `resolved` change the pattern's status. Anything else is stored
+    verbatim as a reflection and changes no plan; if it asks for a workout
+    change it then falls through to the existing swap flow (propose, confirm).
+    Claims nothing outside a pattern thread.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    root_id = post.get("root_id") or ""
+    if not root_id:
+        return False
+    from artemis import health_patterns as hp
+    from artemis.quiet_hours import get_system_value, local_today, set_system_value
+    from knowledge.db import get_connection
+
+    thread_key = hp.checkin_thread_key(root_id)
+    one_shot = False
+    # The lookup runs for every threaded reply — fail open so a pattern-table
+    # problem never turns ordinary thread replies into errors.
+    try:
+        with get_connection() as conn:
+            ids = hp.patterns_for_post(conn.cursor(), root_id)
+    except Exception:
+        logger.exception("pattern_thread lookup failed — not claiming post %s", post.get("id"))
+        return False
+    if not ids:
+        raw = get_system_value(thread_key)
+        try:
+            link = _json.loads(raw) if raw else None
+        except ValueError:
+            link = None
+        if link and link.get("date") == local_today().isoformat():
+            ids, one_shot = list(link.get("ids") or []), True
+    if not ids:
+        return False
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc)
+        kind = hp.classify_thread_reply(question)
+        if kind == "dismissed":
+            hp.set_status(cur, ids, "dismissed", now)
+            reply = "Dismissed — hidden until it gets 2 more hits."
+        elif kind == "resolved":
+            hp.set_status(cur, ids, "resolved", now)
+            reply = "Resolved — it comes back only if new data re-qualifies it."
+        else:
+            hp.store_reflection(cur, ids, question, root_id, post.get("id"))
+            reply = "Noted."
+    if one_shot:
+        set_system_value(thread_key, "")
+
+    if kind == "reflection":
+        from artemis.health import (
+            detect_modality_swap, detect_swap_revert, looks_like_unsupported_workout_change,
+        )
+        if detect_modality_swap(question) or detect_swap_revert(question) \
+                or looks_like_unsupported_workout_change(question):
+            return False  # stored; the swap flow proposes the change
+    if _mm:
+        _mm.post_to_channel_id(post.get("channel_id", ""), reply, root_id=root_id)
     return True
 
 
@@ -4134,6 +4210,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # FRIDAY-1: check-ins and short morning replies, AHEAD of nutrition (whose
         # "i had"/"log" patterns used to swallow check-ins) and of the LLM.
         ("morning_flow", _handle_morning_flow),
+        # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
+        # resolved). After morning_flow so a check-in in the thread is a check-in.
+        ("pattern_thread", _handle_pattern_thread),
         ("nutrition", _handle_nutrition),
         ("health_conversation", _handle_health_conversation),
         ("capture_propose", _handle_capture_propose),

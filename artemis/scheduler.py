@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -190,6 +190,10 @@ class ArtemisScheduler:
             CronSpec("quiet_hours_start", "job_quiet_hours_start", quiet_h, quiet_m),
             # 21:50 — silent DB backstop; writes only, posts nothing.
             CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
+            # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
+            CronSpec("pain_pattern_recompute", "job_pain_pattern_recompute", 21, 55),
+            # Sun 08:00 — weekly health review: new/changed pain patterns only.
+            CronSpec("health_review", "job_health_review", 8, 0, "sun", tier="health"),
         ]
         if config.FOCUS_CLIENT:
             specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
@@ -1554,6 +1558,44 @@ class ArtemisScheduler:
                 logger.info("Posted check-in nudge for %s", today)
         except Exception:
             logger.exception("Check-in nudge failed")
+
+    def job_pain_pattern_recompute(self):
+        """21:55 local — refresh health.pain_pattern. Silent: posts nothing."""
+        try:
+            from artemis.health_patterns import recompute
+            from knowledge.db import get_connection
+
+            with get_connection() as conn:
+                rows = recompute(conn.cursor(), _local_today())
+            logger.info("Pain patterns recomputed: %d row(s), %d candidate(s)",
+                        len(rows), sum(1 for r in rows if r["qualifies"]))
+        except Exception:
+            logger.exception("Pain pattern recompute failed")
+
+    def job_health_review(self):
+        """Sun 08:00 local — one post per new or changed open pain pattern.
+
+        Posts only in the OPEN phase and only when something is new; replies
+        in each post's thread become reflections (main._handle_pattern_thread).
+        """
+        if not self._is_open():
+            logger.info("Health review: phase not open — skipping")
+            return
+        try:
+            from artemis.health_patterns import mark_surfaced, recompute, render, to_surface
+            from knowledge.db import get_connection
+
+            now = datetime.now(timezone.utc)
+            with get_connection() as conn:
+                cur = conn.cursor()
+                rows = to_surface(recompute(cur, _local_today(), now))
+                for row in rows:
+                    resp = self.mm.post_message(config.CHANNEL_OPS, render(row))
+                    mark_surfaced(cur, row, (resp or {}).get("id"), now)
+            if rows:
+                logger.info("Health review posted %d pattern(s)", len(rows))
+        except Exception:
+            logger.exception("Health review failed")
 
     def job_health_evening_prompt(self):
         """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.

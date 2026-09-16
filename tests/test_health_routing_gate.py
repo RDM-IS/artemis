@@ -90,7 +90,8 @@ class TestClassifierBypass(_Base):
         with patch.object(intent, "route_intent") as route, \
              patch.object(main, "_handle_intent_routed") as routed, \
              patch("knowledge.db.get_connection", _fake_conn()), \
-             patch("artemis.health_checkin.process_checkin", return_value=canned) as pc:
+             patch("artemis.health_checkin.process_checkin_full",
+                   return_value=(canned, [])) as pc:
             main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
         route.assert_not_called()
         routed.assert_not_called()
@@ -179,8 +180,8 @@ class TestGeneralReplyCannotReroute(_Base):
         with patch.object(intent, "route_intent", return_value=general_reply) as route, \
              patch.object(main, "_handle_intent_routed") as routed, \
              patch("knowledge.db.get_connection", _fake_conn()), \
-             patch("artemis.health_checkin.process_checkin",
-                   return_value="Logged: 7h sleep, energy 5/5.") as handler:
+             patch("artemis.health_checkin.process_checkin_full",
+                   return_value=("Logged: 7h sleep, energy 5/5.", [])) as handler:
             main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
         # The classifier (which would have said general_reply) is never reached…
         route.assert_not_called()
