@@ -21,10 +21,13 @@ region rules apply to whatever exercises are left. They never add volume,
 load or RPE:
 
   1. Pain day off        pain 4-5 anywhere -> Day off (rest, zero effort).
-  2. Rising day off      pain rising in a region over the last 3 consecutive
-                         check-in days (1->2->3) -> Day off.
-  3. Pain mobility day   pain 3 touches >= 50% of today's exercises (primary or
-                         secondary) -> Mobility / Yoga, 30 min.
+  2. Rising day off      pain in a region rose over 3 consecutive check-in
+                         days, each giving that region a number, starting at
+                         >= 1 (1->2->3) -> Day off. A rise from 0 (0->1->2)
+                         is not a day off: the normal pain rules apply plus a
+                         one-line "rising: <region> 0→1→2" note.
+  3. Pain mobility day   pain 3 in the PRIMARY region of >= 50% of today's
+                         exercises -> Mobility / Yoga, 30 min.
   4. Soreness day swap   2+ SORENESS regions at 4-5 -> Recovery Z2 (20-30 min,
                          recumbent) + mobility.
   5. Pain 3 mobility     pain 3 -> exercises using the region (primary or
@@ -411,7 +414,9 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     recomputes from the plan as written instead of stacking.
 
     `rising`     {region: [d-2, d-1, today]} for regions whose pain rose over
-                 three consecutive check-in days (see rising_pain()).
+                 three consecutive check-in days (see rising_pain()). A chain
+                 starting at >= 1 is a day off; one starting at 0 only adds a
+                 "rising:" note.
     `last_loads` {exercise: top-set lb of its most recent prior session, or None}.
     """
     rising = rising or {}
@@ -445,21 +450,22 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     if pain_off:
         return _day_off(adj, "pain_day_off", f"{_fmt_pain(pain, pain_off)} → day off.")
 
-    # ── 2. Rising pain -> day off ───────────────────────────────────────────
-    if rising:
-        trend = " + ".join(f"{r} {'→'.join(str(v) for v in seq)}" for r, seq in rising.items())
-        return _day_off(adj, "rising_day_off", f"Pain {trend} (rising) → day off.")
+    # ── 2. Rising pain -> day off (only when the chain starts at >= 1) ──────
+    rising_off = {r: seq for r, seq in rising.items() if seq[0] >= 1}
+    if rising_off:
+        return _day_off(adj, "rising_day_off", f"Pain {_trend(rising_off)} (rising) → day off.")
+    rising_notes = [f"rising: {_trend({r: seq})}" for r, seq in rising.items()]
 
     if session_type in LIGHT_TYPES:
         # A walk only yields to the day-off rules.
-        adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3)
+        adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3) + rising_notes
         return adj
 
     blocks = adj.blocks
 
-    # ── 3. Pain 3 on >= half of today's work -> Mobility / Yoga ─────────────
+    # ── 3. Pain 3 as the PRIMARY region of >= half of today's work ──────────
     units = _units(blocks)
-    hit = [u for u in units if pain_3 and hr.uses_any(u, pain_3)]
+    hit = [u for u in units if pain_3 and hr.uses_any(u, pain_3, primary_only=True)]
     if units and hit and 2 * len(hit) >= len(units):
         adj.rules_fired.append("pain_mobility_day")
         adj.session_type = "rest_mobility"
@@ -479,7 +485,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             adj.blocks["location"] = base["location"]
         adj.lines.append(f"{_fmt_pain(pain, pain_3)} → today is Mobility / Yoga: "
                          f"{MOBILITY_DAY_MIN} min, Stretch Trainer + mat.")
-        adj.notes = _pain_notes(pain, pain_low)
+        adj.notes = _pain_notes(pain, pain_low) + rising_notes
         adj.changed = True
         adj.reason = " ".join(adj.lines)
         return adj
@@ -668,13 +674,17 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # Pain that changed nothing is stored and noted — pain 0-1 always, pain 2
     # when no primary exercise could be lightened (e.g. knee 2 on Session B).
     quiet = pain_low + [r for r in pain_2 if not lightened_pain]
-    adj.notes = _pain_notes(pain, quiet)
+    adj.notes = _pain_notes(pain, quiet) + rising_notes
     adj.changed = bool(adj.rules_fired)
     adj.reason = " ".join(adj.lines)
     return adj
 
 
 LIGHTER_NOTE = "go lighter than last time"
+
+
+def _trend(seqs: dict) -> str:
+    return " + ".join(f"{r} {'→'.join(str(v) for v in seq)}" for r, seq in seqs.items())
 
 
 def _pain_notes(pain: dict, regions) -> list[str]:
@@ -871,32 +881,34 @@ def checkin_key(day: date) -> str:
 
 def rising_pain(cur, day: date, ci: CheckIn) -> dict:
     """{region: [d-2, d-1, today]} where pain rose strictly over three
-    consecutive local days of morning check-ins and today is >= 1.
+    consecutive local days of morning check-ins.
 
-    Only health.daily_state (morning check-ins) counts. A missing day breaks
-    the chain. On a check-in day that doesn't mention the region its pain is
-    0; a region named without a number (null) breaks the chain.
+    Only health.daily_state (morning check-ins) counts. Each of the three
+    check-ins must give the region an explicit pain number — a missing day,
+    a check-in that doesn't mention the region, or a region named without a
+    number breaks the chain. compute_adjustment decides what a chain means:
+    starting at >= 1 is a day off, starting at 0 is a note.
     """
     today = _scored(ci.pain)
     if not today:
         return {}
+    d2, d1 = day - timedelta(days=2), day - timedelta(days=1)
     cur.execute(
         "SELECT state_date, soreness FROM health.daily_state "
         "WHERE state_date IN (%s, %s)",
-        (day - timedelta(days=2), day - timedelta(days=1)))
+        (d2, d1))
     by_day = {}
     for d, sore in cur.fetchall():
         sore = sore if isinstance(sore, dict) else (json.loads(sore) if sore else {})
         by_day[d] = (sore or {}).get("pain") or {}
-    d2, d1 = day - timedelta(days=2), day - timedelta(days=1)
     if d2 not in by_day or d1 not in by_day:
         return {}
     out = {}
     for region, now_v in today.items():
-        seq = [by_day[d2].get(region, 0), by_day[d1].get(region, 0), now_v]
-        if any(not isinstance(v, int) for v in seq):
+        seq = [by_day[d2].get(region), by_day[d1].get(region), now_v]
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in seq):
             continue
-        if now_v >= 1 and seq[0] < seq[1] < seq[2]:
+        if seq[0] < seq[1] < seq[2]:
             out[region] = seq
     return out
 

@@ -125,11 +125,11 @@ class TestLadder(Base):
         self.assertEqual(self.checkin("shoulder pain 5", day=thu),
                          "Check-in logged — rest day as planned.")
 
-    def test_p3_whole_day_mobility_when_half_or_more_affected(self):
-        # Shoulder is in 4 of Session B's 7 (goblet, cable row secondary;
-        # incline press, rear delt fly primary) -> whole day.
-        reply = self.checkin("shoulder pain 3")
-        self.assertEqual(reply, "Pain shoulder 3/5 → today is Mobility / Yoga: 30 min, "
+    def test_p3_whole_day_mobility_when_half_or_more_are_primary(self):
+        # Legs + shoulder are the PRIMARY region of 4 of Session B's 7
+        # (goblet squat, leg extension; incline press, rear delt fly) -> whole day.
+        reply = self.checkin("legs pain 3, shoulder pain 3")
+        self.assertEqual(reply, "Pain legs 3/5 + shoulder 3/5 → today is Mobility / Yoga: 30 min, "
                                 "Stretch Trainer + mat.\nReply `original` to undo.")
         row = self.row()
         self.assertEqual((row["session_type"], row["est_duration_min"], row["target_rpe"]),
@@ -138,11 +138,32 @@ class TestLadder(Base):
         self.assertEqual((b["type"], b["display_name"], b["duration_min"]),
                          ("mobility", "Mobility / Yoga", 30))
         self.assertEqual(b["equipment"], ["Stretch Trainer", "mat"])
-        self.assertEqual(b["mobility_focus"], ["shoulder"])
+        self.assertEqual(b["mobility_focus"], ["legs", "shoulder"])
         self.assertTrue(25 <= b["duration_min"] <= 30)
 
+    def test_p3_shoulder_on_session_b_is_a_region_block_not_a_mobility_day(self):
+        # Shoulder is PRIMARY on 2 of 7 (incline press, rear delt fly) — under
+        # half, even though 4 of 7 use it as primary or secondary.
+        reply = self.checkin("shoulder pain 3")
+        row = self.row()
+        self.assertEqual(row["session_type"], "strength_b")
+        self.assertEqual(row["blocks"]["adjustment"]["rules_fired"], ["pain_mobility"])
+        self.assertEqual(names(self.db), ["Leg extension", "Cable Pallof press", "45° back extension"])
+        b = row["blocks"]
+        self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["shoulder"], 10))
+        self.assertEqual(reply, "Pain shoulder 3/5 → removed DB goblet squat, seated cable row, "
+                                "incline DB press, rear delt fly. Added 10 min shoulder mobility "
+                                "(Stretch Trainer + mat).\nReply `original` to undo.")
+
+    def test_p3_legs_on_a_z2_day_is_a_mobility_day(self):
+        tue = date(2026, 9, 22)
+        self.db = FakeDB(office_row(tue, plan_id=108))
+        self.cur = self.db.cursor()
+        self.checkin("legs pain 3", day=tue)
+        self.assertEqual(self.row(tue)["blocks"]["display_name"], "Mobility / Yoga")
+
     def test_p3_beats_soreness_day_swap(self):
-        self.checkin("sore legs 4 and back 4, shoulder pain 3")
+        self.checkin("sore legs 4 and back 4, legs pain 3, shoulder pain 3")
         self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_mobility_day"])
 
     def test_p3_region_mobility_replaces_affected_exercises(self):
@@ -305,10 +326,40 @@ class TestRisingPain(Base):
         self.assertEqual(self.checkin("shoulder pain 1"),
                          "Pain shoulder 1/5 — noted.\nCheck-in logged — run Session B as written.")
 
-    def test_unmentioned_region_on_a_checkin_day_counts_as_zero(self):
+    def test_unmentioned_region_breaks_the_chain(self):
+        self.seed({2: {"knee": 1}, 1: {"shoulder": 1}})
+        reply = self.checkin("shoulder pain 2")
+        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_lighter"])
+        self.assertNotIn("rising", reply)
         self.seed({2: None, 1: {"shoulder": 1}})
-        self.checkin("shoulder pain 2")
-        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["rising_day_off"])
+        self.assertNotIn("rising", self.checkin("shoulder pain 2"))
+
+    def test_0_1_2_is_pain_2_plus_a_rising_note(self):
+        self.seed({2: {"shoulder": 0}, 1: {"shoulder": 1}})
+        reply = self.checkin("shoulder pain 2")
+        self.assertEqual(self.row()["session_type"], "strength_b")
+        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_lighter"])
+        self.assertEqual(reply, "Pain shoulder 2/5 → incline DB press: go lighter than last time; "
+                                "rear delt fly: go lighter than last time.\n"
+                                "rising: shoulder 0→1→2\nReply `original` to undo.")
+        self.assertEqual(sum("rising" in l for l in reply.splitlines()), 1)
+
+    def test_rise_from_0_keeps_the_normal_pain_3_rule(self):
+        self.seed({2: {"low back": 0}, 1: {"low back": 2}})
+        reply = self.checkin("low back pain 3")
+        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_mobility"])
+        self.assertIn("\nrising: low back 0→2→3\n", reply)
+
+    def test_rise_from_0_with_nothing_to_lighten_is_noted(self):
+        self.seed({2: {"knee": 0}, 1: {"knee": 1}})
+        self.assertEqual(self.checkin("knee pain 2"),
+                         "Pain knee 2/5 — noted.\nrising: knee 0→1→2\n"
+                         "Check-in logged — run Session B as written.")
+
+    def test_2_3_4_is_a_day_off_via_pain_4(self):
+        self.seed({2: {"shoulder": 2}, 1: {"shoulder": 3}})
+        self.checkin("shoulder pain 4")
+        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_day_off"])
 
     def test_unscored_region_breaks_the_chain(self):
         self.seed({2: {"shoulder": None}, 1: {"shoulder": 1}})

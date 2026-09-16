@@ -1,10 +1,9 @@
--- 031_pain_patterns.sql
--- feat/pain-ladder (PAIN-1): pain pattern surfacing + reflections, and the
--- FRIDAY-1 energy scale fix.
+-- 032_pain_patterns.sql
+-- feat/pain-ladder (PAIN-1): pain pattern surfacing + reflections.
+-- (The energy 0-5 CHECK fix shipped separately as 031.)
 --
--- Idempotent (IF NOT EXISTS guards + a guarded CHECK swap). Nothing is
--- dropped except the old energy CHECK, which is replaced in the same statement
--- block. No existing rows change.
+-- Idempotent (IF NOT EXISTS guards). Additive only — no existing table or
+-- row changes.
 
 -- ---------------------------------------------------------------------------
 -- health.pain_pattern — one row per exercise x region that has ever qualified.
@@ -68,32 +67,3 @@ CREATE TABLE IF NOT EXISTS health.reflection (
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS reflection_pattern_idx ON health.reflection (pattern_id);
-
--- ---------------------------------------------------------------------------
--- health.daily_state.energy: 013 allowed 1-5, but check-ins are 0-5 since
--- FRIDAY-1 ("energy 0" would fail the insert and lose the whole check-in).
--- Swap the inline CHECK (auto-named daily_state_energy_check) for 0-5.
--- ---------------------------------------------------------------------------
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint c
-        JOIN pg_class t ON t.oid = c.conrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        WHERE n.nspname = 'health' AND t.relname = 'daily_state'
-          AND c.conname = 'daily_state_energy_check'
-          AND pg_get_constraintdef(c.oid) NOT LIKE '%>= 0%'
-    ) THEN
-        ALTER TABLE health.daily_state DROP CONSTRAINT daily_state_energy_check;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint c
-        JOIN pg_class t ON t.oid = c.conrelid
-        JOIN pg_namespace n ON n.oid = t.relnamespace
-        WHERE n.nspname = 'health' AND t.relname = 'daily_state'
-          AND c.conname = 'daily_state_energy_check'
-    ) THEN
-        ALTER TABLE health.daily_state
-            ADD CONSTRAINT daily_state_energy_check CHECK (energy BETWEEN 0 AND 5);
-    END IF;
-END$$;

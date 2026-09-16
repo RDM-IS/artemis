@@ -241,7 +241,7 @@ crm_write_guard(entity_type, data, confidence, source_pb,
 **Database:** `health` schema (migration 013) — `health.plan`,
 `health.session_log`, `health.daily_state`, `health.adjustments`,
 `health.training_rules`, `health.phase_config`; `health.pain_pattern` and
-`health.reflection` (migration 031). Isolated; no `public`
+`health.reflection` (migration 032). Isolated; no `public`
 or `acos` writes.
 
 ### Triggers — proactive (scheduled jobs)
@@ -300,8 +300,8 @@ long sleep never adds work — progression belongs to the program.
 | # | When | Change |
 |---|---|---|
 | 1 | **pain 4–5** in any region | **Day off**: the row becomes `rest_mobility`, blocks `{type: mobility, display_name: "Day off", duration_min: 0}`, no RPE, 0 min. No nudge. |
-| 2 | **rising pain** (below) | **Day off**, same as 1. The reply names the trend. |
-| 3 | **pain 3** in a region used (primary **or** secondary) by **≥ 50%** of today's exercises (a Z2/walk block counts as one) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). |
+| 2 | **rising pain** starting at ≥ 1 (below) | **Day off**, same as 1. The reply names the trend. |
+| 3 | **pain 3** in the **primary** region of **≥ 50%** of today's exercises (a Z2/walk block counts as one, by its primary region) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). Secondary use doesn't count toward the 50%: shoulder pain 3 on Session B (primary on 2 of 7) is a rule-5 block, not a mobility day. |
 | 4 | 2+ **soreness** regions at 4–5 | Day swap → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility. |
 | 5 | **pain 3** (under 50%) | Every exercise using the region (primary or secondary) is removed and replaced by a **mobility block** for it: `mobility_focus`, `mobility_min` (10 min for one region, 15 for several), `mobility_notes` from the region→mobility map in `health_regions.py`; Stretch Trainer + mat added to equipment. **No refill.** A finisher using the region is dropped. |
 | 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, 45° back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
@@ -315,15 +315,22 @@ soreness day swap > pain-3 region mobility > soreness replace > pain-2 lighter >
 soreness lighten > recovery. FRIDAY-1's "pain 4–5 replaces" and "pain 1–3:
 load −20% + mobility" rules are gone.
 
-**Rising pain.** Fires for a region when the morning check-ins on **D−2, D−1
-and today** (three consecutive local days) show strictly increasing pain and
-today is ≥ 1 — `1→2→3` fires; `1→2`, `2→2→3` and `3→2→1` don't. A missing day
-breaks the chain (only the last three consecutive days count). Only morning
-check-ins (`health.daily_state`) count — in-session notes never do. On a
-check-in day that doesn't mention the region its pain counts as 0 (so
-`none→1→2` fires); a region named without a number breaks the chain. Reply:
+**Rising pain.** A chain for a region needs morning check-ins on **D−2, D−1
+and today** (three consecutive local days) that **each give that region a pain
+number**, strictly increasing. A missing day, a check-in that doesn't mention
+the region, or a region named without a number breaks the chain. Only morning
+check-ins (`health.daily_state`) count — in-session notes never do.
+
+- Chain starts at **≥ 1** (`1→2→3`) → **day off** (rule 2).
+- Chain starts at **0** (`0→1→2`) → **no day off**; the normal pain rules
+  apply to today's number, and the reply adds one line `rising: shoulder 0→1→2`.
+- `1→2`, `2→2→3`, `3→2→1`, `(unmentioned)→1→2` → nothing.
 
 > Pain shoulder 1→2→3 (rising) → day off. Reply `original` to undo.
+
+> Pain shoulder 2/5 → incline DB press: go lighter than last time; rear delt fly: go lighter than last time.
+> rising: shoulder 0→1→2
+> Reply `original` to undo.
 
 Rest days are never adjusted. A walk day only yields to the day-off rules
 (1–2). A second check-in the same day recomputes from `blocks.original` (never
@@ -366,7 +373,7 @@ for today's rules.
 ### Pain patterns and the Sunday review (PAIN-1)
 
 `artemis/health_patterns.py`, tables `health.pain_pattern` and
-`health.reflection` (migration 031). It counts and reports; it never states a
+`health.reflection` (migration 032). It counts and reports; it never states a
 cause and never changes a plan.
 
 - **Exposure:** exercise E logged on day D (a non-skipped set, or a set with a
