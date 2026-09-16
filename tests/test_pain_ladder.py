@@ -141,19 +141,62 @@ class TestLadder(Base):
         self.assertEqual(b["mobility_focus"], ["legs", "shoulder"])
         self.assertTrue(25 <= b["duration_min"] <= 30)
 
-    def test_p3_shoulder_on_session_b_is_a_region_block_not_a_mobility_day(self):
+    def test_p3_shoulder_on_session_b_primary_mobility_secondary_substituted(self):
         # Shoulder is PRIMARY on 2 of 7 (incline press, rear delt fly) — under
-        # half, even though 4 of 7 use it as primary or secondary.
+        # half, so no mobility day. Primary -> shoulder mobility block;
+        # secondary-only (goblet squat, seated row) -> pool substitutes.
         reply = self.checkin("shoulder pain 3")
         row = self.row()
         self.assertEqual(row["session_type"], "strength_b")
-        self.assertEqual(row["blocks"]["adjustment"]["rules_fired"], ["pain_mobility"])
-        self.assertEqual(names(self.db), ["Leg extension", "Cable Pallof press", "45° back extension"])
         b = row["blocks"]
+        self.assertEqual(b["adjustment"]["rules_fired"], ["pain_mobility", "pain_substitute"])
+        self.assertEqual(names(self.db), ["Leg press", "Seated leg curl", "Leg extension",
+                                          "Cable Pallof press", "45° back extension"])
+        by = self.by_name()
+        self.assertEqual((by["Leg press"]["added_by"], by["Leg press"]["replaces"]),
+                         ("checkin", "DB goblet squat"))
+        self.assertEqual(by["Seated leg curl"]["replaces"], "Seated cable row")
+        for sub in ("Leg press", "Seated leg curl"):
+            self.assertFalse(hr.uses_any(sub, ["shoulder"]), sub)
+            self.assertTrue(by[sub]["notes"].startswith("2×"), by[sub]["notes"])
+        for kept in ("Leg extension", "Cable Pallof press", "45° back extension"):
+            self.assertNotIn("added_by", by[kept])
         self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["shoulder"], 10))
-        self.assertEqual(reply, "Pain shoulder 3/5 → removed DB goblet squat, seated cable row, "
-                                "incline DB press, rear delt fly. Added 10 min shoulder mobility "
-                                "(Stretch Trainer + mat).\nReply `original` to undo.")
+        self.assertIn("leg press", b["equipment"])
+        self.assertIn("leg curl", b["equipment"])
+        self.assertEqual(b["adjustment"]["removed"],
+                         ["Incline DB press", "Rear delt fly", "DB goblet squat", "Seated cable row"])
+        self.assertEqual(b["adjustment"]["added"], ["Leg press", "Seated leg curl"])
+        self.assertEqual(reply, "Pain shoulder 3/5 → removed incline DB press and rear delt fly. "
+                                "Added 10 min shoulder mobility (Stretch Trainer + mat). "
+                                "Swapped DB goblet squat → leg press, seated cable row → seated "
+                                "leg curl.\nReply `original` to undo.")
+
+    def test_p3_secondary_falls_back_to_mobility_when_no_substitute_fits(self):
+        # Hip is secondary-only on B (goblet squat, back extension). With legs
+        # sore too, every pool exercise touches hip or legs -> both go to the
+        # hip mobility block.
+        reply = self.checkin("hip pain 3, legs sore 2")
+        b = self.row()["blocks"]
+        self.assertEqual(b["adjustment"]["rules_fired"], ["pain_mobility", "lighten_sore"])
+        self.assertEqual(names(self.db), ["Seated cable row", "Incline DB press", "Leg extension",
+                                          "Rear delt fly", "Cable Pallof press"])
+        self.assertFalse(any(e.get("added_by") for e in b["exercises"]))
+        self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["hip"], 10))
+        self.assertTrue(reply.startswith("Pain hip 3/5 → removed DB goblet squat and 45° back "
+                                         "extension. Added 10 min hip mobility"), reply)
+
+    def test_p3_secondary_only_region_needs_no_mobility_block(self):
+        # Knee is secondary-only on B (goblet squat, leg extension); both get
+        # substitutes, so there is nothing to put in a mobility block.
+        reply = self.checkin("knee pain 3")
+        b = self.row()["blocks"]
+        self.assertEqual(b["adjustment"]["rules_fired"], ["pain_substitute"])
+        self.assertNotIn("mobility_min", b)
+        for ex in b["exercises"]:
+            self.assertFalse(hr.uses_any(ex["name"], ["knee"]), ex["name"])
+        self.assertEqual(len(b["exercises"]), 7)
+        self.assertTrue(reply.startswith("Pain knee 3/5 → swapped DB goblet squat → "), reply)
 
     def test_p3_legs_on_a_z2_day_is_a_mobility_day(self):
         tue = date(2026, 9, 22)
@@ -166,21 +209,20 @@ class TestLadder(Base):
         self.checkin("sore legs 4 and back 4, legs pain 3, shoulder pain 3")
         self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_mobility_day"])
 
-    def test_p3_region_mobility_replaces_affected_exercises(self):
-        # Low back: goblet squat (secondary) + back extension (primary) = 2 of 7.
+    def test_p3_region_mobility_and_substitute(self):
+        # Low back: back extension (primary) -> mobility; goblet squat
+        # (secondary) -> leg press.
         reply = self.checkin("low back pain 3")
-        got = names(self.db)
-        self.assertEqual(got, ["Seated cable row", "Incline DB press", "Leg extension",
-                               "Rear delt fly", "Cable Pallof press"])
+        self.assertEqual(names(self.db), ["Leg press", "Seated cable row", "Incline DB press",
+                                          "Leg extension", "Rear delt fly", "Cable Pallof press"])
         b = self.row()["blocks"]
         self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["low back"], 10))
         self.assertIn("Stretch Trainer", b["equipment"])
         self.assertIn("mat", b["equipment"])
         self.assertEqual(b["mobility_notes"], hr.MOBILITY["low back"])
-        self.assertFalse(any(e.get("added_by") for e in b["exercises"]), "pain 3 never refills")
-        self.assertEqual(reply, "Pain low back 3/5 → removed DB goblet squat and 45° back "
-                                "extension. Added 10 min low back mobility (Stretch Trainer + mat)."
-                                "\nReply `original` to undo.")
+        self.assertEqual(reply, "Pain low back 3/5 → removed 45° back extension. Added 10 min "
+                                "low back mobility (Stretch Trainer + mat). Swapped DB goblet "
+                                "squat → leg press.\nReply `original` to undo.")
         self.assertEqual(self.row()["session_type"], "strength_b")
 
     def test_p3_two_regions_is_15_minutes(self):
@@ -195,7 +237,7 @@ class TestLadder(Base):
         # refill never uses the painful region.
         self.checkin("low back pain 3, sore triceps 4")
         rules = self.row()["blocks"]["adjustment"]["rules_fired"]
-        self.assertEqual(rules, ["pain_mobility", "replace"])
+        self.assertEqual(rules, ["pain_mobility", "pain_substitute", "replace"])
         got = names(self.db)
         self.assertNotIn("Incline DB press", got)
         for ex in self.row()["blocks"]["exercises"]:
@@ -347,7 +389,8 @@ class TestRisingPain(Base):
     def test_rise_from_0_keeps_the_normal_pain_3_rule(self):
         self.seed({2: {"low back": 0}, 1: {"low back": 2}})
         reply = self.checkin("low back pain 3")
-        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"], ["pain_mobility"])
+        self.assertEqual(self.row()["blocks"]["adjustment"]["rules_fired"],
+                         ["pain_mobility", "pain_substitute"])
         self.assertIn("\nrising: low back 0→2→3\n", reply)
 
     def test_rise_from_0_with_nothing_to_lighten_is_noted(self):

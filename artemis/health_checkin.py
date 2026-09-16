@@ -30,9 +30,12 @@ load or RPE:
                          exercises -> Mobility / Yoga, 30 min.
   4. Soreness day swap   2+ SORENESS regions at 4-5 -> Recovery Z2 (20-30 min,
                          recumbent) + mobility.
-  5. Pain 3 mobility     pain 3 -> exercises using the region (primary or
-                         secondary) are replaced by a 10-15 min mobility block
-                         for it (Stretch Trainer + mat). No refill.
+  5. Pain 3 region       pain 3 -> exercises with the region as PRIMARY are
+                         replaced by a 10-15 min mobility block for it
+                         (Stretch Trainer + mat); exercises with it as
+                         SECONDARY only are swapped for a pool substitute that
+                         avoids every affected region (mobility block when
+                         nothing fits).
   6. Soreness replace    soreness 4-5 -> remove every exercise with it as
                          primary or secondary; refill to the same count from
                          the pool, avoiding every affected region.
@@ -523,31 +526,59 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     exercises = blocks.get("exercises") or []
     swapped = "day_swap" in adj.rules_fired
 
-    # ── 5. Pain 3 -> the region's exercises become a mobility block ─────────
+    # ── 5. Pain 3 -> primary: mobility block; secondary only: substitute ────
     if pain_3 and not swapped and exercises:
-        removed = [e["name"] for e in exercises if hr.uses_any(e["name"], pain_3)]
-        if removed:
-            blocks["exercises"] = exercises = [e for e in exercises if e["name"] not in removed]
-            focus = list(dict.fromkeys(list(blocks.get("mobility_focus") or []) + pain_3))
-            blocks["mobility_focus"] = focus
-            blocks["mobility_min"] = hr.mobility_minutes(focus)
-            blocks["mobility_notes"] = "; ".join(hr.MOBILITY[r] for r in focus if r in hr.MOBILITY)
-            eq = list(blocks.get("equipment") or [])
-            for item in hr.MOBILITY_EQUIPMENT:
-                if item not in eq:
-                    eq.append(item)
-            blocks["equipment"] = eq
-            if adj.est_duration_min:
-                sets = int(blocks.get("rounds") or 1)
-                adj.est_duration_min = max(
-                    blocks["mobility_min"],
-                    int(adj.est_duration_min) - round(sets * len(removed) * 2.5)
-                    + blocks["mobility_min"])
-            adj.rules_fired.append("pain_mobility")
-            adj.removed += removed
-            adj.lines.append(
-                f"{_fmt_pain(pain, pain_3)} → removed {_join(removed)}. Added "
-                f"{blocks['mobility_min']} min {', '.join(focus)} mobility (Stretch Trainer + mat).")
+        present = {e["name"] for e in exercises} | set(adj.removed)
+        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected)]
+        out_list, to_mobility, swaps = [], [], []
+        for ex in exercises:
+            name = ex["name"]
+            if not hr.uses_any(name, pain_3):
+                out_list.append(ex)
+            elif hr.uses_any(name, pain_3, primary_only=True):
+                to_mobility.append(name)
+            else:
+                sub = next((x for x in pool if x not in present), None)
+                if sub is None:
+                    to_mobility.append(name)          # nothing fits -> mobility
+                    continue
+                present.add(sub)
+                new = _office_exercise(sub, exercise_sets(ex, blocks), week_num)
+                new["added_by"] = "checkin"
+                new["replaces"] = name
+                out_list.append(new)
+                swaps.append((name, sub))
+        if to_mobility or swaps:
+            blocks["exercises"] = exercises = out_list
+            parts = []
+            if to_mobility:
+                focus = list(dict.fromkeys(list(blocks.get("mobility_focus") or []) + pain_3))
+                blocks["mobility_focus"] = focus
+                blocks["mobility_min"] = hr.mobility_minutes(focus)
+                blocks["mobility_notes"] = "; ".join(hr.MOBILITY[r] for r in focus if r in hr.MOBILITY)
+                eq = list(blocks.get("equipment") or [])
+                for item in hr.MOBILITY_EQUIPMENT:
+                    if item not in eq:
+                        eq.append(item)
+                blocks["equipment"] = eq
+                if adj.est_duration_min:
+                    sets = int(blocks.get("rounds") or 1)
+                    adj.est_duration_min = max(
+                        blocks["mobility_min"],
+                        int(adj.est_duration_min) - round(sets * len(to_mobility) * 2.5)
+                        + blocks["mobility_min"])
+                adj.rules_fired.append("pain_mobility")
+                parts.append(f"removed {_join(to_mobility)}. Added {blocks['mobility_min']} min "
+                             f"{', '.join(focus)} mobility (Stretch Trainer + mat).")
+            if swaps:
+                blocks["equipment"] = _equipment_for(exercises, blocks.get("equipment") or [])
+                adj.rules_fired.append("pain_substitute")
+                parts.append("Swapped " + ", ".join(f"{_join([a])} → {_join([b])}"
+                                                    for a, b in swaps) + ".")
+            adj.removed += to_mobility + [a for a, _ in swaps]
+            adj.added += [b for _, b in swaps]
+            text = " ".join(parts)
+            adj.lines.append(f"{_fmt_pain(pain, pain_3)} → {text[0].lower() + text[1:]}")
         _drop_finisher(adj, blocks, pain_3)
 
     # ── 6. Soreness 4-5 -> replace from the pool ────────────────────────────
