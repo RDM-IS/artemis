@@ -127,20 +127,10 @@ def _first_event_line(calendar) -> str | None:
 
 def _weather_line() -> str | None:
     """Today's high/low + precipitation for the ACTIVE location (override city
-    when one is set, else home)."""
+    when one is set, else home). None when weather is unavailable."""
     from artemis import weather as weather_mod
 
-    lat, lon = weather_mod.WEST_BEND_LAT, weather_mod.WEST_BEND_LON
-    row = get_timezone_override()
-    if row:
-        label = row.get("city_name") or row.get("timezone", "").split("/")[-1].replace("_", " ")
-        coords = weather_mod.geocode(label)
-        if coords:
-            lat, lon = coords
-        else:
-            logger.info("wake: no coordinates for %r — using home weather", label)
-            return None
-    f = weather_mod.get_today_forecast(lat, lon)
+    f = weather_mod.get_today_forecast()
     if not f.get("available"):
         return None
     bits = []
@@ -149,7 +139,10 @@ def _weather_line() -> str | None:
     if f.get("summary"):
         bits.append(str(f["summary"]))
     if f.get("precip_chance") is not None:
-        bits.append(f"{f['precip_chance']}% precip")
+        precip = f"{f['precip_chance']}% precip"
+        if f.get("precip_in"):
+            precip += f" ({f['precip_in']:.2f} in)"
+        bits.append(precip)
     return "Weather: " + " · ".join(bits) if bits else None
 
 

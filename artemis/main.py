@@ -104,6 +104,10 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
+# HARDEN-1: scrub appid= / key= / token= values from every log line and
+# traceback before it reaches the journal.
+from artemis.log_redaction import install as _install_log_redaction  # noqa: E402
+_install_log_redaction()
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)

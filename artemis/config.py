@@ -159,6 +159,9 @@ OPEN_TIME = os.environ.get("OPEN_TIME", "06:30")
 # QUIET_HOURS_END in the environment still wins so an old .env keeps working.
 QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", WAKE_TIME)
 HOME_TIMEZONE = os.environ.get("HOME_TIMEZONE", "America/Chicago")
+# Home location for weather (West Bend, WI). A timezone override's city wins.
+HOME_LAT = float(os.environ.get("HOME_LAT", "43.4253"))
+HOME_LON = float(os.environ.get("HOME_LON", "-88.1834"))
 OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 
 # Pre-departure checklist read out in the 04:30 wake post.
