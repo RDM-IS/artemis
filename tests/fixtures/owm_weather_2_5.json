@@ -1,0 +1,46 @@
+{
+ "coord": {
+  "lon": -88.1767,
+  "lat": 43.427
+ },
+ "weather": [
+  {
+   "id": 804,
+   "main": "Clouds",
+   "description": "overcast clouds",
+   "icon": "04d"
+  }
+ ],
+ "base": "stations",
+ "main": {
+  "temp": 59.85,
+  "feels_like": 58.96,
+  "temp_min": 57.94,
+  "temp_max": 61.16,
+  "pressure": 1027,
+  "humidity": 73,
+  "sea_level": 1027,
+  "grnd_level": 990
+ },
+ "visibility": 10000,
+ "wind": {
+  "speed": 3,
+  "deg": 309,
+  "gust": 3
+ },
+ "clouds": {
+  "all": 98
+ },
+ "dt": 1789565687,
+ "sys": {
+  "type": 2,
+  "id": 2010639,
+  "country": "US",
+  "sunrise": 1789558398,
+  "sunset": 1789603321
+ },
+ "timezone": -18000,
+ "id": 5278422,
+ "name": "West Bend",
+ "cod": 200
+}
