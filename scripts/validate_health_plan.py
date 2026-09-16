@@ -156,9 +156,9 @@ def selftest_live(fault: bool) -> dict[date, dict]:
                              "blocks": copy.deepcopy(r["blocks"])}
             for r in office.build_rows()}
     if fault:
-        live[office.WEEK1_MONDAY]["blocks"]["equipment"].append("water rower")
-        live[office.WEEK1_MONDAY + timedelta(days=1)]["session_type"] = "cardio_intervals"
-        live.pop(office.WEEK1_MONDAY + timedelta(days=3))
+        live[office.WEEK1_START]["blocks"]["equipment"].append("water rower")
+        live[office.WEEK1_START + timedelta(days=1)]["session_type"] = "cardio_intervals"
+        live.pop(office.WEEK1_START + timedelta(days=3))
         live[office.OFFICE_END + timedelta(days=1)] = {
             "phase": 1, "week_num": 7, "session_type": "cardio_z2",
             "blocks": {"type": "steady", "equipment": ["bike on trainer"]}}

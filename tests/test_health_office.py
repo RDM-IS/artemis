@@ -33,33 +33,53 @@ _A_EXERCISES = ["Leg press", "DB bench press", "Lat pulldown", "Seated leg curl"
                 "Cable face pull (rope)", "Captain's chair knee raise"]
 
 
-def _wk_date(week_num: int, weekday: int) -> date:
-    return office.WEEK1_MONDAY + timedelta(days=7 * (week_num - 1) + weekday)
+def _wk_date(week_num: int, day_in_week: int) -> date:
+    """Weeks run Wed..Tue, so day_in_week 0 = Wednesday."""
+    return office.WEEK1_START + timedelta(days=7 * (week_num - 1) + day_in_week)
 
 
 class TestSchedule(unittest.TestCase):
     def test_window_and_count(self):
-        self.assertEqual(len(_ROWS), 54)
+        self.assertEqual(len(_ROWS), 49)          # 7 weeks x 7 days, no ramp-up
         self.assertEqual(min(_BY_DATE), date(2026, 9, 16))
-        self.assertEqual(max(_BY_DATE), date(2026, 11, 8))
+        self.assertEqual(max(_BY_DATE), date(2026, 11, 3))
         office.validate_rows(_ROWS)
 
-    def test_rampup_days(self):
-        expected = {date(2026, 9, 16): "cardio_z2", date(2026, 9, 17): "strength_a",
-                    date(2026, 9, 18): "cardio_z2", date(2026, 9, 19): "walk",
-                    date(2026, 9, 20): "rest_mobility"}
-        for d, st in expected.items():
-            r = _BY_DATE[d]
-            self.assertEqual(r["session_type"], st, d)
-            self.assertEqual(r["week_num"], 1)
-            self.assertIn("wk0", r["notes"])
-        self.assertEqual(_BY_DATE[date(2026, 9, 17)]["blocks"]["rounds"], 2)
-        self.assertEqual(_BY_DATE[date(2026, 9, 18)]["blocks"]["duration_min"], 20)
-        self.assertEqual(_BY_DATE[date(2026, 9, 19)]["blocks"]["display_name"], "Recovery Walk")
+    def test_go_live_day_is_week_1_strength_a(self):
+        """9/16 is a Wednesday and is day 1 of week 1 — Ryan trains that morning."""
+        r = _BY_DATE[date(2026, 9, 16)]
+        self.assertEqual(date(2026, 9, 16).weekday(), 2, "9/16 must be a Wednesday")
+        self.assertEqual(r["session_type"], "strength_a")
+        self.assertEqual(r["week_num"], 1)
+        self.assertEqual(r["phase"], 1)
+        self.assertEqual(r["blocks"]["display_name"], "Office Strength A")
+        self.assertEqual(r["blocks"]["location"], "office gym")
+        self.assertEqual(r["blocks"]["rounds"], 2)
+        self.assertEqual(r["target_rpe"], 6.0)
+
+    def test_no_rampup_rows_remain(self):
+        self.assertFalse([r for r in _ROWS if "wk0" in r["notes"]])
+        self.assertFalse([r for r in _ROWS if r["blocks"]["display_name"] == "Recovery Walk"])
+
+    def test_rest_days_are_thu_and_sat(self):
+        for r in _ROWS:
+            wd = r["plan_date"].weekday()
+            if r["session_type"] == "rest_mobility":
+                self.assertIn(wd, (3, 5), f"{r['plan_date']} rest on weekday {wd}")
+            if r["session_type"].startswith("strength"):
+                self.assertIn(wd, (0, 2, 4), "strength must fall on a weekday")
+
+    def test_no_back_to_back_strength_days(self):
+        by_date = sorted(_BY_DATE)
+        for a, b in zip(by_date, by_date[1:]):
+            if (_BY_DATE[a]["session_type"].startswith("strength")
+                    and _BY_DATE[b]["session_type"].startswith("strength")):
+                self.fail(f"back-to-back strength on {a} and {b}")
 
     def test_weekly_pattern_and_weeks(self):
-        pattern = ["strength_a", "cardio_z2", "rest_mobility", "strength_b",
-                   "strength_c", "rest_mobility", "walk"]
+        # Wed..Tue
+        pattern = ["strength_a", "rest_mobility", "strength_b", "rest_mobility",
+                   "walk", "strength_c", "cardio_z2"]
         for wk in range(1, 8):
             for wd, st in enumerate(pattern):
                 r = _BY_DATE[_wk_date(wk, wd)]
@@ -72,15 +92,15 @@ class TestSchedule(unittest.TestCase):
         ramp = {1: (2, 6.0, 20), 2: (2, 6.0, 20), 3: (3, 7.0, 30), 4: (3, 7.0, 30),
                 5: (3, 7.5, 40), 6: (3, 7.5, 40), 7: (2, 6.0, 30)}
         for wk, (sets, rpe, z2) in ramp.items():
-            for wd in (0, 3, 4):
+            for wd in (0, 2, 5):          # Wed strength_a, Fri strength_b, Mon strength_c
                 r = _BY_DATE[_wk_date(wk, wd)]
                 self.assertEqual(r["blocks"]["rounds"], sets)
                 self.assertEqual(r["target_rpe"], rpe)
-            z = _BY_DATE[_wk_date(wk, 1)]
+            z = _BY_DATE[_wk_date(wk, 6)]   # Tue
             self.assertEqual(z["est_duration_min"], z2)
             self.assertEqual(z["target_hr_zone"], 2)
             self.assertIn("conversational pace", z["blocks"]["setup_notes"][0])
-        self.assertEqual(_BY_DATE[_wk_date(5, 1)]["blocks"]["target_range_min"], [35, 40])
+        self.assertEqual(_BY_DATE[_wk_date(5, 6)]["blocks"]["target_range_min"], [35, 40])
 
     def test_strength_day_contract(self):
         for r in _ROWS:
@@ -99,17 +119,17 @@ class TestSchedule(unittest.TestCase):
                     self.assertNotIn("target_load_lbs", ex)
 
     def test_exercise_lists_and_top_of_range(self):
-        a = _BY_DATE[_wk_date(1, 0)]["blocks"]["exercises"]
+        a = _BY_DATE[_wk_date(1, 0)]["blocks"]["exercises"]   # Wed = strength_a
         self.assertEqual([e["name"] for e in a], _A_EXERCISES)
         self.assertEqual(a[0]["target_reps"], 12)
         self.assertEqual(a[4]["target_reps"], 15)
-        b = _BY_DATE[_wk_date(1, 3)]["blocks"]["exercises"]
+        b = _BY_DATE[_wk_date(1, 2)]["blocks"]["exercises"]   # Fri = strength_b
         self.assertEqual(b[0]["name"], "DB goblet squat")
         self.assertEqual(len(b), 7)
         pallof = next(e for e in b if e["name"] == "Cable Pallof press")
         self.assertEqual(pallof["target_reps"], 10)
         self.assertIn("each side", pallof["notes"])
-        c = _BY_DATE[_wk_date(1, 4)]["blocks"]["exercises"]
+        c = _BY_DATE[_wk_date(1, 5)]["blocks"]["exercises"]   # Mon = strength_c
         self.assertEqual(c[0]["name"], "DB Romanian deadlift")
 
     def test_machine_setting_note_week1_only(self):
@@ -122,8 +142,8 @@ class TestSchedule(unittest.TestCase):
 
     def test_finisher_and_smith_alt_weeks_5_6_only(self):
         for wk in range(1, 8):
-            c = _BY_DATE[_wk_date(wk, 4)]["blocks"]
-            b = _BY_DATE[_wk_date(wk, 3)]["blocks"]
+            c = _BY_DATE[_wk_date(wk, 5)]["blocks"]   # Mon strength_c
+            b = _BY_DATE[_wk_date(wk, 2)]["blocks"]   # Fri strength_b
             goblet = b["exercises"][0]["notes"]
             if wk in (5, 6):
                 self.assertEqual(c["finisher"]["rounds"], 6)
@@ -133,21 +153,19 @@ class TestSchedule(unittest.TestCase):
             else:
                 self.assertNotIn("finisher", c)
                 self.assertNotIn("Smith", goblet)
-            for wd in (0, 3):
+            for wd in (0, 2):   # strength_a, strength_b never carry it
                 self.assertNotIn("finisher", _BY_DATE[_wk_date(wk, wd)]["blocks"])
 
     def test_walk_and_rest(self):
-        w = _BY_DATE[_wk_date(3, 6)]
+        w = _BY_DATE[_wk_date(3, 4)]          # Sun walk
         self.assertEqual(w["blocks"]["location"], "outside")
         self.assertEqual(w["est_duration_min"], 30)
-        self.assertEqual(_BY_DATE[_wk_date(3, 2)]["blocks"]["type"], "mobility")
+        self.assertEqual(_BY_DATE[_wk_date(3, 1)]["blocks"]["type"], "mobility")   # Thu
 
 
 class TestRegressionNoRetiredEquipment(unittest.TestCase):
-    def test_no_rower_or_bike_on_trainer_from_0921(self):
+    def test_no_rower_or_bike_on_trainer(self):
         for r in _ROWS:
-            if r["plan_date"] < date(2026, 9, 21):
-                continue
             blob = (json.dumps(r["blocks"]) + " " + r["notes"]).lower()
             self.assertNotIn("rower", blob, r["plan_date"])
             self.assertNotIn("bike on trainer", blob, r["plan_date"])
@@ -187,20 +205,20 @@ class TestResolver(unittest.TestCase):
     def test_cardio_ignores_weather(self):
         r = health.resolve_equipment_and_location(
             "cardio_z2", weather={"temp_f": 20.0, "precip_next_90min": True},
-            blocks=_BY_DATE[_wk_date(1, 1)]["blocks"])
+            blocks=_BY_DATE[_wk_date(1, 6)]["blocks"])   # Tue cardio_z2
         self.assertEqual(r["location"], "office gym")
         self.assertIsNone(r["notes"])
 
     def test_walk_weather_still_applies(self):
         r = health.resolve_equipment_and_location(
-            "walk", weather={"temp_f": 30.0}, blocks=_BY_DATE[_wk_date(1, 6)]["blocks"])
+            "walk", weather={"temp_f": 30.0}, blocks=_BY_DATE[_wk_date(1, 4)]["blocks"])
         self.assertIn("Cold", r["notes"])
 
 
 class TestRenders(unittest.TestCase):
-    def test_plan_detail_0921_office_a_no_bike_weather(self):
-        row = dict(_BY_DATE[date(2026, 9, 21)])
-        text = health._render_full_block(date(2026, 9, 21), row, date(2026, 9, 21))
+    def test_plan_detail_0916_office_a_no_bike_weather(self):
+        row = dict(_BY_DATE[date(2026, 9, 16)])
+        text = health._render_full_block(date(2026, 9, 16), row, date(2026, 9, 16))
         self.assertIn("Office Strength A", text)
         for name in _A_EXERCISES:
             self.assertIn(name, text)
@@ -208,13 +226,13 @@ class TestRenders(unittest.TestCase):
         for bad in ("bike", "weather", "rower", "bike on trainer", "trainer set"):
             self.assertNotIn(bad, low)
 
-    def test_friday_wk5_renders_conditioning_finisher(self):
-        d = _wk_date(5, 4)
+    def test_monday_wk5_renders_conditioning_finisher(self):
+        d = _wk_date(5, 5)   # Mon strength_c
         text = health._render_full_block(d, dict(_BY_DATE[d]), d)
         self.assertIn("**Conditioning finisher** — 6 rounds", text)
 
     def test_morning_calibrated_post_where_office_gym(self):
-        row = _BY_DATE[date(2026, 9, 21)]
+        row = _BY_DATE[date(2026, 9, 16)]
         plan = {"session_type": row["session_type"], "est_duration_min": row["est_duration_min"],
                 "blocks": row["blocks"]}
         resolved = health.resolve_equipment_and_location(row["session_type"], blocks=row["blocks"])

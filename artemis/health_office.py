@@ -1,8 +1,14 @@
 """HEALTH-2 — office gym program (all Precor).
 
-Canonical office inventory, the 9/16-11/08 schedule (ramp-up days + weeks 1-7),
-the block builders, a structural validator, and the transactional writer shared
-by scripts/reseed_health_plan_v2.py --office and scripts/validate_health_plan.py.
+Canonical office inventory, the 9/16-11/03 schedule (phase 1, weeks 1-7), the
+block builders, a structural validator, and the transactional writer shared by
+scripts/reseed_health_plan_v2.py --office and scripts/validate_health_plan.py.
+
+GO-LIVE reset: weeks run **Wed-Tue**, anchored on Wed 2026-09-16, so training
+starts the morning after the seed. Rest days are Thu and Sat (was Wed and Sat)
+— that avoids back-to-back strength days and keeps every training day on a
+weekday, when the office gym is open. The pre-week-1 ramp-up days are gone:
+9/16 IS week 1 day 1.
 
 Location is PLAN DATA: every row carries blocks.location (and blocks.equipment),
 which artemis.health.resolve_equipment_and_location prefers over its static
@@ -12,8 +18,7 @@ from the plan.
 Rows are written INSERT ... ON CONFLICT (plan_date) DO UPDATE in ONE transaction
 with an acos.audit_log row, so plan_ids are stable and a session logged against a
 date mid-run is never orphaned. generated_by='manual' (CHECK-legal); week_num is
-1-7 (CHECK 1..19) — the pre-week-1 ramp-up days are week_num=1, tagged 'wk0' in
-notes.
+1-7 (CHECK 1..19).
 """
 
 import copy
@@ -24,9 +29,9 @@ LOCATION = "office gym"
 PHASE = 1
 GENERATED_BY = "manual"
 
-OFFICE_START = date(2026, 9, 16)   # first ramp-up day
-WEEK1_MONDAY = date(2026, 9, 21)
-OFFICE_END = date(2026, 11, 8)     # last day of week 7
+OFFICE_START = date(2026, 9, 16)   # Wed — week 1, day 1
+WEEK1_START = date(2026, 9, 16)    # weeks run Wed..Tue from here
+OFFICE_END = date(2026, 11, 3)     # Tue — last day of week 7
 
 # ── Canonical office inventory (PB-009) ─────────────────────────────────────
 EQ_LEG_PRESS = "leg press"
@@ -118,9 +123,9 @@ _DISPLAY = {
     "rest_mobility": "Rest / Mobility",
 }
 
-# Mon=0 .. Sun=6
-WEEKLY_PATTERN = {0: "strength_a", 1: "cardio_z2", 2: "rest_mobility",
-                  3: "strength_b", 4: "strength_c", 5: "rest_mobility", 6: "walk"}
+# Mon=0 .. Sun=6. Rest Thu + Sat; no two strength days adjacent.
+WEEKLY_PATTERN = {0: "strength_c", 1: "cardio_z2", 2: "strength_a",
+                  3: "rest_mobility", 4: "strength_b", 5: "rest_mobility", 6: "walk"}
 
 # week_num -> (sets, target_rpe, z2 minutes (lo, hi))
 RAMP = {
@@ -132,17 +137,6 @@ RAMP = {
     6: (3, 7.5, (35, 40)),
     7: (2, 6.0, (30, 30)),
 }
-
-# Pre-week-1 ramp-up (HEALTH-2 confirm): 9/16-9/18 ramp-up work, 9/19 recovery
-# walk, 9/20 rest. Stored as week_num=1 (CHECK), tagged wk0 in notes.
-RAMPUP = {
-    date(2026, 9, 16): "cardio_z2",
-    date(2026, 9, 17): "strength_a",
-    date(2026, 9, 18): "cardio_z2",
-    date(2026, 9, 19): "walk",
-    date(2026, 9, 20): "rest_mobility",
-}
-
 
 # ============================================================================
 # Block builders
@@ -252,12 +246,15 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: boo
 # ============================================================================
 
 def build_schedule() -> list[dict]:
-    """Ordered specs {plan_date, session_type, week_num, wk0} for 9/16-11/08."""
-    specs = [{"plan_date": d, "session_type": st, "week_num": 1, "wk0": True}
-             for d, st in sorted(RAMPUP.items())]
-    d = WEEK1_MONDAY
+    """Ordered specs {plan_date, session_type, week_num, wk0} for 9/16-11/03.
+
+    Weeks are Wed-Tue blocks counted off WEEK1_START, so week 1 is
+    9/16..9/22 and week 7 is 10/28..11/03.
+    """
+    specs: list[dict] = []
+    d = WEEK1_START
     while d <= OFFICE_END:
-        week_num = (d - WEEK1_MONDAY).days // 7 + 1
+        week_num = (d - WEEK1_START).days // 7 + 1
         specs.append({"plan_date": d, "session_type": WEEKLY_PATTERN[d.weekday()],
                       "week_num": week_num, "wk0": False})
         d += timedelta(days=1)
@@ -309,7 +306,7 @@ def validate_rows(rows: list[dict]) -> None:
     dates = [r["plan_date"] for r in rows]
     assert len(dates) == len(set(dates)), "duplicate plan_date"
     expected = [OFFICE_START + timedelta(days=i) for i in range((OFFICE_END - OFFICE_START).days + 1)]
-    assert sorted(dates) == expected, "office rows must cover every day 9/16..11/08"
+    assert sorted(dates) == expected, "office rows must cover every day 9/16..11/03"
     for r in rows:
         b = r["blocks"]
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
