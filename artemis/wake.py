@@ -74,13 +74,17 @@ def _workout_section(plan: dict | None) -> list[str]:
         session_type, weather=weather, blocks=blocks,
     )
 
+    from artemis.health_checkin import render_plan_lines
+
     lines = [f"\U0001f3cb️ Today: **{name}**{duration_str}.", f"Where: {resolved['location']}"]
     if resolved.get("equipment"):
-        lines.append(f"Bring: {', '.join(resolved['equipment'])}")
-    if resolved.get("first_lift"):
-        lines.append(f"First lift: {resolved['first_lift']}")
+        lines.append(f"Uses: {', '.join(resolved['equipment'])}")
     if blocks.get("warmup"):
         lines.append(f"Warmup: {blocks['warmup']}")
+    # Plan-exact: every exercise, set, rep, RPE and load comes from the row.
+    lines.extend(render_plan_lines({**plan, "blocks": blocks}))
+    if blocks.get("cooldown"):
+        lines.append(f"Cooldown: {blocks['cooldown']}")
     if resolved.get("notes"):
         lines.append(f"_{resolved['notes']}_")
     lines.append("gym.rdm.is is up — full plan there.")

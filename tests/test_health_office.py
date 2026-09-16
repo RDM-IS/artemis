@@ -231,16 +231,14 @@ class TestRenders(unittest.TestCase):
         text = health._render_full_block(d, dict(_BY_DATE[d]), d)
         self.assertIn("**Conditioning finisher** — 6 rounds", text)
 
-    def test_morning_calibrated_post_where_office_gym(self):
-        row = _BY_DATE[date(2026, 9, 16)]
-        plan = {"session_type": row["session_type"], "est_duration_min": row["est_duration_min"],
-                "blocks": row["blocks"]}
-        resolved = health.resolve_equipment_and_location(row["session_type"], blocks=row["blocks"])
-        post = health.build_calibrated_plan_post(plan, resolved, state=None)
+    def test_wake_workout_section_where_office_gym(self):
+        from artemis import wake
+        row = dict(_BY_DATE[date(2026, 9, 16)])
+        post = "\n".join(wake._workout_section(row))
         self.assertIn("Today: **Office Strength A** —", post)
         self.assertNotIn("Push/Legs", post)
         self.assertIn("Where: office gym", post)
-        self.assertIn("First lift: Leg press", post)
+        self.assertIn("1. Leg press — 2×10-12 · RPE ≤6", post)
         self.assertIn("Warmup: 5 min elliptical, easy", post)
 
 

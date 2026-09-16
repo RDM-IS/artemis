@@ -250,17 +250,73 @@ are held durably and flushed at the next wake (WAKE-1 — see the day-phase
 section in `docs/ARTEMIS_STATE.md`). All times are local wall-clock in the
 **active** timezone, which follows `set timezone to <place>`.
 
-**The wake post (04:30 local, `job_wake` → `artemis/wake.py`)** — there is no
-separate morning-prompt cron any more. One post carries: today's session
-(name, duration, `Where:` from `blocks.location`, equipment, first lift,
-warmup), the morning survey, any held health notices, and pre-departure
-(checklist, first event, weather, `depart:` commitments).
+### Check-in-driven morning (FRIDAY-1)
+
+The morning is **event-driven**; there is no timed calibration post any more.
+
+| When | What |
+|---|---|
+| 04:30 | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>` in `acos.system_state`. |
+| on the check-in reply | Parsed **deterministically** (`artemis/health_checkin.py`, no LLM) and upserted to `health.daily_state`. If no sets are logged for today yet, the adjustment rules run and today's plan row is rewritten; the reply is the plan-exact diff plus the adjusted session. If sets are already logged: stored only, reply `Logged.` |
+| 05:15 | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): on a training day with no check-in and no sets, one post — "No check-in yet — run Session X as written." Never repeats. |
+
+**Routing.** The `morning_flow` handler sits ahead of `nutrition` and the LLM.
+It always claims check-in-shaped text and `original`. While the check-in window
+is open (wake post sent, before 12:00 local) or outside the OPEN phase it also
+claims short replies: acks (`nope`, `all good`) and done-words (`done`,
+`workout completed`, `logged in app`), answered from the DB. `done <thread-id>`
+and `done <commitment>` are never claimed. Outside the OPEN phase the general
+LLM fallback gets **no business data** (no Gmail, calendar, commitments, inbox).
+
+**Parsing.** Sleep, energy (1–5), weight, RHR, soreness. Soreness is stored
+0–10: `x/10` as written, a 1–5 value doubled, a bare 6–10 read as out of 10;
+`sore 0` is stored as `{"overall": 0}`, never NULL. Regions: shoulder, chest,
+back, low back, arms, biceps, triceps, legs, quads, hamstrings, calves, core,
+knee, hip, neck (aliases in `artemis/health_regions.py`). An unknown region is
+stored and flagged in the reply ("didn't recognize region X"), with no change
+for it. Pain words (pain, sharp, injury, tweaked, strain…) set a pain flag for
+that region; a bare number next to a pain word is read out of 10, and pain with
+no number counts as 7.
+
+**Adjustment rules** (applied in order; they never add volume, load or RPE —
+great sleep and energy never add work; progression belongs to the program):
+
+1. **Day swap** — 2+ regions ≥ 7 → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility.
+2. **Replace** — a region ≥ 7 (sore or pain) → remove every exercise that uses
+   it (primary or secondary, per `health_regions.py`) and fill each slot from the
+   substitution pool (leg press, seated leg curl, leg extension, calf press,
+   captain's chair knee raise, 45° back extension, Pallof press), avoiding every
+   flagged region and never duplicating. A weeks 5–6 finisher that uses it is dropped.
+3. **Ease** — a region 4–6 → exercises with it as **primary** get −1 set (min 1)
+   and RPE cap −1. **Pain below 7** → exercises that use the region get load −20%
+   and RPE cap −1, and 5 min mobility for that region is added.
+4. **Global recovery** — sleep < 6 or energy ≤ 2 → RPE cap −1 on everything,
+   sets capped at 2, Z2 duration −25%.
+5. Otherwise no change: "Check-in logged — run Session X as written."
+
+Rest and walk days are never adjusted. A second check-in recomputes from the
+plan as written (never stacks); an all-clear second check-in restores it.
+
+**Storage and undo.** The adjusted blocks are written to today's
+`health.plan` row with `blocks.original` (the untouched blocks and row fields)
+and `blocks.adjustment` = `{reason, rules_fired, checkin_id, at, removed, added,
+eased, summary}` — no migration. `/api/health/today` serves the adjusted row, so
+gym-display shows it. Replying **`original`** restores `blocks.original` and
+clears the adjustment. Every write and restore is audited in `acos.audit_log`.
+Replies state only the plan change — no health advice.
+
+**Flag.** `CHECKIN_ADJUST=0` keeps parsing and storing but never rewrites the
+plan (the would-be change is audited as `checkin_adjust_suppressed`).
+
+**Plan-claim guard.** Any LLM text that still reaches Ryan is checked by
+`artemis/health_guard.py`: an exercise not in the plan window (±7 days), a load
+not in any plan/log/body-weight row, or a "last session(s)" figure not in the
+logs rejects the draft, which is replaced by the deterministic plan detail and
+logged as a guardrail violation.
 
 The survey variant comes from the **plan row**, never the weekday
-(`wake.prompt_type_for`): `rest_mobility`/`walk` → logging-only, everything
-else → `workout_am`. Ryan replies via the existing `log_morning_state` intent;
-after the `daily_state` row writes, the calibrated plan posts ~15 min later
-(`job_health_calibration_followup`, scheduled as a one-shot at wake time).
+(`wake.prompt_type_for`): `rest_mobility`/`walk` → check-in only (no "workout is
+later" line), everything else → `workout_am`.
 
 > The old weekday table (Tue 04:01 / Wed 07:00 / …) is gone: it encoded the
 > home-gym AM/PM split. Workouts are now AM at the office gym, so the plan row
@@ -283,9 +339,10 @@ as low-confidence signal.
 Routed via `detect_health_intent()` regex pre-check, then Claude
 intent classifier (rules 9-11 in `artemis/intent.py`):
 
-- **Morning state** ("slept 6h, energy 3/5, legs sore", "feel great",
-  "RHR 58") → `log_morning_state` → upserts `health.daily_state` on
-  `state_date` (COALESCE preserves earlier-filled fields)
+- **Morning state** ("slept 6h, energy 3, legs sore 3", "sore shoulder 8/10",
+  "RHR 58") → the deterministic `morning_flow` check-in (see above) → upserts
+  `health.daily_state` on `state_date` (COALESCE preserves earlier-filled fields)
+  and may adjust today's plan
 - **Workout debrief** ("did 3 rounds of...", "burpees 15 reps RPE 8",
   "done", per-exercise reports) → `log_workout_debrief` → inserts N
   `session_log` exercise rows + 1 summary row, all with
@@ -402,28 +459,11 @@ Example debrief confirm-back:
 - Idempotency: `_idempotency_key()` hashes the Mattermost message ID;
   duplicate webhook deliveries are no-ops
 
-### Recovery override
+### Recovery override (retired)
 
-When the calibrated plan is built (`build_calibrated_plan_post`),
-the prompt prepends a recovery override message if **sleep < 5h
-AND energy ≤ 2** on today's `daily_state` row. The override changes
-the Mattermost prompt text only — it does not modify the
-`health.plan` row, does not set `daily_state.is_override`, and does
-NOT update what `/api/health/today` returns. Consequence: the
-gym-display TV at `gym.rdm.is` will show the original scheduled
-workout while the trainer voice prompt on your phone says "drop
-to mobility + walk." Mattermost is authoritative when the two
-disagree.
-
-The 5h / energy 2 thresholds are conservative defaults from sports
-science guidance — protecting against compound-lift injury risk
-when both sleep deprivation and CNS fatigue stack. They are NOT
-configurable in T4; tuning will land with the autoregulator
-ticket which moves the rules into `health.training_rules` config
-reads instead of hardcoded prompt-builder checks.
-
-User can override the override by replying "do it anyway" — the
-debrief intent will fire normally and log against the original plan.
+The old "Recovery override" line in the timed calibrated post never changed the
+plan and is gone with that post. Recovery is now rule 4 of the check-in
+adjustment above, and it does change `health.plan` (and therefore gym-display).
 
 ### Out of scope (deferred to future tickets)
 

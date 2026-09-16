@@ -86,41 +86,39 @@ class TestSorenessNormalization(unittest.TestCase):
 # ============================================================================
 
 class TestMorningHandler(unittest.TestCase):
-    def test_parse_and_format(self):
-        """Full roundtrip: parse → upsert → confirm."""
-        fake_parsed = {
-            "sleep_hrs": 6.5,
-            "energy": 3,
-            "soreness": {"legs": 3},
-            "weight_lbs": None,
-            "resting_hr": 58,
-            "free_text": "feel slow",
-        }
-        with patch.object(health, "_call_claude_json", return_value=fake_parsed), \
-             patch.object(health, "upsert_daily_state") as mock_upsert:
-            result = health.handle_morning_intent("slept 6.5 energy 3 legs sore 3 RHR 58")
+    """FRIDAY-1: handle_morning_intent is deterministic — it delegates to
+    artemis.health_checkin.process_checkin inside one DB transaction and never
+    calls the LLM."""
 
-        # Confirms DB write happened
-        mock_upsert.assert_called_once()
-        # Confirms trainer-voice output
-        self.assertIn("6.5h sleep", result)
-        self.assertIn("energy 3/5", result)
-        self.assertIn("RHR 58", result)
-        self.assertIn("Anything to fix?", result)
+    def _conn(self, cur):
+        from contextlib import contextmanager
 
-    def test_parse_failure_returns_useful_error(self):
-        """When parser fails, return guidance, not a stack trace."""
-        with patch.object(health, "_call_claude_json", side_effect=ValueError("malformed")):
-            result = health.handle_morning_intent("garbled garbage")
-        self.assertIn("couldn't parse", result.lower())
-        self.assertIn("slept", result.lower())  # example shown to user
+        @contextmanager
+        def conn():
+            m = MagicMock()
+            m.cursor.return_value = cur
+            yield m
+        return conn
+
+    def test_delegates_to_deterministic_checkin(self):
+        cur = MagicMock()
+        with patch("knowledge.db.get_connection", self._conn(cur)), \
+             patch("artemis.health_checkin.process_checkin",
+                   return_value="Check-in logged — run Session A as written.") as pc, \
+             patch.object(health, "_call_claude_json",
+                          side_effect=AssertionError("LLM must not be called")):
+            result = health.handle_morning_intent("slept 6.5 energy 3 legs sore 3 RHR 58",
+                                                  message_id="p1")
+        pc.assert_called_once()
+        self.assertEqual(pc.call_args[0][0], cur)
+        self.assertEqual(pc.call_args[0][1], "slept 6.5 energy 3 legs sore 3 RHR 58")
+        self.assertEqual(pc.call_args.kwargs["checkin_id"], "p1")
+        self.assertEqual(result, "Check-in logged — run Session A as written.")
 
     def test_db_failure_returns_warning(self):
-        fake_parsed = {"sleep_hrs": 6.0, "energy": 4}
-        with patch.object(health, "_call_claude_json", return_value=fake_parsed), \
-             patch.object(health, "upsert_daily_state", side_effect=RuntimeError("conn lost")):
+        with patch("knowledge.db.get_connection", side_effect=RuntimeError("conn lost")):
             result = health.handle_morning_intent("slept 6")
-        self.assertIn("Couldn", result)  # "Couldn't save"
+        self.assertIn("Couldn", result)
         self.assertIn("DB", result)
 
 
@@ -458,17 +456,20 @@ class TestPromptBuilders(unittest.TestCase):
         "blocks": {"type": "intervals", "rounds": 8},
     }
 
-    def test_morning_survey_workout_includes_calibration_note(self):
+    def test_morning_survey_workout_says_reply_adjusts(self):
+        # FRIDAY-1: no timed "calibrated plan in 15 min" — the reply adjusts.
         from artemis.health import build_morning_survey_prompt
         out = build_morning_survey_prompt(self._PLAN_STRENGTH, "workout_am")
         self.assertIn("Strength A", out)
-        self.assertIn("40 min", out)
-        self.assertIn("15 min", out)  # calibration heads-up
+        self.assertIn("when you reply", out)
+        self.assertIn("`original`", out)
+        self.assertNotIn("15 min", out)
 
     def test_morning_survey_logging_only_no_calibration_note(self):
         from artemis.health import build_morning_survey_prompt
         out = build_morning_survey_prompt(self._PLAN_STRENGTH, "logging_only")
-        self.assertIn("later", out)
+        self.assertIn("check-in", out)
+        self.assertNotIn("later", out)       # FRIDAY-1: no "workout is later" on rest days
         self.assertNotIn("15 min", out)
 
     def test_evening_prompt_includes_resolved_location(self):
@@ -484,31 +485,11 @@ class TestPromptBuilders(unittest.TestCase):
         self.assertIn("Where: office gym", out)
         self.assertIn("stepmill", out)
 
-    def test_calibration_includes_warmup(self):
-        from artemis.health import build_calibrated_plan_post
-        resolved = {
-            "location": "office gym",
-            "equipment": ["leg press", "DBs"],
-            "first_lift": "Leg press",
-            "notes": None,
-        }
-        out = build_calibrated_plan_post(self._PLAN_STRENGTH, resolved, state=None)
-        self.assertIn("First lift: Leg press", out)
-        self.assertIn("Where: office gym", out)
-        self.assertIn("Warmup:", out)
-
-    def test_calibration_recovery_override_when_low_sleep(self):
-        """Sleep < 5h → recovery override prepended."""
-        from artemis.health import build_calibrated_plan_post
-        resolved = {
-            "location": "office gym",
-            "equipment": ["leg press", "DBs"],
-            "first_lift": "Leg press",
-            "notes": None,
-        }
-        state = {"sleep_hrs": 4.0, "energy": 3}
-        out = build_calibrated_plan_post(self._PLAN_STRENGTH, resolved, state=state)
-        self.assertIn("Recovery override", out)
+    def test_calibration_post_is_retired(self):
+        """FRIDAY-1: the timed calibrated-plan post (and its false "Recovery
+        override" line) is gone — adjustments happen on check-in instead."""
+        from artemis import health
+        self.assertFalse(hasattr(health, "build_calibrated_plan_post"))
 
 
 # ============================================================================

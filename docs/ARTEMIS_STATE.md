@@ -118,6 +118,8 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 | 6 session-expired banner | in gym-display #3 |
 | 8 ramp dry run | engine incompatible with the office program — keep retired (see RAMP-RETIRE) |
 
+**FRIDAY-1 — check-in-driven morning (2026-09-17).** The fixed 04:45 calibration post is retired. The 04:30 wake post is plan-exact and opens the check-in; the reply is parsed deterministically and adjusts today's `health.plan` row by fixed rules (`blocks.original` + `blocks.adjustment`, `original` to undo), with a 05:15 nudge if nothing arrives. Short morning replies are answered from the DB, and the LLM fallback gets no business data outside the OPEN phase. A plan-claim guard rejects invented exercises, loads, or "last session" figures. Flag: `CHECKIN_ADJUST`. See PB-009.
+
 ---
 
 ## 6. Backlog (prioritized)
@@ -168,7 +170,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 - **Office equipment unconfirmed** — Precor pin-stack step (default 10 lb), Icarian Smith bar weight, and the hex dumbbell range are guesses; `TODO(office)` in gym-display `src/lib/equipment.ts`.
 - **Three pre-existing test failures**, identical on `main`: `test_confirm_dispatch` and `test_commitments_rds` (no DB pool locally), `artemis/test_opsdiag` (py3.14 `requests`). Run the suite on py3.11 or give them a pool stub.
 - **Lambda deploy drift** — `rdmis-crm-api` is deployed by hand (`api/deploy.sh`); there is no CI deploy and no check that the live function matches `main`.
-- **API Gateway has no access logs or detailed metrics** — per-route counts don't exist. On 2026-07-19 (05:00–10:00 CDT) the API served **154,023 authenticated, successful reads** (~10/s, 0 4xx, no writes); cause unattributed, most likely a client refetch loop during OPS-2 development that morning. Enable HTTP API access logging.
+- **API Gateway has no access logs or detailed metrics** — per-route counts don't exist. On 2026-07-19 (**10:00–15:00 CDT**, 15:00–20:00 UTC — corrected from an earlier 05:00–10:00 misreading of local-labelled CloudWatch buckets) the API served **154,023 authenticated, successful reads** (~10/s, 0 4xx, no writes); cause unattributed, most likely a client refetch loop during that day's OPS-2 dashboard work (10:35–14:45 CDT, ending with a 14:45 fix for silent reload loops). A second flood ran 2026-05-04 23:00 CDT → 05-05 ~15:00 (~394k requests). Since 2026-09-16 the stage is throttled to 5 req/s, burst 10. Enable HTTP API access logging.
 - **Machine settings never captured** — the 9/16 session logged 6 machine sets with no `setting=` note; Artemis's own parser also discards seat/pin.
 - **WAKE-2** — the next day-phase slice (not started).
 - **TV retirement decision** — the gym-display TV layout is gone; decide whether the TV is retired for good or gets a read-only glance view.

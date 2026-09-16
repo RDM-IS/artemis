@@ -887,27 +887,18 @@ def _idempotency_key(message_id: str | None) -> str | None:
 
 
 def handle_morning_intent(message: str, message_id: str | None = None, user_id: str | None = None) -> str:
-    """Parse a morning check-in and UPSERT into health.daily_state.
-
-    Returns the trainer-voice confirmation string. On parse failure returns
-    a useful error message.
-    """
+    """Morning check-in — deterministic (FRIDAY-1). Parses, stores to
+    health.daily_state, and adjusts today's plan per artemis.health_checkin.
+    No LLM is involved."""
+    from artemis.health_checkin import process_checkin
+    from knowledge.db import get_connection
     try:
-        state = parse_morning_checkin(message)
-    except (ValidationError, json.JSONDecodeError, anthropic.APIError) as e:
-        logger.warning("Morning check-in parse failed: %s", e)
-        return "I couldn't parse that. Try: 'slept 6.5, energy 3, legs sore 3'."
+        with get_connection() as conn:
+            return process_checkin(conn.cursor(), message, datetime.now(_local_tz()).date(),
+                                   checkin_id=message_id or "")
     except Exception:
-        logger.exception("Morning check-in parse failed (unknown)")
-        return "I couldn't parse that. Try: 'slept 6.5, energy 3, legs sore 3'."
-
-    try:
-        upsert_daily_state(state)
-    except Exception:
-        logger.exception("Failed to write daily_state")
+        logger.exception("Morning check-in failed")
         return "⚠️ Couldn't save morning check-in — check DB."
-
-    return format_morning_confirm(state)
 
 
 def handle_debrief_intent(message: str, message_id: str | None = None, user_id: str | None = None) -> str:
@@ -1412,7 +1403,8 @@ def _plan_session_name(plan: dict) -> str:
 
 
 _SURVEY_QUESTIONS = (
-    "Reply with: sleep hrs, energy 1-5, soreness (region 1-5), weight if you weighed, RHR if you took it.\n"
+    "Reply with: sleep hrs, energy 1-5, soreness by region (1-5, or x/10; `sore 0` if none), "
+    "weight if you weighed, RHR if you took it.\n"
     "Example: `slept 6.5 energy 3 legs sore 3 weight 271 RHR 58`"
 )
 
@@ -1428,17 +1420,13 @@ def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
     duration_str = f" — {duration} min" if duration else ""
 
     if prompt_type == "logging_only":
-        return (
-            f"Morning. Today's workout is later: **{session}**{duration_str}.\n"
-            f"For now: morning check-in.\n\n"
-            f"{_SURVEY_QUESTIONS}"
-        )
+        return f"Morning check-in.\n\n{_SURVEY_QUESTIONS}"
 
     # workout_am
     return (
-        f"Morning. Today: **{session}**{duration_str}.\n\n"
+        f"Morning check-in.\n\n"
         f"{_SURVEY_QUESTIONS}\n\n"
-        f"_Calibrated plan in ~15 min once you reply._"
+        f"_I'll adjust {session} when you reply (reply `original` to undo)._"
     )
 
 
@@ -1458,35 +1446,6 @@ def build_evening_prompt(plan: dict, resolved: dict) -> str:
         lines.append(f"First lift: {resolved['first_lift']}")
     if resolved.get("notes"):
         lines.append(f"_{resolved['notes']}_")
-    lines.append("gym.rdm.is is up — full plan there.")
-    return "\n".join(lines)
-
-
-def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -> str:
-    """Build the trainer-voice calibrated plan post that follows morning survey
-    by ~15 minutes."""
-    session = _plan_session_name(plan)
-    duration = plan.get("est_duration_min")
-    duration_str = f" — {duration} min" if duration else ""
-
-    lines = [f"Today: **{session}**{duration_str}.", f"Where: {resolved['location']}"]
-    if resolved["equipment"]:
-        lines.append(f"Bring: {', '.join(resolved['equipment'])}")
-    if resolved.get("first_lift"):
-        lines.append(f"First lift: {resolved['first_lift']}")
-    blocks = _coerce_blocks(plan.get("blocks"))
-    if blocks.get("warmup"):
-        lines.append(f"Warmup: {blocks['warmup']}")
-    if resolved.get("notes"):
-        lines.append(f"_{resolved['notes']}_")
-
-    # Recovery-day override notice if morning state suggests it
-    if state:
-        sleep = state.get("sleep_hrs")
-        energy = state.get("energy")
-        if (sleep is not None and sleep < 5) or (energy is not None and energy <= 2):
-            lines.insert(0, "**Recovery override.** Sleep low or energy low. Today drops to mobility + walk.")
-
     lines.append("gym.rdm.is is up — full plan there.")
     return "\n".join(lines)
 
