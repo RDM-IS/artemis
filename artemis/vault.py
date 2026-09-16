@@ -42,7 +42,17 @@ from knowledge.secrets import get_vault_repo
 
 logger = logging.getLogger(__name__)
 
-_CT = ZoneInfo("America/Chicago")
+def _local_tz():
+    """Active timezone (WAKE-1) — resolved per call, so a timezone override
+    applies to every "today" this module computes."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
+
+
+def _tz_param() -> str:
+    """Timezone name for SQL date anchors (never interpolated)."""
+    from artemis.quiet_hours import get_active_timezone
+    return get_active_timezone()
 
 # Sources that get an extraction pass. journal feeds the morning diff but is never
 # extracted; legacy-* is study/archival material — extracting to-dos from it is noise.
@@ -80,7 +90,7 @@ _TYPE_LABEL = {
 
 
 def _ct_today() -> date:
-    return datetime.now(_CT).date()
+    return datetime.now(_local_tz()).date()
 
 
 def _audit(action: str, metadata: dict | None = None) -> None:
@@ -473,7 +483,7 @@ def sync_vault() -> dict:
     last_sha = _state_get("last_sha")
 
     if sha == last_sha:
-        _state_set("last_run", datetime.now(_CT).isoformat())
+        _state_set("last_run", datetime.now(_local_tz()).isoformat())
         _state_set("last_run_counts", counts)
         _audit("sync_no_change", {"sha": sha})
         return {"sha": sha, "no_change": True, **counts}
@@ -497,7 +507,7 @@ def sync_vault() -> dict:
     counts["proposals"] = ex_counts["proposals"]
 
     _state_set("last_sha", sha)
-    _state_set("last_run", datetime.now(_CT).isoformat())
+    _state_set("last_run", datetime.now(_local_tz()).isoformat())
     _state_set("last_run_counts", counts)
     _audit("sync", {"sha": sha, **counts})
     return {"sha": sha, "no_change": False, **counts}
@@ -671,8 +681,8 @@ def _pending_proposals(today_only: bool) -> list[dict]:
     )
     params: tuple = ()
     if today_only:
-        sql += "AND (p.created_at AT TIME ZONE 'America/Chicago')::date = %s "
-        params = (_ct_today(),)
+        sql += "AND (p.created_at AT TIME ZONE %s)::date = %s "
+        params = (_tz_param(), _ct_today())
     rows = execute_query(sql + "ORDER BY p.created_at, p.id", params)
     rows.sort(key=lambda r: (_TYPE_RANK.get(r["extraction_type"], 9), r["created_at"] or datetime.min, r["id"]))
     return rows
@@ -1060,8 +1070,8 @@ def _journal_diff_section(mirror: str, day: date) -> str:
         "SELECT p.extraction_type, p.payload FROM vault.extraction_proposal p "
         "JOIN vault.notes n ON n.capture_id = p.capture_id "
         "WHERE p.extraction_type IN ('decision_candidate', 'commitment') "
-        "AND (n.created_at AT TIME ZONE 'America/Chicago')::date = %s",
-        (day,),
+        "AND (n.created_at AT TIME ZONE %s)::date = %s",
+        (_tz_param(), day),
     )
     extracted = "\n".join(
         f"- ({p['extraction_type']}) {str((p['payload'] or {}).get('text', '')).strip()}" for p in props
@@ -1171,8 +1181,8 @@ def run_coverage_monitor(calendar, mm) -> str | None:
     captures = execute_one(
         "SELECT count(*) c FROM vault.notes "
         "WHERE deleted_at IS NULL AND source IN ('meeting', 'dictation') "
-        "AND (first_ingested_at AT TIME ZONE 'America/Chicago')::date = %s",
-        (today,),
+        "AND (first_ingested_at AT TIME ZONE %s)::date = %s",
+        (_tz_param(), today),
     )["c"]
 
     result = f"{len(meetings)} meeting{'s' if len(meetings) != 1 else ''}, {captures} captured"

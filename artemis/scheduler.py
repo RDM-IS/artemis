@@ -4,9 +4,12 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from artemis import config
 from artemis import morning_brief
@@ -59,6 +62,40 @@ from artemis.utils import next_business_day
 
 logger = logging.getLogger(__name__)
 
+
+def _local_today():
+    """Today for Ryan — active timezone (WAKE-1). Never the box's zone."""
+    from artemis.quiet_hours import local_today
+    return local_today()
+
+
+def _hhmm(value: str) -> tuple[int, int]:
+    h, _, m = value.partition(":")
+    return int(h), int(m or 0)
+
+
+def _minus_minutes(hour: int, minute: int, delta: int) -> tuple[int, int]:
+    total = (hour * 60 + minute - delta) % (24 * 60)
+    return total // 60, total % 60
+
+
+@dataclass(frozen=True)
+class CronSpec:
+    """One cron job, in LOCAL wall-clock time.
+
+    THE registry: every cron job in Artemis is declared here and registered
+    through apply_timezone(), so a timezone override reschedules all of them
+    together. Interval and one-shot date jobs are unaffected.
+    """
+    id: str
+    func_name: str
+    hour: int
+    minute: int
+    day_of_week: str | None = None
+    #  health   → posts in wake + open      business → posts in open only
+    tier: str = "business"
+
+
 # ---------------------------------------------------------------------------
 # Playbook helpers
 # ---------------------------------------------------------------------------
@@ -101,7 +138,9 @@ class ArtemisScheduler:
         self.gmail = gmail
         self.calendar = calendar
         self.crm = CRMClient()
-        self.scheduler = BackgroundScheduler()
+        self.scheduler = BackgroundScheduler(timezone=ZoneInfo(config.HOME_TIMEZONE))
+        self._cron_specs: list[CronSpec] = []
+        self._applied_tz: str | None = None
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
         self._pending_availability: dict[str, dict] = {}
@@ -109,177 +148,295 @@ class ArtemisScheduler:
         self._gmail_fail_count: int = 0
         self._calendar_fail_count: int = 0
 
-    def start(self):
-        # Inbox triage — every 5 minutes
-        self.scheduler.add_job(self.job_inbox_triage, "interval", minutes=5, id="inbox_triage")
+    # ── Cron registry (WAKE-1 §C) ─────────────────────────────────────────
+    #  Local wall-clock times. apply_timezone() is the ONLY registration path;
+    #  no add_job(..., "cron", ...) call may live outside it.
 
-        # Triage batch post — every 30 minutes
-        self.scheduler.add_job(self.job_post_triage_batch, "interval", minutes=30, id="triage_batch")
+    def cron_specs(self) -> list[CronSpec]:
+        wake_h, wake_m = _hhmm(config.WAKE_TIME)
+        open_h, open_m = _hhmm(config.OPEN_TIME)
+        quiet_h, quiet_m = _hhmm(config.QUIET_HOURS_START)
+        brief_h, brief_m = _hhmm(config.MORNING_BRIEF_TIME)
+        pre_h, pre_m = _minus_minutes(brief_h, brief_m, 5)
 
-        # Pre-meeting brief check — every 10 minutes
-        self.scheduler.add_job(self.job_pre_meeting_briefs, "interval", minutes=10, id="pre_meeting")
-
-        # Morning brief
-        hour, minute = config.MORNING_BRIEF_TIME.split(":")
-        self.scheduler.add_job(
-            self.job_morning_brief, "cron", hour=int(hour), minute=int(minute), id="morning_brief"
-        )
-
-        # SSL check — daily at 8am
-        self.scheduler.add_job(self.job_ssl_check, "cron", hour=8, minute=0, id="ssl_check")
-
-        # Domain expiry check — daily at 8am
-        self.scheduler.add_job(self.job_domain_check, "cron", hour=8, minute=5, id="domain_check")
-
-        # Inbox zero audit — every 60 minutes
-        self.scheduler.add_job(self.job_inbox_zero_audit, "interval", minutes=60, id="inbox_zero_audit")
-
-        # Inbox zero morning section — 5 minutes before morning brief
-        brief_min = int(minute) - 5
-        brief_hour = int(hour)
-        if brief_min < 0:
-            brief_min += 60
-            brief_hour -= 1
-        self.scheduler.add_job(
-            self.job_inbox_zero_morning, "cron", hour=brief_hour, minute=brief_min, id="inbox_zero_morning"
-        )
-
-        # Titanium focus reminder — weekdays at 9am
+        specs = [
+            # 03:30 — silent vault ingest, before the wake window.
+            CronSpec("vault_sync", "job_vault_sync", 3, 30),
+            # 04:30 — wake: health holds flush + the wake post.
+            CronSpec("wake", "job_wake", wake_h, wake_m, tier="health"),
+            # 06:25 / 06:30 — open: business holds flush, then the brief.
+            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m),
+            CronSpec("open", "job_open", open_h, open_m),
+            CronSpec("morning_brief", "job_morning_brief", brief_h, brief_m),
+            CronSpec("ssl_check", "job_ssl_check", 8, 0),
+            CronSpec("domain_check", "job_domain_check", 8, 5),
+            CronSpec("follow_up_radar", "job_follow_up_radar", 8, 0, "mon-fri"),
+            CronSpec("update_check", "job_update_check", 8, 0, "mon"),
+            CronSpec("commitment_reminders", "job_commitment_reminders", 8, 15, "mon-fri"),
+            # 16:30 — workouts are AM now, so the debrief nag moved off 21:00
+            # (which would sit inside the 17:00 quiet window and never fire).
+            CronSpec("health_nag", "job_health_nag", 16, 30, tier="health"),
+            CronSpec("vault_coverage", "job_vault_coverage", 16, 30, "mon-fri"),
+            CronSpec("quiet_hours_start", "job_quiet_hours_start", quiet_h, quiet_m),
+            # 21:50 — silent DB backstop; writes only, posts nothing.
+            CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
+        ]
         if config.FOCUS_CLIENT:
-            self.scheduler.add_job(
-                self.job_focus_reminder, "cron", hour=9, minute=0, day_of_week="mon-fri",
-                id="focus_reminder",
+            specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
+        return specs
+
+    def _wrap_cron(self, spec: CronSpec):
+        """Wrap a registry job in the once-per-LOCAL-day duplicate guard."""
+        func = getattr(self, spec.func_name)
+
+        def runner():
+            if not self._once_per_local_day(spec.id):
+                return
+            func()
+
+        runner.__name__ = f"cron_{spec.id}"
+        return runner
+
+    def _once_per_local_day(self, job_id: str) -> bool:
+        """False when this job already ran on today's LOCAL date.
+
+        A timezone switch can replay a wall-clock time on the same local date
+        (e.g. a Paris override expiring at 17:00 CT would re-arm the 17:00 jobs).
+        The guard is keyed on (job_id, local date at fire time) in system_state.
+        """
+        from artemis.quiet_hours import get_system_value, local_today, set_system_value
+
+        key = f"cron_last_run:{job_id}"
+        today = local_today().isoformat()
+        if get_system_value(key) == today:
+            logger.info("Cron %s already ran on local day %s — skipping (tz replay guard)",
+                        job_id, today)
+            return False
+        set_system_value(key, today)
+        return True
+
+    def apply_timezone(self, tz_name: str) -> None:
+        """(Re)register every registry job against `tz_name` and record it."""
+        from artemis.quiet_hours import set_system_value
+
+        try:
+            tz = ZoneInfo(tz_name)
+        except (KeyError, ValueError):
+            logger.error("apply_timezone: unknown zone %r — keeping %s", tz_name, self._applied_tz)
+            return
+
+        self._cron_specs = self.cron_specs()
+        for spec in self._cron_specs:
+            trigger = CronTrigger(
+                hour=spec.hour, minute=spec.minute,
+                day_of_week=spec.day_of_week, timezone=tz,
             )
+            if self.scheduler.get_job(spec.id):
+                self.scheduler.reschedule_job(spec.id, trigger=trigger)
+            else:
+                self.scheduler.add_job(
+                    self._wrap_cron(spec), trigger=trigger, id=spec.id, replace_existing=True,
+                )
+        self._applied_tz = tz_name
+        set_system_value("scheduler_tz", tz_name)
+        logger.info("Scheduler timezone applied: %s", tz_name)
+        for line in self.job_dump():
+            logger.info("  %s", line)
 
-        # Weekly update check — Mondays at 8am
-        self.scheduler.add_job(
-            self.job_update_check, "cron", hour=8, minute=0, day_of_week="mon",
-            id="update_check",
-        )
+    def job_dump(self) -> list[str]:
+        """Next fire time of every cron job, in local and CT — the verify surface."""
+        home = ZoneInfo(config.HOME_TIMEZONE)
+        out = []
+        for spec in self._cron_specs or self.cron_specs():
+            job = self.scheduler.get_job(spec.id)
+            nxt = getattr(job, "next_run_time", None) if job else None
+            if nxt is None and job is not None:
+                # Before scheduler.start() APScheduler hasn't computed one yet —
+                # ask the trigger directly so the startup dump is still useful.
+                try:
+                    tz = job.trigger.timezone
+                    nxt = job.trigger.get_next_fire_time(None, datetime.now(tz))
+                except Exception:  # pragma: no cover - defensive
+                    nxt = None
+            if nxt is None:
+                out.append(f"{spec.id:<24} {spec.hour:02d}:{spec.minute:02d} local  next=—")
+                continue
+            out.append(
+                f"{spec.id:<24} {spec.hour:02d}:{spec.minute:02d} local  "
+                f"next={nxt.isoformat()}  ct={nxt.astimezone(home).isoformat()}"
+            )
+        return out
 
-        # STAB-1 A2: websocket watchdog — every 60s, force-close a half-open socket
-        # so the reconnect loop fires (the 2026-07-17 silent-death guard).
-        self.scheduler.add_job(
-            self.job_ws_watchdog, "interval", seconds=60, id="ws_watchdog",
-        )
+    def start(self):
+        from artemis.quiet_hours import get_active_timezone
 
-        # PB-005: Commitment deadline reminders — weekdays at 8:15am
-        self.scheduler.add_job(
-            self.job_commitment_reminders, "cron", hour=8, minute=15, day_of_week="mon-fri",
-            id="commitment_reminders",
-        )
+        # ── Interval jobs (timezone-independent) ──
+        # Business intervals require the OPEN phase; each checks _is_open().
+        self.scheduler.add_job(self.job_inbox_triage, "interval", minutes=5, id="inbox_triage")
+        self.scheduler.add_job(self.job_post_triage_batch, "interval", minutes=30, id="triage_batch")
+        self.scheduler.add_job(self.job_pre_meeting_briefs, "interval", minutes=10, id="pre_meeting")
+        self.scheduler.add_job(self.job_inbox_zero_audit, "interval", minutes=60, id="inbox_zero_audit")
+        self.scheduler.add_job(self.job_action_item_reminders, "interval", minutes=30,
+                               id="action_item_reminders")
+        self.scheduler.add_job(self.job_demo_intake, "interval", minutes=5, id="demo_intake")
+        logger.info("PB-001 demo intake enabled")
 
-        # PB-007: Billing intake — every 15 minutes (check for billing-labeled emails)
         scopes_ok, missing = check_billing_scopes()
         if scopes_ok:
-            self.scheduler.add_job(
-                self.job_billing_intake, "interval", minutes=15, id="billing_intake",
-            )
+            self.scheduler.add_job(self.job_billing_intake, "interval", minutes=15, id="billing_intake")
             logger.info("PB-007 billing intake enabled")
         else:
             logger.warning("PB-007 billing intake disabled — missing scopes: %s", missing)
 
-        # PB-001 v2: Demo intake — every 5 minutes (scan for Lucint demo emails)
-        self.scheduler.add_job(
-            self.job_demo_intake, "interval", minutes=5, id="demo_intake",
-        )
-        logger.info("PB-001 demo intake enabled")
+        # STAB-1 A2: websocket watchdog — every 60s.
+        self.scheduler.add_job(self.job_ws_watchdog, "interval", seconds=60, id="ws_watchdog")
 
-        # Health: workout debrief nag at 21:00 CT (1hr before quiet hours)
-        # Day-of-week suppression handled inside job_health_nag (Tue/Fri off).
-        self.scheduler.add_job(
-            self.job_health_nag, "cron", hour=21, minute=0, id="health_nag",
-        )
-        # Inferred-summary backstop at 21:50 CT (50min after nag, just before
-        # quiet hours start) — operates on TODAY's plan, not yesterday's.
-        # Fires every day regardless of nag suppression — data-quality backstop.
-        self.scheduler.add_job(
-            self.job_health_inferred_summary, "cron", hour=21, minute=50, id="health_inferred_summary",
-        )
-        # ── T4: Proactive prompts (PB-009) ────────────────────────────────
-        # Morning workout prompt — Tue/Thu/Fri at 04:01 CT (just after quiet ends)
-        self.scheduler.add_job(
-            self.job_health_morning_prompt, "cron",
-            hour=7, minute=0, day_of_week="mon-sun",
-            id="health_morning_prompt",
-        )
-        # Recalibrated schedule (2026-05-05): no more evening workouts —
-        # all sessions are morning-prompted. job_health_morning_prompt
-        # internally dispatches workout_am vs logging_only based on dow.
-        # Old Tue/Thu/Fri 04:01 early cron and Wed/Sat 16:30 evening
-        # cron jobs have been retired. job_health_evening_prompt method
-        # is preserved for future use but no longer cron-registered.
-        logger.info("Health nag + morning prompt jobs scheduled")
+        # Working session inactivity check — every 1 minute.
+        self.scheduler.add_job(self.job_override_expiry_check, "interval", minutes=1,
+                               id="override_expiry_check")
 
-        # Quiet hours entry/exit announcements
-        qh_start_h, qh_start_m = config.QUIET_HOURS_START.split(":")
-        qh_end_h, qh_end_m = config.QUIET_HOURS_END.split(":")
-        self.scheduler.add_job(
-            self.job_quiet_hours_start, "cron",
-            hour=int(qh_start_h), minute=int(qh_start_m), id="quiet_hours_start",
-        )
-        self.scheduler.add_job(
-            self.job_quiet_hours_end, "cron",
-            hour=int(qh_end_h), minute=int(qh_end_m), id="quiet_hours_end",
-        )
+        # WAKE-1: the schedule follows the active timezone. This is the ONLY
+        # path that switches it (replaces the old noon expiry cron), and it also
+        # sweeps an expired override and announces the change.
+        self.scheduler.add_job(self.job_tz_sync, "interval", seconds=60, id="tz_sync")
 
-        # Timezone override expiry check — daily at noon
-        self.scheduler.add_job(
-            self.job_check_timezone_expiry, "cron", hour=12, minute=0,
-            id="timezone_expiry_check",
-        )
+        # A goodnight with a custom wake time ("wake me at 6") must actually
+        # wake — the 04:30 cron alone returned early and nothing re-checked.
+        self.scheduler.add_job(self.job_wake_watch, "interval", minutes=1, id="wake_watch")
 
-        # Working session inactivity check — every 1 minute
-        self.scheduler.add_job(
-            self.job_override_expiry_check, "interval", minutes=1,
-            id="override_expiry_check",
-        )
-
-        # Action item reminders — every 30 minutes
-        self.scheduler.add_job(
-            self.job_action_item_reminders, "interval", minutes=30,
-            id="action_item_reminders",
-        )
-
-        # Follow-up radar — weekdays at 8:00 AM (same TZ as other morning jobs)
-        self.scheduler.add_job(
-            self.job_follow_up_radar, "cron", hour=8, minute=0,
-            day_of_week="mon-fri", id="follow_up_radar",
-        )
-
-        # PB-011: Vault ingest — 04:00 CT daily sync (same code path as
-        # `@artemis vault sync`). Anchored explicitly to America/Chicago.
-        self.scheduler.add_job(
-            self.job_vault_sync, "cron", hour=4, minute=0,
-            id="vault_sync", timezone="America/Chicago",
-        )
-        # PB-011: Coverage monitor — weekdays 16:30 CT (calendar meetings vs
-        # dictated captures). One nudge/day, handled inside the job.
-        self.scheduler.add_job(
-            self.job_vault_coverage, "cron", hour=16, minute=30, day_of_week="mon-fri",
-            id="vault_coverage", timezone="America/Chicago",
-        )
-
-        # HEALTH-2: the feat/health-ramp nightly job (00:15 CT) is retired — its
-        # weeks 1-7 window (7/25-9/11) passed undeployed, and it would slide and
-        # re-propose over the office plan (9/16+). Do not re-register it.
+        # ── Cron jobs: registry, in the active timezone ──
+        self.apply_timezone(get_active_timezone())
 
         # Load playbooks at startup
         load_playbooks()
 
         self.scheduler.start()
-        logger.info("Scheduler started")
+        logger.info("Scheduler started (cron tz=%s)", self._applied_tz)
 
     def stop(self):
         self.scheduler.shutdown()
 
     def _is_quiet(self) -> bool:
-        """Check if quiet hours are active. Used as a guard at the top of scheduled jobs."""
+        """True in the QUIET phase — health jobs guard on this."""
         try:
             from artemis.quiet_hours import is_quiet_hours
             return is_quiet_hours()
         except Exception:
             return False
+
+    def _is_open(self) -> bool:
+        """True in the OPEN phase — every business job guards on this."""
+        try:
+            from artemis.quiet_hours import is_open
+            return is_open()
+        except Exception:
+            return False
+
+    def _post(self, channel: str, text: str, tier: str = "business") -> bool:
+        """Scheduled posts go through the phase gate: post now, or hold durably."""
+        from artemis.posting import post_or_hold
+        return post_or_hold(self.mm, channel, text, tier)
+
+    # ── Phase jobs (WAKE-1) ───────────────────────────────────────────────
+
+    def _do_wake(self) -> None:
+        """Enter the wake phase, flush health holds into the wake post, and
+        schedule the calibration follow-up."""
+        from artemis import wake as wake_mod
+        from artemis.posting import take_holds
+        from artemis.quiet_hours import exit_quiet, local_now
+
+        exit_quiet()
+        held = take_holds("health")
+        text = wake_mod.build_wake_message(calendar=self.calendar, held_health=held)
+        self.mm.post_message(config.CHANNEL_OPS, text)
+
+        # Calibrated plan ~15 min later, in the ACTIVE timezone.
+        try:
+            from artemis.health import get_today_plan
+            plan = get_today_plan()
+            if plan and wake_mod.prompt_type_for(plan) == "workout_am":
+                run_at = local_now() + timedelta(minutes=15)
+                today = _local_today()
+                self.scheduler.add_job(
+                    self.job_health_calibration_followup, "date", run_date=run_at,
+                    id=f"health_calibration_{today.isoformat()}", replace_existing=True,
+                )
+                logger.info("Scheduled calibration follow-up at %s", run_at.isoformat())
+        except Exception:
+            logger.exception("Failed to schedule calibration follow-up")
+
+    def job_wake(self):
+        """04:30 local — wake. Health only; business waits for 06:30."""
+        try:
+            from artemis.quiet_hours import get_quiet_state
+            state = get_quiet_state()
+            wake_at = state.get("wake_time")
+            if state.get("manual_override") and wake_at:
+                # A custom wake time was asked for — job_wake_watch owns it.
+                logger.info("Wake: custom wake time %s set — deferring to wake_watch", wake_at)
+                return
+            self._do_wake()
+        except Exception:
+            logger.exception("Wake job failed")
+
+    def job_wake_watch(self):
+        """Every minute: honour a goodnight's custom wake time ("wake me at 6").
+
+        Finding 8 on main: the 04:30 cron returned early when a custom wake time
+        was set and nothing ever re-checked, so Artemis never woke.
+        """
+        try:
+            from artemis.quiet_hours import _parse_time, get_quiet_state, local_now
+            state = get_quiet_state()
+            if not (state.get("manual_override") and state.get("is_quiet")):
+                return
+            wake_at = state.get("wake_time")
+            if not wake_at:
+                return
+            if local_now().time() < _parse_time(wake_at):
+                return
+            if not self._once_per_local_day("wake"):
+                return
+            self._do_wake()
+        except Exception:
+            logger.debug("Wake watch failed", exc_info=True)
+
+    def job_open(self):
+        """06:30 local — business opens: flush held business posts, then the
+        overnight summary that used to ride on quiet-hours-end at 04:00."""
+        try:
+            from artemis.posting import flush_holds
+            from artemis.quiet_hours import get_quiet_state
+            state = get_quiet_state()
+            if state.get("is_quiet") and state.get("manual_override"):
+                # Still manually quiet (goodnight with a late wake) — hold.
+                logger.info("Open: manual quiet still active — not opening")
+                return
+            flush_holds(self.mm, "business")
+            self.mm.post_message(config.CHANNEL_OPS, self._build_overnight_summary())
+        except Exception:
+            logger.exception("Open job failed")
+
+    def job_tz_sync(self):
+        """Every 60s: keep the cron schedule on the ACTIVE timezone.
+
+        Also sweeps an expired override (atomic delete) and announces the
+        change. The set/clear command calls this directly so there is no lag.
+        """
+        try:
+            from artemis.quiet_hours import check_expired_overrides, get_active_timezone
+
+            announcement = check_expired_overrides()
+            active = get_active_timezone()
+            if active != self._applied_tz:
+                logger.info("Timezone change: %s → %s — rescheduling crons",
+                            self._applied_tz, active)
+                self.apply_timezone(active)
+            if announcement:
+                self._post(config.CHANNEL_OPS, announcement, tier="business")
+        except Exception:
+            logger.exception("Timezone sync failed")
 
     def _poll_gmail(self, max_results: int = 20) -> list[dict]:
         """Poll Gmail inline using the already-authenticated GmailClient."""
@@ -390,7 +547,7 @@ class ArtemisScheduler:
 
     def job_inbox_triage(self):
         """Poll Gmail, classify new messages, archive, and execute playbooks."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             messages = self._poll_gmail(max_results=20)
@@ -431,7 +588,7 @@ class ArtemisScheduler:
                     body = self.gmail.get_full_message(msg["id"])
                     if body:
                         msg["full_body"] = body
-                    post = self.mm.post_message(
+                    post = self._post(
                         config.CHANNEL_OPS,
                         f"\U0001f4ec **Priority email** from {msg['from']}\n"
                         f"Subject: {msg['subject']}\n"
@@ -448,7 +605,7 @@ class ArtemisScheduler:
                     logger.exception(
                         "Failed to track priority email — NOT archiving %s", msg["id"]
                     )
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\u26a0\ufe0f Failed to track priority email from {msg['from']} — left in inbox",
                     )
@@ -482,7 +639,7 @@ class ArtemisScheduler:
                         )
 
                     if urgency == "high":
-                        self.mm.post_message(
+                        self._post(
                             config.CHANNEL_OPS,
                             f"\U0001f4ec **High urgency email**: {item.get('one_line_summary', 'New email')}",
                         )
@@ -626,7 +783,7 @@ class ArtemisScheduler:
             slots_preview = " | ".join(
                 f"{b['date_label']} {b['time_label']}" for b in free_blocks
             )
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\U0001f4c5 **Scheduling request** from {sender_name} ({sender_email})\n"
                 f"Duration: {duration} min | Confidence: {result['confidence']:.0%}\n"
@@ -646,7 +803,7 @@ class ArtemisScheduler:
 
     def job_post_triage_batch(self):
         """Post batched triage summary."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         if not self._pending_triage:
             return
@@ -660,14 +817,14 @@ class ArtemisScheduler:
                 action = " (action needed)" if item.get("needs_action") else ""
                 lines.append(f"- [{urgency}/{sender_type}] {summary}{action}")
 
-            self.mm.post_message(config.CHANNEL_OPS, "\n".join(lines))
+            self._post(config.CHANNEL_OPS, "\n".join(lines))
             self._pending_triage.clear()
         except Exception:
             logger.exception("Triage batch post failed")
 
     def job_pre_meeting_briefs(self):
         """Generate briefs for upcoming meetings with external attendees."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             # Refresh calendar cache on every cycle
@@ -720,7 +877,7 @@ class ArtemisScheduler:
 
                 if brief:
                     header = f"### Brief: {event['summary']} — {event['start']}\n**Attendees**: {', '.join(attendee_names)}\n\n"
-                    self.mm.post_message(config.CHANNEL_BRIEFS, header + brief)
+                    self._post(config.CHANNEL_BRIEFS, header + brief)
 
         except Exception as exc:
             self._record_calendar_failure(str(exc))
@@ -733,7 +890,7 @@ class ArtemisScheduler:
         threaded through every date, so the header and every relative line share
         one anchor and can't drift. No LLM - the LLM free-composition path is
         exactly what produced the Jul-6 header."""
-        today = self._today_ct_date()
+        today = _local_today()
         return morning_brief.compose(
             today, gmail=self.gmail, calendar=self.calendar,
             include_monitors=include_monitors,
@@ -744,7 +901,7 @@ class ArtemisScheduler:
         try:
             brief = self.compose_morning_brief(include_monitors=True)
             if brief:
-                self.mm.post_message(config.CHANNEL_OPS, brief)
+                self._post(config.CHANNEL_OPS, brief)
                 # OPS-2 health-panel truth: record a DURABLE last-brief timestamp
                 # (acos.system_state, same helper as last_run_at). The ops health
                 # strip reads this real value — the dashboard's old "41d ago" came
@@ -758,15 +915,16 @@ class ArtemisScheduler:
             logger.exception("Morning brief generation failed")
 
     def job_vault_sync(self):
-        """PB-011: 04:00 CT vault ingest — fetch mirror, upsert notes, recompute
+        """PB-011: 03:30 local vault ingest — fetch mirror, upsert notes, recompute
         links, run the throttled extraction pass. Identical code path to the
-        `@artemis vault sync` command. Renders nothing (silent unless it errors)."""
-        if self._is_quiet():
-            return
+        `@artemis vault sync` command. Silent, and deliberately UNGATED: it runs
+        inside quiet hours and posts nothing (only a failure runbook, which is
+        held until business opens).
+        """
         try:
             from artemis import vault
             summary = vault.sync_vault()
-            logger.info("Vault sync (04:00 CT): %s", summary)
+            logger.info("Vault sync (03:30 local): %s", summary)
         except Exception as exc:
             logger.exception("Vault sync job failed")
             # OPS-1: a nightly sync failure is otherwise silent-until-morning — classify
@@ -774,9 +932,9 @@ class ArtemisScheduler:
             # remediation is on hand. report_failure also writes the audit row.
             try:
                 from artemis import opsdiag
-                self.mm.post_message(
+                self._post(
                     config.CHANNEL_OPS,
-                    "\U0001f5c4️ **Vault sync (04:00 CT) failed**\n"
+                    "\U0001f5c4️ **Vault sync (03:30 local) failed**\n"
                     + opsdiag.report_failure(exc, {"stage": "vault sync (cron)"}, agent="vault"),
                 )
             except Exception:
@@ -785,7 +943,7 @@ class ArtemisScheduler:
     def job_vault_coverage(self):
         """PB-011: weekday 16:30 CT — compare today's real calendar meetings to
         today's dictated captures; post at most one nudge to #artemis-ryan."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             from artemis import vault
@@ -795,38 +953,38 @@ class ArtemisScheduler:
 
     def job_ssl_check(self):
         """Check SSL certs and alert if expiring."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             results = check_all_ssl()
             alert = format_ssl_alerts(results)
             if alert:
-                self.mm.post_message(config.CHANNEL_OPS, f"\u26a0\ufe0f **SSL Certificate Alerts:**\n{alert}")
+                self._post(config.CHANNEL_OPS, f"\u26a0\ufe0f **SSL Certificate Alerts:**\n{alert}")
         except Exception:
             logger.exception("SSL check failed")
 
     def job_domain_check(self):
         """Check domain expiry and alert."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             results = check_domain_expiry()
             alert = format_domain_alerts(results)
             if alert:
-                self.mm.post_message(config.CHANNEL_OPS, f"\u26a0\ufe0f **Domain Expiry Alerts:**\n{alert}")
+                self._post(config.CHANNEL_OPS, f"\u26a0\ufe0f **Domain Expiry Alerts:**\n{alert}")
         except Exception:
             logger.exception("Domain check failed")
 
     def job_inbox_zero_audit(self):
         """Audit inbox threads — nudge stale items, resurface snoozed, detect replies."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             # 1. NEEDS_ACTION older than 24h → nudge
             stale_na = get_stale_needs_action(hours=24)
             for t in stale_na:
                 if can_nudge(t["id"], min_hours=12):
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\U0001f4ec **Nudge:** This thread still needs action:\n"
                         f"**{t['subject']}** from {t['sender']}\n\n"
@@ -843,7 +1001,7 @@ class ArtemisScheduler:
                     t["id"], t["waiting_since"]
                 ):
                     mark_needs_action(t["id"])
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\U0001f4ec **Reply received** on: **{t['subject']}** \u2014 moved back to NEEDS_ACTION\n\n"
                         f"Reply: `done {t['id'][:12]}` · `wait {t['id'][:12]}` · "
@@ -853,7 +1011,7 @@ class ArtemisScheduler:
                     who = t.get("waiting_on") or "them"
                     snippet = self.gmail.get_my_last_message_snippet(t["id"])
                     context = f' re: "{snippet}"' if snippet else ""
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\U0001f4ec **Still waiting on {who}{context}** \u2014 no reply in 3+ days\n"
                         f"Thread: **{t['subject']}**\n\n"
@@ -865,7 +1023,7 @@ class ArtemisScheduler:
             snoozed_due = get_snoozed_due()
             for t in snoozed_due:
                 mark_needs_action(t["id"])
-                self.mm.post_message(
+                self._post(
                     config.CHANNEL_OPS,
                     f"\U0001f4ec **Resurfaced (snooze ended):**\n"
                     f"**{t['subject']}** from {t['sender']}\n\n"
@@ -878,7 +1036,7 @@ class ArtemisScheduler:
 
     def job_inbox_zero_morning(self):
         """Pre-compute inbox zero stats before morning brief (stats are pulled inline)."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         # This is a no-op hook — the actual data is pulled by format_morning_inbox_section()
         # during job_morning_brief. This job exists as a named anchor in case
@@ -887,7 +1045,7 @@ class ArtemisScheduler:
 
     def job_focus_reminder(self):
         """Post daily focus reminder for the configured focus client."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             keywords = config.FOCUS_KEYWORDS or [config.FOCUS_CLIENT]
@@ -904,7 +1062,7 @@ class ArtemisScheduler:
             else:
                 commitment_text = "No specific commitments on file — check in with the team."
 
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\U0001f3af Titanium focus check: {commitment_text}\n\n"
                 f"Everything else is secondary.",
@@ -922,7 +1080,7 @@ class ArtemisScheduler:
 
     def job_update_check(self):
         """Check GitHub for new commits and post if an update is available."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             from artemis.version import get_commit_hash, get_latest_github_version
@@ -936,7 +1094,7 @@ class ArtemisScheduler:
             if latest_hash.startswith(local_hash):
                 return  # up to date — stay silent
 
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\U0001f504 Artemis update available \u2014 latest commit: {latest_hash} ({latest_date}).\n"
                 f"Deploy with `bash scripts/deploy.sh` on the box (pull \u2192 migrate \u2192 "
@@ -973,7 +1131,7 @@ class ArtemisScheduler:
 
         except Exception:
             logger.exception("Playbook %s failed for [%s]", playbook_id, msg.get("subject", ""))
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\u26a0\ufe0f Playbook {playbook_id} failed on [{msg.get('subject', '?')}]: "
                 f"check logs for details",
@@ -1036,13 +1194,13 @@ class ArtemisScheduler:
             add_commitment(title=followup_title, due_date=due, effort_days=2, client=company)
             add_commitment(title=deliver_title, due_date=due, effort_days=1, client=company)
 
-        self.mm.post_message(
+        self._post(
             config.CHANNEL_COMMITMENTS,
             f"\U0001f4cb Meeting follow-up from {sender_name}:\n"
             f"- Follow up: {summary[:80]} (due {due})\n"
             f"- Send deliverables to {sender_name} (due {due})",
         )
-        self.mm.post_message(
+        self._post(
             config.CHANNEL_OPS,
             f"\U0001f4cb {sender_name} follow-up processed \u2014 "
             f"2 commitments created, due {due}",
@@ -1057,7 +1215,7 @@ class ArtemisScheduler:
         )
         # Only post to ops if sender is priority contact
         if self.gmail.is_priority_sender(msg.get("from_email", "")):
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\U0001f4dd Survey/feedback request from {msg.get('from', 'unknown')} \u2014 due {due}",
             )
@@ -1069,7 +1227,7 @@ class ArtemisScheduler:
             msg["thread_id"], msg["subject"], msg.get("from_email", ""),
             state=NEEDS_ACTION,
         )
-        self.mm.post_message(
+        self._post(
             config.CHANNEL_OPS,
             f"\U0001f4c5 Meeting request from {msg.get('from', 'unknown')} \u2014 needs response\n"
             f"Subject: {msg.get('subject', '')}",
@@ -1141,7 +1299,7 @@ class ArtemisScheduler:
             booking_link=config.BOOKING_LINK,
         )
 
-        post_result = self.mm.post_message(config.CHANNEL_OPS, formatted)
+        post_result = self._post(config.CHANNEL_OPS, formatted)
 
         # Track in inbox
         upsert_thread(
@@ -1176,7 +1334,7 @@ class ArtemisScheduler:
 
     def job_commitment_reminders(self):
         """PB-005: Commitment Deadline Reminder Chain."""
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             # Try CRM API first, fall back to SQLite
@@ -1213,23 +1371,23 @@ class ArtemisScheduler:
                 effort = c.get("effort_days", 1)
 
                 if days_left == 0:
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\U0001f6a8 **TODAY**: {c['title']} is due today! (client: {c.get('client', 'n/a')})",
                     )
                 elif days_left == 1:
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_COMMITMENTS,
                         f"\U0001f534 **Due tomorrow**: {c['title']} (client: {c.get('client', 'n/a')})",
                     )
                 elif days_left == effort:
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_COMMITMENTS,
                         f"\u26a0\ufe0f **Start today**: {c['title']} \u2014 needs {effort}d effort, "
                         f"due {c['due_date']} (client: {c.get('client', 'n/a')})",
                     )
                 elif days_left == 5:
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_COMMITMENTS,
                         f"\U0001f4c5 **5 days out**: {c['title']} due {c['due_date']} "
                         f"(client: {c.get('client', 'n/a')})",
@@ -1240,7 +1398,7 @@ class ArtemisScheduler:
 
     def job_demo_intake(self):
         """PB-001 v2: Scan for Lucint demo notification emails and process them."""
-        if self._is_quiet():
+        if not self._is_open():
             return
 
         try:
@@ -1267,7 +1425,7 @@ class ArtemisScheduler:
                 except Exception:
                     logger.exception("PB-001: Error processing demo message %s", msg_id)
                     try:
-                        self.mm.post_message(
+                        self._post(
                             config.CHANNEL_OPS,
                             f"\u26a0\ufe0f PB-001 demo intake failed on message "
                             f"{msg_id[:12]}\u2026 — check logs. Lead NOT processed.",
@@ -1281,7 +1439,7 @@ class ArtemisScheduler:
 
     def job_billing_intake(self):
         """PB-007: Scan for billing-labeled emails and process them."""
-        if self._is_quiet():
+        if not self._is_open():
             return
 
         # One-time label check per process lifetime. POLISH-1: announce ONLY on an
@@ -1292,7 +1450,7 @@ class ArtemisScheduler:
             label_id, created = ensure_billing_label(self.gmail)
             if label_id:
                 if created:
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         "\U0001f4c1 Created Gmail label **artemis/billing** — "
                         "tag expense emails with this label for automatic intake",
@@ -1326,7 +1484,7 @@ class ArtemisScheduler:
                     logger.exception("PB-007: Error processing billing message %s", msg_id)
                     # Post failure alert — never silently drop an expense
                     try:
-                        self.mm.post_message(
+                        self._post(
                             config.CHANNEL_OPS,
                             f"\u26a0\ufe0f PB-007 billing intake failed on message {msg_id[:12]}… "
                             f"— check logs. Email NOT processed.",
@@ -1336,32 +1494,19 @@ class ArtemisScheduler:
         except Exception:
             logger.exception("PB-007 billing intake job failed")
 
-    @staticmethod
-    def _today_ct_date():
-        """Return today's date in America/Chicago. Used by health/training jobs."""
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/Chicago")).date()
-
     def job_health_nag(self):
-        """Health: at 21:00 CT, prompt for workout debrief if missing.
+        """Health: 16:30 local — prompt for a workout debrief if one is missing.
 
-        Day-of-week suppression per PB-009: Tue and Fri have no PM workout
-        and no PM social tolerance — skip the nag entirely on those days.
+        Suppression is by PLAN, not day-of-week: run_nag_check() already skips
+        rest_mobility / walk / skipped days and days that already have a log.
         """
         if self._is_quiet():
             return
         try:
-            today = self._today_ct_date()
-            dow = today.weekday()  # Mon=0, Tue=1, ..., Fri=4, Sat=5, Sun=6
-            if dow in (1, 4):  # Tue, Fri
-                logger.debug("Health nag suppressed (Tue/Fri schedule)")
-                return
-
             from artemis.health import run_nag_check
             msg = run_nag_check()
             if msg:
-                self.mm.post_message(config.CHANNEL_OPS, msg)
+                self._post(config.CHANNEL_OPS, msg, tier="health")
                 logger.info("Posted health debrief nag")
         except Exception:
             logger.exception("Health nag job failed")
@@ -1383,69 +1528,9 @@ class ArtemisScheduler:
 
     # ── T4: Proactive prompts (PB-009) ────────────────────────────────────
 
-    def job_health_morning_prompt(self):
-        """Post the morning survey prompt to #artemis-ryan.
-
-        Routes by day-of-week:
-            Mon/Sun (07:00) and Tue/Thu/Fri (04:01) → workout_am variant
-                                                       (schedules calibration)
-            Wed/Sat (07:00)                          → logging_only variant
-
-        Idempotent per (slot, today) via system_state KV.
-        """
-        if self._is_quiet():
-            return
-        try:
-            from datetime import datetime, timedelta
-            from zoneinfo import ZoneInfo
-            from artemis.health import (
-                already_prompted_today, build_morning_survey_prompt,
-                get_today_plan, mark_prompted,
-            )
-
-            today = self._today_ct_date()
-            dow = today.weekday()
-
-            # Recalibrated schedule (2026-05-05):
-            #   Mon (0) cardio_intervals  → workout_am
-            #   Tue (1) OFF/rest_mobility → logging_only
-            #   Wed (2) strength_c        → workout_am
-            #   Thu (3) cardio_intervals  → workout_am
-            #   Fri (4) OFF/rest_mobility → logging_only
-            #   Sat (5) strength_a/MetCon → workout_am
-            #   Sun (6) strength_c        → workout_am
-            if dow in (1, 4):              # Tue, Fri = OFF days
-                prompt_type = "logging_only"
-            else:                          # Sun, Mon, Wed, Thu, Sat = workout days
-                prompt_type = "workout_am"
-
-            slot = "morning"
-            if already_prompted_today(slot, today):
-                logger.debug("Morning prompt already fired today — skipping")
-                return
-
-            plan = get_today_plan()
-            if not plan:
-                logger.info("No plan for %s — skipping morning prompt", today)
-                return
-
-            text = build_morning_survey_prompt(plan, prompt_type)
-            self.mm.post_message(config.CHANNEL_OPS, text)
-            mark_prompted(slot, today)
-            logger.info("Posted morning %s prompt (%s)", prompt_type, today)
-
-            # Schedule one-shot calibration follow-up only for workout_am
-            if prompt_type == "workout_am":
-                ct = ZoneInfo("America/Chicago")
-                run_at = datetime.now(ct) + timedelta(minutes=15)
-                job_id = f"health_calibration_{today.isoformat()}"
-                self.scheduler.add_job(
-                    self.job_health_calibration_followup,
-                    "date", run_date=run_at, id=job_id, replace_existing=True,
-                )
-                logger.info("Scheduled calibration follow-up at %s", run_at.isoformat())
-        except Exception:
-            logger.exception("Health morning prompt failed")
+    # job_health_morning_prompt is gone (WAKE-1): the survey prompt is part of
+    # the 04:30 wake post, and its variant comes from plan.session_type
+    # (wake.prompt_type_for) instead of a hardcoded day-of-week map.
 
     def job_health_calibration_followup(self):
         """Read morning state + today's plan, post the calibrated plan with
@@ -1464,7 +1549,7 @@ class ArtemisScheduler:
             )
             from artemis.weather import get_current_conditions
 
-            today = self._today_ct_date()
+            today = _local_today()
             slot = "morning_calibration"
             if already_prompted_today(slot, today):
                 logger.debug("Calibration follow-up already fired today — skipping")
@@ -1485,7 +1570,7 @@ class ArtemisScheduler:
 
             state = get_today_state()
             text = build_calibrated_plan_post(plan, resolved, state)
-            self.mm.post_message(config.CHANNEL_OPS, text)
+            self._post(config.CHANNEL_OPS, text, tier="health")
             mark_prompted(slot, today)
             logger.info("Posted calibrated plan for %s", today)
         except Exception:
@@ -1505,7 +1590,7 @@ class ArtemisScheduler:
             )
             from artemis.weather import get_current_conditions
 
-            today = self._today_ct_date()
+            today = _local_today()
             slot = "evening"
             if already_prompted_today(slot, today):
                 return
@@ -1523,7 +1608,7 @@ class ArtemisScheduler:
                 session_type, weather=weather, blocks=plan.get("blocks"),
             )
             text = build_evening_prompt(plan, resolved)
-            self.mm.post_message(config.CHANNEL_OPS, text)
+            self._post(config.CHANNEL_OPS, text, tier="health")
             mark_prompted(slot, today)
             logger.info("Posted evening prompt for %s", today)
         except Exception:
@@ -1540,38 +1625,10 @@ class ArtemisScheduler:
                 return  # Already quiet via manual goodnight
 
             announcement = enter_quiet(manual=False)
+            # The boundary post itself — still open for this instant.
             self.mm.post_message(config.CHANNEL_OPS, announcement)
         except Exception:
             logger.exception("Quiet hours start failed")
-
-    def job_quiet_hours_end(self):
-        """Exit quiet hours and post overnight summary."""
-        try:
-            from artemis.quiet_hours import exit_quiet, get_quiet_state
-
-            # Don't auto-wake if user has a custom wake time set
-            state = get_quiet_state()
-            wake = state.get("wake_time")
-            if wake:
-                # Check if we've reached the custom wake time
-                from artemis.quiet_hours import get_active_timezone
-                tz_name = get_active_timezone()
-                try:
-                    tz = ZoneInfo(tz_name)
-                except (KeyError, ValueError):
-                    tz = ZoneInfo(config.HOME_TIMEZONE)
-                now_local = datetime.now(tz).time()
-                from datetime import time as _time
-                parts = wake.split(":")
-                wake_time = _time(int(parts[0]), int(parts[1]))
-                if now_local < wake_time:
-                    return  # Not yet time to wake
-
-            exit_quiet()
-            summary = self._build_overnight_summary()
-            self.mm.post_message(config.CHANNEL_OPS, summary)
-        except Exception:
-            logger.exception("Quiet hours end failed")
 
     def _build_overnight_summary(self) -> str:
         """Build the overnight summary message for quiet hours exit or good morning."""
@@ -1629,17 +1686,6 @@ class ArtemisScheduler:
 
         return "\n".join(lines)
 
-    def job_check_timezone_expiry(self):
-        """Check if timezone override has expired and announce if so."""
-        try:
-            from artemis.quiet_hours import check_expired_overrides
-
-            announcement = check_expired_overrides()
-            if announcement:
-                self.mm.post_message(config.CHANNEL_OPS, announcement)
-        except Exception:
-            logger.exception("Timezone expiry check failed")
-
     def job_override_expiry_check(self):
         """Check if working session override has expired due to inactivity."""
         try:
@@ -1647,7 +1693,7 @@ class ArtemisScheduler:
 
             announcement = check_override_expiry()
             if announcement:
-                self.mm.post_message(config.CHANNEL_OPS, announcement)
+                self._post(config.CHANNEL_OPS, announcement)
         except Exception:
             logger.debug("Override expiry check failed", exc_info=True)
 
@@ -1673,13 +1719,13 @@ class ArtemisScheduler:
         reminder_count / last_reminded_at plus a small counter in the metadata JSONB
         (reminders_today / reminders_today_date). No new table.
         """
-        if self._is_quiet():
+        if not self._is_open():
             return
         try:
             import json as _json
             from knowledge.db import execute_query, execute_write
 
-            today_iso = self._today_ct_date().isoformat()
+            today_iso = _local_today().isoformat()
 
             # Fetch all live pending items; the send/skip decision (backoff, daily
             # cap, demotion) is made per item below where the counter is visible.
@@ -1705,7 +1751,7 @@ class ArtemisScheduler:
                            WHERE id = %s""",
                         (item["id"],),
                     )
-                    self.mm.post_message(
+                    self._post(
                         config.CHANNEL_OPS,
                         f"\u23f0 **Expired:** {item['title']} (no action after 7 days)",
                     )
@@ -1734,7 +1780,7 @@ class ArtemisScheduler:
                 # Post reminder
                 age_str = f"{age.days}d {age.seconds // 3600}h" if age.days else f"{age.seconds // 3600}h"
                 priority_tag = " \U0001f534" if item["priority"] == "high" else ""
-                self.mm.post_message(
+                self._post(
                     config.CHANNEL_OPS,
                     f"\u23f0 **Pending action{priority_tag}:** {item['title']}\n"
                     f"Waiting since: {age_str} ago (reminded {sent_count}x)\n"
@@ -1852,14 +1898,14 @@ class ArtemisScheduler:
         # Post catch-up summary
         gap_str = f"{gap_hours:.0f} hours" if gap_hours >= 1 else f"{gap_hours * 60:.0f} minutes"
         if emails_processed or playbooks_fired:
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\U0001f504 Catch-up complete \u2014 processed {emails_processed} emails and "
                 f"{commitment_checks} commitment checks since last run ({gap_str} ago). "
                 f"{playbooks_fired} playbooks fired.",
             )
         else:
-            self.mm.post_message(
+            self._post(
                 config.CHANNEL_OPS,
                 f"\u2705 All caught up \u2014 nothing missed since last run {gap_str} ago.",
             )
@@ -1974,7 +2020,7 @@ class ArtemisScheduler:
 
         if has_items:
             try:
-                self.mm.post_message(config.CHANNEL_OPS, "\n".join(lines))
+                self._post(config.CHANNEL_OPS, "\n".join(lines))
             except Exception:
                 logger.exception("Failed to post follow-up radar")
         else:
@@ -1990,7 +2036,7 @@ class ArtemisScheduler:
         logger.error("Gmail failure #%d: %s", self._gmail_fail_count, error)
         if self._gmail_fail_count == 3:
             try:
-                self.mm.post_message(
+                self._post(
                     config.CHANNEL_OPS,
                     f"\u26a0\ufe0f Gmail polling has failed 3 times \u2014 check credentials. "
                     f"Last error: {error[:300]}",
@@ -2008,7 +2054,7 @@ class ArtemisScheduler:
         logger.error("Calendar failure #%d: %s", self._calendar_fail_count, error)
         if self._calendar_fail_count == 3:
             try:
-                self.mm.post_message(
+                self._post(
                     config.CHANNEL_OPS,
                     f"\u26a0\ufe0f Calendar API has failed 3 times \u2014 check credentials. "
                     f"Last error: {error[:300]}",

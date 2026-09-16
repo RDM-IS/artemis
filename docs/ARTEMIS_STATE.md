@@ -74,7 +74,29 @@ Capture (dumb, immutable) → Surface (synthesis surfacer detects high-surprise 
 - **Calendar guards**: dupe-detection + audit (Brad guards), anti-confabulation guard.
 - **Context-snapshot system** + `ssh rdmis` over SSM + clean branch hygiene (auto-delete on merge).
 - **SQLite→RDS migration — COMPLETE (7/7):** guardrails, life_ops workouts (+ rest-day shim), crm (deleted), inbox (018), quiet_hours (019), commitments (020). `artemis.db` deleted; `execute_query` params-hardened (killed the `%`/quote landmine); no-SQLite CI regression guards in every migrated module. CT-anchoring applied inline where each phase touched date logic.
-- **PB-011 Vault / Second Brain Ingest (v1) ✅** — schema `vault` (migration 028); sync (04:00 CT cron + on-demand `vault sync` / `digest`); one extraction pass per new note → gated proposals adjudicated with the E3 `approve`/`reject` range syntax; morning-brief digest + journal-diff coverage + undictated-meeting nudge. The vault file is canon; Postgres is a rebuildable projection.
+- **Day phases + timezone-following schedule (WAKE-1) ✅** — quiet/wake/open phases on the active timezone, durable held posts by tier, one cron registry re-registered by `apply_timezone`, `set timezone to <place> [through <date>]`, and the 04:30 wake post. Detail in the day-phase section below.
+- **PB-011 Vault / Second Brain Ingest (v1) ✅** — schema `vault` (migration 028); sync (03:30 local cron + on-demand `vault sync` / `digest`); one extraction pass per new note → gated proposals adjudicated with the E3 `approve`/`reject` range syntax; morning-brief digest + journal-diff coverage + undictated-meeting nudge. The vault file is canon; Postgres is a rebuildable projection.
+
+---
+
+### Day phases + timezone-following schedule ✅ (WAKE-1)
+
+The day has three phases, evaluated on the **local wall clock in the active
+timezone** (`artemis/quiet_hours.py`):
+
+| phase | window | what may post |
+|---|---|---|
+| `quiet` | 17:00 → 04:30 | nothing proactive; posts are **held**, not dropped |
+| `wake` | 04:30 → 06:30 | health tier only — the wake post + pre-departure |
+| `open` | 06:30 → 17:00 | everything |
+
+- **Posting tiers.** Every *scheduled* post goes through `posting.post_or_hold(mm, channel, text, tier)`. `health` posts in wake+open, `business` in open only. A held post is appended to a durable JSON list in `acos.system_state` (`held_posts:health` / `held_posts:business`), so a restart between hold and flush keeps it. `job_wake` folds held health notices into the wake post; `job_open` flushes business FIFO. Replies to Ryan's own messages are never held.
+- **One cron registry.** `ArtemisScheduler.cron_specs()` is the single source of truth for every cron job (id, method, local h:mm, optional day-of-week, tier). `apply_timezone(tz)` is the **only** registration path — a test asserts no `add_job(..., "cron", ...)` exists outside it. `job_dump()` prints every job's next fire in local + CT and is the verify surface.
+- **The schedule follows Ryan.** `@artemis set timezone to <place> [through <date>]` writes `acos.timezone_overrides` (id=1 singleton, TIMESTAMPTZ `expires_at`); `job_tz_sync` (60s, and called directly by the command so there is no lag) re-registers every cron against the new zone and sweeps an expired override. `through 9/23` means all of 9/23 **local-away**; 9/24 runs Central.
+- **Duplicate guard.** A zone switch can replay a wall-clock time on the same local date (a Paris override expiring at 17:00 CT would re-arm the 17:00 jobs). `_once_per_local_day(job_id)` keys on `(job_id, local date)` in `system_state`.
+- **The wake post** (`artemis/wake.py`) is strictly scoped: today's session, the morning survey, held health notices, pre-departure. No email, inbox, triage, action items, vault digest, or ops alerts — those wait for 06:30.
+
+> **EOD-1 note:** an end-of-day wrap must fire at `QUIET_HOURS_START − 60 min` = **16:00 local**, not later. Anything scheduled at or after 17:00 lands inside the quiet window and will be held until the next morning.
 
 ---
 

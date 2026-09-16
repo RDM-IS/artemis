@@ -40,7 +40,7 @@ TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
 
 # Scheduling
 BRIEF_LEAD_TIME_MINUTES = int(os.environ.get("BRIEF_LEAD_TIME_MINUTES", "90"))
-MORNING_BRIEF_TIME = os.environ.get("MORNING_BRIEF_TIME", "07:30")
+MORNING_BRIEF_TIME = os.environ.get("MORNING_BRIEF_TIME", "06:30")
 
 # LLM models. Dossier extraction (EXT-1) uses a frontier model — a few calls/day,
 # quality-critical, latency-insensitive (drafts are reviewed async). Overridable
@@ -147,11 +147,24 @@ def is_meeting_avoid_day(weekday: int) -> bool:
     avoid = {_DAY_ABBR_TO_INT.get(d.lower()[:3], -1) for d in MEETING_AVOID_DAYS}
     return weekday in avoid
 
-# Quiet hours
-QUIET_HOURS_START = os.environ.get("QUIET_HOURS_START", "22:00")
-QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", "04:00")
+# ── Day phases (WAKE-1) ───────────────────────────────────────────────────
+# Local wall-clock in the ACTIVE timezone (override-aware — quiet_hours.local_tz):
+#   quiet  QUIET_HOURS_START .. WAKE_TIME   nothing proactive
+#   wake   WAKE_TIME .. OPEN_TIME           health + pre-departure only
+#   open   OPEN_TIME .. QUIET_HOURS_START   everything
+QUIET_HOURS_START = os.environ.get("QUIET_HOURS_START", "17:00")
+WAKE_TIME = os.environ.get("WAKE_TIME", "04:30")
+OPEN_TIME = os.environ.get("OPEN_TIME", "06:30")
+# Back-compat alias: QUIET_HOURS_END is the old name for WAKE_TIME. An explicit
+# QUIET_HOURS_END in the environment still wins so an old .env keeps working.
+QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", WAKE_TIME)
 HOME_TIMEZONE = os.environ.get("HOME_TIMEZONE", "America/Chicago")
 OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
+
+# Pre-departure checklist read out in the 04:30 wake post.
+DEPARTURE_CHECKLIST = _list(
+    os.environ.get("DEPARTURE_CHECKLIST", "gym bag, badge, lunch, iPad")
+)
 
 
 def _bool(val: str, default: bool = False) -> bool:

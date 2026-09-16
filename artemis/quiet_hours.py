@@ -1,24 +1,40 @@
-"""Quiet hours session management — silence scheduled jobs during off-hours.
+"""Day phases, quiet-hours state, and the active timezone (WAKE-1).
 
-State-based quiet system with manual goodnight/morning, working session
+State-based phase system with manual goodnight/morning, working-session
 overrides with inactivity timers, and timezone overrides. Backed by RDS
 (acos.system_state / acos.quiet_state / acos.timezone_overrides, migration 019)
 via knowledge.db; no SQLite remains in this module.
+
+DAY PHASES — local wall-clock in the ACTIVE timezone:
+
+    quiet  QUIET_HOURS_START (17:00) .. WAKE_TIME (04:30)  nothing proactive
+    wake   WAKE_TIME (04:30) .. OPEN_TIME (06:30)          health + pre-departure
+    open   OPEN_TIME (06:30) .. QUIET_HOURS_START          everything
 
 Timezone handling is the module's own: get_active_timezone() resolves the
 override (if set and unexpired) else config.HOME_TIMEZONE, and every wall-clock
 window check goes through it. Stored instants are TIMESTAMPTZ, so override-expiry
 and inactivity-elapsed comparisons are absolute and unambiguous.
+
+local_tz() / local_today() / local_now() are THE date helpers for anything that
+means "today for Ryan" — the schedule, health day math, and SQL date anchors all
+follow the override. Only genuinely fixed anchors (config defaults, historical
+migrations) keep a literal zone.
 """
 
 import logging
-from datetime import datetime, time, timedelta, timezone
+import re
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from artemis import config
 from knowledge.db import execute_one, execute_write
 
 logger = logging.getLogger(__name__)
+
+PHASE_QUIET = "quiet"
+PHASE_WAKE = "wake"
+PHASE_OPEN = "open"
 
 # Common city → IANA timezone map for natural-language overrides
 _CITY_TIMEZONES: dict[str, str] = {
@@ -80,6 +96,9 @@ _CITY_TIMEZONES: dict[str, str] = {
     "vancouver": "America/Vancouver",
     "mexico city": "America/Mexico_City",
     "sao paulo": "America/Sao_Paulo",
+    "são paulo": "America/Sao_Paulo",
+    "rio": "America/Sao_Paulo",
+    "rio de janeiro": "America/Sao_Paulo",
     "buenos aires": "America/Argentina/Buenos_Aires",
     "santiago": "America/Santiago",
     "bogota": "America/Bogota",
@@ -102,6 +121,43 @@ _CITY_TIMEZONES: dict[str, str] = {
     "reykjavik": "Atlantic/Reykjavik",
 }
 
+# Country → PRIMARY zone. Multi-zone countries are flagged so the reply names the
+# zone and Ryan can correct it with an exact IANA name.
+_COUNTRY_TIMEZONES: dict[str, str] = {
+    "brazil": "America/Sao_Paulo",
+    "france": "Europe/Paris",
+    "spain": "Europe/Madrid",
+    "italy": "Europe/Rome",
+    "germany": "Europe/Berlin",
+    "uk": "Europe/London",
+    "england": "Europe/London",
+    "united kingdom": "Europe/London",
+    "ireland": "Europe/Dublin",
+    "portugal": "Europe/Lisbon",
+    "netherlands": "Europe/Amsterdam",
+    "holland": "Europe/Amsterdam",
+    "japan": "Asia/Tokyo",
+    "mexico": "America/Mexico_City",
+    "canada": "America/Toronto",
+}
+
+# US zone words.
+_US_ZONE_WORDS: dict[str, str] = {
+    "central": "America/Chicago",
+    "eastern": "America/New_York",
+    "mountain": "America/Denver",
+    "pacific": "America/Los_Angeles",
+}
+
+# Countries spanning several zones — the reply names the chosen primary zone.
+_MULTI_ZONE_PLACES = {
+    "brazil", "canada", "mexico", "us", "usa", "united states", "australia", "russia",
+}
+
+# Words that carry no zone information; stripped before lookup so
+# "central chicago" → chicago and "paris france" → paris.
+_FILLER_WORDS = {"the", "city", "of", "in", "time", "timezone", "tz", "zone"}
+
 
 def _parse_time(t: str) -> time:
     """Parse 'HH:MM' to time object."""
@@ -110,27 +166,8 @@ def _parse_time(t: str) -> time:
 
 
 # ---------------------------------------------------------------------------
-# City / timezone resolution
+# Active timezone + local date helpers (THE anchors for "today")
 # ---------------------------------------------------------------------------
-
-
-def resolve_city_timezone(city_or_tz: str) -> str | None:
-    """Resolve a city name or IANA timezone string to an IANA timezone.
-
-    Returns None if unrecognized.
-    """
-    normalized = city_or_tz.strip().lower()
-
-    if normalized in _CITY_TIMEZONES:
-        return _CITY_TIMEZONES[normalized]
-
-    try:
-        ZoneInfo(city_or_tz.strip())
-        return city_or_tz.strip()
-    except (KeyError, ValueError):
-        pass
-
-    return None
 
 
 def get_active_timezone() -> str:
@@ -151,6 +188,26 @@ def get_active_timezone() -> str:
     return config.HOME_TIMEZONE
 
 
+def local_tz() -> ZoneInfo:
+    """ZoneInfo for the active timezone (falls back to HOME on a bad name)."""
+    name = get_active_timezone()
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError):
+        logger.warning("Unknown active timezone %r — falling back to HOME", name)
+        return ZoneInfo(config.HOME_TIMEZONE)
+
+
+def local_now() -> datetime:
+    """Now, as a tz-aware datetime in the active timezone."""
+    return datetime.now(local_tz())
+
+
+def local_today() -> date:
+    """Today's date for Ryan — in the ACTIVE timezone, not the box's."""
+    return local_now().date()
+
+
 def get_tz_abbrev(tz_name: str | None = None) -> str:
     """Get timezone abbreviation (e.g., CDT, CET) for the active or specified timezone."""
     tz_name = tz_name or get_active_timezone()
@@ -159,6 +216,164 @@ def get_tz_abbrev(tz_name: str | None = None) -> str:
         return datetime.now(tz).strftime("%Z")
     except Exception:
         return "???"
+
+
+# ---------------------------------------------------------------------------
+# Place / date parsing for the timezone command
+# ---------------------------------------------------------------------------
+
+
+def _normalize_place(text: str) -> str:
+    s = (text or "").strip().lower()
+    s = s.strip(".,!?;:")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _lookup_place(token: str) -> tuple[str | None, bool]:
+    """Exact lookup in city → country → US word → raw IANA. Returns (tz, multi)."""
+    if not token:
+        return None, False
+    if token in _CITY_TIMEZONES:
+        return _CITY_TIMEZONES[token], token in _MULTI_ZONE_PLACES
+    if token in _COUNTRY_TIMEZONES:
+        return _COUNTRY_TIMEZONES[token], token in _MULTI_ZONE_PLACES
+    if token in _US_ZONE_WORDS:
+        return _US_ZONE_WORDS[token], False
+    try:
+        ZoneInfo(token)
+        return token, False
+    except (KeyError, ValueError):
+        pass
+    # IANA names are case-sensitive; try the original casing of a slashed token.
+    return None, False
+
+
+def resolve_place_timezone(text: str) -> tuple[str | None, str, bool]:
+    """Resolve a place to (iana_tz | None, label, is_multi_zone).
+
+    Order: city map → country map → US zone word → raw IANA. Filler words are
+    stripped and multi-word inputs are narrowed ("central chicago" → chicago,
+    "paris france" → paris) so a qualifier never blocks the match.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, "", False
+
+    # Raw IANA first, preserving case ("America/Manaus").
+    try:
+        ZoneInfo(raw)
+        return raw, raw, False
+    except (KeyError, ValueError):
+        pass
+
+    norm = _normalize_place(raw)
+    tz, multi = _lookup_place(norm)
+    if tz:
+        return tz, norm, multi
+
+    words = [w for w in norm.split(" ") if w and w not in _FILLER_WORDS]
+    # Longest contiguous runs first, then single words (last word wins for
+    # "paris france"-style inputs; a leading US zone word yields to the city).
+    for size in range(len(words), 0, -1):
+        for start in range(0, len(words) - size + 1):
+            token = " ".join(words[start:start + size])
+            tz, multi = _lookup_place(token)
+            if tz:
+                return tz, token, multi
+    return None, norm, False
+
+
+_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def parse_date_token(text: str, today: date | None = None) -> date | None:
+    """Parse 9/23, 9/23/26, 9/23/2026, 2026-09-23, 'Sep 23', 'September 23'.
+
+    A year-less date rolls forward to the next occurrence on or after `today`.
+    Returns None when nothing parses.
+    """
+    s = _normalize_place(text)
+    if not s:
+        return None
+    today = today or local_today()
+
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2}|\d{4}))?", s)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        year_s = m.group(3)
+        try:
+            if year_s:
+                year = int(year_s)
+                if year < 100:
+                    year += 2000
+                return date(year, month, day)
+            return _roll_forward(month, day, today)
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"([a-z]+)\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?", s)
+    if m and m.group(1) in _MONTHS:
+        month, day = _MONTHS[m.group(1)], int(m.group(2))
+        try:
+            if m.group(3):
+                return date(int(m.group(3)), month, day)
+            return _roll_forward(month, day, today)
+        except ValueError:
+            return None
+
+    # Day-first: "23 Sep", "23 September 2026".
+    m = re.fullmatch(r"(\d{1,2})\s+([a-z]+)\.?(?:,?\s*(\d{4}))?", s)
+    if m and m.group(2) in _MONTHS:
+        day, month = int(m.group(1)), _MONTHS[m.group(2)]
+        try:
+            if m.group(3):
+                return date(int(m.group(3)), month, day)
+            return _roll_forward(month, day, today)
+        except ValueError:
+            return None
+    return None
+
+
+def _roll_forward(month: int, day: int, today: date) -> date:
+    candidate = date(today.year, month, day)
+    if candidate < today:
+        candidate = date(today.year + 1, month, day)
+    return candidate
+
+
+def expires_at_for_through(through: date, tz_name: str) -> datetime:
+    """Midnight starting the day AFTER `through`, in the override's timezone.
+
+    'through 9/23' must cover all of 9/23 local-away; 9/24 runs on home time.
+    """
+    tz = ZoneInfo(tz_name)
+    return datetime.combine(through + timedelta(days=1), time(0, 0), tzinfo=tz)
+
+
+def expires_at_for_days(days: int, tz_name: str, today: date | None = None) -> datetime:
+    """Midnight local-away on today+days."""
+    tz = ZoneInfo(tz_name)
+    base = today or datetime.now(tz).date()
+    return datetime.combine(base + timedelta(days=days), time(0, 0), tzinfo=tz)
+
+
+def resolve_city_timezone(city_or_tz: str) -> str | None:
+    """Back-compat wrapper — returns just the IANA zone, or None."""
+    tz, _label, _multi = resolve_place_timezone(city_or_tz)
+    return tz
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +422,7 @@ def _upsert_quiet_state(**kwargs) -> None:
 
     updated_at is always server-side now(); only the columns the caller passes
     are written (others keep their value on update, or take their default on
-    first insert) — preserving the SQLite select-then-update-only-given-columns
-    behavior. last_interaction is passed as a tz-aware datetime by callers.
+    first insert). last_interaction is passed as a tz-aware datetime by callers.
     """
     cols = list(kwargs.keys())
     insert_cols = ["id"] + cols + ["updated_at"]
@@ -225,41 +439,111 @@ def _upsert_quiet_state(**kwargs) -> None:
         logger.exception("Failed to upsert quiet_state")
 
 
-def _is_in_time_window() -> bool:
-    """Check if current time is within the configured quiet hours window."""
-    tz_name = get_active_timezone()
-    try:
-        tz = ZoneInfo(tz_name)
-    except (KeyError, ValueError):
-        tz = ZoneInfo(config.HOME_TIMEZONE)
-
-    now = datetime.now(tz).time()
-    start = _parse_time(config.QUIET_HOURS_START)
-    end = _parse_time(config.QUIET_HOURS_END)
-
+def _in_window(now: time, start: time, end: time) -> bool:
+    """Wrap-around-safe [start, end) membership."""
     if start <= end:
         return start <= now < end
-    else:
-        return now >= start or now < end
+    return now >= start or now < end
 
 
-def is_quiet() -> bool:
-    """Check if Artemis should be in quiet mode.
+def _is_in_time_window() -> bool:
+    """True when the local wall clock is inside the QUIET window."""
+    now = local_now().time()
+    start = _parse_time(config.QUIET_HOURS_START)
+    end = _parse_time(config.WAKE_TIME)
+    return _in_window(now, start, end)
+
+
+def _time_phase() -> str:
+    """Phase from the clock alone (no manual/working-session overrides)."""
+    if _is_in_time_window():
+        return PHASE_QUIET
+    now = local_now().time()
+    return PHASE_WAKE if now < _parse_time(config.OPEN_TIME) else PHASE_OPEN
+
+
+def _boundaries(state: dict | None) -> list[time]:
+    """Phase boundaries for today, including a goodnight's custom wake time."""
+    bounds = [
+        _parse_time(config.WAKE_TIME),
+        _parse_time(config.OPEN_TIME),
+        _parse_time(config.QUIET_HOURS_START),
+    ]
+    wake = (state or {}).get("wake_time")
+    if wake:
+        try:
+            bounds.append(_parse_time(wake))
+        except (ValueError, IndexError):
+            pass
+    return sorted(set(bounds))
+
+
+def _manual_expired(state: dict) -> bool:
+    """True when a phase boundary has passed since the manual state was set.
+
+    A goodnight must not stick past the wake time, and a good-morning must not
+    hold the wake phase past 06:30.
+    """
+    set_at = state.get("updated_at")
+    if not set_at:
+        return False
+    tz = local_tz()
+    try:
+        if isinstance(set_at, str):
+            set_at = datetime.fromisoformat(set_at)
+        if set_at.tzinfo is None:
+            set_at = set_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+    set_local = set_at.astimezone(tz)
+    now_local = local_now()
+    for b in _boundaries(state):
+        # The first occurrence of boundary `b` strictly after set_at.
+        candidate = datetime.combine(set_local.date(), b, tzinfo=tz)
+        if candidate <= set_local:
+            candidate += timedelta(days=1)
+        if now_local >= candidate:
+            return True
+    return False
+
+
+def get_phase() -> str:
+    """Current day phase: "quiet" | "wake" | "open" (active timezone).
 
     Priority:
-    1. override_active=1 → NOT quiet (working session)
-    2. manual_override=1 AND is_quiet=1 → quiet (user said goodnight)
-    3. manual_override=1 AND is_quiet=0 → NOT quiet (user said good morning)
-    4. No manual override → check time-based window
+      1. working session (override_active)     → open
+      2. manual goodnight / good-morning       → until the next phase boundary
+      3. the clock
     """
     state = _get_quiet_row()
     if state:
         if state.get("override_active"):
+            return PHASE_OPEN
+        if state.get("manual_override") and not _manual_expired(state):
+            if state.get("is_quiet"):
+                return PHASE_QUIET
+            # Good morning: wake until OPEN_TIME, then open.
+            now = local_now().time()
+            return PHASE_WAKE if now < _parse_time(config.OPEN_TIME) else PHASE_OPEN
+    return _time_phase()
+
+
+def is_quiet() -> bool:
+    """True only in the quiet phase (nothing proactive posts)."""
+    state = _get_quiet_row()
+    if state:
+        if state.get("override_active"):
             return False  # Working session overrides everything
-        if state.get("manual_override"):
+        if state.get("manual_override") and not _manual_expired(state):
             return bool(state.get("is_quiet"))
     # Fall through to time-based check
     return _is_in_time_window()
+
+
+def is_open() -> bool:
+    """True when business-tier posting is allowed."""
+    return get_phase() == PHASE_OPEN
 
 
 # Backward compatibility alias
@@ -298,28 +582,28 @@ def enter_quiet(manual: bool = False, wake_time: str | None = None) -> str:
     if wake_time:
         wake_display = _parse_time(wake_time).strftime("%I:%M %p").lstrip("0")
         return (
-            f"\U0001f319 Goodnight \u2014 going quiet. Jobs paused. "
+            f"\U0001f319 Goodnight — going quiet. Jobs paused. "
             f"I'll resume at {wake_display} {tz_abbrev} or when you say good morning."
         )
 
-    end_display = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
+    wake_display = _parse_time(config.WAKE_TIME).strftime("%I:%M %p").lstrip("0")
     if manual:
         return (
-            f"\U0001f319 Goodnight \u2014 going quiet. Jobs paused. "
-            f"I'll resume at {end_display} {tz_abbrev} or when you say good morning."
+            f"\U0001f319 Goodnight — going quiet. Jobs paused. "
+            f"I'll resume at {wake_display} {tz_abbrev} or when you say good morning."
         )
 
     # Automatic (cron-triggered)
     return (
-        f"\U0001f319 Artemis entering quiet hours \u2014 scheduled jobs paused "
-        f"until {end_display} {tz_abbrev}."
+        f"\U0001f319 Artemis entering quiet hours — scheduled jobs paused "
+        f"until {wake_display} {tz_abbrev}."
     )
 
 
 def exit_quiet() -> str:
-    """Exit quiet mode. Called by cron job or manually via good morning.
+    """Exit quiet mode. Called by the wake job or manually via good morning.
 
-    Returns an announcement string (caller adds overnight summary).
+    Returns an announcement string (caller adds the wake/overnight content).
     """
     _upsert_quiet_state(
         is_quiet=0,
@@ -345,11 +629,11 @@ def start_override(until_time: str | None = None) -> str:
     if until_time:
         tz_abbrev = get_tz_abbrev()
         display = _parse_time(until_time).strftime("%I:%M %p").lstrip("0")
-        return f"\u26a1 Active until {display} {tz_abbrev}. Let's work."
+        return f"⚡ Active until {display} {tz_abbrev}. Let's work."
 
     timeout = config.OVERRIDE_TIMEOUT_MINUTES
     return (
-        f"\u26a1 Working session started. I'll go quiet after {timeout} minutes "
+        f"⚡ Working session started. I'll go quiet after {timeout} minutes "
         f"of inactivity. Say `@artemis extend` to reset the timer or "
         f"`@artemis goodnight` when done."
     )
@@ -359,7 +643,7 @@ def extend_override() -> str:
     """Reset the inactivity timer on the working session override."""
     _upsert_quiet_state(last_interaction=datetime.now(timezone.utc))
     timeout = config.OVERRIDE_TIMEOUT_MINUTES
-    return f"\u23f1 Timer reset \u2014 going quiet after {timeout} min of inactivity."
+    return f"⏱ Timer reset — going quiet after {timeout} min of inactivity."
 
 
 def check_override_expiry() -> str | None:
@@ -373,17 +657,12 @@ def check_override_expiry() -> str | None:
         return None
 
     # Check time-based override limit (override until X) — wall-clock comparison
-    # in the ACTIVE timezone (unchanged: already correct).
+    # in the ACTIVE timezone.
     until = state.get("override_until")
     if until:
-        tz_name = get_active_timezone()
-        try:
-            tz = ZoneInfo(tz_name)
-        except (KeyError, ValueError):
-            tz = ZoneInfo(config.HOME_TIMEZONE)
-        local_now = datetime.now(tz).time()
+        local_now_time = local_now().time()
         until_time = _parse_time(until)
-        if local_now >= until_time:
+        if local_now_time >= until_time:
             _upsert_quiet_state(override_active=0, override_until=None, is_quiet=1)
             return (
                 f"\U0001f319 Working session ended (reached {until}). Going quiet. "
@@ -404,7 +683,7 @@ def check_override_expiry() -> str | None:
                 _upsert_quiet_state(override_active=0, override_until=None, is_quiet=1)
                 return (
                     f"\U0001f319 No activity for {config.OVERRIDE_TIMEOUT_MINUTES} minutes "
-                    f"\u2014 going quiet. Say `@artemis override` to keep working."
+                    f"— going quiet. Say `@artemis override` to keep working."
                 )
         except (ValueError, TypeError):
             pass
@@ -424,36 +703,45 @@ def update_last_interaction() -> None:
 # ---------------------------------------------------------------------------
 
 
+def phase_summary() -> str:
+    """One line describing the phase windows in the active timezone."""
+    tz_abbrev = get_tz_abbrev()
+    wake = _parse_time(config.WAKE_TIME).strftime("%H:%M")
+    open_ = _parse_time(config.OPEN_TIME).strftime("%H:%M")
+    quiet = _parse_time(config.QUIET_HOURS_START).strftime("%H:%M")
+    return f"Wake {wake} · business {open_} · quiet {quiet} ({tz_abbrev})"
+
+
 def quiet_hours_status() -> str:
-    """Return a formatted status string for quiet hours and session state."""
+    """Return a formatted status string for phase, session state, and timezone."""
     tz_name = get_active_timezone()
     tz_abbrev = get_tz_abbrev(tz_name)
-    start_str = _parse_time(config.QUIET_HOURS_START).strftime("%I:%M %p").lstrip("0")
-    end_str = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
+    phase = get_phase()
     state = get_quiet_state()
+    now_str = local_now().strftime("%H:%M")
 
-    lines = []
+    icon = {PHASE_QUIET: "\U0001f319", PHASE_WAKE: "\U0001f305", PHASE_OPEN: "☀️"}[phase]
+    lines = [f"{icon} Phase: **{phase}** — {now_str} {tz_abbrev}. {phase_summary()}."]
 
-    # Current quiet state
     if state.get("override_active"):
-        lines.append(f"\u26a1 Working session active. Quiet hours window: {start_str} - {end_str} {tz_abbrev}.")
         until = state.get("override_until")
         if until:
             display = _parse_time(until).strftime("%I:%M %p").lstrip("0")
-            lines.append(f"\u23f1 Active until {display} {tz_abbrev}.")
+            lines.append(f"⚡ Working session active until {display} {tz_abbrev}.")
         else:
-            lines.append(f"\u23f1 {config.OVERRIDE_TIMEOUT_MINUTES}-min inactivity timer running.")
-    elif is_quiet():
-        if state.get("manual_override"):
-            lines.append(f"\U0001f319 Quiet (manual goodnight). Window: {start_str} - {end_str} {tz_abbrev}.")
-            wake = state.get("wake_time")
-            if wake:
-                wake_display = _parse_time(wake).strftime("%I:%M %p").lstrip("0")
-                lines.append(f"Wake time: {wake_display} {tz_abbrev}.")
+            lines.append(
+                f"⚡ Working session active — "
+                f"{config.OVERRIDE_TIMEOUT_MINUTES}-min inactivity timer running."
+            )
+    elif state.get("manual_override"):
+        wake = state.get("wake_time")
+        if wake:
+            wake_display = _parse_time(wake).strftime("%I:%M %p").lstrip("0")
+            lines.append(f"\U0001f319 Manual goodnight — wake at {wake_display} {tz_abbrev}.")
+        elif state.get("is_quiet"):
+            lines.append("\U0001f319 Manual goodnight — until the next phase boundary.")
         else:
-            lines.append(f"\U0001f319 Quiet hours active ({start_str} - {end_str} {tz_abbrev}). Scheduled jobs paused.")
-    else:
-        lines.append(f"\u2600\ufe0f Outside quiet hours ({start_str} - {end_str} {tz_abbrev}).")
+            lines.append("☀️ Manual good-morning — until the next phase boundary.")
 
     # Timezone override — show only if still active (expiry filtered in SQL).
     try:
@@ -462,11 +750,25 @@ def quiet_hours_status() -> str:
             "WHERE id = 1 AND expires_at > now()"
         )
         if row:
-            city = row["city_name"] or row["timezone"]
-            expires_str = row["expires_at"].strftime("%b %d")
-            lines.append(f"\U0001f30d Timezone: {city} ({row['timezone']}) until {expires_str}.")
+            label = (row["city_name"] or row["timezone"]).title()
+            through = (row["expires_at"].astimezone(ZoneInfo(row["timezone"]))
+                       - timedelta(days=0)).date() - timedelta(days=1)
+            lines.append(
+                f"\U0001f30d Timezone: {label} ({row['timezone']}) through "
+                f"{through.strftime('%a %b %d')}."
+            )
+        else:
+            lines.append(f"\U0001f3e0 Timezone: home ({config.HOME_TIMEZONE}).")
     except Exception:
         pass
+
+    try:
+        from artemis.posting import holds_summary
+        held = holds_summary()
+        if held:
+            lines.append(held)
+    except Exception:
+        logger.debug("holds summary unavailable", exc_info=True)
 
     return "\n".join(lines)
 
@@ -475,15 +777,29 @@ def quiet_hours_status() -> str:
 # Timezone override CRUD
 # ---------------------------------------------------------------------------
 
+DEFAULT_OVERRIDE_DAYS = 7
 
-def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> str:
-    """Set a timezone override that expires after `days` days."""
-    # Absolute instant `days` out, stored tz-aware (TIMESTAMPTZ).
-    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-    tz_abbrev = get_tz_abbrev(tz_name)
-    start_str = _parse_time(config.QUIET_HOURS_START).strftime("%I:%M %p").lstrip("0")
-    end_str = _parse_time(config.QUIET_HOURS_END).strftime("%I:%M %p").lstrip("0")
-    expires_str = expires_at.strftime("%B %d")
+
+def get_timezone_override() -> dict | None:
+    """The active override row, or None."""
+    try:
+        return execute_one(
+            "SELECT timezone, city_name, expires_at, set_at FROM acos.timezone_overrides "
+            "WHERE id = 1 AND expires_at > now()"
+        )
+    except Exception:
+        logger.debug("Failed to read timezone override", exc_info=True)
+        return None
+
+
+def set_timezone_override(tz_name: str, label: str = "", expires_at: datetime | None = None) -> str:
+    """Set a timezone override that ends at the absolute instant `expires_at`.
+
+    `label` is the human place name (stored in city_name). When expires_at is
+    omitted the default 7-day window applies, counted in the override's own zone.
+    """
+    if expires_at is None:
+        expires_at = expires_at_for_days(DEFAULT_OVERRIDE_DAYS, tz_name)
 
     try:
         execute_write(
@@ -491,17 +807,13 @@ def set_timezone_override(tz_name: str, city_name: str = "", days: int = 7) -> s
             "VALUES (1, %s, %s, %s) "
             "ON CONFLICT (id) DO UPDATE SET timezone = EXCLUDED.timezone, "
             "expires_at = EXCLUDED.expires_at, city_name = EXCLUDED.city_name, set_at = now()",
-            (tz_name, expires_at, city_name or tz_name),
+            (tz_name, expires_at, label or tz_name),
         )
     except Exception:
         logger.exception("Failed to set timezone override")
-        return "\u26a0\ufe0f Failed to set timezone override \u2014 check logs."
+        return "⚠️ Failed to set timezone override — check logs."
 
-    display_city = city_name.title() if city_name else tz_name
-    return (
-        f"\U0001f30d Got it \u2014 quiet hours adjusted to {start_str} - {end_str} {tz_abbrev} "
-        f"through {expires_str}. All times in your briefs will reflect {display_city} time."
-    )
+    return ""  # the caller (main._handle_timezone_command) renders the reply
 
 
 def clear_timezone_override() -> str:
@@ -510,10 +822,13 @@ def clear_timezone_override() -> str:
         execute_write("DELETE FROM acos.timezone_overrides WHERE id = 1")
     except Exception:
         logger.exception("Failed to clear timezone override")
-        return "\u26a0\ufe0f Failed to clear timezone override \u2014 check logs."
+        return "⚠️ Failed to clear timezone override — check logs."
 
     home_abbrev = get_tz_abbrev(config.HOME_TIMEZONE)
-    return f"\U0001f3e0 Timezone reset to {config.HOME_TIMEZONE} ({home_abbrev}). Welcome back!"
+    return (
+        f"\U0001f3e0 Timezone reset to {config.HOME_TIMEZONE} ({home_abbrev}). "
+        f"{phase_summary()}. Welcome back!"
+    )
 
 
 def check_expired_overrides() -> str | None:
@@ -530,8 +845,8 @@ def check_expired_overrides() -> str | None:
         if row:
             home_abbrev = get_tz_abbrev(config.HOME_TIMEZONE)
             return (
-                f"\U0001f30d Timezone override expired \u2014 reverting to {config.HOME_TIMEZONE} "
-                f"({home_abbrev}). If you're still traveling, let me know."
+                f"\U0001f30d Timezone override expired — reverting to {config.HOME_TIMEZONE} "
+                f"({home_abbrev}). {phase_summary()}. If you're still traveling, let me know."
             )
     except Exception:
         logger.exception("Failed to check timezone override expiry")

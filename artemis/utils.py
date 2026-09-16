@@ -23,7 +23,7 @@ def describe_due(d: date | None, today: date) -> str:
 
     A wrong "today" anchor must be *visible*, never plausible: every relative
     phrase is rendered beside the concrete date it resolved to, from a single
-    ``today`` the caller anchored in America/Chicago.
+    ``today`` the caller anchored in the active timezone.
 
     Examples (today = Sun Jul 19)::
 

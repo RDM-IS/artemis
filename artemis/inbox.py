@@ -2,7 +2,7 @@
 
 Backend: acos.inbox_threads (Postgres/RDS) via knowledge.db. Migrated off SQLite
 (migration 018); no SQLite remains in this module. Every "today" comparison is
-anchored to America/Chicago — the box runs UTC, a day ahead of CT after ~19:00,
+anchored to the ACTIVE timezone — the box runs UTC, a day ahead of local after ~19:00,
 so bare current_date would resurface snoozes / flag due items a day early.
 """
 
@@ -24,14 +24,24 @@ NOISE = "NOISE"
 
 VALID_STATES = {NEEDS_ACTION, WAITING, SNOOZED, DONE, NOISE}
 
-# CT anchor. (now() AT TIME ZONE 'America/Chicago')::date is "today in CT" inside
+# Local anchor. (now() AT TIME ZONE %s)::date is "today for Ryan" inside
 # SQL; _ct_today() is the same value for the DATE columns we write in Python.
-_CT = ZoneInfo("America/Chicago")
-_CT_TODAY_SQL = "(now() AT TIME ZONE 'America/Chicago')::date"
+def _local_tz():
+    """Active timezone (WAKE-1) — resolved per call, so a timezone override
+    applies to every "today" this module computes."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
+# Parameterized so the anchor follows the ACTIVE timezone; never interpolated.
+_TODAY_SQL = "(now() AT TIME ZONE %s)::date"
+
+
+def _tz_param() -> str:
+    from artemis.quiet_hours import get_active_timezone
+    return get_active_timezone()
 
 
 def _ct_today() -> date:
-    return datetime.now(_CT).date()
+    return datetime.now(_local_tz()).date()
 
 
 def _coerce_date(value):
@@ -228,9 +238,9 @@ def get_stale_waiting(days: int = 3) -> list[dict]:
     return execute_query(
         f"""SELECT * FROM acos.inbox_threads
            WHERE state = 'WAITING'
-             AND waiting_since <= {_CT_TODAY_SQL} - %s
+             AND waiting_since <= {_TODAY_SQL} - %s
            ORDER BY waiting_since ASC""",
-        (days,),
+        (_tz_param(), days),
     )
 
 
@@ -240,8 +250,9 @@ def get_due_today() -> list[dict]:
         f"""SELECT * FROM acos.inbox_threads
            WHERE state IN ('NEEDS_ACTION', 'WAITING')
              AND due_date IS NOT NULL
-             AND due_date <= {_CT_TODAY_SQL}
-           ORDER BY due_date ASC"""
+             AND due_date <= {_TODAY_SQL}
+           ORDER BY due_date ASC""",
+        (_tz_param(),),
     )
 
 
@@ -250,8 +261,9 @@ def get_snoozed_due() -> list[dict]:
     return execute_query(
         f"""SELECT * FROM acos.inbox_threads
            WHERE state = 'SNOOZED'
-             AND snoozed_until <= {_CT_TODAY_SQL}
-           ORDER BY snoozed_until ASC"""
+             AND snoozed_until <= {_TODAY_SQL}
+           ORDER BY snoozed_until ASC""",
+        (_tz_param(),),
     )
 
 

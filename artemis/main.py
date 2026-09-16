@@ -63,9 +63,22 @@ from artemis.life_ops import (
 from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.quiet_hours import (
+    DEFAULT_OVERRIDE_DAYS,
+    PHASE_OPEN,
+    PHASE_QUIET,
+    PHASE_WAKE,
     clear_timezone_override,
     enter_quiet,
     exit_quiet,
+    expires_at_for_days,
+    expires_at_for_through,
+    get_phase,
+    get_timezone_override,
+    local_now,
+    local_today,
+    parse_date_token,
+    phase_summary,
+    resolve_place_timezone,
     extend_override,
     get_quiet_state,
     is_quiet,
@@ -2621,80 +2634,181 @@ def _handle_availability_mention(post: dict, question: str) -> bool:
     return True
 
 
-def _handle_timezone_command(post: dict, question: str) -> bool:
-    """Handle timezone override commands.
+_TZ_SET_RE = re.compile(
+    r"^set\s+(?:current\s+|my\s+)?time\s*zone\s+to\s+(.+)$", re.IGNORECASE
+)
+_TZ_BARE_RE = re.compile(r"^time\s*zone\s+(.+)$", re.IGNORECASE)
+_IM_IN_RE = re.compile(r"^i['\u2019]?m\s+in\s+(.+)$", re.IGNORECASE)
+_TZ_RESET_PHRASES = {
+    "i'm back home", "im back home", "i'm home", "im home", "reset timezone",
+    "back home", "home timezone",
+}
+_HOME_WORDS = {"home", "central", "chicago", "central chicago", "central time"}
 
-    Patterns:
-      - "I'm in Paris" / "i'm in Tokyo this week"
-      - "timezone Europe/Paris"
-      - "I'm back home" / "I'm in Milwaukee" / "reset timezone"
+
+def _split_tz_duration(text: str) -> tuple[str, str, object]:
+    """Split '<place> through <date>' / '<place> for N days' / '<place>'.
+
+    Returns (place, kind, value) where kind is "through" | "days" | "none".
     """
-    q_lower = question.lower().strip()
+    m = re.search(r"\s+(?:through|thru|until|til|till)\s+(.+)$", text, re.IGNORECASE)
+    if m:
+        return text[:m.start()].strip(), "through", m.group(1).strip()
+    m = re.search(r"\s+for\s+(\d+)\s+days?$", text, re.IGNORECASE)
+    if m:
+        return text[:m.start()].strip(), "days", int(m.group(1))
+    m = re.search(r"\s+(?:for\s+)?this\s+week$", text, re.IGNORECASE)
+    if m:
+        return text[:m.start()].strip(), "days", 7
+    return text.strip(), "none", None
+
+
+def _apply_tz_now() -> None:
+    """Reschedule the crons immediately so there's no 60s lag after a change."""
+    try:
+        if _sched is not None:
+            _sched.job_tz_sync()
+    except Exception:
+        logger.exception("Immediate timezone apply failed — the 60s sync will catch it")
+
+
+def _next_wake_line(tz_name: str) -> str:
+    """Next wake fire time in local time and in CT."""
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _ZI
+    from artemis.quiet_hours import _parse_time
+
+    tz = _ZI(tz_name)
+    now = _dt.now(tz)
+    wake_t = _parse_time(config.WAKE_TIME)
+    nxt = _dt.combine(now.date(), wake_t, tzinfo=tz)
+    if nxt <= now:
+        nxt += _td(days=1)
+    home = _ZI(config.HOME_TIMEZONE)
+    return (
+        f"Next wake: {nxt.strftime('%a %H:%M %Z')} "
+        f"({nxt.astimezone(home).strftime('%a %H:%M %Z')})."
+    )
+
+
+def _tz_set_reply(tz_name: str, label: str, expires_at, *, multi: bool,
+                  replaced: dict | None, defaulted: bool) -> str:
+    from datetime import timedelta as _td
+    from zoneinfo import ZoneInfo as _ZI
+
+    tz = _ZI(tz_name)
+    now_local = _dt_now(tz)
+    last_day = (expires_at.astimezone(tz) - _td(seconds=1)).date()
+    first_home = last_day + _td(days=1)
+    pretty = label.title() if label and "/" not in label else label
+
+    lines = [
+        f"\U0001f30d Timezone \u2192 {pretty} ({tz_name}), now "
+        f"{now_local.strftime('%H:%M')} local. Schedule follows it through "
+        f"{last_day.strftime('%a %b %-d')}; {first_home.strftime('%a %b %-d')} runs on Central. "
+        f"{phase_summary()}. `reset timezone` to undo."
+    ]
+    lines.append(_next_wake_line(tz_name))
+    if defaulted:
+        lines.append(
+            f"No end date given \u2014 defaulting to {DEFAULT_OVERRIDE_DAYS} days. "
+            f"Say `set timezone to {pretty} through <date>` to pin it."
+        )
+    if multi:
+        lines.append(
+            f"{pretty} spans several zones \u2014 using {tz_name}. "
+            f"Pass an exact IANA name (e.g. `America/Manaus`) if that's wrong."
+        )
+    if replaced:
+        prev = (replaced.get("city_name") or replaced.get("timezone") or "").title()
+        lines.append(f"Replaced the active override ({prev}).")
+    return "\n".join(lines)
+
+
+def _dt_now(tz):
+    from datetime import datetime as _dt
+    return _dt.now(tz)
+
+
+def _handle_timezone_command(post: dict, question: str) -> bool:
+    """Timezone override commands (WAKE-1 §D).
+
+    Accepted:
+      - "set [current] timezone to <place>"            (+ "through <date>",
+        "until <date>", "for N days")
+      - "timezone <place>"  ·  "I'm in <place> [for N days]"
+      - "reset timezone" / "I'm home" / "set timezone to central" → clear
+    """
+    q_lower = question.lower().strip().rstrip(".")
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
 
-    # Reset patterns
-    if q_lower in ("i'm back home", "im back home", "i'm home", "im home", "reset timezone"):
-        reply = clear_timezone_override()
+    def reply(text: str) -> bool:
         if _mm:
-            _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            _mm.post_to_channel_id(channel_id, text, root_id=root_id)
         return True
 
-    # "timezone Europe/Paris" — raw IANA
-    if q_lower.startswith("timezone "):
-        tz_input = question[len("timezone "):].strip()
-        tz_name = resolve_city_timezone(tz_input)
-        if tz_name:
-            # Check if it's the home timezone
-            if tz_name == config.HOME_TIMEZONE:
-                reply = clear_timezone_override()
-            else:
-                reply = set_timezone_override(tz_name, city_name=tz_input)
-            if _mm:
-                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
-            return True
-        else:
-            if _mm:
-                _mm.post_to_channel_id(
-                    channel_id,
-                    f"I don't recognize that timezone: `{tz_input}`. "
-                    f"Try a city name (e.g., Paris, Tokyo) or IANA timezone (e.g., Europe/Paris).",
-                    root_id=root_id,
-                )
-            return True
+    if q_lower in _TZ_RESET_PHRASES:
+        out = clear_timezone_override()
+        _apply_tz_now()
+        return reply(out)
 
-    # "I'm in [city]" pattern
-    im_in_match = re.match(r"i['\u2019]?m\s+in\s+(.+?)(?:\s+this\s+week|\s+for\s+\d+\s+days?)?$", q_lower)
-    if im_in_match:
-        city = im_in_match.group(1).strip()
+    raw = None
+    for rx in (_TZ_SET_RE, _TZ_BARE_RE, _IM_IN_RE):
+        m = rx.match(question.strip())
+        if m:
+            raw = m.group(1).strip()
+            break
+    if raw is None:
+        return False
 
-        # Extract optional duration
-        days = 7  # default
-        duration_match = re.search(r"for\s+(\d+)\s+days?", q_lower)
-        if duration_match:
-            days = int(duration_match.group(1))
+    place, kind, value = _split_tz_duration(raw)
 
-        tz_name = resolve_city_timezone(city)
-        if tz_name:
-            # Home city → reset
-            if tz_name == config.HOME_TIMEZONE:
-                reply = clear_timezone_override()
-            else:
-                reply = set_timezone_override(tz_name, city_name=city, days=days)
-            if _mm:
-                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
-            return True
-        else:
-            if _mm:
-                _mm.post_to_channel_id(
-                    channel_id,
-                    f"I don't recognize \"{city}\" as a city. "
-                    f"Try `timezone Europe/Paris` with an IANA timezone name instead.",
-                    root_id=root_id,
-                )
-            return True
+    # "central" / "chicago" / "home" clear the override.
+    if place.lower().strip() in _HOME_WORDS:
+        out = clear_timezone_override()
+        _apply_tz_now()
+        return reply(out)
 
-    return False
+    tz_name, label, multi = resolve_place_timezone(place)
+    if not tz_name:
+        return reply(
+            f"I don't recognize \"{place}\" as a place. Try a city (Paris), a country "
+            f"(Brazil), a US zone (eastern), or an IANA name (Europe/Paris)."
+        )
+    if tz_name == config.HOME_TIMEZONE:
+        out = clear_timezone_override()
+        _apply_tz_now()
+        return reply(out)
+
+    today_local = local_today()
+    defaulted = False
+    if kind == "through":
+        through = parse_date_token(str(value), today_local)
+        if through is None:
+            return reply(
+                f"I couldn't read \"{value}\" as a date. Try `9/23`, `2026-09-23`, or `Sep 23`."
+            )
+        if through < today_local:
+            return reply(
+                f"{through.isoformat()} is in the past \u2014 nothing changed. "
+                f"Give a date on or after {today_local.isoformat()}."
+            )
+        expires_at = expires_at_for_through(through, tz_name)
+    elif kind == "days":
+        expires_at = expires_at_for_days(int(value), tz_name)
+    else:
+        defaulted = True
+        expires_at = expires_at_for_days(DEFAULT_OVERRIDE_DAYS, tz_name)
+
+    replaced = get_timezone_override()
+    err = set_timezone_override(tz_name, label=label, expires_at=expires_at)
+    if err:
+        return reply(err)
+    _apply_tz_now()
+    return reply(_tz_set_reply(
+        tz_name, label, expires_at, multi=multi, replaced=replaced, defaulted=defaulted,
+    ))
 
 
 def _handle_calendar_view_mention(post: dict, question: str) -> bool:
@@ -2915,7 +3029,29 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
 
     # ── Good morning ──
     if q_lower in ("good morning", "morning", "gm", "goodmorning"):
+        from artemis.quiet_hours import _parse_time as _pt
+
         exit_quiet()
+
+        # Before 06:30 this is a WAKE, not an open: the wake post only (workout,
+        # check-in, pre-departure). Email/inbox/meetings wait for job_open.
+        if local_now().time() < _pt(config.OPEN_TIME):
+            from artemis import wake as wake_mod
+            from artemis.posting import take_holds
+            reply = wake_mod.build_wake_message(
+                calendar=_calendar, held_health=take_holds("health"),
+            )
+            if _mm:
+                _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+            return True
+
+        # After 06:30 — business is open; flush anything held overnight.
+        try:
+            from artemis.posting import flush_holds
+            if _mm:
+                flush_holds(_mm, "business")
+        except Exception:
+            logger.exception("Failed to flush held business posts on good morning")
 
         # Build a quick overnight summary
         summary_parts = ["\u2600\ufe0f Good morning! Quiet hours ended."]
@@ -4284,12 +4420,18 @@ def _handle_mention(post: dict, thread: list[dict]):
         # Check if Claude's response contains commitments to save
         response = _process_commitments(response, channel_id=channel_id)
 
-        # Append quiet/override status note
+        # Append phase / override status note
         state = get_quiet_state()
+        phase = get_phase()
         if state.get("override_active"):
             response += "\n\n\u26a1 _Working session active. Inactivity timer running._"
-        elif is_quiet():
+        elif phase == PHASE_QUIET:
             response += "\n\n\U0001f319 _Quiet hours active. Say `@artemis override` to start a working session._"
+        elif phase == PHASE_WAKE:
+            response += (
+                f"\n\n\U0001f305 _Wake window \u2014 health only until "
+                f"{config.OPEN_TIME}; email and triage hold until then._"
+            )
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)
         _track_artemis_response(post, response)
