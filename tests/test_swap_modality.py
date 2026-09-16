@@ -5,8 +5,8 @@ No live DB: knowledge.db primitives and the durable pending KV are mocked.
 
 Covers (per SPEC):
   - detect_modality_swap / detect_swap_revert regex suite (positives + negatives)
-  - translate_blocks round-trip (translate -> revert == original) for all three
-    targets across cardio_z2 (steady) and cardio_intervals shapes
+  - translate_blocks round-trip (translate -> revert == original) for every
+    office machine target across cardio_z2 (steady) and cardio_intervals shapes
   - structural + stimulus preservation through translation
   - CT-anchored target-date resolution (the ~20:00 CT / 01:00 UTC day-ahead bug)
   - lifecycle: propose -> yes applies; propose -> no cancels; "yes <reason>"
@@ -14,7 +14,7 @@ Covers (per SPEC):
   - double-swap: pre_swap still holds the ORIGINAL after two swaps
   - refusals: strength day; revert with no pre_swap; yes with no pending swap
   - verify-from-reread: a write that doesn't persist -> failure, no confirmation
-  - weather-fetch exception -> swap still applies, context=null in the audit row
+  - HEALTH-2: retired rower / bike trainer / walking pad targets refuse honestly
   - Part A: deterministic health intents bypass the LLM classifier (route_intent
     is never called); no live route reaches add_note or the "learning" re-route
 
@@ -40,7 +40,7 @@ os.environ.setdefault("RDS_DB", "test-db")
 from artemis import health  # noqa: E402
 
 
-# ── Block fixtures (mirror scripts/reseed_health_plan_v2.py) ────────────────
+# ── Block fixtures (cardio shapes the swap operates on) ─────────────────────
 
 _INTERVALS_BLOCKS = {
     "type": "intervals", "rounds": 8,
@@ -50,15 +50,15 @@ _INTERVALS_BLOCKS = {
         "work_sec": 60, "work_settings": "hard effort (Z4)",
         "rest_sec": 90, "rest_settings": "easy spin",
     },
-    "equipment": ["bike on trainer", "water rower"],
-    "setup_notes": ["Indoor trainer or water rower", "8 rounds: 60s hard / 90s easy"],
+    "equipment": ["stepmill", "upright bike"],
+    "setup_notes": ["Stepmill or upright bike", "8 rounds: 60s hard / 90s easy"],
 }
 
 _Z2_BLOCKS = {
     "type": "steady", "duration_min": 55, "target_range_min": [45, 55],
     "intensity": "Zone 2", "warmup_sec": 300, "cooldown_sec": 300,
-    "equipment": ["road bike"],
-    "setup_notes": ["Steady 45-55 min Zone 2", "Road bike outside; trainer if rain"],
+    "equipment": ["treadmill", "elliptical"],
+    "setup_notes": ["Steady 45-55 min Zone 2", "Treadmill incline walk or elliptical"],
     "finisher": {"rounds": 3, "exercises": [{"name": "Plank", "duration_sec": 30}]},
 }
 
@@ -80,14 +80,15 @@ def _plan_row(blocks, session_type="cardio_z2", plan_id=42, plan_date=None):
 class TestModalitySwapRegex(unittest.TestCase):
     def test_positives(self):
         cases = [
-            ("update outdoor workout to indoor rower", "rower", None),
-            ("swap today to indoor bike", "bike", None),
-            ("switch my run to rowing", "rower", None),
-            ("swap to rower due to wildfire smoke", "rower", "wildfire smoke"),
-            ("indoor bike today", "bike", None),           # bare form
-            ("@artemis swap my cardio to walking pad", "walking_pad", None),
-            ("- change today's session to bike because it's raining", "bike",
-             "it's raining"),
+            ("update outdoor workout to indoor elliptical", "elliptical", None),
+            ("swap today to indoor bike", "upright_bike", None),
+            ("switch my run to the treadmill", "treadmill", None),
+            ("swap to stepmill due to wildfire smoke", "stepmill", "wildfire smoke"),
+            ("indoor bike today", "upright_bike", None),     # bare form
+            ("@artemis swap my cardio to recumbent bike", "recumbent_bike", None),
+            ("swap my walk to the stair master", "stepmill", None),
+            ("- change today's session to upright bike because it's raining",
+             "upright_bike", "it's raining"),
         ]
         for msg, target, reason in cases:
             with self.subTest(msg=msg):
@@ -97,7 +98,7 @@ class TestModalitySwapRegex(unittest.TestCase):
                 self.assertEqual(r["reason"], reason)
 
     def test_reason_captured(self):
-        r = health.detect_modality_swap("swap to rower due to wildfire smoke")
+        r = health.detect_modality_swap("swap to stepmill due to wildfire smoke")
         self.assertEqual(r["reason"], "wildfire smoke")
 
     def test_revert(self):
@@ -114,18 +115,19 @@ class TestModalitySwapRegex(unittest.TestCase):
                 self.assertIsNone(health.detect_modality_swap(neg),
                                   f"{neg!r} must NOT match a modality swap")
 
-    def test_trainer_override_not_swallowed(self):
-        # 'trainer set indoor' stays a trainer override, never a swap.
+    def test_retired_trainer_command_not_swallowed(self):
+        # 'trainer set indoor' is the retired bike-trainer command, never a swap.
         self.assertIsNone(health.detect_modality_swap("trainer set indoor"))
         self.assertEqual(health.detect_health_intent("trainer set indoor"),
-                         health.INTENT_TRAINER_OVERRIDE)
+                         health.INTENT_TRAINER_RETIRED)
 
-    def test_unsupported_machine_is_not_a_swap_but_is_a_refusal(self):
-        # A swap-shaped request naming an unsupported machine must NOT parse as a
-        # swap (no confirmation possible) AND must route to the honest refusal,
-        # never to the LLM.
-        for msg in ("swap today to indoor elliptical",
-                    "switch my workout to the treadmill",
+    def test_retired_machine_is_not_a_swap_but_is_a_refusal(self):
+        # HEALTH-2: the rower, bike trainer, and walking pad are retired. A
+        # swap-shaped request naming one (or another unsupported option) must NOT
+        # parse as a swap AND must route to the honest refusal, never the LLM.
+        for msg in ("swap today to indoor rower",
+                    "switch my workout to the walking pad",
+                    "switch my cardio to rowing",
                     "change today's cardio to a swim"):
             with self.subTest(msg=msg):
                 self.assertIsNone(health.detect_modality_swap(msg))
@@ -140,7 +142,7 @@ class TestTranslateBlocks(unittest.TestCase):
     def test_round_trip_all_targets_all_shapes(self):
         for shape, stype in ((_INTERVALS_BLOCKS, "cardio_intervals"),
                              (_Z2_BLOCKS, "cardio_z2")):
-            for target in ("rower", "bike", "walking_pad"):
+            for target in health._SWAP_TARGETS:
                 with self.subTest(shape=stype, target=target):
                     new = health.apply_modality_swap(
                         shape, target, session_type=stype, reason="AQI",
@@ -150,7 +152,7 @@ class TestTranslateBlocks(unittest.TestCase):
                                      "revert must reproduce the exact original")
 
     def test_structural_preservation(self):
-        new = health.translate_blocks(_INTERVALS_BLOCKS, "rower",
+        new = health.translate_blocks(_INTERVALS_BLOCKS, "stepmill",
                                       session_type="cardio_intervals")
         self.assertEqual(new["type"], "intervals")
         self.assertEqual(new["rounds"], 8)
@@ -160,38 +162,42 @@ class TestTranslateBlocks(unittest.TestCase):
         self.assertEqual(new["intervals_template"]["rest_sec"], 90)
 
     def test_stimulus_carries_unchanged(self):
-        new = health.translate_blocks(_Z2_BLOCKS, "walking_pad")
+        new = health.translate_blocks(_Z2_BLOCKS, "treadmill")
         self.assertEqual(new["intensity"], "Zone 2")
         self.assertEqual(new["target_range_min"], [45, 55])
         self.assertEqual(new["finisher"], _Z2_BLOCKS["finisher"])
 
     def test_modality_labels(self):
-        r = health.translate_blocks(_INTERVALS_BLOCKS, "rower",
+        r = health.translate_blocks(_INTERVALS_BLOCKS, "stepmill",
                                     session_type="cardio_intervals")
-        self.assertEqual(r["equipment"], ["water rower"])
-        self.assertEqual(r["intervals_template"]["work_settings"], "moderate row")
-        self.assertEqual(r["intervals_template"]["rest_settings"], "easy row")
-        self.assertEqual(r["warmup_settings"], "easy row")
-        self.assertEqual(r["display_name"], "Indoor Row — Intervals")
+        self.assertEqual(r["equipment"], ["stepmill"])
+        self.assertEqual(r["location"], "office gym")
+        self.assertEqual(r["intervals_template"]["work_settings"], "hard climb")
+        self.assertEqual(r["intervals_template"]["rest_settings"], "easy climb")
+        self.assertEqual(r["warmup_settings"], "easy climb")
+        self.assertEqual(r["display_name"], "Stepmill — Intervals")
 
-        z2_rower = health.translate_blocks(_Z2_BLOCKS, "rower", session_type="cardio_z2")
-        self.assertEqual(z2_rower["display_name"], "Indoor Row — Z2 Intervals")
-        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "bike")["display_name"],
-                         "Indoor Bike — Z2")
-        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "walking_pad")["display_name"],
-                         "Indoor Walk — Z2")
+        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "elliptical",
+                                                 session_type="cardio_z2")["display_name"],
+                         "Elliptical — Z2")
+        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "upright_bike")["display_name"],
+                         "Upright Bike — Z2")
+        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "recumbent_bike")["equipment"],
+                         ["recumbent bike"])
+        self.assertEqual(health.translate_blocks(_Z2_BLOCKS, "treadmill")["display_name"],
+                         "Treadmill — Z2")
 
     def test_setup_notes_reason_prefix(self):
-        n = health.translate_blocks(_INTERVALS_BLOCKS, "rower", reason="wildfire AQI")
-        self.assertTrue(n["setup_notes"][0].startswith("Indoor row (wildfire AQI)"))
+        n = health.translate_blocks(_INTERVALS_BLOCKS, "stepmill", reason="wildfire AQI")
+        self.assertTrue(n["setup_notes"][0].startswith("Stepmill (wildfire AQI)"))
         # trailing lines survive
         self.assertEqual(n["setup_notes"][1], _INTERVALS_BLOCKS["setup_notes"][1])
 
     def test_double_swap_preserves_original(self):
-        s1 = health.apply_modality_swap(_INTERVALS_BLOCKS, "rower",
+        s1 = health.apply_modality_swap(_INTERVALS_BLOCKS, "stepmill",
                                         session_type="cardio_intervals",
                                         swap_meta={"n": 1})
-        s2 = health.apply_modality_swap(s1, "bike",
+        s2 = health.apply_modality_swap(s1, "upright_bike",
                                         session_type="cardio_intervals",
                                         swap_meta={"n": 2})
         self.assertEqual(s2["pre_swap"], _INTERVALS_BLOCKS,
@@ -248,7 +254,7 @@ class TestTargetDateResolution(unittest.TestCase):
 
 
 # ============================================================================
-# B4/B5 — lifecycle (propose / yes / no), verify-from-reread, audit + weather
+# B4/B5 — lifecycle (propose / yes / no), verify-from-reread, audit
 # ============================================================================
 
 class _LifecycleBase(unittest.TestCase):
@@ -290,16 +296,9 @@ class _LifecycleBase(unittest.TestCase):
         self._audit_patch = patch("knowledge.db.log_audit", self._audit)
         self._audit_patch.start()
 
-        # Weather present by default.
-        self._weather_patch = patch("artemis.weather.get_current_conditions",
-                                    return_value={"temp_f": 41.0,
-                                                  "precip_next_90min": False,
-                                                  "fetched_at": None})
-        self._weather_patch.start()
-
     def tearDown(self):
         for p in (self._get, self._set, self._write_patch, self._one_patch,
-                  self._audit_patch, self._weather_patch):
+                  self._audit_patch):
             p.stop()
 
     def _audit_meta(self):
@@ -312,8 +311,8 @@ class TestSwapLifecycle(_LifecycleBase):
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
             reply = health.propose_modality_swap(
-                "swap today to indoor rower", "chan1")
-        self.assertIn("Indoor Row", reply)
+                "swap today to elliptical", "chan1")
+        self.assertIn("Elliptical", reply)
         self.assertIn("yes", reply.lower())
         self.assertNotIn("blocks", self._written)  # nothing written on propose
         self.assertIsNotNone(health.load_swap_pending("chan1"))
@@ -321,28 +320,28 @@ class TestSwapLifecycle(_LifecycleBase):
     def test_propose_then_yes_applies_and_audits(self):
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor rower", "chan1")
+            health.propose_modality_swap("swap today to elliptical", "chan1")
             reply = health.commit_modality_swap("chan1")
         self.assertIn("Swapped", reply)
         # The row was actually written and carries the swap + pre_swap.
         self.assertIn("swap", self._written["blocks"])
         self.assertIn("pre_swap", self._written["blocks"])
-        self.assertEqual(self._written["blocks"]["display_name"], "Indoor Row — Z2 Intervals")
+        self.assertEqual(self._written["blocks"]["display_name"], "Elliptical — Z2")
+        self.assertEqual(self._written["blocks"]["location"], "office gym")
         # Pending cleared after commit.
         self.assertIsNone(health.load_swap_pending("chan1"))
         # Audit ledger row shape.
         meta = self._audit_meta()
         self.assertEqual(meta["action"], "plan_modality_swap")
         md = meta["metadata"]
-        self.assertEqual(md["to"]["modality"], "rower")
+        self.assertEqual(md["to"]["modality"], "elliptical")
         self.assertEqual(md["from"]["session_type"], "cardio_z2")
-        self.assertIsNotNone(md["context"])  # weather present
-        self.assertIn("weather", md["context"])
+        self.assertNotIn("context", md)  # HEALTH-2: no weather snapshot
 
     def test_propose_then_no_cancels(self):
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor bike", "chan1")
+            health.propose_modality_swap("swap today to upright bike", "chan1")
             reply = health.cancel_modality_swap("chan1")
         self.assertIn("Cancelled", reply)
         self.assertNotIn("blocks", self._written)
@@ -351,7 +350,7 @@ class TestSwapLifecycle(_LifecycleBase):
     def test_yes_reason_captured_into_audit(self):
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor rower", "chan1")
+            health.propose_modality_swap("swap today to elliptical", "chan1")
             health.commit_modality_swap("chan1", reason_override="wildfire AQI")
         md = self._audit_meta()["metadata"]
         self.assertEqual(md["reason"], "wildfire AQI")
@@ -370,30 +369,16 @@ class TestSwapLifecycle(_LifecycleBase):
                         "blocks": json.loads(json.dumps(_Z2_BLOCKS))}
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor rower", "chan1")
+            health.propose_modality_swap("swap today to elliptical", "chan1")
             reply = health.commit_modality_swap("chan1")
         self.assertIn("did not persist", reply)
         self.assertNotIn("Swapped", reply)
         self.assertFalse(self._audit.called, "no audit row on a failed persist")
 
-    def test_weather_exception_still_swaps_context_null(self):
-        self._weather_patch.stop()
-        self._weather_patch = patch("artemis.weather.get_current_conditions",
-                                    side_effect=RuntimeError("owm down"))
-        self._weather_patch.start()
-        with patch.object(health, "_fetch_swap_plan_row",
-                          return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor rower", "chan1")
-            reply = health.commit_modality_swap("chan1")
-        self.assertIn("Swapped", reply)  # swap still applied
-        md = self._audit_meta()["metadata"]
-        self.assertIsNone(md["context"], "weather failure → context=null")
-
-
 class TestRevertLifecycle(_LifecycleBase):
     def _swapped_row(self):
         swapped = health.apply_modality_swap(
-            _Z2_BLOCKS, "rower", session_type="cardio_z2", reason="AQI",
+            _Z2_BLOCKS, "elliptical", session_type="cardio_z2", reason="AQI",
             swap_meta={"reason": "AQI", "requested_via": "mattermost"})
         return _plan_row(swapped, "cardio_z2")
 
@@ -424,14 +409,14 @@ class TestUnsupportedTargetRefusal(_LifecycleBase):
     confirmation — with ZERO plan writes and ZERO audit rows."""
 
     def test_unknown_target_at_parse_time_refuses_no_writes(self):
-        # An unsupported modality isn't recognized as a swap at all → the
+        # A retired modality isn't recognized as a swap at all → the
         # proposer returns the honest command list, writes nothing, audits
         # nothing, and stages no pending.
-        self.assertIsNone(health.detect_modality_swap("swap today to indoor elliptical"))
+        self.assertIsNone(health.detect_modality_swap("swap today to indoor rower"))
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
             reply = health.propose_modality_swap(
-                "swap today to indoor elliptical", "chanX")
+                "swap today to indoor rower", "chanX")
         self.assertNotIn("✅", reply)
         self.assertIn("handler", reply.lower())          # format_health_help
         self.assertNotIn("blocks", self._written)        # no plan UPDATE
@@ -442,7 +427,7 @@ class TestUnsupportedTargetRefusal(_LifecycleBase):
         # Defense in depth: a stale/hand-crafted pending with an unsupported
         # target must be refused at commit — no write, no audit, no "✅".
         health.store_swap_pending("chanX", {
-            "kind": "swap", "target": "elliptical", "reason": None,
+            "kind": "swap", "target": "rower", "reason": None,
             "plan_id": 42, "plan_date": date.today().isoformat(),
             "session_type": "cardio_z2",
             "created_at": _dt.datetime.now(health.CT).isoformat(),
@@ -463,7 +448,7 @@ class TestConfirmationOnlyFromReread(_LifecycleBase):
     def _stage_swap(self):
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
-            health.propose_modality_swap("swap today to indoor rower", "chan1")
+            health.propose_modality_swap("swap today to elliptical", "chan1")
 
     def test_swap_success_name_comes_from_reread_not_intent(self):
         # The re-read returns a DELIBERATELY different display_name than intent.
@@ -502,19 +487,19 @@ class TestConfirmationOnlyFromReread(_LifecycleBase):
 
     def test_swap_success_uses_verified_display_name(self):
         # Happy path: the '✅ Swapped to **X**' name is exactly the re-read
-        # display_name (rower → 'Indoor Row — Z2 Intervals').
+        # display_name (elliptical → 'Elliptical — Z2').
         self._stage_swap()
         with patch.object(health, "_fetch_swap_plan_row",
                           return_value=_plan_row(_Z2_BLOCKS, "cardio_z2")):
             reply = health.commit_modality_swap("chan1")
-        self.assertIn("✅ Swapped to **Indoor Row — Z2 Intervals**", reply)
+        self.assertIn("✅ Swapped to **Elliptical — Z2**", reply)
         self.assertEqual(self._audit.call_args.kwargs["metadata"]["to"]["display_name"],
                          self._written["blocks"]["display_name"])
 
     def test_revert_success_only_when_reread_clears_swap(self):
         # Re-read still shows a swap key (revert didn't persist) → NO success.
         swapped = health.apply_modality_swap(
-            _Z2_BLOCKS, "rower", session_type="cardio_z2",
+            _Z2_BLOCKS, "elliptical", session_type="cardio_z2",
             swap_meta={"reason": None, "requested_via": "mattermost"})
         row = _plan_row(swapped, "cardio_z2")
         with patch.object(health, "_fetch_swap_plan_row", return_value=row):

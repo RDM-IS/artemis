@@ -79,14 +79,16 @@ class TestClassifierBypass(_Base):
             "sleep 7 energy 5 legs sore 3", "handle_morning_intent",
             "Logged: 7h sleep, energy 5/5. Anything to fix?")
 
-    def test_trainer_override_bypasses_classifier(self):
+    def test_retired_trainer_command_bypasses_classifier(self):
+        # HEALTH-2: the bike trainer is retired; `trainer set indoor` gets the
+        # deterministic honest reply — never a bike handler, never the LLM.
         self._run_expecting_health(
-            "trainer set indoor", "handle_trainer_override",
-            "Got it — bike on trainer set indoor for Sun Jul 20.")
+            "trainer set indoor", "format_trainer_retired",
+            "Bike trainer setup is retired — Nothing changed.")
 
     def test_modality_swap_bypasses_classifier(self):
         self._run_expecting_health(
-            "swap today to indoor rower", "propose_modality_swap",
+            "swap today to elliptical", "propose_modality_swap",
             "**Swap today's session:** … reply `yes`")
 
     def test_swap_revert_bypasses_classifier(self):
@@ -108,7 +110,7 @@ class TestNoConfabulationRoutes(_Base):
         self.assertNotIn("data_vault_satellites", src)
 
     def test_no_health_actions_in_classifier(self):
-        for a in ("log_morning_state", "log_workout_debrief", "trainer_override",
+        for a in ("log_morning_state", "log_workout_debrief", "trainer_retired",
                   "modality_swap"):
             self.assertNotIn(a, intent.VALID_ACTIONS)
 
@@ -217,11 +219,11 @@ class TestFabricationGate(_Base):
         # A deterministic handler that returns a "✅ Swapped" confirmation posts
         # it verbatim; the free-text gate never runs, nothing is logged.
         import knowledge.db as kdb
-        real = "✅ Swapped to **Indoor Row — Z2 Intervals**. gym.rdm.is is up to date."
+        real = "✅ Swapped to **Elliptical — Z2**. gym.rdm.is is up to date."
         with patch.object(health, "propose_modality_swap", return_value=real), \
              patch.object(main, "handle_mention") as llm, \
              patch.object(kdb, "log_guardrail_violation") as glog:
-            main._handle_mention(_post("swap today to indoor rower"), [])
+            main._handle_mention(_post("swap today to elliptical"), [])
         self.assertEqual(self._last_post(), real)  # verbatim, untouched
         llm.assert_not_called()                    # never reached the LLM path
         glog.assert_not_called()                   # nothing suppressed/logged

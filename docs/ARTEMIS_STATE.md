@@ -82,6 +82,8 @@ Capture (dumb, immutable) → Surface (synthesis surfacer detects high-surprise 
 
 Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
+**HEALTH-2 — office gym rebuild (`feat/health-office-gym`).** Ryan trains at the office gym (all Precor); the rower and outdoor bike are retired from the plan. Location is now plan data (`blocks.location` / `blocks.equipment`, static map is fallback); bike branch, `trainer set` override, and cardio weather removed (weather stays for `walk`); modality swap retargeted to office machines; office program seeded 9/16→11/08 (ramp-up + weeks 1-7) via `reseed_health_plan_v2.py --office`. The feat/health-ramp nightly job and `--ramp` reseed are retired (window 7/25-9/11 passed undeployed; it would slide/re-propose over the office plan).
+
 ---
 
 ## 6. Backlog (prioritized)
@@ -103,6 +105,10 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 - **Worst case:** the ramp pending **never expires**, so it can coexist for days with a just-created `rule add`/dossier pending; the user types `yes` to activate the rule and (pre-fix) the ramp repeat/restart fires instead.
 - **Interim (shipped on feat/health-ramp):** `ramp_confirm` matches **only** the qualified `yes ramp`/`no ramp` and never a bare control word — it removes ramp from the bare-`yes` contention entirely. The *general* race (debrief↔swap↔nutrition↔rule↔disposition ordering) remains.
 - **Fix (this item):** a shared `_count_open_pendings(channel_id)` helper over all stores; when **>1** pending is open and a bare control word arrives, reply with a disambiguation prompt (`reply `yes ramp` or `yes rule``) and consume the word safely instead of first-match-wins; teach each confirm handler to also accept its qualified form. Keep first-match-wins when exactly one pending is open.
+
+**RAMP-RETIRE — delete the dormant feat/health-ramp engine (low; after HEALTH-2 deploys).** HEALTH-2 unregistered the nightly job and made `--ramp` refuse, but `artemis/health_ramp.py`, `_handle_ramp_confirm` (+ its chain entry and routing-gate tests), `tests/test_health_ramp.py`, and the `health.ramp_state` table (migration 030) remain. Nothing writes `ramp_state.pending_payload` any more, so `yes ramp` is inert. Remove them (drop-table migration, migrate-first) or re-point the engine at the office program. With ramp gone, CONFIRM-ARB's worst case (never-expiring ramp pending) no longer applies.
+
+**PB9-CRON — morning prompt times vs office arrival (low).** The PB-009 morning prompt schedule predates the office gym; retime once Ryan's office arrival time is confirmed (TODO in PLAYBOOKS.md).
 
 **CRM-2 / COMMIT-1 — two-store seams (medium).** Two contact stores: `public.contacts`/`organizations` (CRM API) vs `public.persons`/`companies` (Write Guard, PB-008). Two commitment stores: `acos.commitments` (personal tracker) vs `public.commitments` (CRM contact/deal-scoped). Both intentional/legitimate, but the boundaries need documenting before the cognition layer reasons over them. `crm status` reads only the `contacts`/`public.commitments` side.
 

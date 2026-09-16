@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 import anthropic
 from pydantic import BaseModel, Field, ValidationError
 
+from artemis import health_office as _office
+
 logger = logging.getLogger(__name__)
 
 CT = ZoneInfo("America/Chicago")
@@ -259,8 +261,8 @@ RULES:
 - Reps: "10 reps"/"x 10"/"10x" → reps_done.
 - Distance: ".16 mile"/"3.28 miles" → distance + distance_unit:"mi"; "200 ft" → "ft".
 - Duration / pace / splits: "51:36"/"1:48" → duration (keep the "MM:SS" string).
-- Strength: log_type="strength_set". Cardio (runs, intervals, rides, walks,
-  rows, treadmill) → log_type="cardio_block".
+- Strength (machines, cables, DBs, bodyweight): log_type="strength_set". Cardio
+  (treadmill, elliptical, stepmill, bikes, walks, runs, intervals) → log_type="cardio_block".
 - CARDIO SEGMENTS: a paste with "Run #1 … Run #2 …" or "Interval 1 …" → one
   cardio_block row PER segment. Name them "Run 1","Run 2",… (or "Interval 1",…)
   and set round_num to the segment index (1,2,3,…). Carry that segment's own
@@ -277,14 +279,14 @@ Today's plan context:
 
 Examples:
 
-Input: "Burpees 15 reps RPE 10 HR peak 159, RDLs 10 at 50 RPE 6, rows were good felt strong, skipped planks knee was off, overall RPE 8 felt gassed."
+Input: "Leg press 12 at 180 RPE 7 HR peak 139, DB RDLs 10 at 40 RPE 6, lat pulldown was good felt strong, skipped captain's chair shoulder was off, overall RPE 8 felt gassed."
 Output:
 {
   "exercises": [
-    {"exercise":"Burpees","log_type":"cardio_block","set_num":null,"round_num":null,"reps_done":15,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":10.0,"hr_avg":null,"hr_peak":159,"notes":null,"user_suggestion":null,"is_skipped":false},
-    {"exercise":"RDL","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":10,"weight_lbs":50.0,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":6.0,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false},
-    {"exercise":"Rows","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"felt strong","user_suggestion":null,"is_skipped":false},
-    {"exercise":"Plank","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"skipped: knee was off","user_suggestion":null,"is_skipped":true}
+    {"exercise":"Leg press","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":12,"weight_lbs":180.0,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":7.0,"hr_avg":null,"hr_peak":139,"notes":null,"user_suggestion":null,"is_skipped":false},
+    {"exercise":"DB Romanian deadlift","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":10,"weight_lbs":40.0,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":6.0,"hr_avg":null,"hr_peak":null,"notes":null,"user_suggestion":null,"is_skipped":false},
+    {"exercise":"Lat pulldown","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"felt strong","user_suggestion":null,"is_skipped":false},
+    {"exercise":"Captain's chair knee raise","log_type":"strength_set","set_num":null,"round_num":null,"reps_done":null,"weight_lbs":null,"duration":null,"distance":null,"distance_unit":null,"rpe_actual":null,"hr_avg":null,"hr_peak":null,"notes":"skipped: shoulder was off","user_suggestion":null,"is_skipped":true}
   ],
   "session_summary": {"duration":null,"distance":null,"distance_unit":null,"hr_avg":null,"rpe_actual":8.0,"notes":"felt gassed","user_suggestion":null}
 }
@@ -1014,7 +1016,8 @@ _PLAN_META_RE = re.compile(
 _PLAN_TERM_BODY = (
     r"work\s?outs?|exercises?|cardio|routines?|training|program|"
     r"warm\s?ups?|cool\s?downs?|circuits?|intervals?|finishers?|"
-    r"deadlift|goblet|squat|lunge|rdl|kettlebell|dumbbell|powerblock|rower|treadmill|"
+    r"deadlift|goblet|squat|lunge|rdl|kettlebell|dumbbell|treadmill|"
+    r"leg\s+press|pulldown|smith|stepmill|elliptical|cable|pec\s+fly|leg\s+curl|leg\s+extension|"
     r"run[\s-]?walk|rest\s+day|zone\s+\d|z2|workout\s+plan|training\s+plan"
 )
 # Retrieval signals: possessive/demonstrative or a retrieval verb adjacent to a
@@ -1047,12 +1050,13 @@ def detect_health_intent(message: str) -> str | None:
     """Lightweight regex pre-check for health intents.
 
     Returns 'plan_detail', 'plan_lookup', 'log_morning_state',
-    'log_workout_debrief', 'trainer_override', or None. Cheaper than calling
+    'log_workout_debrief', 'trainer_retired', or None. Cheaper than calling
     Claude — used as a first pass before the main router.
     """
-    # Trainer override is most specific — match first.
-    if _OVERRIDE_RE.match(message):
-        return INTENT_TRAINER_OVERRIDE
+    # Retired bike-trainer command is most specific — match first so it gets an
+    # honest reply, never the LLM path.
+    if _TRAINER_RETIRED_RE.match(message):
+        return INTENT_TRAINER_RETIRED
 
     # The plan-QUERY family (plan_detail depth, plan_lookup breadth, meta, and the
     # retrieval fallback) are single-utterance ASKS — evaluate them against the
@@ -1088,8 +1092,8 @@ def detect_health_intent(message: str) -> str | None:
     # DATA-RETRIEVAL fallback (tightened — Option C): only a message that wants
     # the plan DATA (possessive/retrieval signal + a plan term, and NOT a
     # conceptual/progress/state question) routes to plan_detail. Conceptual asks
-    # ("why is zone 2 important", "how's my training going", "is the rower better
-    # than running") fall through to the now plan-aware general_reply path. The
+    # ("why is zone 2 important", "how's my training going", "is the elliptical
+    # better than the treadmill") fall through to the now plan-aware general_reply path. The
     # scrub_db_denial output guard remains the anti-denial backstop.
     if not _CONCEPTUAL_RE.search(head) and _PLAN_RETRIEVAL_RE.search(head):
         return INTENT_PLAN_DETAIL
@@ -1222,234 +1226,133 @@ def insert_inferred_summary() -> bool:
 # T4: Equipment & location resolver (PB-009)
 # ============================================================================
 
-# Static map of session_type → base equipment + location.
-# Cardio sessions (cardio_intervals, cardio_z2) and walk consult weather +
-# override dynamically below; the static base lists below describe the
-# non-bike-decision equipment that's always relevant.
+# Fallback map of session_type → location + equipment. HEALTH-2: location is
+# plan data — a row's blocks.location / blocks.equipment win, and this map is
+# only consulted when a row doesn't carry them. Equipment lists come from
+# artemis.health_office so the fallback and the seeded blocks can't drift.
 #
-# Equipment inventory (canonical, from PB-009):
-#   - Road bike with indoor trainer (whatever is set at 04:00 wins)
-#   - Water rower
-#   - Walking pad (lives in home office, movable to gym)
-#   - TRX bands, exercise ball, yoga mat, resistance bands w/ anchors
-#   - PowerBlock dumbbells, curl bar (2x 10# + 2x 25# plates), flat bench
+# Equipment inventory (canonical office gym, all Precor — PB-009):
+#   - Machines: pulldown/seated row, rear delt/pec fly, leg extension/leg curl,
+#     leg press/calf extension, abdominal/back extension
+#   - Cable/rack: S3.23 functional trainer (rope + handles), Icarian Smith machine
+#   - Free weights: hex DBs, Olympic bar + plates, 2 flat benches, 1 adjustable bench
+#   - Bodyweight: captain's chair/dip tower, 45° back extension
+#   - Cardio: treadmills, ellipticals, upright bike, recumbent bike, stepmill,
+#     Stretch Trainer
+#   - Accessories: stability balls, mats
+# The rower and outdoor bike are retired from the plan. The home gym still
+# exists — a row that trains there says so in blocks.location.
 _EQUIPMENT_MAP: dict[str, dict] = {
     "strength_a": {
-        "location": "downstairs gym",
-        "equipment": [
-            "PowerBlock dumbbells", "flat bench", "TRX",
-            "resistance bands", "exercise mat",
-        ],
-        "first_lift": "Goblet squat",
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["strength_a"],
+        "first_lift": "Leg press",
     },
     "strength_b": {
-        "location": "downstairs gym",
-        "equipment": [
-            "PowerBlock dumbbells", "TRX", "resistance bands", "rower",
-        ],
-        "first_lift": "DB deadlift",
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["strength_b"],
+        "first_lift": "DB goblet squat",
     },
     "strength_c": {
-        "location": "downstairs gym",
-        "equipment": [
-            "PowerBlock dumbbells", "TRX", "exercise mat", "rower or bike",
-        ],
-        "first_lift": "Goblet squat",
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["strength_c"],
+        "first_lift": "DB Romanian deadlift",
     },
     "cardio_z2": {
-        # Z2 = sustained low-intensity. Walking pad is appropriate here
-        # (low-impact, well-suited for Z2 pace). Bike on trainer is the
-        # default; pad is the alternative the user can pick at workout time.
-        "location": "downstairs gym",
-        "equipment": ["bike on trainer", "walking pad"],
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["cardio_z2"],
         "first_lift": None,
     },
     "cardio_intervals": {
-        # Intervals require real intensity bursts. Walking pad is NOT
-        # appropriate here. Choices are water rower OR bike on trainer
-        # (intervals); user picks at workout time.
-        "location": "downstairs gym",
-        "equipment": ["water rower", "bike on trainer (intervals)"],
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["cardio_intervals"],
         "first_lift": None,
     },
     "walk": {
-        # Default = outside. Weather branch swaps to indoor walking pad
-        # when cold (<40°F) or rainy.
+        # Default = outside. Weather swaps to an indoor walk when cold or rainy.
         "location": "outside",
         "equipment": ["walking shoes"],
         "first_lift": None,
     },
     "rest_mobility": {
-        "location": "anywhere — living room is fine",
-        "equipment": ["mat", "resistance bands"],
+        "location": "office gym",
+        "equipment": _office.SESSION_EQUIPMENT["rest_mobility"],
         "first_lift": None,
     },
 }
-
-# Sessions whose bike sub-equipment is decided by weather + user_override.
-# (cardio_intervals and cardio_z2 both have a bike option in their list.)
-_BIKE_SESSIONS = {"cardio_z2", "cardio_intervals"}
-
-# Per-session-type "alternative" equipment that's preserved in the final
-# list even after the bike branch decides indoor/outdoor. The user picks
-# bike vs alternative at workout time — both surfaces in the calibrated post.
-_BIKE_ALTERNATIVE = {
-    "cardio_intervals": "water rower",
-    "cardio_z2": "walking pad",
-}
-
-
-def _blocks_use_bike(blocks) -> bool:
-    """True if a blocks payload describes an actual bike session.
-
-    Discriminator: equipment mentions a bike. Empty equipment with a run/walk
-    display_name is explicitly NOT a bike session (Sunday run-walk)."""
-    b = _coerce_blocks(blocks)
-    equip = b.get("equipment") or []
-    if any("bike" in str(e).lower() for e in equip):
-        return True
-    if not equip:
-        dn = str(b.get("display_name") or "").lower()
-        return not ("run" in dn or "walk" in dn)
-    return False
-
-
-def is_bike_session(plan: dict) -> bool:
-    """True only for cardio sessions that actually use a bike.
-
-    Sat (long Z2 ride) and Sun (run-walk) both map to session_type='cardio_z2',
-    so weather / indoor-outdoor resolution must key on the blocks payload, not
-    session_type alone — otherwise Sunday's run-walk would wrongly get
-    bike-weather handling. Used by the scheduler to gate override + weather.
-    """
-    if (plan.get("session_type") or "") not in _BIKE_SESSIONS:
-        return False
-    return _blocks_use_bike(plan.get("blocks"))
 
 
 def resolve_equipment_and_location(
     session_type: str,
     weather: dict | None = None,
-    user_override: str | None = None,
     blocks: dict | None = None,
 ) -> dict:
     """Return {'location': str, 'equipment': list[str], 'notes': str | None,
                 'first_lift': str | None}.
 
-    For bike-based sessions (cardio_z2, cardio_intervals) the bike's
-    indoor/outdoor location is chosen by:
-        1. user_override='indoor' or 'outdoor' wins outright (with note)
-        2. otherwise: temp_f < 40 OR precip_next_90min → indoor
-        3. otherwise → outdoor
-    The non-bike alternative (water rower for intervals, walking pad for Z2)
-    is always preserved in the equipment list — user picks at workout time.
+    blocks.location and blocks.equipment win when present; _EQUIPMENT_MAP is the
+    fallback. Weather applies to walk only: rain in the next 90 min or <40°F
+    moves the walk indoors.
 
-    For walk: weather alone drives the indoor (walking pad) vs outdoor
-    decision. user_override does NOT apply to walks.
-
-    Pure function. No I/O. Caller passes weather + override in.
+    Pure function. No I/O. Caller passes weather in.
     """
     base = _EQUIPMENT_MAP.get(session_type)
+    b = _coerce_blocks(blocks)
     if not base:
         # Unknown session type — return safe defaults rather than raise
         return {
-            "location": "downstairs gym",
-            "equipment": [],
+            "location": b.get("location") or "office gym",
+            "equipment": list(b.get("equipment") or []),
             "notes": f"Unknown session_type '{session_type}'.",
             "first_lift": None,
         }
 
     result = {
-        "location": base["location"],
-        "equipment": list(base["equipment"]),
+        "location": b.get("location") or base["location"],
+        "equipment": list(b.get("equipment") or base["equipment"]),
         "first_lift": base.get("first_lift"),
         "notes": None,
     }
 
+    if session_type != "walk":
+        return result
+
     # ── Walk branch: weather-driven indoor swap ────────────────────────
-    if session_type == "walk":
-        w = weather or {}
-        temp_f = w.get("temp_f", 50.0)
-        precip = bool(w.get("precip_next_90min", False))
-        if precip:
-            result["location"] = "downstairs gym (walking pad)"
-            result["equipment"] = ["walking pad"]
-            result["notes"] = "Rain expected — walking pad indoor."
-        elif temp_f < 40:
-            result["location"] = "downstairs gym (walking pad)"
-            result["equipment"] = ["walking pad"]
-            result["notes"] = f"Cold ({temp_f:.0f}°F) — walking pad indoor."
-        return result
-
-    # Strength / rest_mobility — no weather logic
-    if session_type not in _BIKE_SESSIONS:
-        return result
-
-    # ── Non-bike cardio guard (PB-009) ─────────────────────────────────
-    # A cardio_z2/cardio_intervals row whose blocks don't use a bike (e.g.
-    # Sunday run-walk, now mapped to cardio_z2) must NOT get bike/weather
-    # handling. Only applies when blocks are provided (legacy callers that pass
-    # no blocks keep the original bike behavior).
-    if blocks is not None and not _blocks_use_bike(blocks):
-        b = _coerce_blocks(blocks)
-        return {
-            "location": "outside (run-walk)",
-            "equipment": list(b.get("equipment") or []),
-            "first_lift": None,
-            "notes": "Run-walk session — outdoor; weather/bike setup not applicable.",
-        }
-
-    # ── Bike branch (cardio_intervals, cardio_z2) ──────────────────────
-    # Preserve the non-bike alternative (water rower / walking pad)
-    # alongside whichever bike configuration the override/weather picks.
-    alt = _BIKE_ALTERNATIVE.get(session_type)
-
-    def _with_alt(bike_equip: list[str]) -> list[str]:
-        return ([alt] if alt else []) + bike_equip
-
-    if user_override == "indoor":
-        result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
-        result["notes"] = "Per your override: indoor."
-        return result
-
-    if user_override == "outdoor":
-        result["location"] = "outside (road bike)"
-        result["equipment"] = _with_alt(["road bike", "helmet", "water bottle"])
-        result["notes"] = "Per your override: outdoor."
-        return result
-
-    # No override — consult weather (or safe default if unavailable)
     w = weather or {}
     temp_f = w.get("temp_f", 50.0)
     precip = bool(w.get("precip_next_90min", False))
-
     if precip:
-        result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
-        result["notes"] = "Rain expected in next 90 min — indoor."
+        result["location"] = "indoors (walking pad)"
+        result["equipment"] = ["walking pad"]
+        result["notes"] = "Rain expected — walking pad indoor."
     elif temp_f < 40:
-        result["location"] = "downstairs gym (bike on trainer)"
-        result["equipment"] = _with_alt(["bike on trainer", "fan", "towel"])
-        result["notes"] = f"Cold ({temp_f:.0f}°F) — indoor."
-    else:
-        result["location"] = "outside (road bike)"
-        result["equipment"] = _with_alt(["road bike", "helmet", "water bottle"])
-        result["notes"] = f"Clear and {temp_f:.0f}°F — outside."
-
+        result["location"] = "indoors (walking pad)"
+        result["equipment"] = ["walking pad"]
+        result["notes"] = f"Cold ({temp_f:.0f}°F) — walking pad indoor."
     return result
 
 
 # ============================================================================
-# T4: Trainer override capture
+# HEALTH-2: retired bike trainer override
 # ============================================================================
 
-INTENT_TRAINER_OVERRIDE = "trainer_override"
+INTENT_TRAINER_RETIRED = "trainer_retired"
 
-_OVERRIDE_RE = re.compile(
-    r"^\s*(?:@?artemis\s+)?trainer\s+set\s+(?P<mode>indoor|outdoor)\s*$",
+# `trainer set indoor/outdoor` configured the home bike trainer, which is retired
+# from the plan. The phrase is still matched deterministically so it gets an
+# honest reply instead of reaching the LLM path (HEALTH-1).
+_TRAINER_RETIRED_RE = re.compile(
+    r"^\s*(?:@?artemis\s+)?trainer\s+set\s+(?:indoor|outdoor)\s*$",
     re.IGNORECASE,
 )
+
+
+def format_trainer_retired() -> str:
+    """Honest reply for the retired bike-trainer command. Changes nothing."""
+    return (
+        "Bike trainer setup is retired — cardio is at the office gym now "
+        "(treadmill, elliptical, upright/recumbent bike, stepmill). Nothing changed."
+    )
 
 
 def _next_cardio_date(today: date | None = None) -> date:
@@ -1475,82 +1378,6 @@ def _next_cardio_date(today: date | None = None) -> date:
     return base + timedelta(days=1)
 
 
-def detect_trainer_override(text: str) -> str | None:
-    """Returns 'indoor' or 'outdoor' if the text matches; else None."""
-    m = _OVERRIDE_RE.match(text)
-    if not m:
-        return None
-    return m.group("mode").lower()
-
-
-def write_bike_override(target_date: date, mode: str) -> None:
-    """Stash bike_setup_override inside health.plan.blocks JSONB for target_date.
-
-    Uses jsonb_set so we don't clobber the rest of the blocks shape. If no
-    plan row exists for target_date (shouldn't happen for seeded dates), this
-    is a no-op silently.
-    """
-    from knowledge.db import execute_write
-
-    execute_write(
-        """UPDATE health.plan
-           SET blocks = jsonb_set(
-               COALESCE(blocks, '{}'::jsonb),
-               '{bike_setup_override}',
-               to_jsonb(%s::text)
-           )
-           WHERE plan_date = %s""",
-        (mode, target_date),
-    )
-
-
-def read_bike_override(target_date: date) -> str | None:
-    """Read bike_setup_override from health.plan.blocks for target_date.
-
-    Returns 'indoor', 'outdoor', or None.
-    """
-    from knowledge.db import execute_one
-
-    row = execute_one(
-        "SELECT blocks FROM health.plan WHERE plan_date = %s",
-        (target_date,),
-    )
-    if not row:
-        return None
-    blocks = row.get("blocks") or {}
-    val = blocks.get("bike_setup_override")
-    if val in ("indoor", "outdoor"):
-        return val
-    return None
-
-
-def handle_trainer_override(message: str, message_id: str | None = None,
-                             user_id: str | None = None) -> str:
-    """Parse 'trainer set indoor/outdoor' and write to next cardio plan row.
-
-    Always targets the *next* cardio workout from now forward (today included
-    if today is cardio). Per PB-009: morning workout days (Tue/Thu/Fri 04:01)
-    pick up overrides written the prior evening; evening workout days
-    (Wed/Sat 16:30) pick up same-day overrides written before the prompt fires.
-
-    Returns trainer-voice confirm string.
-    """
-    mode = detect_trainer_override(message)
-    if mode is None:
-        # Caller should have pre-checked, but be defensive.
-        return "I couldn't parse that. Try: 'trainer set indoor' or 'trainer set outdoor'."
-
-    target_date = _next_cardio_date()
-    try:
-        write_bike_override(target_date, mode)
-    except Exception:
-        logger.exception("Failed to write bike override")
-        return "⚠️ Couldn't save override — check DB."
-
-    nice_date = target_date.strftime("%a %b %-d") if hasattr(target_date, "strftime") else str(target_date)
-    return f"Got it — bike on trainer set {mode} for {nice_date}."
-
-
 # ============================================================================
 # T4: Prompt builders (trainer voice)
 # ============================================================================
@@ -1567,6 +1394,13 @@ def _session_pretty_name(session_type: str) -> str:
     }.get(session_type, session_type)
 
 
+def _plan_session_name(plan: dict) -> str:
+    """Canonical session name for a plan row: blocks.display_name, falling back
+    to the legacy session_type label."""
+    blocks = _coerce_blocks(plan.get("blocks"))
+    return blocks.get("display_name") or _session_pretty_name(plan.get("session_type", "?"))
+
+
 _SURVEY_QUESTIONS = (
     "Reply with: sleep hrs, energy 1-5, soreness (region 1-5), weight if you weighed, RHR if you took it.\n"
     "Example: `slept 6.5 energy 3 legs sore 3 weight 271 RHR 58`"
@@ -1579,7 +1413,7 @@ def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
     workout_am: full survey + heads-up that the calibrated plan arrives in 15 min.
     logging_only: just the survey; the workout is later in the day.
     """
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1600,7 +1434,7 @@ def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
 
 def build_evening_prompt(plan: dict, resolved: dict) -> str:
     """Build the evening pre-workout prompt for Wed/Sat 16:30."""
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1621,7 +1455,7 @@ def build_evening_prompt(plan: dict, resolved: dict) -> str:
 def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -> str:
     """Build the trainer-voice calibrated plan post that follows morning survey
     by ~15 minutes."""
-    session = _session_pretty_name(plan.get("session_type", "?"))
+    session = _plan_session_name(plan)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
 
@@ -1630,7 +1464,7 @@ def build_calibrated_plan_post(plan: dict, resolved: dict, state: dict | None) -
         lines.append(f"Bring: {', '.join(resolved['equipment'])}")
     if resolved.get("first_lift"):
         lines.append(f"First lift: {resolved['first_lift']}")
-    blocks = plan.get("blocks") or {}
+    blocks = _coerce_blocks(plan.get("blocks"))
     if blocks.get("warmup"):
         lines.append(f"Warmup: {blocks['warmup']}")
     if resolved.get("notes"):
@@ -2844,7 +2678,8 @@ def _format_exercise_detail(ex: dict) -> str:
 
 def _render_finisher(fin: dict) -> str:
     rounds = fin.get("rounds")
-    head = f"**Core finisher** — {rounds} rounds:" if rounds else "**Core finisher:**"
+    title = fin.get("display_name") or "Core finisher"
+    head = f"**{title}** — {rounds} rounds:" if rounds else f"**{title}:**"
     out = [head]
     for ex in fin.get("exercises") or []:
         if isinstance(ex, dict) and ex.get("name"):
@@ -3687,7 +3522,7 @@ def detect_nutrition_intent(message: str) -> str | None:
 
 
 # ============================================================================
-# SWAP-2 — gated session-modality swap (rower / bike / walking pad)
+# SWAP-2 — gated session-modality swap (office cardio machines — HEALTH-2)
 #
 # A modality swap changes the TOOL, never the training stimulus: session_type,
 # target_rpe, HR zone, rounds, and interval timing carry over unchanged. The
@@ -3708,8 +3543,14 @@ INTENT_SWAP_REVERT = "swap_revert"
 # to the next cardio session.
 _SWAP_ELIGIBLE = ("cardio_z2", "cardio_intervals", "walk")
 
-# The three modalities a session can be swapped to.
-_SWAP_TARGETS = ("rower", "bike", "walking_pad")
+# The office cardio machines a session can be swapped to (HEALTH-2).
+_SWAP_TARGETS = ("treadmill", "elliptical", "upright_bike", "recumbent_bike", "stepmill")
+
+# Target tokens captured by the swap grammar (normalized by _normalize_swap_target).
+_SWAP_TARGET_TOKENS = (
+    r"treadmill|elliptical|step\s?mill|stair\s?master|"
+    r"upright(?:\s+bike)?|recumbent(?:\s+bike)?|bike|cycling"
+)
 
 # Primary swap grammar. Tolerant of a leading "@artemis" and a leading dash.
 # (?P<target>…) is normalized by _normalize_swap_target; (?P<reason>…) is optional.
@@ -3717,19 +3558,19 @@ _MODALITY_SWAP_RE = re.compile(
     r"(?:@?artemis\s+)?-?\s*"
     r"(?:update|change|swap|switch|make)\s+"
     r"(?:(?:today'?s?|the|my)\s+)?"
-    r"(?:outdoor\s+)?(?:workout|cardio|run|session)?\s*"
-    r"(?:to|for)\s+(?:an?\s+)?(?:indoor\s+)?"
-    r"(?P<target>rower?|rowing|bike|cycling|trainer|walk(?:ing)?(?:\s+pad)?)"
+    r"(?:outdoor\s+)?(?:workout|cardio|run|walk|session)?\s*"
+    r"(?:to|for)\s+(?:an?\s+|the\s+)?(?:indoor\s+)?"
+    rf"(?P<target>{_SWAP_TARGET_TOKENS})"
     r"(?:\s+(?:because|due\s+to|—|-)\s+(?P<reason>.+))?",
     re.IGNORECASE,
 )
 
-# Bare form: "indoor bike today", "indoor rower". The "indoor" qualifier is what
+# Bare form: "indoor bike today", "indoor stepmill". The "indoor" qualifier is what
 # distinguishes a modality-swap command from an incidental equipment mention.
 _MODALITY_SWAP_BARE_RE = re.compile(
     r"^\s*(?:@?artemis\s+)?-?\s*"
     r"indoor\s+"
-    r"(?P<target>rower?|rowing|bike|cycling|trainer|walk(?:ing)?(?:\s+pad)?)"
+    rf"(?P<target>{_SWAP_TARGET_TOKENS})"
     r"(?:\s+today)?"
     r"(?:\s+(?:because|due\s+to|—|-)\s+(?P<reason>.+))?"
     r"\s*$",
@@ -3754,9 +3595,9 @@ _UNSUPPORTED_CHANGE_RE = re.compile(
     r"[^\n]*\b(?:workout|cardio|session|run|training|lift(?:ing)?|strength|plan|"
     # cardio modalities/machines we do NOT support as swap targets — a swap-shaped
     # request naming one refuses honestly instead of reaching the LLM. (Supported
-    # targets — rower/bike/walking pad — are handled by detect_modality_swap and
-    # never reach here.)
-    r"treadmill|elliptical|stair\s?master|spin\s+class|erg|swim|pool|leg\s+day|"
+    # office machines are handled by detect_modality_swap and never reach here;
+    # the rower, bike trainer, and walking pad are retired — HEALTH-2.)
+    r"rower|rowing|walking\s+pad|trainer|spin\s+class|erg|swim|pool|leg\s+day|"
     # rest / recovery / mobility / off-day changes are NOT modality swaps and are
     # not supported yet — refuse honestly rather than confabulate.
     r"rest(?:\s+day)?|recovery|mobility|off\s+day)\b",
@@ -3772,16 +3613,19 @@ _REST_CHANGE_RE = re.compile(
 
 
 def _normalize_swap_target(raw: str | None) -> str | None:
-    """Map a captured target token to one of rower | bike | walking_pad."""
+    """Map a captured target token to one of _SWAP_TARGETS. A bare 'bike' means
+    the upright bike."""
     if not raw:
         return None
-    t = raw.strip().lower()
-    if t.startswith("row"):
-        return "rower"
-    if t in ("bike", "cycling", "trainer"):
-        return "bike"
-    if t.startswith("walk"):
-        return "walking_pad"
+    t = re.sub(r"\s+", " ", raw.strip().lower())
+    if t in ("treadmill", "elliptical"):
+        return t
+    if t.startswith(("step", "stair")):
+        return "stepmill"
+    if t.startswith("recumbent"):
+        return "recumbent_bike"
+    if t.startswith("upright") or t in ("bike", "cycling"):
+        return "upright_bike"
     return None
 
 
@@ -3793,9 +3637,9 @@ def detect_swap_revert(text: str) -> bool:
 def detect_modality_swap(text: str) -> dict | None:
     """Deterministic modality-swap detector, checked BEFORE the LLM classifier.
 
-    Returns {"target": rower|bike|walking_pad, "reason": str|None} on a positive
-    match, else None. A revert command is NOT a swap (handled separately), and a
-    'trainer set indoor/outdoor' override is NOT a swap (no leading swap verb).
+    Returns {"target": <one of _SWAP_TARGETS>, "reason": str|None} on a positive
+    match, else None. A revert command is NOT a swap (handled separately), and the
+    retired 'trainer set indoor/outdoor' command is NOT a swap (no swap verb).
     """
     msg = text or ""
     if detect_swap_revert(msg):
@@ -3824,48 +3668,55 @@ def looks_like_unsupported_workout_change(text: str) -> bool:
 # Per-modality settings. work/rest settings live inside intervals_template;
 # warmup/cooldown settings are top-level. equipment/display_name are top-level.
 _MODALITY_SPEC = {
-    "rower": {
-        "equipment": ["water rower"],
-        "work_settings": "moderate row",
-        "rest_settings": "easy row",
-        "wc_settings": "easy row",
-        "modality_word": "row",
+    "treadmill": {
+        "equipment": ["treadmill"],
+        "work_settings": "brisk incline walk",
+        "rest_settings": "easy walk",
+        "wc_settings": "easy walk",
+        "label": "Treadmill",
     },
-    "bike": {
-        "equipment": ["bike on trainer"],
+    "elliptical": {
+        "equipment": ["elliptical"],
+        "work_settings": "moderate elliptical",
+        "rest_settings": "easy elliptical",
+        "wc_settings": "easy elliptical",
+        "label": "Elliptical",
+    },
+    "upright_bike": {
+        "equipment": ["upright bike"],
         "work_settings": "moderate spin",
         "rest_settings": "easy spin",
         "wc_settings": "easy spin",
-        "modality_word": "bike",
+        "label": "Upright Bike",
     },
-    "walking_pad": {
-        "equipment": ["walking pad"],
-        "work_settings": "brisk walk",
-        "rest_settings": "easy walk",
-        "wc_settings": "easy walk",
-        "modality_word": "walk",
+    "recumbent_bike": {
+        "equipment": ["recumbent bike"],
+        "work_settings": "moderate spin",
+        "rest_settings": "easy spin",
+        "wc_settings": "easy spin",
+        "label": "Recumbent Bike",
+    },
+    "stepmill": {
+        "equipment": ["stepmill"],
+        "work_settings": "hard climb",
+        "rest_settings": "easy climb",
+        "wc_settings": "easy climb",
+        "label": "Stepmill",
     },
 }
 
 
 def _swap_display_name(target: str, session_type: str | None) -> str:
-    """Display name for the swapped session. cardio_intervals rowers read
-    'Indoor Row — Intervals'; everything else uses the Z2 form."""
-    if target == "rower":
-        if session_type == "cardio_intervals":
-            return "Indoor Row — Intervals"
-        return "Indoor Row — Z2 Intervals"
-    if target == "bike":
-        return "Indoor Bike — Z2"
-    return "Indoor Walk — Z2"
+    """Display name for the swapped session: '<Machine> — Intervals' for
+    cardio_intervals, '<Machine> — Z2' otherwise."""
+    suffix = "Intervals" if session_type == "cardio_intervals" else "Z2"
+    return f"{_MODALITY_SPEC[target]['label']} — {suffix}"
 
 
 def _rewrite_setup_notes(setup_notes, target: str, reason: str | None) -> list[str]:
-    """Rewrite the first setup-notes line to describe the new modality (prefixing
-    the reason when given). Remaining lines carry over unchanged."""
-    spec = _MODALITY_SPEC[target]
-    word = spec["modality_word"]
-    head = f"Indoor {word}"
+    """Rewrite the first setup-notes line to name the new machine (suffixing the
+    reason when given). Remaining lines carry over unchanged."""
+    head = _MODALITY_SPEC[target]["label"]
     if reason:
         head += f" ({reason})"
     notes = list(setup_notes) if isinstance(setup_notes, (list, tuple)) else []
@@ -3885,8 +3736,8 @@ def translate_blocks(blocks: dict, target: str, *, session_type: str | None = No
     Preserves every structural key a renderer depends on (type, rounds,
     warmup_sec, cooldown_sec, and the intervals_template work_sec/rest_sec shape)
     and every stimulus key (intensity, target_range_min, finisher). Only the tool
-    changes: equipment, the work/rest/warmup/cooldown *settings* labels, the
-    display_name, and the first setup-notes line. Any pre-existing swap/pre_swap
+    changes: equipment, location (the office gym), the work/rest/warmup/cooldown
+    *settings* labels, the display_name, and the first setup-notes line. Any pre-existing swap/pre_swap
     bookkeeping is stripped — the lifecycle re-adds it deliberately.
     """
     if target not in _MODALITY_SPEC:
@@ -3898,6 +3749,7 @@ def translate_blocks(blocks: dict, target: str, *, session_type: str | None = No
 
     spec = _MODALITY_SPEC[target]
     out["equipment"] = list(spec["equipment"])
+    out["location"] = _office.LOCATION
 
     it = out.get("intervals_template")
     if isinstance(it, dict):
@@ -3982,27 +3834,6 @@ def resolve_swap_target(today: date | None = None) -> tuple[date | None, dict | 
     # Rest day or no plan today → the next cardio session.
     nxt = _next_cardio_date(base)
     return nxt, _fetch_swap_plan_row(nxt), None
-
-
-# ── Weather context for the history ledger (best-effort) ────────────────────
-
-def _swap_weather_context() -> dict | None:
-    """Snapshot current conditions for the audit ledger. BEST-EFFORT: any
-    failure returns None so the swap is never blocked by weather."""
-    try:
-        from artemis import weather
-        w = weather.get_current_conditions()
-        ctx = {
-            "weather": {
-                "temp_f": w.get("temp_f"),
-                "precip_next_90min": w.get("precip_next_90min"),
-            },
-            "captured_at": datetime.now(CT).isoformat(),
-        }
-        return ctx
-    except Exception:
-        logger.warning("Swap weather context fetch failed — recording null", exc_info=True)
-        return None
 
 
 # ── Durable pending payload (system_state KV — same store E3/capture use) ────
@@ -4196,7 +4027,7 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
         clear_swap_pending(channel_id)
         logger.error("Swap commit refused: unsupported target %r", target)
         return ("⚠️ Unsupported swap target — nothing changed. I only swap to a "
-                "rower, bike, or walking pad.")
+                "treadmill, elliptical, upright bike, recumbent bike, or stepmill.")
 
     try:
         plan_date = date.fromisoformat(payload["plan_date"])
@@ -4217,7 +4048,6 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
     old_blocks = _coerce_blocks(row.get("blocks"))
     old_name = old_blocks.get("display_name") or _session_pretty_name(session_type or "?")
 
-    context = _swap_weather_context()
     swap_meta = {
         "reason": reason,
         "requested_via": "mattermost",
@@ -4261,7 +4091,6 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
                 "from": {"display_name": old_name, "session_type": session_type},
                 "to": {"display_name": verified_name, "modality": target},
                 "reason": reason,
-                "context": context,
             },
         )
     except Exception:
@@ -4307,7 +4136,6 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
         clear_swap_pending(channel_id)
         return "That session isn't swapped — nothing to revert."
 
-    context = _swap_weather_context()
     try:
         written = _write_swap_and_verify(plan_id, plan_date, restored)
     except Exception:
@@ -4339,7 +4167,6 @@ def commit_swap_revert(channel_id: str, reason_override: str | None = None) -> s
                 "from": {"display_name": from_name, "session_type": session_type},
                 "to": {"display_name": verified_to_name, "modality": None},
                 "reason": reason,
-                "context": context,
             },
         )
     except Exception:
@@ -4360,11 +4187,10 @@ def format_health_help() -> str:
     Never a fabricated confirmation, never a claim of any action or learning."""
     return (
         "I don't have a handler for that. Here's what I can do with training:\n"
-        "• **Swap the tool** — `swap today to indoor rower` (or bike / walking pad); "
-        "reply `yes` to confirm. `swap revert` to undo.\n"
+        "• **Swap the machine** — `swap today to elliptical` (or treadmill / upright "
+        "bike / recumbent bike / stepmill); reply `yes` to confirm. `swap revert` to undo.\n"
         "• **Morning check-in** — `slept 6.5 energy 3 legs sore 3`\n"
         "• **Log a workout** — paste your metrics; I echo them and confirm before writing\n"
-        "• **Bike setup** — `trainer set indoor` / `trainer set outdoor`\n"
         "• **See the plan** — `what's today's workout` · `next 3 days` · `this week`\n"
         "_I can't reschedule sessions or change the session type — those aren't built._"
     )
