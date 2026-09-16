@@ -122,6 +122,32 @@ def _logged_in_window(cur) -> list[tuple]:
     return cur.fetchall()
 
 
+def _read_tail(cur) -> list[tuple]:
+    """Rows PAST the program end — left behind when the window shortened
+    (HEALTH-2 seeded through 11/08; the GO-LIVE reset ends 11/03). They are
+    orphans of the old schedule and must not linger as real plan days."""
+    cur.execute(
+        "SELECT p.plan_date, p.session_type, "
+        "       (SELECT count(*) FROM health.session_log sl "
+        "        WHERE sl.plan_id = p.plan_id AND sl.logged_via <> 'inferred') "
+        "FROM health.plan p WHERE p.plan_date > %s ORDER BY p.plan_date",
+        (office.OFFICE_END,))
+    return cur.fetchall()
+
+
+def _delete_tail(cur) -> int:
+    """Delete post-window rows. Refuses if any carries a real session_log."""
+    tail = _read_tail(cur)
+    logged = [(d, st, n) for d, st, n in tail if n]
+    if logged:
+        raise SystemExit(f"[ABORT] rows after {office.OFFICE_END} carry real session_log "
+                         f"rows — refusing to delete: {logged}")
+    if not tail:
+        return 0
+    cur.execute("DELETE FROM health.plan WHERE plan_date > %s", (office.OFFICE_END,))
+    return cur.rowcount
+
+
 def _read_existing(cur) -> dict:
     cur.execute(
         "SELECT plan_date, phase, week_num, session_type, blocks FROM health.plan "
@@ -161,10 +187,15 @@ def print_diff(existing: dict, rows: list[dict]) -> None:
 
 def print_samples(rows: list[dict]) -> None:
     """One full row per distinct (session_type, week_num) shape worth eyeballing."""
-    picks = {office.OFFICE_START, office.WEEK1_MONDAY, office.WEEK1_MONDAY.replace(day=24),
-             office.WEEK1_MONDAY.replace(day=25), office.WEEK1_MONDAY.replace(day=22)}
-    fri_wk5 = office.WEEK1_MONDAY.replace(month=10, day=23)
-    picks.add(fri_wk5)
+    from datetime import timedelta as _td
+    wk1 = office.WEEK1_START
+    picks = {wk1,                 # Wed  wk1 strength_a (go-live day)
+             wk1 + _td(days=2),   # Fri  wk1 strength_b
+             wk1 + _td(days=4),   # Sun  wk1 walk
+             wk1 + _td(days=5),   # Mon  wk1 strength_c
+             wk1 + _td(days=6),   # Tue  wk1 cardio_z2
+             wk1 + _td(days=1),   # Thu  wk1 rest
+             wk1 + _td(days=33)}  # Mon  wk5 strength_c (finisher)
     for r in rows:
         if r["plan_date"] in picks:
             meta = {k: r[k] for k in ("plan_date", "phase", "week_num", "session_type",
@@ -208,14 +239,27 @@ def reseed_office(dry_run: bool) -> int:
 
         print_diff(_read_existing(cur), rows)
 
+        tail = _read_tail(cur)
+        if tail:
+            print(f"ROWS PAST {office.OFFICE_END} (to DELETE — orphans of the old window):")
+            for d, st, n in tail:
+                flag = f"  << {n} REAL session_log row(s)" if n else ""
+                print(f"  {d.isoformat()}  {d.strftime('%a')}  {st}{flag}")
+            print(f"  ({len(tail)} row(s) to delete)\n")
+        else:
+            print(f"No rows past {office.OFFICE_END}.\n")
+
         if dry_run:
             conn.rollback()
             print("[DRY-RUN] (default) No rows written. Re-run with --office --commit to write.")
             return 0
 
         try:
+            n_deleted = _delete_tail(cur)
             office.write_rows(cur, rows)
             conn.commit()
+            if n_deleted:
+                print(f"[OK] Deleted {n_deleted} row(s) past {office.OFFICE_END}.")
         except Exception:
             conn.rollback()
             raise
@@ -226,7 +270,7 @@ def reseed_office(dry_run: bool) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reseed health.plan (HEALTH-2 office gym).")
     ap.add_argument("--office", action="store_true",
-                    help="Seed the 9/16-11/08 office gym schedule.")
+                    help="Seed the office gym schedule (see health_office window).")
     ap.add_argument("--commit", action="store_true",
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true", help="No DB. Print the schedule.")
