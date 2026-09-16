@@ -943,12 +943,14 @@ class TestLastLoggedEndpoint(unittest.TestCase):
                     "exercise": "Goblet squat",
                     "weight_lbs": 35.0, "reps_done": 10, "rpe_actual": 7.5,
                     "duration_sec": None, "distance_m": None, "hr_avg": None, "hr_peak": None,
+                    "notes": "setting=7; machine taken",
                     "plan_date": date(2026, 6, 4),
                 },
                 {
                     "exercise": "Plank",
                     "weight_lbs": None, "reps_done": None, "rpe_actual": 6.5,
                     "duration_sec": 30, "distance_m": None, "hr_avg": None, "hr_peak": None,
+                    "notes": None,
                     "plan_date": date(2026, 6, 4),
                 },
             ],
@@ -964,6 +966,9 @@ class TestLastLoggedEndpoint(unittest.TestCase):
         self.assertEqual(body["by_exercise"]["Goblet squat"]["reps_done"], 10)
         self.assertEqual(body["by_exercise"]["Plank"]["duration_sec"], 30)
         self.assertIsNone(body["by_exercise"]["Plank"]["weight_lbs"])
+        # Per-set notes ride along so gym-display can prefill `setting=<n>`.
+        self.assertEqual(body["by_exercise"]["Goblet squat"]["notes"], "setting=7; machine taken")
+        self.assertIsNone(body["by_exercise"]["Plank"]["notes"])
 
 
 if __name__ == "__main__":
