@@ -335,18 +335,42 @@ rest_mobility    -> office gym: mat / Stretch Trainer
 Weather is consulted for `walk` only. There is no bike indoor/outdoor decision
 and no `trainer set` override any more.
 
-**Office program (seeded 2026-09-16 → 2026-11-08)** —
+**Office program — phase 1, anchored Wed 2026-09-16, seeded 9/16 → 11/03** —
 `scripts/reseed_health_plan_v2.py --office` (dry-run default, `--commit` to
-write), validated by `scripts/validate_health_plan.py`. Ramp-up 9/16-9/20
-(Z2 20 min, Strength A 2 sets, Z2 20 min, recovery walk, rest), then weeks 1-7
-(phase 1): Mon A · Tue Z2 · Wed rest · Thu B · Fri C · Sat rest · Sun walk.
-Sets/RPE/Z2: wk1-2 2/6/20 min · wk3-4 3/7/30 · wk5-6 3/7.5/35-40 (Fri C
-stepmill/upright-bike finisher 6×30s/90s) · wk7 deload 2/6/30. Warmup 5 min
-elliptical, cooldown 5 min Stretch Trainer; loads null weeks 1-2; week 1
-machine exercises note "log seat + pin setting".
+write; also deletes orphan rows past the program end), validated by
+`scripts/validate_health_plan.py`. All sessions are at the **office gym**
+(`blocks.location`); the Sunday walk is outside.
 
-The feat/health-ramp nightly slide/evaluate job and its `--ramp` reseed are
-retired (their 7/25-9/11 window passed undeployed and would overwrite this plan).
+Week windows run **Wed–Tue** from 2026-09-16 (week 1 = 9/16–9/22 … week 7 =
+10/28–11/03). There are no ramp-up days: 9/16 is week 1, day 1.
+
+| Wed | Thu | Fri | Sat | Sun | Mon | Tue |
+|---|---|---|---|---|---|---|
+| Strength A | rest | Strength B | rest | walk | Strength C | Z2 |
+
+Rest is Thu + Sat, so no two strength days are adjacent and every training day
+falls on a weekday, when the office gym is open.
+
+| Weeks | Sets | RPE | Z2 | Notes |
+|---|---|---|---|---|
+| 1–2 | 2 | 6 | 20 min | `target_load_lbs` null (finding weights); week 1 machine exercises note "log seat + pin setting" |
+| 3–4 | 3 | 7 | 30 min | |
+| 5–6 | 3 | 7.5 | 35–40 min | Mon Strength C adds the stepmill/upright-bike finisher, 6 × (30s hard / 90s easy) |
+| 7 | 2 | 6 | 30 min | deload |
+
+Warmup 5 min elliptical, cooldown 5 min Stretch Trainer.
+
+> ⚠️ `health.phase_config` caps phase 1 at `max_session_rpe = 7.0`, below the
+> weeks 5–6 target of 7.5. Nothing enforces the cap today; resolve before 10/14.
+
+**Ramp engine — retired, and incompatible.** The feat/health-ramp nightly
+slide/evaluate job is not scheduled and must stay that way. A HARDEN-1 dry run
+against live data showed it groups weeks **Sun–Sat** (it would evaluate
+9/13–9/19, mixing three old phase-3 rows with week 1), evaluates on Sunday
+night rather than Wednesday, counts rest days as sessions (marking them
+`missed`), and requires 5/5 completions — so every scenario ends in a
+**restart proposal** that re-seeds the home-gym program. `yes ramp` would
+delete the office plan. See RAMP-RETIRE in `docs/ARTEMIS_STATE.md`.
 
 ### Trainer voice
 
@@ -407,7 +431,7 @@ debrief intent will fire normally and log against the original plan.
   based on rolling RPE / recovery signal. Will write to
   `health.adjustments` audit table.
 - **Workout creation/editing from chat** — only logging is supported.
-  The office program is seeded 2026-09-16 → 2026-11-08; future plan
+  The office program is seeded 2026-09-16 → 2026-11-03; future plan
   modifications go through the autoregulator or a reviewed reseed.
 - **Wake word ("Hey Artemis" voice mode)** — Picovoice Porcupine
   planned, not built.
@@ -416,8 +440,12 @@ debrief intent will fire normally and log against the original plan.
 
 ### Frontend consumer
 
-`gym.rdm.is` (gym-display) reads `GET /api/health/today` with
-`X-API-Key` header, displays today's plan on TV/iPad in the gym.
+`gym.rdm.is` (gym-display) is an iPad Pro 11" Safari app (the TV layout is
+retired). The browser calls the **same-origin** `/api/*` Pages Function, never
+the Lambda directly; the Function requires a Cloudflare Access JWT, answers
+only on `gym.rdm.is` and `*.gym-display.pages.dev`, and attaches `X-API-Key`
+server-side (see gym-display `docs/API_AUTH.md`). A lapsed Access session shows
+a "Session expired — tap to sign in" banner; unsynced sets stay queued.
 Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
 `ryan@rdm.is`. Frontend repo: `RDM-IS/gym-display`.
 

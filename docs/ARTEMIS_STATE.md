@@ -104,7 +104,19 @@ timezone** (`artemis/quiet_hours.py`):
 
 Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
-**HEALTH-2 — office gym rebuild (`feat/health-office-gym`).** Ryan trains at the office gym (all Precor); the rower and outdoor bike are retired from the plan. Location is now plan data (`blocks.location` / `blocks.equipment`, static map is fallback); bike branch, `trainer set` override, and cardio weather removed (weather stays for `walk`); modality swap retargeted to office machines; office program seeded 9/16→11/08 (ramp-up + weeks 1-7) via `reseed_health_plan_v2.py --office`. The feat/health-ramp nightly job and `--ramp` reseed are retired (window 7/25-9/11 passed undeployed; it would slide/re-propose over the office plan).
+**HEALTH-2 — office gym rebuild (`feat/health-office-gym`).** Ryan trains at the office gym (all Precor); the rower and outdoor bike are retired from the plan. Location is now plan data (`blocks.location` / `blocks.equipment`, static map is fallback); bike branch, `trainer set` override, and cardio weather removed (weather stays for `walk`); modality swap retargeted to office machines; office program seeded via `reseed_health_plan_v2.py --office`. The feat/health-ramp nightly job and `--ramp` reseed are retired (window 7/25-9/11 passed undeployed; it would slide/re-propose over the office plan). **Live since 2026-09-16** (#85, #88): phase 1 anchored Wed 9/16, Wed–Tue week windows, 9/16 → 11/03, pattern Wed A · Thu rest · Fri B · Sat rest · Sun walk · Mon C · Tue Z2, all at the office gym. Day phases per WAKE-1 (wake post 04:30, business 06:30, quiet 17:00).
+
+**HARDEN-1 — post-launch hardening (2026-09-16).**
+| Item | Status |
+|---|---|
+| 1a host guard + no key in the bundle | ✅ merged (gym-display #4), verified: `gym-display.pages.dev/api` → 403, `gym.rdm.is/api` → 302 |
+| 1b Access JWT on `/api` | PR gym-display #3 — needs `ACCESS_AUD_PRODUCTION` / `ACCESS_AUD_PREVIEW` set before merge |
+| 2 tampering audit | done — no suspect `session_log` rows; see backlog for the 7/19 read flood |
+| 3 log redaction / 5 free OWM endpoints | PR #89, deployed on the box pre-merge, weather live |
+| 3 key rotations | **pending (Ryan)** — OpenWeatherMap key (24 journal lines) and the health API key (was in the public bundle) |
+| 4 9/16 workout check | clean — 12 sets + summary, no duplicates; no `setting=` notes captured |
+| 6 session-expired banner | in gym-display #3 |
+| 8 ramp dry run | engine incompatible with the office program — keep retired (see RAMP-RETIRE) |
 
 ---
 
@@ -128,7 +140,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 - **Interim (shipped on feat/health-ramp):** `ramp_confirm` matches **only** the qualified `yes ramp`/`no ramp` and never a bare control word — it removes ramp from the bare-`yes` contention entirely. The *general* race (debrief↔swap↔nutrition↔rule↔disposition ordering) remains.
 - **Fix (this item):** a shared `_count_open_pendings(channel_id)` helper over all stores; when **>1** pending is open and a bare control word arrives, reply with a disambiguation prompt (`reply `yes ramp` or `yes rule``) and consume the word safely instead of first-match-wins; teach each confirm handler to also accept its qualified form. Keep first-match-wins when exactly one pending is open.
 
-**RAMP-RETIRE — delete the dormant feat/health-ramp engine (low; after HEALTH-2 deploys).** HEALTH-2 unregistered the nightly job and made `--ramp` refuse, but `artemis/health_ramp.py`, `_handle_ramp_confirm` (+ its chain entry and routing-gate tests), `tests/test_health_ramp.py`, and the `health.ramp_state` table (migration 030) remain. Nothing writes `ramp_state.pending_payload` any more, so `yes ramp` is inert. Remove them (drop-table migration, migrate-first) or re-point the engine at the office program. With ramp gone, CONFIRM-ARB's worst case (never-expiring ramp pending) no longer applies.
+**RAMP-RETIRE — delete the dormant feat/health-ramp engine (medium — the confirm route is live).** HARDEN-1's dry run showed the engine cannot be re-pointed as-is: Sun–Sat windows, Sunday-night evaluation, rest days counted and marked missed, a 5/5 threshold the 4-session office week can never meet, and a restart proposal that re-seeds the home-gym program — accepting it with `yes ramp` deletes the office plan. If adherence evaluation is wanted, write a small new evaluator on `health_office.WEEK1_START` (Wed–Tue, training days only, report-only) and decide the thresholds first. Original note: HEALTH-2 unregistered the nightly job and made `--ramp` refuse, but `artemis/health_ramp.py`, `_handle_ramp_confirm` (+ its chain entry and routing-gate tests), `tests/test_health_ramp.py`, and the `health.ramp_state` table (migration 030) remain. Nothing writes `ramp_state.pending_payload` any more, so `yes ramp` is inert. Remove them (drop-table migration, migrate-first) or re-point the engine at the office program. With ramp gone, CONFIRM-ARB's worst case (never-expiring ramp pending) no longer applies.
 
 **PB9-CRON — morning prompt times vs office arrival (low).** The PB-009 morning prompt schedule predates the office gym; retime once Ryan's office arrival time is confirmed (TODO in PLAYBOOKS.md).
 
@@ -151,6 +163,15 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 **Papercuts.** SIGTERM-ignored shutdown (90s SIGKILL every restart — likely websocket/scheduler not closing on signal); Mattermost websocket flap (~60s reconnect loop); SSO re-auth friction (longer session or self-healing ProxyCommand); Mac-vs-EC2 prompt confusion (distinct prompt / dedicated tab).
 
 ---
+
+**HARDEN-1 follow-ups (open).**
+- **Office equipment unconfirmed** — Precor pin-stack step (default 10 lb), Icarian Smith bar weight, and the hex dumbbell range are guesses; `TODO(office)` in gym-display `src/lib/equipment.ts`.
+- **Three pre-existing test failures**, identical on `main`: `test_confirm_dispatch` and `test_commitments_rds` (no DB pool locally), `artemis/test_opsdiag` (py3.14 `requests`). Run the suite on py3.11 or give them a pool stub.
+- **Lambda deploy drift** — `rdmis-crm-api` is deployed by hand (`api/deploy.sh`); there is no CI deploy and no check that the live function matches `main`.
+- **API Gateway has no access logs or detailed metrics** — per-route counts don't exist. On 2026-07-19 (05:00–10:00 CDT) the API served **154,023 authenticated, successful reads** (~10/s, 0 4xx, no writes); cause unattributed, most likely a client refetch loop during OPS-2 development that morning. Enable HTTP API access logging.
+- **Machine settings never captured** — the 9/16 session logged 6 machine sets with no `setting=` note; Artemis's own parser also discards seat/pin.
+- **WAKE-2** — the next day-phase slice (not started).
+- **TV retirement decision** — the gym-display TV layout is gone; decide whether the TV is retired for good or gets a read-only glance view.
 
 ## 7. Operating disciplines (non-negotiable)
 
