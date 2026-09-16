@@ -64,6 +64,7 @@ from artemis.mattermost import MattermostClient
 from artemis.prompts import UNTRUSTED_PREFIX
 from artemis.quiet_hours import (
     DEFAULT_OVERRIDE_DAYS,
+    MAX_OVERRIDE_DAYS,
     PHASE_OPEN,
     PHASE_QUIET,
     PHASE_WAKE,
@@ -2793,6 +2794,17 @@ def _handle_timezone_command(post: dict, question: str) -> bool:
             return reply(
                 f"{through.isoformat()} is in the past \u2014 nothing changed. "
                 f"Give a date on or after {today_local.isoformat()}."
+            )
+        # A year-less date behind today rolled forward a year — almost always a
+        # typo for a nearby past date, and it would pin the schedule away for
+        # months. Refuse rather than set it silently.
+        if (through - today_local).days > MAX_OVERRIDE_DAYS:
+            return reply(
+                f"I read \"{value}\" as {through.isoformat()} \u2014 "
+                f"{(through - today_local).days} days out, which is longer than I'll "
+                f"set a timezone for. Nothing changed. If you meant a date that has "
+                f"already passed, give one on or after {today_local.isoformat()}; if "
+                f"you really mean {through.isoformat()}, write it with the year."
             )
         expires_at = expires_at_for_through(through, tz_name)
     elif kind == "days":

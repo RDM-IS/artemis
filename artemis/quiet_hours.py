@@ -779,6 +779,13 @@ def quiet_hours_status() -> str:
 
 DEFAULT_OVERRIDE_DAYS = 7
 
+# A year-less date is rolled FORWARD (9/23 typed in January means this year;
+# 1/5 typed in September means next January). That rule and "a past date is
+# rejected" collide on a date just behind today: "through 9/14" typed on 9/15
+# rolls to 9/14 NEXT year and would silently pin the schedule away for a year.
+# Beyond this horizon we assume a typo for a nearby past date and say so.
+MAX_OVERRIDE_DAYS = 180
+
 
 def get_timezone_override() -> dict | None:
     """The active override row, or None."""

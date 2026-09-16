@@ -239,6 +239,27 @@ class TestCommandHandling(unittest.TestCase):
         self.assertIsNone(self.db.row)
         self.assertIn("past", reply.lower())
 
+    def test_a_year_less_date_just_behind_today_is_refused(self):
+        """Regression (found on the box): "through 9/14" typed on 9/15 rolled
+        forward to 2027-09-14 and silently pinned the schedule away for a year.
+        The roll-forward rule and "a past date is rejected" collide here."""
+        reply = self.run_cmd("set timezone to Brazil through 9/14")
+        self.assertIsNone(self.db.row, "a year-long override was set silently")
+        self.assertIn("2027-09-14", reply)
+        self.assertIn("with the year", reply)
+
+    def test_a_year_less_date_inside_the_horizon_still_rolls_forward(self):
+        # 1/5 from September is ~112 days out — a real trip over new year.
+        self.run_cmd("set timezone to Paris through 1/5")
+        self.assertEqual(
+            self.db.row["expires_at"],
+            datetime(2027, 1, 6, 0, 0, tzinfo=ZoneInfo("Europe/Paris")))
+
+    def test_an_explicit_far_future_date_is_refused_too(self):
+        reply = self.run_cmd("set timezone to Brazil through 2028-01-01")
+        self.assertIsNone(self.db.row)
+        self.assertIn("longer than I'll set a timezone for", reply)
+
     def test_unreadable_date_changes_nothing(self):
         reply = self.run_cmd("set timezone to Brazil through soonish")
         self.assertIsNone(self.db.row)
