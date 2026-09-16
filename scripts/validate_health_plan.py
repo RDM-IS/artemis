@@ -107,9 +107,15 @@ def evaluate(live: dict[date, dict]) -> list[dict]:
             continue
         add(d, "PRESENT", True)
         b = _coerce_blocks(row["blocks"])
+        session_type = row["session_type"]
+        # FRIDAY-1: a check-in adjustment keeps the plan as written in
+        # blocks.original — validate that, not the day's adjusted copy.
+        if isinstance(b.get("original"), dict):
+            session_type = b["original"].get("session_type") or session_type
+            b = _coerce_blocks(b["original"].get("blocks"))
         eb = exp["blocks"]
-        add(d, "SESSION_TYPE", row["session_type"] == exp["session_type"],
-            f"session_type={row['session_type']!r}, expected {exp['session_type']!r}")
+        add(d, "SESSION_TYPE", session_type == exp["session_type"],
+            f"session_type={session_type!r}, expected {exp['session_type']!r}")
         add(d, "PHASE/WEEK", (row["phase"], row["week_num"]) == (exp["phase"], exp["week_num"]),
             f"phase/week={row['phase']}/{row['week_num']}, expected {exp['phase']}/{exp['week_num']}")
         add(d, "BLOCK_TYPE", b.get("type") == eb["type"],

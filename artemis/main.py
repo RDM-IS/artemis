@@ -322,6 +322,19 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     time_str = now.strftime("%I:%M %p")
     parts.append(f"**Current time:** {day_name}, {time_str}")
 
+    # FRIDAY-1: outside the OPEN phase the general fallback gets no business
+    # data at all — no Gmail, calendar, commitments or inbox.
+    if get_phase() != PHASE_OPEN:
+        parts.append(f"\n**Business data held until {config.OPEN_TIME}** (wake/quiet phase).")
+        try:
+            from artemis.health import build_context_slice
+            health_slice = build_context_slice()
+            if health_slice:
+                parts.append("\n" + health_slice)
+        except Exception:
+            logger.exception("Failed to add training slice to mention context")
+        return UNTRUSTED_PREFIX + "\n".join(parts)
+
     # Recent emails — fetch full bodies so Claude has real content
     try:
         messages = gmail.get_recent_messages(max_results=10)
@@ -3667,6 +3680,41 @@ def _strip_wake_word(message: str) -> str:
     return stripped.replace("@artemis", "").strip()
 
 
+def _handle_morning_flow(post: dict, question: str) -> bool:
+    """FRIDAY-1 — check-ins, `original`, and the short check-in replies.
+
+    Claims check-in-shaped text, ack words ("nope", "all good"), done words
+    ("workout completed", "logged in app") and `original` — and nothing else.
+    Deterministic end to end: a claimed message never reaches an LLM or Gmail.
+    """
+    from artemis.health_checkin import (
+        classify, process_ack, process_checkin, process_done, process_original,
+    )
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+
+    kind = classify(question)
+    if kind is None:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    today = local_today()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        if kind == "checkin":
+            reply = process_checkin(cur, question, today, checkin_id=post.get("id") or "")
+        elif kind == "original":
+            reply = process_original(cur, today)
+        elif kind == "done":
+            reply = process_done(cur, today)
+        else:
+            reply = process_ack(cur, today)
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_health_conversation(post: dict, question: str) -> bool:
     """PB-009 — conversational workout session + training history Q&A.
 
@@ -4083,6 +4131,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
+        # FRIDAY-1: check-ins and short morning replies, AHEAD of nutrition (whose
+        # "i had"/"log" patterns used to swallow check-ins) and of the LLM.
+        ("morning_flow", _handle_morning_flow),
         ("nutrition", _handle_nutrition),
         ("health_conversation", _handle_health_conversation),
         ("capture_propose", _handle_capture_propose),
@@ -4393,6 +4444,14 @@ def _handle_mention(post: dict, thread: list[dict]):
         response = scrub_db_denial(response, question)
     except Exception:
         logger.exception("scrub_db_denial failed")
+
+    # FRIDAY-1 part C: exercise names, loads and "last session" figures in an
+    # LLM draft must exist in the plan/logs, else the plan template replaces it.
+    try:
+        from artemis.health_guard import guard_workout_reply
+        response = guard_workout_reply(response, question)
+    except Exception:
+        logger.exception("workout-claim guard failed")
 
     if response and _mm:
         channel_id = post.get("channel_id", "")

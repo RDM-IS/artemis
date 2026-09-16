@@ -243,7 +243,7 @@ class TestWakeMessage(unittest.TestCase):
         msg = self._build()
         self.assertIn("Office Strength A", msg)
         self.assertIn("Where: office gym", msg)
-        self.assertIn("First lift: Leg press", msg)
+        self.assertIn("1. Leg press — 1×12", msg)
         self.assertIn("Warmup: 5 min elliptical, easy", msg)
         self.assertIn("gym.rdm.is", msg)
         self.assertIn("sleep hrs", msg.lower())

@@ -165,6 +165,11 @@ HOME_LON = float(os.environ.get("HOME_LON", "-88.1834"))
 OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 
 # Pre-departure checklist read out in the 04:30 wake post.
+# FRIDAY-1: check-in-driven morning. CHECKIN_ADJUST=0 keeps parsing/storing the
+# check-in but never rewrites today's plan. The nudge fires this many minutes
+# after WAKE_TIME when no check-in has arrived (training days only).
+CHECKIN_ADJUST = os.environ.get("CHECKIN_ADJUST", "1").strip().lower() not in ("0", "false", "no", "off")
+CHECKIN_NUDGE_OFFSET_MIN = int(os.environ.get("CHECKIN_NUDGE_OFFSET_MIN", "45"))
 DEPARTURE_CHECKLIST = _list(
     os.environ.get("DEPARTURE_CHECKLIST", "gym bag, badge, lunch, iPad")
 )

@@ -39,6 +39,17 @@ def _post(message: str, channel: str = "chanA") -> dict:
     return {"id": "post1", "channel_id": channel, "message": message, "root_id": None}
 
 
+def _fake_conn(cur=None):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def conn():
+        m = MagicMock()
+        m.cursor.return_value = cur if cur is not None else MagicMock()
+        yield m
+    return conn
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         main._pending_confirms.clear()
@@ -73,11 +84,18 @@ class TestClassifierBypass(_Base):
         self.assertEqual(self._last_post(), canned)
 
     def test_morning_checkin_bypasses_classifier(self):
-        # A4: the HEALTH-1 morning check-in routes straight to the morning
-        # handler (which writes daily_state and replies "Logged: …").
-        self._run_expecting_health(
-            "sleep 7 energy 5 legs sore 3", "handle_morning_intent",
-            "Logged: 7h sleep, energy 5/5. Anything to fix?")
+        # FRIDAY-1: a check-in is claimed by the deterministic morning flow
+        # (ahead of nutrition and the classifier) and never reaches the LLM.
+        canned = "Check-in logged — run Session A as written."
+        with patch.object(intent, "route_intent") as route, \
+             patch.object(main, "_handle_intent_routed") as routed, \
+             patch("knowledge.db.get_connection", _fake_conn()), \
+             patch("artemis.health_checkin.process_checkin", return_value=canned) as pc:
+            main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
+        route.assert_not_called()
+        routed.assert_not_called()
+        pc.assert_called_once()
+        self.assertEqual(self._last_post(), canned)
 
     def test_retired_trainer_command_bypasses_classifier(self):
         # HEALTH-2: the bike trainer is retired; `trainer set indoor` gets the
@@ -131,20 +149,24 @@ class TestMorningStateWritten(_Base):
     handler runs for real (only the LLM parse + the DB write are stubbed)."""
 
     def test_checkin_writes_daily_state_with_ct_date(self):
-        import knowledge.db as kdb
         from datetime import datetime
-        from artemis.health import CT, MorningState
+        from artemis.health import CT
 
-        state = MorningState(sleep_hrs=7.0, energy=5, soreness={"legs": 3})
-        with patch.object(health, "parse_morning_checkin", return_value=state), \
-             patch.object(kdb, "execute_write") as ew:
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.fetchall.return_value = []
+        cur.description = []
+        with patch("knowledge.db.get_connection", _fake_conn(cur)):
             reply = health.handle_morning_intent("sleep 7 energy 5 legs sore 3")
 
-        ew.assert_called_once()
-        sql, params = ew.call_args[0][0], ew.call_args[0][1]
-        self.assertIn("health.daily_state", sql)
-        self.assertEqual(params[0], datetime.now(CT).date())   # state_date = CT today
-        self.assertIn("Logged", reply)
+        writes = [c for c in cur.execute.call_args_list if "health.daily_state" in c[0][0]
+                  and c[0][0].lstrip().startswith("INSERT")]
+        self.assertEqual(len(writes), 1)
+        params = writes[0][0][1]
+        self.assertEqual(params[0], datetime.now(CT).date())   # state_date = local today
+        self.assertEqual(params[3], 5)                          # energy
+        self.assertIn('"legs": 3', params[4])                   # stored on the 0–5 scale
+        self.assertIn("Check-in logged", reply)
 
 
 class TestGeneralReplyCannotReroute(_Base):
@@ -156,8 +178,9 @@ class TestGeneralReplyCannotReroute(_Base):
         general_reply = MagicMock(name="general_reply_classification")
         with patch.object(intent, "route_intent", return_value=general_reply) as route, \
              patch.object(main, "_handle_intent_routed") as routed, \
-             patch.object(health, "handle_morning_intent",
-                          return_value="Logged: 7h sleep, energy 5/5.") as handler:
+             patch("knowledge.db.get_connection", _fake_conn()), \
+             patch("artemis.health_checkin.process_checkin",
+                   return_value="Logged: 7h sleep, energy 5/5.") as handler:
             main._handle_mention(_post("sleep 7 energy 5 legs sore 3"), [])
         # The classifier (which would have said general_reply) is never reached…
         route.assert_not_called()

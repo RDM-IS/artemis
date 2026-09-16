@@ -74,6 +74,11 @@ def _hhmm(value: str) -> tuple[int, int]:
     return int(h), int(m or 0)
 
 
+def _plus_minutes(hour: int, minute: int, delta: int) -> tuple[int, int]:
+    total = (hour * 60 + minute + delta) % (24 * 60)
+    return total // 60, total % 60
+
+
 def _minus_minutes(hour: int, minute: int, delta: int) -> tuple[int, int]:
     total = (hour * 60 + minute - delta) % (24 * 60)
     return total // 60, total % 60
@@ -164,6 +169,11 @@ class ArtemisScheduler:
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
             # 04:30 — wake: health holds flush + the wake post.
             CronSpec("wake", "job_wake", wake_h, wake_m, tier="health"),
+            # 05:15 — one nudge if no check-in arrived (FRIDAY-1). Event-driven
+            # adjustment replaced the fixed 04:45 calibration post.
+            CronSpec("checkin_nudge", "job_checkin_nudge",
+                     *_plus_minutes(wake_h, wake_m, config.CHECKIN_NUDGE_OFFSET_MIN),
+                     tier="health"),
             # 06:25 / 06:30 — open: business holds flush, then the brief.
             CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m),
             CronSpec("open", "job_open", open_h, open_m),
@@ -340,31 +350,19 @@ class ArtemisScheduler:
     # ── Phase jobs (WAKE-1) ───────────────────────────────────────────────
 
     def _do_wake(self) -> None:
-        """Enter the wake phase, flush health holds into the wake post, and
-        schedule the calibration follow-up."""
+        """Enter the wake phase, flush health holds into the wake post, and open
+        today's check-in. There is no timed calibration post any more: the plan
+        is adjusted when the check-in arrives (artemis.health_checkin)."""
         from artemis import wake as wake_mod
+        from artemis.health_checkin import checkin_key
         from artemis.posting import take_holds
-        from artemis.quiet_hours import exit_quiet, local_now
+        from artemis.quiet_hours import exit_quiet, set_system_value
 
         exit_quiet()
         held = take_holds("health")
         text = wake_mod.build_wake_message(calendar=self.calendar, held_health=held)
         self.mm.post_message(config.CHANNEL_OPS, text)
-
-        # Calibrated plan ~15 min later, in the ACTIVE timezone.
-        try:
-            from artemis.health import get_today_plan
-            plan = get_today_plan()
-            if plan and wake_mod.prompt_type_for(plan) == "workout_am":
-                run_at = local_now() + timedelta(minutes=15)
-                today = _local_today()
-                self.scheduler.add_job(
-                    self.job_health_calibration_followup, "date", run_date=run_at,
-                    id=f"health_calibration_{today.isoformat()}", replace_existing=True,
-                )
-                logger.info("Scheduled calibration follow-up at %s", run_at.isoformat())
-        except Exception:
-            logger.exception("Failed to schedule calibration follow-up")
+        set_system_value(checkin_key(_local_today()), "open")
 
     def job_wake(self):
         """04:30 local — wake. Health only; business waits for 06:30."""
@@ -1532,49 +1530,30 @@ class ArtemisScheduler:
     # the 04:30 wake post, and its variant comes from plan.session_type
     # (wake.prompt_type_for) instead of a hardcoded day-of-week map.
 
-    def job_health_calibration_followup(self):
-        """Read morning state + today's plan, post the calibrated plan with
-        equipment + location (from the plan row's blocks). Fires once, ~15 min after the morning
-        survey prompt on workout days.
+    def job_checkin_nudge(self):
+        """WAKE + 45 min (05:15) — one nudge on a training day with no check-in.
 
-        Idempotent per day via system_state KV.
+        Never repeats (the registry's once-per-local-day guard) and says only
+        what the plan says; it does not adjust anything.
         """
-        if self._is_quiet():
-            return
         try:
-            from artemis.health import (
-                already_prompted_today, build_calibrated_plan_post,
-                get_today_plan, get_today_state, mark_prompted,
-                resolve_equipment_and_location,
-            )
-            from artemis.weather import get_current_conditions
+            from artemis.health_checkin import has_checkin, load_plan, logged_set_count, nudge_text
+            from knowledge.db import get_connection
 
             today = _local_today()
-            slot = "morning_calibration"
-            if already_prompted_today(slot, today):
-                logger.debug("Calibration follow-up already fired today — skipping")
-                return
-
-            plan = get_today_plan()
-            if not plan:
-                return
-
-            session_type = plan.get("session_type", "")
-            # HEALTH-2: weather only matters for an outdoor walk; cardio is at the
-            # office gym and location comes from the plan row's blocks.
-            weather = get_current_conditions() if session_type == "walk" else None
-
-            resolved = resolve_equipment_and_location(
-                session_type, weather=weather, blocks=plan.get("blocks"),
-            )
-
-            state = get_today_state()
-            text = build_calibrated_plan_post(plan, resolved, state)
-            self._post(config.CHANNEL_OPS, text, tier="health")
-            mark_prompted(slot, today)
-            logger.info("Posted calibrated plan for %s", today)
+            with get_connection() as conn:
+                cur = conn.cursor()
+                plan = load_plan(cur, today)
+                if plan is None or has_checkin(cur, today):
+                    return
+                if logged_set_count(cur, plan["plan_id"]) > 0:
+                    return
+                text = nudge_text(plan)
+            if text:
+                self._post(config.CHANNEL_OPS, text, tier="health")
+                logger.info("Posted check-in nudge for %s", today)
         except Exception:
-            logger.exception("Health calibration follow-up failed")
+            logger.exception("Check-in nudge failed")
 
     def job_health_evening_prompt(self):
         """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.
