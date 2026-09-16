@@ -3680,28 +3680,12 @@ def _strip_wake_word(message: str) -> str:
     return stripped.replace("@artemis", "").strip()
 
 
-_CHECKIN_WINDOW_END = "12:00"
-
-
-def _checkin_window_open() -> bool:
-    """True while this morning's check-in is open (set by the wake post) and
-    it's before noon local — or at any time outside the OPEN phase."""
-    from artemis.health_checkin import checkin_key
-    from artemis.quiet_hours import get_system_value, local_now, local_today, _parse_time
-    if get_phase() != PHASE_OPEN:
-        return True
-    if get_system_value(checkin_key(local_today())) != "open":
-        return False
-    return local_now().time() < _parse_time(_CHECKIN_WINDOW_END)
-
-
 def _handle_morning_flow(post: dict, question: str) -> bool:
-    """FRIDAY-1 — check-ins, `original`, and short morning replies.
+    """FRIDAY-1 — check-ins, `original`, and the short check-in replies.
 
-    Deterministic end to end; no LLM, no Gmail. A check-in or `original` is
-    always claimed. Short acks ("nope") and "done"-style replies are claimed
-    only while the morning check-in window is open (or outside business hours),
-    so they never reach the general LLM fallback in the morning.
+    Claims check-in-shaped text, ack words ("nope", "all good"), done words
+    ("workout completed", "logged in app") and `original` — and nothing else.
+    Deterministic end to end: a claimed message never reaches an LLM or Gmail.
     """
     from artemis.health_checkin import (
         classify, process_ack, process_checkin, process_done, process_original,
@@ -3711,8 +3695,6 @@ def _handle_morning_flow(post: dict, question: str) -> bool:
 
     kind = classify(question)
     if kind is None:
-        return False
-    if kind in ("ack", "done") and not _checkin_window_open():
         return False
 
     channel_id = post.get("channel_id", "")

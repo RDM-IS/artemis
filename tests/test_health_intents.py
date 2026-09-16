@@ -456,13 +456,12 @@ class TestPromptBuilders(unittest.TestCase):
         "blocks": {"type": "intervals", "rounds": 8},
     }
 
-    def test_morning_survey_workout_says_reply_adjusts(self):
-        # FRIDAY-1: no timed "calibrated plan in 15 min" — the reply adjusts.
+    def test_morning_survey_uses_the_0_to_5_prompt(self):
+        # FRIDAY-1: one prompt, 0–5 ratings; no timed "calibrated plan in 15 min".
         from artemis.health import build_morning_survey_prompt
         out = build_morning_survey_prompt(self._PLAN_STRENGTH, "workout_am")
-        self.assertIn("Strength A", out)
-        self.assertIn("when you reply", out)
-        self.assertIn("`original`", out)
+        self.assertEqual(out, "Morning check-in.\n\nReply with: sleep hrs, energy 0–5, soreness by "
+                              "area 0–5 (0 = none), weight, RHR.\nExample: `slept 7 energy 4 sore 0 weight 283`")
         self.assertNotIn("15 min", out)
 
     def test_morning_survey_logging_only_no_calibration_note(self):

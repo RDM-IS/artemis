@@ -6,36 +6,36 @@ The morning is event-driven:
   reply  check-in parsed HERE, deterministically. If no sets are logged yet,
          the adjustment rules run and today's health.plan row is rewritten;
          otherwise the check-in is stored and the reply is just "Logged."
-  05:15  one nudge if no check-in arrived: "No check-in yet — run Session X as
-         written."
+  05:15  training days only: one nudge if no check-in arrived.
 
-No LLM parses the check-in or decides the plan. The rules below are the whole
-policy; they never add volume, load or RPE.
+No LLM parses the check-in or decides the plan.
 
-  1. Day swap        2+ regions >= 7  -> Recovery Z2 (20-30 min, recumbent) +
-                     mobility.
-  2. Replace         a region >= 7 (sore or pain) -> remove every exercise that
-                     uses it (primary or secondary) and fill each slot from the
-                     substitution pool, avoiding every flagged region and never
-                     duplicating.
-  3. Ease            a region 4-6 (not pain) -> exercises with it as PRIMARY get
-                     -1 set (min 1) and RPE cap -1.
-     Pain < 7        exercises that use the region (primary or secondary) get
-                     load -20% and RPE cap -1; a mobility item for the region is
-                     added.
-  4. Global recovery sleep < 6 or energy <= 2 -> RPE cap -1 everywhere, sets
-                     capped at 2, Z2 duration -25%.
-  5. Otherwise       no change. Great sleep and energy never add work.
+Every rating is 0-5 (0 = none, 5 = can't use it): energy, soreness, pain.
+Sleep stays in hours. "x/10" is halved and rounded up (8/10 -> 4); "x/5" is
+taken as is; a bare number above 5 is refused ("Ratings are 0–5.") and
+nothing is stored. "sore 0" is stored as {"overall": 0}. A region named
+without a number is stored unscored (null) and changes nothing.
 
-Soreness is stored on a 0-10 scale: "x/10" as written; a 1-5 value (the survey
-scale) doubled; a bare 6-10 read as out of 10. "sore 0" is stored as
-{"overall": 0}, never NULL.
+Rules, in order — they never add volume, load or RPE:
+
+  1. Day swap   2+ SORENESS regions at 4-5 -> Recovery Z2 (20-30 min,
+                recumbent) + mobility. Pain never swaps the day.
+  2. Replace    soreness 4-5 or pain 4-5 in a region -> remove every exercise
+                with it as primary or secondary; refill to the same count from
+                the pool, avoiding every affected region, no duplicates.
+  3. Lighten    soreness 2-3 -> exercises with it as PRIMARY: -1 set (min 1),
+                RPE cap -1.
+  4. Lighten    pain 1-3 -> exercises with it as PRIMARY: load -20%, plus a
+                mobility block for the region.
+  5. Recovery   sleep < 6 or energy <= 2 -> RPE cap -1 everywhere (stacks with
+                rule 3, floor 1), sets capped at 2, Z2 duration -25%.
+  6. Otherwise  no change. High energy or long sleep never adds work.
 
 The adjusted blocks are written to TODAY'S health.plan row with
 blocks.original (the untouched blocks + row fields) and blocks.adjustment
 ({reason, rules_fired, checkin_id, at, ...}). `original` restores them.
-The feature flag config.CHECKIN_ADJUST=0 keeps parsing/storing but never
-rewrites the plan.
+config.CHECKIN_ADJUST=0 keeps parsing/storing but never rewrites the plan.
+Replies state the plan change only — never advice.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -60,6 +61,8 @@ PAIN_WORDS = ("pain", "painful", "sharp", "injury", "injured", "tweaked", "tweak
               "strain", "strained", "pulled")
 SORE_WORDS = ("sore", "soreness", "tight", "ache", "aching", "achy", "stiff") + PAIN_WORDS
 
+RATINGS_ERROR = "Ratings are 0–5."
+
 _NUM = r"(\d{1,2}(?:\.\d)?)"
 _SCALE = r"(\s*(?:/|out\s+of)\s*(?:10|5))?"
 
@@ -67,7 +70,7 @@ _SLEEP_RE = re.compile(
     rf"\b(?:slept|sleep)\s*(?:for|of|was|:)?\s*(?:about|around|~)?\s*{_NUM}\s*(?:h\b|hrs?\b|hours?\b)?"
     rf"|\b{_NUM}\s*(?:h|hrs?|hours?)\s*(?:of\s+)?sleep\b",
     re.I)
-_ENERGY_RE = re.compile(rf"\benergy\s*(?:is|was|of|at|:)?\s*(\d)(\s*/\s*5)?\b", re.I)
+_ENERGY_RE = re.compile(rf"\benergy\s*(?:is|was|of|at|:)?\s*{_NUM}{_SCALE}", re.I)
 _WEIGHT_RE = re.compile(
     r"\b(?:weight|weighed|wt|scale)\s*(?:is|was|in\s+at|at|of|:)?\s*(\d{2,3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)?\b"
     r"|\b(\d{3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)\b",
@@ -93,12 +96,12 @@ _NOT_REGIONS = {
     "after", "from", "since", "yesterday", "workout", "session", "lifting", "training",
     "again", "today's", "this", "morning", "last", "night", "day", "days", "with", "for",
     "getting", "got", "feels", "be", "been", "am", "are", "so", "too", "just", "only",
-    "kinda", "somewhat", "quite", "less", "more", "than", "better", "worse", "same",
+    "kinda", "somewhat", "quite", "less", "more", "than", "better", "worse", "same", "plus",
 }
 
-# Unmarked soreness / pain without a number.
-DEFAULT_SORE_SCORE = 6
-DEFAULT_PAIN_SCORE = 7
+
+class RatingError(ValueError):
+    """A rating outside 0-5."""
 
 
 @dataclass
@@ -107,47 +110,42 @@ class CheckIn:
     energy: int | None = None
     weight_lbs: float | None = None
     resting_hr: int | None = None
-    soreness: dict = field(default_factory=dict)      # region -> 0..10
-    pain: set = field(default_factory=set)            # regions with a pain word
+    soreness: dict = field(default_factory=dict)      # region -> 0..5 (None = unscored)
+    pain: dict = field(default_factory=dict)          # region -> 0..5 (None = unscored)
     unknown_regions: dict = field(default_factory=dict)
     free_text: str | None = None
+    rating_error: bool = False
 
     @property
     def has_data(self) -> bool:
         return any(v is not None for v in (self.sleep_hrs, self.energy, self.weight_lbs,
-                                           self.resting_hr)) or bool(self.soreness) \
-            or bool(self.unknown_regions)
+                                           self.resting_hr)) \
+            or bool(self.soreness) or bool(self.pain) or bool(self.unknown_regions)
 
     def soreness_json(self) -> dict | None:
-        """What lands in health.daily_state.soreness (0-10; pain flagged)."""
-        if not self.soreness and not self.unknown_regions:
+        """health.daily_state.soreness — every value 0-5 (or null = unscored).
+        Pain is kept apart: {"pain": {"shoulder": 2}}."""
+        if not (self.soreness or self.pain or self.unknown_regions):
             return None
         out = dict(self.soreness)
-        for r, s in self.unknown_regions.items():
-            out[r] = s
+        for r, sc in self.unknown_regions.items():
+            out[r] = sc
         if self.pain:
-            out["pain"] = sorted(self.pain)
+            out["pain"] = dict(self.pain)
         return out
 
 
-def normalize_score(value: float, scale: str | None, *, pain: bool = False) -> int | None:
-    """Return 0-10, or None when the number can't be a soreness score.
-
-    A bare number is the 1-5 survey scale when <= 5 (doubled) — except next to
-    a pain word, where it is read as the usual 0-10 pain scale.
-    """
+def normalize_score(value: float, scale: str | None) -> int:
+    """A rating on 0-5. x/10 -> halved, rounded up; x/5 as is. Raises
+    RatingError for anything outside 0-5."""
     scale = (scale or "").replace(" ", "").lower()
     if scale.endswith("10"):
-        v = value
-    elif scale.endswith("5"):
-        v = value * 2
-    elif value <= 5 and not pain:
-        v = value * 2
-    else:
-        v = value
-    if v < 0 or v > 10:
-        return None
-    return int(round(v))
+        if value < 0 or value > 10:
+            raise RatingError(value)
+        return int(math.ceil(value / 2))
+    if value < 0 or value > 5:
+        raise RatingError(value)
+    return int(math.ceil(value)) if value != int(value) else int(value)
 
 
 def _blank(text: str, span: tuple[int, int]) -> str:
@@ -168,7 +166,7 @@ def _find_regions(clause: str) -> tuple[list[str], list[str]]:
             consumed = _blank(consumed, m.span())
     unknown: list[str] = []
     # Only a word right next to a soreness/pain word (fillers skipped) can be an
-    # unrecognized region: "sore elbow 6", "elbow sore 6".
+    # unrecognized region: "sore elbow 3", "elbow sore 3".
     words = _WORD_RE.findall(consumed)
     for i, w in enumerate(words):
         if w not in SORE_WORDS:
@@ -185,70 +183,66 @@ def _find_regions(clause: str) -> tuple[list[str], list[str]]:
 
 
 def parse_checkin(text: str) -> CheckIn:
-    """Deterministic check-in parser. Never raises; unparsed words are ignored."""
+    """Deterministic check-in parser. Never raises; an out-of-range rating sets
+    `rating_error` (the caller replies RATINGS_ERROR and stores nothing)."""
     ci = CheckIn()
     work = f" {text or ''} "
+    try:
+        m = _SLEEP_RE.search(work)
+        if m:
+            ci.sleep_hrs = float(m.group(1) or m.group(2))
+            work = _blank(work, m.span())
+        m = _ENERGY_RE.search(work)
+        if m:
+            ci.energy = normalize_score(float(m.group(1)), m.group(2))
+            work = _blank(work, m.span())
+        m = _RHR_RE.search(work)
+        if m:
+            ci.resting_hr = int(m.group(1))
+            work = _blank(work, m.span())
+        m = _WEIGHT_RE.search(work)
+        if m:
+            ci.weight_lbs = float(m.group(1) or m.group(2))
+            work = _blank(work, m.span())
 
-    m = _SLEEP_RE.search(work)
-    if m:
-        ci.sleep_hrs = float(m.group(1) or m.group(2))
-        work = _blank(work, m.span())
-    m = _ENERGY_RE.search(work)
-    if m:
-        e = int(m.group(1))
-        if 1 <= e <= 5:
-            ci.energy = e
-        work = _blank(work, m.span())
-    m = _RHR_RE.search(work)
-    if m:
-        ci.resting_hr = int(m.group(1))
-        work = _blank(work, m.span())
-    m = _WEIGHT_RE.search(work)
-    if m:
-        ci.weight_lbs = float(m.group(1) or m.group(2))
-        work = _blank(work, m.span())
+        zero = _ZERO_SORE_RE.search(work)
+        if zero:
+            work = _blank(work, zero.span())
 
-    zero = _ZERO_SORE_RE.search(work)
-    if zero:
-        work = _blank(work, zero.span())
-
-    mentions_soreness = any(re.search(rf"\b{w}\b", work, re.I) for w in SORE_WORDS)
-    if mentions_soreness:
-        # Sentences (comma/semicolon/newline/period) are independent; inside one,
-        # "and"-joined parts share the next score: "shoulder and neck sore 6".
-        for sentence in _SENTENCE_SPLIT.split(work):
-            pending: list[tuple[str, bool]] = []
-            pending_unknown: list[str] = []
-            for part in _AND_SPLIT.split(sentence):
-                if not part.strip():
-                    continue
-                regions, unknown = _find_regions(part)
-                is_pain = any(re.search(rf"\b{w}\b", part, re.I) for w in PAIN_WORDS)
-                sm = _SCORE_RE.search(part)
-                score = normalize_score(float(sm.group(1)), sm.group(2),
-                                        pain=is_pain or any(pn for _, pn in pending)) if sm else None
-                pending += [(r, is_pain) for r in regions]
-                pending_unknown += unknown
-                if score is None:
-                    continue
-                if pending or pending_unknown:
-                    for r, pain in pending:
-                        ci.soreness[r] = max(score, ci.soreness.get(r, 0))
-                        if pain:
-                            ci.pain.add(r)
-                    for u in pending_unknown:
-                        ci.unknown_regions[u] = score
-                    pending, pending_unknown = [], []
-                else:
-                    ci.soreness.setdefault("overall", score)
-            # Named with no number: moderate soreness, or 7 when it's pain.
-            for r, pain in pending:
-                ci.soreness[r] = max(DEFAULT_PAIN_SCORE if pain else DEFAULT_SORE_SCORE,
-                                     ci.soreness.get(r, 0))
-                if pain:
-                    ci.pain.add(r)
-            for u in pending_unknown:
-                ci.unknown_regions.setdefault(u, DEFAULT_SORE_SCORE)
+        if any(re.search(rf"\b{w}\b", work, re.I) for w in SORE_WORDS):
+            # Sentences (comma/semicolon/newline/period) are independent; inside
+            # one, "and"-joined parts share the next score: "shoulder and neck
+            # sore 3". A pain word marks only the regions in its own part.
+            for sentence in _SENTENCE_SPLIT.split(work):
+                pending: list[tuple[str, bool]] = []
+                pending_unknown: list[str] = []
+                for part in _AND_SPLIT.split(sentence):
+                    if not part.strip():
+                        continue
+                    regions, unknown = _find_regions(part)
+                    is_pain = any(re.search(rf"\b{w}\b", part, re.I) for w in PAIN_WORDS)
+                    sm = _SCORE_RE.search(part)
+                    score = normalize_score(float(sm.group(1)), sm.group(2)) if sm else None
+                    pending += [(r, is_pain) for r in regions]
+                    pending_unknown += unknown
+                    if score is None:
+                        continue
+                    if pending or pending_unknown:
+                        for r, pain in pending:
+                            target = ci.pain if pain else ci.soreness
+                            target[r] = max(score, target.get(r) or 0)
+                        for u in pending_unknown:
+                            ci.unknown_regions[u] = score
+                        pending, pending_unknown = [], []
+                    else:
+                        ci.soreness.setdefault("overall", score)
+                # Named with no number: stored unscored, changes nothing.
+                for r, pain in pending:
+                    (ci.pain if pain else ci.soreness).setdefault(r, None)
+                for u in pending_unknown:
+                    ci.unknown_regions.setdefault(u, None)
+    except RatingError:
+        return CheckIn(rating_error=True)
 
     if zero and not ci.soreness:
         ci.soreness = {"overall": 0}
@@ -338,14 +332,19 @@ class Adjustment:
     reason: str = ""
 
 
-def _fmt_regions(scores: dict, regions) -> str:
-    return " + ".join(f"{r.title()} {scores[r]}/10" for r in regions)
+def _fmt(scores: dict, regions, word: str = "") -> str:
+    w = f" {word}" if word else ""
+    return " + ".join(f"{r.title()}{w} {scores[r]}/5" for r in regions)
 
 
 def _cap(value, base):
     if value is None:
         return base
     return min(value, base)
+
+
+def _scored(d: dict) -> dict:
+    return {r: v for r, v in d.items() if r in hr.REGIONS and isinstance(v, int)}
 
 
 def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
@@ -370,16 +369,22 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
     if session_type in LIGHT_TYPES:
         return adj
 
-    scores = {r: s for r, s in ci.soreness.items() if r in hr.REGIONS}
-    heavy = [r for r, s in scores.items() if s >= 7]
-    pain_low = [r for r in ci.pain if r in scores and scores[r] < 7]
-    moderate = [r for r, s in scores.items() if 4 <= s <= 6 and r not in ci.pain]
+    sore = _scored(ci.soreness)
+    pain = _scored(ci.pain)
+    # Regions keep the order Ryan wrote them in.
+    sore_heavy = [r for r, v in sore.items() if v >= 4]
+    pain_heavy = [r for r, v in pain.items() if v >= 4]
+    sore_mid = [r for r, v in sore.items() if 2 <= v <= 3]
+    pain_mid = [r for r, v in pain.items() if 1 <= v <= 3]
+    replace_regions = sore_heavy + [r for r in pain_heavy if r not in sore_heavy]
+    # Every region with something going on — substitutes must avoid them all.
+    affected = set(replace_regions) | set(sore_mid) | set(pain_mid)
     recovery = (ci.sleep_hrs is not None and ci.sleep_hrs < 6) or \
                (ci.energy is not None and ci.energy <= 2)
     blocks = adj.blocks
 
-    # ── Rule 1: day swap ────────────────────────────────────────────────────
-    if len(heavy) >= 2:
+    # ── Rule 1: day swap — soreness only ────────────────────────────────────
+    if len(sore_heavy) >= 2:
         from artemis import health_office as office
         z2_hi = office.RAMP.get(week_num, office.RAMP[1])[2][1]
         minutes = max(20, min(30, z2_hi))
@@ -393,32 +398,28 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
             "duration_min": minutes,
             "intensity": "Zone 2",
             "equipment": ["recumbent bike"],
-            "setup_notes": [
-                "recumbent bike (lowest impact) — conversational pace",
-                "then 10 min mobility (mat or Stretch Trainer)",
-            ],
-            "mobility_focus": sorted(heavy),
+            "setup_notes": ["recumbent bike (lowest impact) — conversational pace",
+                            "then 10 min mobility (mat or Stretch Trainer)"],
+            "mobility_focus": list(sore_heavy),
             "mobility_min": 10,
         }
         adj.est_duration_min = minutes + 10
         adj.lines.append(
-            f"{_fmt_regions(scores, sorted(heavy))} → today is **Recovery Z2 + Mobility**: "
-            f"{minutes} min recumbent bike, then 10 min mobility "
-            f"({', '.join(sorted(heavy))}).")
+            f"{_fmt(sore, sore_heavy)} → today is Recovery Z2 + Mobility: "
+            f"{minutes} min recumbent bike, then 10 min mobility.")
 
     exercises = blocks.get("exercises") or []
-    sets_base = int(blocks.get("rounds") or 1)
+    swapped = "day_swap" in adj.rules_fired
 
-    # ── Rule 2: replace (>= 7) ──────────────────────────────────────────────
-    if heavy and "day_swap" not in adj.rules_fired and exercises:
-        flagged = set(scores_r for scores_r, s in scores.items() if s >= 4) | set(ci.pain)
+    # ── Rule 2: replace (soreness 4-5 or pain 4-5) ──────────────────────────
+    if replace_regions and not swapped and exercises:
         present = {e["name"] for e in exercises}
+        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected)]
         out_list, removed, added = [], [], []
-        pool = [p for p in hr.SUBSTITUTION_POOL if not hr.uses_any(p, flagged)]
         for ex in exercises:
-            if hr.uses_any(ex["name"], heavy):
+            if hr.uses_any(ex["name"], replace_regions):
                 removed.append(ex["name"])
-                sub = next((p for p in pool if p not in present), None)
+                sub = next((x for x in pool if x not in present), None)
                 if sub is not None:
                     present.add(sub)
                     new = _office_exercise(sub, exercise_sets(ex, blocks), week_num)
@@ -433,65 +434,58 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
             blocks["equipment"] = _equipment_for(exercises, blocks.get("equipment") or [])
             adj.rules_fired.append("replace")
             adj.removed, adj.added = removed, added
-            line = (f"{_fmt_regions(scores, sorted(heavy))} → removed {_join(removed)}.")
+            who = " + ".join(filter(None, [_fmt(sore, sore_heavy), _fmt(pain, pain_heavy, "pain")]))
+            line = f"{who} → removed {_join(removed)}."
             if added:
                 line += f" Added {_join(added)}."
             if len(added) < len(removed):
-                line += f" No safe substitute for {len(removed) - len(added)} slot(s)."
+                n = len(removed) - len(added)
+                line += f" No substitute left for {n} slot{'s' if n != 1 else ''}."
             adj.lines.append(line)
         fin = blocks.get("finisher")
-        if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), heavy)
+        if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), replace_regions)
                                          for e in fin.get("exercises") or []):
             blocks.pop("finisher")
             adj.rules_fired.append("drop_finisher")
             adj.lines.append("Conditioning finisher removed.")
 
-    # ── Rule 3: ease (4-6) and pain below 7 ─────────────────────────────────
-    if exercises and "day_swap" not in adj.rules_fired:
-        eased = []
+    # ── Rule 3: lighten, soreness 2-3 (primary) ─────────────────────────────
+    if sore_mid and exercises and not swapped:
+        names = []
         for ex in exercises:
-            if ex.get("added_by") == "checkin":
-                continue
-            if moderate and hr.uses_any(ex["name"], moderate, primary_only=True):
-                s = max(1, exercise_sets(ex, blocks) - 1)
-                ex["sets"] = s
-                _set_note_sets(ex, s)
+            if ex.get("added_by") != "checkin" and hr.uses_any(ex["name"], sore_mid, primary_only=True):
+                s_ = max(1, exercise_sets(ex, blocks) - 1)
+                ex["sets"] = s_
+                _set_note_sets(ex, s_)
                 if base_rpe is not None:
                     ex["rpe_cap"] = _cap(ex.get("rpe_cap"), base_rpe) - 1
-                eased.append(ex["name"])
-            if pain_low and hr.uses_any(ex["name"], pain_low):
-                ex["load_pct"] = 80
-                if base_rpe is not None and ex["name"] not in eased:
-                    ex["rpe_cap"] = _cap(ex.get("rpe_cap"), base_rpe) - 1
-                if ex["name"] not in eased:
-                    eased.append(ex["name"])
-        if moderate:
-            names = [e["name"] for e in exercises
-                     if e.get("added_by") != "checkin"
-                     and hr.uses_any(e["name"], moderate, primary_only=True)]
-            if names:
-                adj.rules_fired.append("ease")
-                first = _by_name(exercises, names[0])
-                n_sets = exercise_sets(first, blocks)
-                cap = f", RPE ≤{_n(first['rpe_cap'])}" if first.get("rpe_cap") is not None else ""
-                adj.lines.append(
-                    f"{_fmt_regions(scores, sorted(moderate))} → {_join(names)}: "
-                    f"{n_sets} set{'s' if n_sets != 1 else ''}{cap}.")
-        if pain_low:
-            names = [e["name"] for e in exercises
-                     if e.get("added_by") != "checkin" and hr.uses_any(e["name"], pain_low)]
-            blocks["mobility_focus"] = sorted(set(blocks.get("mobility_focus") or []) | set(pain_low))
-            blocks["mobility_min"] = 5 * len(blocks["mobility_focus"])
-            adj.rules_fired.append("pain_reduce")
-            what = f"{_join(names)}: load −20%" if names else "no exercises use it"
-            adj.lines.append(
-                f"{' + '.join(f'{r.title()} pain {scores[r]}/10' for r in sorted(pain_low))} → "
-                f"{what}. Added {blocks['mobility_min']} min "
-                f"{', '.join(blocks['mobility_focus'])} mobility.")
-        if eased:
-            adj.eased = eased
+                names.append(ex["name"])
+        if names:
+            adj.rules_fired.append("lighten_sore")
+            adj.eased += names
+            first = _by_name(exercises, names[0])
+            n_sets = exercise_sets(first, blocks)
+            cap = f", RPE ≤{_n(first['rpe_cap'])}" if first.get("rpe_cap") is not None else ""
+            adj.lines.append(f"{_fmt(sore, sore_mid)} → {_join(names)}: "
+                             f"{n_sets} set{'s' if n_sets != 1 else ''}{cap}.")
 
-    # ── Rule 4: global recovery ─────────────────────────────────────────────
+    # ── Rule 4: lighten, pain 1-3 (primary): load −20% + mobility ───────────
+    if pain_mid and not swapped:
+        names = []
+        for ex in exercises:
+            if ex.get("added_by") != "checkin" and hr.uses_any(ex["name"], pain_mid, primary_only=True):
+                ex["load_pct"] = 80
+                names.append(ex["name"])
+                if ex["name"] not in adj.eased:
+                    adj.eased.append(ex["name"])
+        blocks["mobility_focus"] = sorted(set(blocks.get("mobility_focus") or []) | set(pain_mid))
+        blocks["mobility_min"] = 5 * len(blocks["mobility_focus"])
+        adj.rules_fired.append("lighten_pain")
+        what = f"{_join(names)}: load −20%. " if names else ""
+        adj.lines.append(f"{_fmt(pain, pain_mid, 'pain')} → {what}"
+                         f"Added {blocks['mobility_min']} min {', '.join(blocks['mobility_focus'])} mobility.")
+
+    # ── Rule 5: global recovery ─────────────────────────────────────────────
     if recovery:
         adj.rules_fired.append("recovery")
         why = []
@@ -504,13 +498,12 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
             for ex in blocks["exercises"]:
                 if base_rpe is not None:
                     ex["rpe_cap"] = _cap(ex.get("rpe_cap"), base_rpe) - 1
-                s = exercise_sets(ex, blocks)
-                if s > 2:
+                if exercise_sets(ex, blocks) > 2:
                     ex["sets"] = 2
                     _set_note_sets(ex, 2)
             if base_rpe is not None:
                 what.append(f"RPE ≤{_n(base_rpe - 1)} on every exercise")
-            if sets_base > 2:
+            if int(blocks.get("rounds") or 1) > 2:
                 what.append("sets capped at 2")
         if blocks.get("type") == "steady" and blocks.get("duration_min"):
             before = int(blocks["duration_min"])
@@ -523,7 +516,7 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
                 adj.est_duration_min = int(adj.est_duration_min) - (before - after)
             what.append(f"Z2 {before} → {after} min")
         if adj.target_rpe is not None:
-            adj.target_rpe = float(adj.target_rpe) - 1
+            adj.target_rpe = max(1.0, float(adj.target_rpe) - 1)
             blocks["rpe_cap"] = adj.target_rpe
         adj.lines.append(f"{' / '.join(why).capitalize()} → {'; '.join(what) or 'easier day'}.")
 
@@ -532,7 +525,7 @@ def compute_adjustment(plan: dict, ci: CheckIn) -> Adjustment:
             ex["rpe_cap"] = max(1.0, float(ex["rpe_cap"]))
 
     adj.changed = bool(adj.rules_fired)
-    adj.reason = "; ".join(adj.lines)
+    adj.reason = " ".join(adj.lines)
     return adj
 
 
@@ -720,9 +713,11 @@ def process_checkin(cur, text: str, day: date, *, checkin_id: str,
     now = now or datetime.now(timezone.utc)
     adjust = config.CHECKIN_ADJUST if adjust is None else adjust
     ci = parse_checkin(text)
+    if ci.rating_error:
+        return RATINGS_ERROR
     if not ci.has_data:
         return ("I couldn't read a check-in there. Try: "
-                "`slept 7 energy 4 sore shoulder 6/10 weight 283`.")
+                "`slept 7 energy 4 sore 0 weight 283`.")
     store_checkin(cur, day, ci)
 
     plan = load_plan(cur, day)
@@ -748,8 +743,7 @@ def process_checkin(cur, text: str, day: date, *, checkin_id: str,
             logger.info("CHECKIN_ADJUST=0 — would have applied: %s", adj.reason)
             audit(cur, "checkin_adjust_suppressed", "flag_off",
                   {"plan_id": plan["plan_id"], "rules": adj.rules_fired})
-        was_adjusted = "adjustment" in plan["blocks"]
-        if was_adjusted and adjust:
+        if "adjustment" in plan["blocks"] and adjust:
             # A newer check-in that no longer warrants changes: back to as-written.
             restore_original(cur, plan)
             return "\n".join([f"Check-in logged — back to {label} as written."] + notes)
@@ -761,11 +755,8 @@ def process_checkin(cur, text: str, day: date, *, checkin_id: str,
     audit(cur, "checkin_adjust", ",".join(adj.rules_fired),
           {"plan_id": plan["plan_id"], "checkin_id": checkin_id, "removed": adj.removed,
            "added": adj.added, "eased": adj.eased})
-    written = load_plan(cur, day)            # render only from what was written
-    new_label = session_label(written["session_type"], written["blocks"])
-    out = adj.lines + notes + ["", f"**{new_label} (adjusted):**"] + \
-        render_plan_lines(written) + ["", "Reply `original` to undo."]
-    return "\n".join(out)
+    # Plan-exact diff only — no advice, no health text.
+    return "\n".join(adj.lines + notes + ["Reply `original` to undo."])
 
 
 def restore_original(cur, plan: dict) -> bool:
@@ -785,7 +776,7 @@ def process_original(cur, day: date) -> str:
         return "No adjustment to undo — today's plan is as written."
     written = load_plan(cur, day)
     label = session_label(written["session_type"], written["blocks"])
-    return "\n".join([f"Restored — run {label} as written.", ""] + render_plan_lines(written))
+    return f"Restored — run {label} as written."
 
 
 def process_done(cur, day: date) -> str:
@@ -828,9 +819,9 @@ def nudge_text(plan: dict) -> str | None:
 # Routing — which short replies belong to the morning flow
 # ============================================================================
 
+# Replies to "anything to fix?" — deliberately narrow: "ok"/"thanks" are not claimed.
 _ACK_RE = re.compile(
-    r"^\s*(?:nope|no|nah|all\s+good|looks\s+good|good|fine|ok(?:ay)?|k|nothing|"
-    r"no\s+changes?|nothing\s+to\s+fix|we'?re\s+good|sounds\s+good|thanks?|thank\s+you|ty)"
+    r"^\s*(?:nope|no|nah|all\s+good|looks\s+good|nothing\s+to\s+fix|no\s+changes?|we'?re\s+good)"
     r"\s*[.!]*\s*$", re.I)
 # "done" alone (or "workout done", "done with the workout") — never
 # "done <thread-id>" / "done <commitment>", which belong to the inbox handlers.
@@ -852,8 +843,10 @@ def classify(text: str) -> str | None:
         return None
     if _ORIGINAL_RE.match(t):
         return "original"
-    if _CHECKIN_SHAPE_RE.search(t) and parse_checkin(t).has_data:
-        return "checkin"
+    if _CHECKIN_SHAPE_RE.search(t):
+        ci = parse_checkin(t)
+        if ci.has_data or ci.rating_error:
+            return "checkin"
     if _DONE_RE.search(t) and len(t.split()) <= 8:
         return "done"
     if _ACK_RE.match(t):

@@ -120,6 +120,8 @@ def names(db, d=FRI):
 # ----------------------------------------------------------------------------
 
 class TestSessionBScenarios(unittest.TestCase):
+    """The final FRIDAY-1 spec's numbered tests (Session B unless noted)."""
+
     def setUp(self):
         self.db = FakeDB(office_row(FRI))
         self.cur = self.db.cursor()
@@ -129,6 +131,9 @@ class TestSessionBScenarios(unittest.TestCase):
         return hc.process_checkin(self.cur, text, FRI, checkin_id="post-1", now=self.now,
                                   adjust=kw.get("adjust", True))
 
+    def by_name(self):
+        return {e["name"]: e for e in self.db.plan[FRI]["blocks"]["exercises"]}
+
     def test_friday_row_is_session_b(self):
         row = self.db.plan[FRI]
         self.assertEqual(row["session_type"], "strength_b")
@@ -136,17 +141,16 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(row["blocks"]["rounds"], 2)
         self.assertEqual(row["target_rpe"], 6.0)
 
-    def test_1_all_clear_no_change_and_zero_stored(self):
+    def test_01_all_clear_no_change_and_zero_stored(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("Slept 8 hours, energy 5, sore 0, weight 283")
+        reply = self.checkin("slept 8 hours, energy 5, sore 0, weight 283")
         self.assertEqual(reply, "Check-in logged — run Session B as written.")
         self.assertEqual(self.db.plan[FRI], before)
         st = self.db.daily[FRI]
         self.assertEqual(st["soreness"], {"overall": 0})
         self.assertEqual((st["sleep_hrs"], st["energy"], st["weight_lbs"]), (8.0, 5, 283.0))
 
-    def test_2_shoulder_8_replaces_four_keeps_three_adds_four(self):
-        reply = self.checkin("Slept 8, energy 5, sore shoulder 8/10, weight 283")
+    def _assert_shoulder_replace(self, reply):
         got = names(self.db)
         for gone in ("DB goblet squat", "Seated cable row", "Incline DB press", "Rear delt fly"):
             self.assertNotIn(gone, got)
@@ -161,21 +165,28 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual([e["name"] for e in b["original"]["blocks"]["exercises"]], B_NAMES)
         self.assertEqual(b["adjustment"]["checkin_id"], "post-1")
         self.assertEqual(b["adjustment"]["rules_fired"], ["replace"])
-        # substitutes carry the week's sets and no shoulder work
+        for key in ("reason", "rules_fired", "checkin_id", "at"):
+            self.assertIn(key, b["adjustment"])
         for ex in b["exercises"]:
             if ex.get("added_by") == "checkin":
                 self.assertTrue(ex["notes"].startswith("2×"))
                 self.assertFalse(regions.uses_any(ex["name"], ["shoulder"]))
-        self.assertIn("Shoulder 8/10 → removed DB goblet squat, seated cable row, "
-                      "incline DB press, rear delt fly. Added leg press, seated leg curl, "
-                      "calf press, captain's chair knee raise.", reply)
-        self.assertIn("Reply `original` to undo.", reply)
-        self.assertNotRegex(reply.lower(), r"\b(ice|rest it|see a|doctor|physio|advice)\b")
+        self.assertEqual(reply,
+            "Shoulder 4/5 → removed DB goblet squat, seated cable row, incline DB press, "
+            "rear delt fly. Added leg press, seated leg curl, calf press, captain's chair knee "
+            "raise.\nReply `original` to undo.")
 
-    def test_3_legs_6_eases_goblet_and_extension(self):
+    def test_02_shoulder_4_replaces(self):
+        self._assert_shoulder_replace(self.checkin("slept 8, energy 5, sore shoulder 4, weight 283"))
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+
+    def test_03_eight_of_ten_is_four(self):
+        self._assert_shoulder_replace(self.checkin("sore shoulder 8/10"))
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+
+    def test_04_legs_3_lightens_goblet_and_extension(self):
         reply = self.checkin("slept 8 energy 5 legs sore 3")
-        b = self.db.plan[FRI]["blocks"]
-        by = {e["name"]: e for e in b["exercises"]}
+        by = self.by_name()
         for n in ("DB goblet squat", "Leg extension"):
             self.assertEqual(by[n]["sets"], 1, n)
             self.assertEqual(by[n]["rpe_cap"], 5.0, n)
@@ -185,10 +196,11 @@ class TestSessionBScenarios(unittest.TestCase):
             self.assertNotIn("sets", by[n], n)
             self.assertNotIn("rpe_cap", by[n], n)
         self.assertEqual(names(self.db), B_NAMES)
-        self.assertIn("Legs 6/10 → DB goblet squat and leg extension: 1 set, RPE ≤5.", reply)
+        self.assertEqual(reply, "Legs 3/5 → DB goblet squat and leg extension: 1 set, RPE ≤5."
+                                "\nReply `original` to undo.")
 
-    def test_4_two_heavy_regions_swap_to_z2(self):
-        reply = self.checkin("slept 8 energy 4 sore shoulder 8 and legs 7")
+    def test_05_two_sore_regions_at_4_swap_to_z2(self):
+        reply = self.checkin("sore shoulder 4 and legs 4")
         row = self.db.plan[FRI]
         self.assertEqual(row["session_type"], "cardio_z2")
         b = row["blocks"]
@@ -198,45 +210,118 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(b["mobility_min"], 10)
         self.assertEqual(b["original"]["session_type"], "strength_b")
         self.assertIn("Recovery Z2 + Mobility", reply)
+        self.assertEqual(b["adjustment"]["rules_fired"], ["day_swap"])
 
-    def test_5_poor_sleep_lowers_rpe_only(self):
-        self.checkin("slept 5 energy 2 sore 0")
+    def test_06_pain_5_in_two_regions_replaces_never_swaps(self):
+        reply = self.checkin("shoulder pain 5 plus legs pain 5")
+        row = self.db.plan[FRI]
+        self.assertEqual(row["session_type"], "strength_b")
+        b = row["blocks"]
+        self.assertEqual(b["type"], "circuit")
+        self.assertNotIn("day_swap", b["adjustment"]["rules_fired"])
+        self.assertIn("replace", b["adjustment"]["rules_fired"])
+        got = names(self.db)
+        for gone in ("DB goblet squat", "Seated cable row", "Incline DB press",
+                     "Rear delt fly", "Leg extension"):
+            self.assertNotIn(gone, got)
+        for ex in b["exercises"]:
+            self.assertFalse(regions.uses_any(ex["name"], ["shoulder", "legs"]), ex["name"])
+        self.assertEqual(len(set(got)), len(got))
+        self.assertTrue(reply.startswith("Shoulder pain 5/5 + Legs pain 5/5 → removed"), reply)
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"pain": {"shoulder": 5, "legs": 5}})
+
+    def test_07_shoulder_pain_2_lighter_load_plus_mobility_no_advice(self):
+        reply = self.checkin("shoulder pain 2")
+        by = self.by_name()
+        self.assertEqual(names(self.db), B_NAMES)
+        for n in ("Incline DB press", "Rear delt fly"):          # shoulder-PRIMARY
+            self.assertEqual(by[n]["load_pct"], 80, n)
+        for n in ("DB goblet squat", "Seated cable row", "Leg extension"):
+            self.assertNotIn("load_pct", by[n], n)                # secondary / unrelated
+        for ex in by.values():
+            self.assertNotIn("rpe_cap", ex)
+            self.assertNotIn("sets", ex)
+        b = self.db.plan[FRI]["blocks"]
+        self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["shoulder"], 5))
+        self.assertEqual(reply, "Shoulder pain 2/5 → incline DB press and rear delt fly: load −20%. "
+                                "Added 5 min shoulder mobility.\nReply `original` to undo.")
+        self.assertNotRegex(reply.lower(),
+            r"\b(ice|rest it|see a|doctor|physio|advice|careful|stop if|listen to|consult)\b")
+
+    def test_08_rating_above_5_refused_nothing_stored(self):
+        before = copy.deepcopy(self.db.plan[FRI])
+        for text in ("sore shoulder 6", "energy 7", "sore shoulder 7/5", "legs sore 12/10"):
+            with self.subTest(text=text):
+                self.assertEqual(self.checkin(text), "Ratings are 0–5.")
+        self.assertEqual(self.db.plan[FRI], before)
+        self.assertEqual(self.db.daily, {})
+        self.assertEqual(self.db.audit, [])
+
+    def test_09_poor_sleep_global_recovery_only(self):
+        reply = self.checkin("slept 5 energy 2 sore 0")
         b = self.db.plan[FRI]["blocks"]
         self.assertEqual(names(self.db), B_NAMES)
         for ex in b["exercises"]:
             self.assertEqual(ex["rpe_cap"], 5.0, ex["name"])
             self.assertLessEqual(hc.exercise_sets(ex, b), 2)
+            self.assertNotIn("load_pct", ex)
         self.assertEqual(self.db.plan[FRI]["target_rpe"], 5.0)
         self.assertEqual(b["adjustment"]["rules_fired"], ["recovery"])
+        self.assertTrue(reply.startswith("Sleep 5h / energy 2/5 → RPE ≤5 on every exercise."), reply)
 
-    def test_6_after_a_logged_set_store_only(self):
+    def test_09b_recovery_stacks_with_lighten_floor_1(self):
+        self.checkin("slept 5 energy 2 legs sore 3")
+        by = self.by_name()
+        self.assertEqual(by["DB goblet squat"]["rpe_cap"], 4.0)     # 6 −1 −1
+        self.assertEqual(by["Seated cable row"]["rpe_cap"], 5.0)
+        row = office_row(FRI)
+        row["target_rpe"] = 1.5
+        adj = hc.compute_adjustment(row, hc.parse_checkin("slept 4 energy 1 legs sore 3"))
+        for ex in adj.blocks["exercises"]:
+            self.assertGreaterEqual(ex["rpe_cap"], 1.0)
+
+    def test_10_after_a_logged_set_store_only(self):
         self.db.logs.append({"plan_id": 105, "logged_via": "manual",
                              "log_type": "strength_set", "exercise": "DB goblet squat"})
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("Slept 8, energy 5, sore shoulder 8/10, weight 283")
+        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 283")
         self.assertEqual(reply, "Logged.")
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 8})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
 
-    def test_7_original_restores(self):
+    def test_11_original_restores(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        self.checkin("Slept 8, energy 5, sore shoulder 8/10, weight 283")
+        self.checkin("sore shoulder 4")
         self.assertNotEqual(self.db.plan[FRI], before)
         reply = hc.process_original(self.cur, FRI)
-        self.assertEqual(self.db.plan[FRI]["blocks"], before["blocks"])
-        self.assertEqual(self.db.plan[FRI]["session_type"], "strength_b")
-        self.assertEqual(self.db.plan[FRI]["target_rpe"], 6.0)
-        self.assertTrue(reply.startswith("Restored — run Session B as written."))
+        self.assertEqual(self.db.plan[FRI], before)
+        self.assertEqual(reply, "Restored — run Session B as written.")
         self.assertEqual(hc.process_original(self.cur, FRI),
                          "No adjustment to undo — today's plan is as written.")
 
-    def test_7b_swap_then_original_restores_row_fields(self):
+    def test_11b_swap_then_original_restores_row_fields(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        self.checkin("sore shoulder 8 and legs 7")
+        self.checkin("sore shoulder 4 and legs 5")
         hc.process_original(self.cur, FRI)
         self.assertEqual(self.db.plan[FRI], before)
 
-    def test_8_nudge_at_0515_then_checkin_at_0520_still_adjusts(self):
+    def test_12_second_checkin_recomputes_from_original(self):
+        self.checkin("sore shoulder 4")
+        self.checkin("legs sore 3")
+        b = self.db.plan[FRI]["blocks"]
+        self.assertEqual(names(self.db), B_NAMES)           # shoulder change not stacked
+        self.assertEqual({e["name"] for e in b["exercises"] if e.get("sets") == 1},
+                         {"DB goblet squat", "Leg extension"})
+        self.assertEqual([e["name"] for e in b["original"]["blocks"]["exercises"]], B_NAMES)
+        self.assertEqual(b["adjustment"]["rules_fired"], ["lighten_sore"])
+
+    def test_12b_all_clear_second_checkin_returns_to_as_written(self):
+        before = copy.deepcopy(self.db.plan[FRI])
+        self.checkin("sore shoulder 4")
+        self.assertEqual(self.checkin("sore 0"), "Check-in logged — back to Session B as written.")
+        self.assertEqual(self.db.plan[FRI], before)
+
+    def test_13_nudge_at_0515_then_checkin_at_0520_still_adjusts(self):
         from artemis.scheduler import ArtemisScheduler
 
         @contextmanager
@@ -252,66 +337,68 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(posted, [("No check-in yet — run Session B as written.", "health")])
 
         self.now = datetime(2026, 9, 18, 10, 20, tzinfo=timezone.utc)   # 05:20 CDT
-        reply = self.checkin("Slept 8, energy 5, sore shoulder 8/10, weight 283")
+        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 283")
         self.assertIn("removed", reply)
         self.assertIn("adjustment", self.db.plan[FRI]["blocks"])
 
+    def test_nudge_skips_rest_and_walk_days(self):
+        from artemis.scheduler import ArtemisScheduler
+        for d, pid in ((date(2026, 9, 17), 104), (date(2026, 9, 20), 107)):
+            db = FakeDB(office_row(d, plan_id=pid))
+
+            @contextmanager
+            def conn(db=db):
+                yield db
+
+            sched = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
+            with patch("knowledge.db.get_connection", conn), \
+                 patch("artemis.scheduler._local_today", return_value=d), \
+                 patch.object(sched, "_post") as post:
+                sched.job_checkin_nudge()
+            post.assert_not_called()
+
     # ── extra coverage ──
-    def test_recheckin_recomputes_from_original_not_stacked(self):
-        self.checkin("sore shoulder 8/10")
-        self.checkin("legs sore 3")
-        b = self.db.plan[FRI]["blocks"]
-        self.assertEqual(names(self.db), B_NAMES)       # shoulder change undone
-        self.assertEqual({e["name"] for e in b["exercises"] if e.get("sets") == 1},
-                         {"DB goblet squat", "Leg extension"})
-        self.assertEqual([e["name"] for e in b["original"]["blocks"]["exercises"]], B_NAMES)
-
-    def test_recheckin_all_clear_returns_to_as_written(self):
-        before = copy.deepcopy(self.db.plan[FRI])
-        self.checkin("sore shoulder 8/10")
-        reply = self.checkin("sore 0")
-        self.assertEqual(reply, "Check-in logged — back to Session B as written.")
-        self.assertEqual(self.db.plan[FRI], before)
-
     def test_flag_off_stores_but_never_adjusts(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("sore shoulder 8/10", adjust=False)
+        reply = self.checkin("sore shoulder 4", adjust=False)
         self.assertEqual(reply, "Check-in logged — run Session B as written.")
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 8})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
         self.assertEqual(self.db.audit[-1][2], "checkin_adjust_suppressed")
 
     def test_config_flag_default_on(self):
         from artemis import config
         self.assertTrue(config.CHECKIN_ADJUST)
 
-    def test_pain_below_7_reduces_load_and_adds_mobility(self):
-        reply = self.checkin("shoulder pain 5")
-        b = self.db.plan[FRI]["blocks"]
-        self.assertEqual(names(self.db), B_NAMES)
-        by = {e["name"]: e for e in b["exercises"]}
-        for n in ("DB goblet squat", "Seated cable row", "Incline DB press", "Rear delt fly"):
-            self.assertEqual(by[n]["load_pct"], 80, n)
-            self.assertEqual(by[n]["rpe_cap"], 5.0, n)
-        self.assertNotIn("load_pct", by["Leg extension"])
-        self.assertEqual(b["mobility_focus"], ["shoulder"])
-        self.assertIn("load −20%", reply)
-        self.assertIn("shoulder mobility", reply)
-
-    def test_pain_7_or_more_replaces(self):
-        self.checkin("tweaked my shoulder, pain 8")
-        self.assertNotIn("Incline DB press", names(self.db))
-
-    def test_unknown_region_is_flagged_and_ignored(self):
+    def test_soreness_0_and_1_change_nothing(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("slept 8 energy 5 sore elbow 8")
+        self.assertEqual(self.checkin("sore shoulder 1, legs sore 0"),
+                         "Check-in logged — run Session B as written.")
+        self.assertEqual(self.db.plan[FRI], before)
+
+    def test_unscored_region_is_stored_and_changes_nothing(self):
+        before = copy.deepcopy(self.db.plan[FRI])
+        reply = self.checkin("slept 8 energy 5 shoulder a bit sore")
+        self.assertEqual(reply, "Check-in logged — run Session B as written.")
+        self.assertEqual(self.db.plan[FRI], before)
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": None})
+
+    def test_unknown_region_is_named_and_ignored(self):
+        before = copy.deepcopy(self.db.plan[FRI])
+        reply = self.checkin("slept 8 energy 5 sore elbow 4")
         self.assertIn("Didn't recognize region elbow", reply)
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"elbow": 8})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"elbow": 4})
+
+    def test_high_energy_long_sleep_never_adds_work(self):
+        before = copy.deepcopy(self.db.plan[FRI])
+        self.checkin("slept 10 energy 5 sore 0")
+        self.assertEqual(self.db.plan[FRI], before)
 
     def test_rules_never_add_volume_load_or_rpe(self):
-        for text in ("sore shoulder 8/10", "legs sore 3", "slept 5 energy 2",
-                     "shoulder pain 5", "sore shoulder 8 and legs 7", "slept 9 energy 5 sore 0"):
+        for text in ("sore shoulder 4", "legs sore 3", "slept 5 energy 2", "shoulder pain 2",
+                     "sore shoulder 4 and legs 5", "shoulder pain 5 plus legs pain 5",
+                     "slept 9 energy 5 sore 0"):
             db = FakeDB(office_row(FRI))
             hc.process_checkin(db.cursor(), text, FRI, checkin_id="x", now=self.now, adjust=True)
             b = db.plan[FRI]["blocks"]
@@ -321,13 +408,14 @@ class TestSessionBScenarios(unittest.TestCase):
                 self.assertLessEqual(hc.exercise_sets(ex, b), 2, text)
                 self.assertLessEqual(ex.get("rpe_cap", 6.0), 6.0, text)
                 self.assertLessEqual(ex.get("load_pct", 100), 100, text)
+            self.assertLessEqual(len(b.get("exercises") or []), 7, text)
             self.assertLessEqual(db.plan[FRI]["est_duration_min"] or 0,
                                  base["est_duration_min"], text)
 
     def test_rest_day_no_adjustment(self):
         thu = date(2026, 9, 17)
         db = FakeDB(office_row(thu, plan_id=104))
-        reply = hc.process_checkin(db.cursor(), "sore shoulder 9/10", thu, checkin_id="x")
+        reply = hc.process_checkin(db.cursor(), "sore shoulder 5", thu, checkin_id="x")
         self.assertEqual(reply, "Check-in logged — rest day as planned.")
         self.assertNotIn("adjustment", db.plan[thu]["blocks"])
 
@@ -342,7 +430,7 @@ class TestSessionBScenarios(unittest.TestCase):
         row = office_row(mon, plan_id=140)
         self.assertIn("finisher", row["blocks"])
         db = FakeDB(row)
-        hc.process_checkin(db.cursor(), "legs sore 8/10", mon, checkin_id="x", adjust=True)
+        hc.process_checkin(db.cursor(), "legs sore 4", mon, checkin_id="x", adjust=True)
         self.assertNotIn("finisher", db.plan[mon]["blocks"])
 
 
@@ -364,7 +452,7 @@ class TestFlows(unittest.TestCase):
 
     def test_ack(self):
         self.assertEqual(hc.process_ack(self.cur, FRI), "Got it — run Session B as written.")
-        hc.process_checkin(self.cur, "sore shoulder 8/10", FRI, checkin_id="x", adjust=True)
+        hc.process_checkin(self.cur, "sore shoulder 4", FRI, checkin_id="x", adjust=True)
         self.assertEqual(hc.process_ack(self.cur, FRI),
                          "Got it — run the adjusted Session B. Reply `original` to go back.")
 
@@ -375,30 +463,51 @@ class TestFlows(unittest.TestCase):
 
 
 class TestParser(unittest.TestCase):
-    def test_forms(self):
+    def test_scale(self):
         cases = {
             "sore 0": {"overall": 0},
-            "sore shoulder 8/10": {"shoulder": 8},
-            "legs sore 3": {"legs": 6},
-            "sore shoulder 8 and legs 7": {"shoulder": 8, "legs": 7},
-            "shoulder and neck sore 6": {"shoulder": 6, "neck": 6},
-            "quads sore 2, lower back sore 4/10": {"quads": 4, "low back": 4},
-            "sore hip 3 out of 5": {"hip": 6},
+            "sore shoulder 4": {"shoulder": 4},
+            "sore shoulder 8/10": {"shoulder": 4},
+            "sore shoulder 5/10": {"shoulder": 3},
+            "sore shoulder 3/5": {"shoulder": 3},
+            "sore shoulder 3 out of 5": {"shoulder": 3},
+            "legs sore 3": {"legs": 3},
+            "sore shoulder 4 and legs 4": {"shoulder": 4, "legs": 4},
+            "shoulder and neck sore 3": {"shoulder": 3, "neck": 3},
+            "quads sore 2, lower back sore 4/10": {"quads": 2, "low back": 2},
             "no soreness": {"overall": 0},
         }
         for text, want in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(hc.parse_checkin(text).soreness, want)
 
-    def test_pain_flag(self):
-        ci = hc.parse_checkin("sharp pain in my lower back, knees a little sore 2")
-        self.assertEqual(ci.pain, {"low back"})
-        self.assertEqual(ci.soreness, {"low back": 7, "knee": 4})
+    def test_energy_is_0_to_5(self):
+        self.assertEqual(hc.parse_checkin("energy 0").energy, 0)
+        self.assertEqual(hc.parse_checkin("energy 8/10").energy, 4)
+        self.assertTrue(hc.parse_checkin("energy 6").rating_error)
+
+    def test_out_of_range_is_an_error(self):
+        for text in ("sore shoulder 6", "sore shoulder 7/5", "legs sore 11/10", "energy 9"):
+            with self.subTest(text=text):
+                ci = hc.parse_checkin(text)
+                self.assertTrue(ci.rating_error)
+                self.assertFalse(ci.has_data)
+
+    def test_score_carries_across_and_but_not_across_commas(self):
+        ci = hc.parse_checkin("sore shoulder, legs 2")
+        self.assertEqual(ci.soreness, {"shoulder": None, "legs": 2})
+
+    def test_pain_attaches_only_to_its_own_region(self):
+        ci = hc.parse_checkin("sharp pain in my lower back 3, knees a little sore 2")
+        self.assertEqual(ci.pain, {"low back": 3})
+        self.assertEqual(ci.soreness, {"knee": 2})
+        ci = hc.parse_checkin("shoulder pain 2 and legs sore 3")
+        self.assertEqual((ci.pain, ci.soreness), ({"shoulder": 2}, {"legs": 3}))
 
     def test_every_region_word_is_recognized(self):
         for r in regions.REGIONS:
             with self.subTest(region=r):
-                self.assertEqual(hc.parse_checkin(f"{r} sore 4/10").soreness, {r: 4})
+                self.assertEqual(hc.parse_checkin(f"{r} sore 2").soreness, {r: 2})
 
     def test_the_real_0916_checkin(self):
         ci = hc.parse_checkin("Slept 6.5\nEnergy 5\nSore 0\nWeight 284.5")
@@ -410,12 +519,15 @@ class TestParser(unittest.TestCase):
 
     def test_classify(self):
         cases = {
-            "Nope": "ack", "all good": "ack", "no": "ack",
-            "Workout completed.  Logged in App.": "done", "done": "done", "workout done": "done",
+            "nope": "ack", "Nope": "ack", "all good": "ack", "no": "ack",
+            "Workout completed.  Logged in App.": "done", "workout completed": "done",
+            "done": "done", "workout done": "done",
             "original": "original", "use original": "original",
-            "Slept 8, energy 5, sore 0": "checkin",
+            "slept 8, energy 5, sore 0": "checkin",
+            "sore shoulder 6": "checkin",          # claimed → answered "Ratings are 0–5."
             "done 1a2b3c": None, "done call Brad about the SOW": None,
             "good morning": None, "what's today's workout": None, "undo": None,
+            "ok": None, "thanks": None, "sounds good": None,   # other short text: not claimed
         }
         for text, want in cases.items():
             with self.subTest(text=text):
@@ -440,8 +552,20 @@ class TestRegionMap(unittest.TestCase):
         p, s = regions.regions_for("DB goblet squat")
         self.assertIn("legs", p)
         self.assertTrue({"shoulder", "low back"} <= s)
-        self.assertTrue({"chest", "shoulder"} <= regions.regions_for("Incline DB press")[0])
+        self.assertTrue({"chest", "shoulder", "triceps"} <= regions.regions_for("Incline DB press")[0])
+        self.assertEqual(regions.regions_for("Rear delt fly")[0], frozenset({"shoulder"}))
+        p, s = regions.regions_for("Seated cable row")
+        self.assertEqual(p, frozenset({"back"}))
+        self.assertTrue({"shoulder", "biceps"} <= s)
+        self.assertIn("legs", regions.regions_for("Leg press")[0])
         self.assertEqual(regions.regions_for("Cable Pallof press")[0], frozenset({"core"}))
+        self.assertEqual(regions.regions_for("45° back extension")[0], frozenset({"low back"}))
+
+    def test_cardio_and_mobility_are_mapped(self):
+        for name in ("Zone 2 Cardio", "Recovery Z2 + Mobility", "Walk", "Rest / Mobility",
+                     "Stepmill or upright bike", "Recumbent bike", "Elliptical"):
+            with self.subTest(name=name):
+                self.assertIn(name, regions.EXERCISE_REGIONS)
 
 
 class TestPlanExactRender(unittest.TestCase):
@@ -466,6 +590,8 @@ class TestPlanExactRender(unittest.TestCase):
             self.assertIn(f"{i}. {n} — 2×", text)
         self.assertNotIn("Calibrated plan", text)
         self.assertNotIn("workout is later", text)
+        self.assertIn("Reply with: sleep hrs, energy 0–5, soreness by area 0–5 (0 = none), "
+                      "weight, RHR.\nExample: `slept 7 energy 4 sore 0 weight 283`", text)
 
     def test_rest_day_prompt_has_no_workout_later(self):
         from artemis.health import build_morning_survey_prompt
@@ -569,12 +695,16 @@ class TestRouting(unittest.TestCase):
         self.gmail.get_recent_messages.assert_not_called()
         self.gmail.get_full_message.assert_not_called()
 
-    def test_ack_outside_the_window_is_not_claimed(self):
-        from artemis import main
-        with patch.object(main, "get_phase", return_value="open"), \
-             patch("artemis.quiet_hours.get_system_value", return_value=None):
-            self.assertFalse(main._handle_morning_flow(
-                {"id": "x", "channel_id": "c1", "root_id": None}, "Nope"))
+    def test_14_nope_and_workout_completed_route_to_health_in_any_phase(self):
+        for phase in ("wake", "open"):
+            with self.subTest(phase=phase), patch.object(self.main, "get_phase", return_value=phase):
+                self.assertEqual(self.send("nope"), "Got it — run Session A as written.")
+                self.assertIn("Session A logged", self.send("workout completed"))
+        self.gmail.get_recent_messages.assert_not_called()
+        self.gmail.get_full_message.assert_not_called()
+
+    def test_rating_error_is_answered_deterministically(self):
+        self.assertEqual(self.send("sore shoulder 6"), "Ratings are 0–5.")
 
 
 class TestMentionContextGate(unittest.TestCase):
@@ -600,14 +730,14 @@ class TestClaimGuard(unittest.TestCase):
         real_sessions=1,
     )
 
-    def test_0916_invented_plan_is_rejected(self):
+    def test_15_0916_invented_plan_is_rejected(self):
         draft = ("| 5 | **Rope Pushdown** (functional trainer) | 2 × 12 | Squeeze |\n"
                  "Target RPE 7–7.5 — same range as your last two sessions, which felt right.")
         v = find_violations(draft, self.EV)
         self.assertTrue(any("rope pushdown" in x for x in v), v)
         self.assertTrue(any("2 prior sessions" in x for x in v), v)
 
-    def test_invented_prior_load_is_rejected(self):
+    def test_15_invented_prior_load_is_rejected(self):
         v = find_violations("Last session you did 185 lb on the leg press for 12 reps.", self.EV)
         self.assertTrue(any("185" in x for x in v), v)
 
@@ -615,6 +745,16 @@ class TestClaimGuard(unittest.TestCase):
         text = ("Today: leg press 2×10-12 at RPE 6, then the lat pulldown and seated leg curl. "
                 "Last session your leg press was 160 lb for 12 reps. Body weight 284.5 lb.")
         self.assertEqual(find_violations(text, self.EV), [])
+
+    def test_15_equipment_words_and_greetings_are_not_exercises(self):
+        text = ("Good morning! Today's workout: grab the DBs and a mat, then the leg press "
+                "for 2 sets at RPE 6.")
+        self.assertEqual(find_violations(text, self.EV), [])
+
+    def test_15_original_blocks_count_as_plan(self):
+        ev = Evidence(exercises=set(self.EV.exercises) | {"rear delt fly"}, loads=set(),
+                      logged_numbers=set(), real_sessions=0)
+        self.assertEqual(find_violations("The workout swapped out the rear delt fly.", ev), [])
 
     def test_non_workout_text_is_ignored(self):
         self.assertEqual(find_violations("Good morning — last week you had 3 meetings.", self.EV), [])

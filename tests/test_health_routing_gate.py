@@ -165,7 +165,7 @@ class TestMorningStateWritten(_Base):
         params = writes[0][0][1]
         self.assertEqual(params[0], datetime.now(CT).date())   # state_date = local today
         self.assertEqual(params[3], 5)                          # energy
-        self.assertIn('"legs": 6', params[4])                   # 1-5 survey value, stored /10
+        self.assertIn('"legs": 3', params[4])                   # stored on the 0–5 scale
         self.assertIn("Check-in logged", reply)
 
 

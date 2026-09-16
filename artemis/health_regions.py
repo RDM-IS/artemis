@@ -6,7 +6,7 @@ artemis.health_checkin read only from here; nothing is inferred by an LLM.
 Regions are coarse on purpose. An exercise lists its PRIMARY regions (the muscles
 it trains) and SECONDARY regions (the ones it loads or holds). The family tags
 work by inclusion: every leg exercise carries "legs" *and* its specific muscle,
-so "legs sore 8" catches them all while "hamstrings sore 8" only catches the
+so "legs sore 4" catches them all while "hamstrings sore 4" only catches the
 hamstring work. "back" means upper/mid back; "low back" is its own region.
 """
 
@@ -63,8 +63,8 @@ _reg("Captain's chair knee raise", {"core"}, {"hip"})
 # ── Office Strength B ──
 # The goblet squat's dumbbell is held at the chest: shoulders and low back work.
 _reg("DB goblet squat", {"legs", "quads"}, {"shoulder", "low back", "hip", "knee"})
-_reg("Seated cable row", {"back"}, {"shoulder", "biceps", "arms"})
-_reg("Incline DB press", {"chest", "shoulder"}, {"triceps", "arms"})
+_reg("Seated cable row", {"back"}, {"shoulder", "biceps"})
+_reg("Incline DB press", {"chest", "shoulder", "triceps"})
 _reg("Leg extension", {"legs", "quads"}, {"knee"})
 _reg("Rear delt fly", {"shoulder"}, {"back"})
 _reg("Cable Pallof press", {"core"})
@@ -78,6 +78,18 @@ _reg("Calf press", {"legs", "calves"})
 _reg("Ab machine crunch", {"core"})
 # ── Weeks 5-6 finisher ──
 _reg("Stepmill or upright bike", {"legs"}, {"knee", "hip"})
+# ── Cardio (steady blocks; rules 2-4 never touch these, listed for coverage) ──
+_reg("Zone 2 Cardio", {"legs"}, {"knee", "hip"})
+_reg("Recovery Z2 + Mobility", {"legs"}, {"knee", "hip"})
+_reg("Treadmill incline walk", {"legs"}, {"calves", "knee", "hip"})
+_reg("Elliptical", {"legs"}, {"knee", "hip"})
+_reg("Recumbent bike", {"legs"}, {"knee"})
+_reg("Upright bike", {"legs"}, {"knee", "hip"})
+_reg("Stepmill", {"legs"}, {"calves", "knee", "hip"})
+# ── Walk / mobility ──
+_reg("Walk", {"legs"}, {"calves", "knee", "hip"})
+_reg("Recovery Walk", {"legs"}, {"calves", "knee", "hip"})
+_reg("Rest / Mobility", set())
 
 # Substitutes, in preference order. Every name must exist in EXERCISE_REGIONS
 # and in health_office's exercise lists (so it can be built for any week).

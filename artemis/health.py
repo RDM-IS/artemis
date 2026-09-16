@@ -1403,31 +1403,19 @@ def _plan_session_name(plan: dict) -> str:
 
 
 _SURVEY_QUESTIONS = (
-    "Reply with: sleep hrs, energy 1-5, soreness by region (1-5, or x/10; `sore 0` if none), "
-    "weight if you weighed, RHR if you took it.\n"
-    "Example: `slept 6.5 energy 3 legs sore 3 weight 271 RHR 58`"
+    "Reply with: sleep hrs, energy 0–5, soreness by area 0–5 (0 = none), weight, RHR.\n"
+    "Example: `slept 7 energy 4 sore 0 weight 283`"
 )
 
 
 def build_morning_survey_prompt(plan: dict, prompt_type: str) -> str:
-    """Builds the morning prompt text. prompt_type ∈ {'workout_am', 'logging_only'}.
+    """The check-in prompt in the 04:30 wake post (FRIDAY-1).
 
-    workout_am: full survey + heads-up that the calibrated plan arrives in 15 min.
-    logging_only: just the survey; the workout is later in the day.
+    Same text on every day — rest and walk days included (no "workout is
+    later" line); the reply adjusts today's plan on training days.
+    `prompt_type` ('workout_am' | 'logging_only') is kept for callers.
     """
-    session = _plan_session_name(plan)
-    duration = plan.get("est_duration_min")
-    duration_str = f" — {duration} min" if duration else ""
-
-    if prompt_type == "logging_only":
-        return f"Morning check-in.\n\n{_SURVEY_QUESTIONS}"
-
-    # workout_am
-    return (
-        f"Morning check-in.\n\n"
-        f"{_SURVEY_QUESTIONS}\n\n"
-        f"_I'll adjust {session} when you reply (reply `original` to undo)._"
-    )
+    return f"Morning check-in.\n\n{_SURVEY_QUESTIONS}"
 
 
 def build_evening_prompt(plan: dict, resolved: dict) -> str:
