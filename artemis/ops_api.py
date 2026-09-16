@@ -37,7 +37,11 @@ from knowledge.db import execute_one, execute_query, log_audit
 
 logger = logging.getLogger(__name__)
 
-_CT = ZoneInfo("America/Chicago")
+def _local_tz():
+    """Active timezone (WAKE-1) — resolved per call, so a timezone override
+    applies to every "today" this module computes."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
 
 bp = Blueprint("ops_api", __name__, url_prefix="/api")
 
@@ -63,7 +67,7 @@ def _cors(resp):
 # ---------------------------------------------------------------------------
 
 def _ct_today() -> date:
-    return datetime.now(_CT).date()
+    return datetime.now(_local_tz()).date()
 
 
 def _iso(v):
@@ -136,7 +140,7 @@ def _health_payload() -> dict:
         "scheduler_jobs": jobs,          # null (not a fake number) if unavailable
         "uptime_seconds": uptime,        # honest elapsed seconds; no fabricated %
         "last_brief": last_brief,        # ISO string from system_state, or null
-        "generated_at": datetime.now(_CT).isoformat(),
+        "generated_at": datetime.now(_local_tz()).isoformat(),
     }
 
 
@@ -368,7 +372,7 @@ def portfolio():
         "unscoped": {"pending_proposals": unscoped_pending, "open_commitments": unscoped_commits},
         "pending_total": scoped_pending_total + unscoped_pending,
         "health": _health_payload(),
-        "generated_at": datetime.now(_CT).isoformat(),
+        "generated_at": datetime.now(_local_tz()).isoformat(),
     })
 
 
@@ -399,7 +403,7 @@ def engagement_detail(slug):
         "dossiers": _recent_people(),
         "projects": _projects(slug),
         "health": _health_payload(),
-        "generated_at": datetime.now(_CT).isoformat(),
+        "generated_at": datetime.now(_local_tz()).isoformat(),
     })
 
 

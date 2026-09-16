@@ -41,7 +41,11 @@ from knowledge.secrets import get_anthropic_key
 
 logger = logging.getLogger(__name__)
 
-_CT = ZoneInfo("America/Chicago")
+def _local_tz():
+    """Active timezone (WAKE-1) — resolved per call, so a timezone override
+    applies to every "today" this module computes."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
 
 
 def _extract_model() -> str:
@@ -61,7 +65,7 @@ _WEEKDAYS = {
 def _ct_today() -> date:
     """CT-anchored 'today'. The box runs UTC (a day ahead of Central after ~19:00
     CT), so every 'today/due/overdue' comparison funnels through this one seam."""
-    return datetime.now(_CT).date()
+    return datetime.now(_local_tz()).date()
 
 
 def fmt_date(d) -> str:
@@ -1401,7 +1405,7 @@ def _open_loops_and_commitments(dossier_id: int) -> list[dict]:
         due = f" — due {fmt_date(c['due_date'])}" if c["due_date"] else ""
         out.append({"text": c["title"] + due, "draft": c["status"] == "draft",
                     "created_at": c["created_at"], "kind": "commitment"})
-    out.sort(key=lambda x: x["created_at"] or datetime.min.replace(tzinfo=_CT))
+    out.sort(key=lambda x: x["created_at"] or datetime.min.replace(tzinfo=_local_tz()))
     return out
 
 

@@ -141,19 +141,32 @@ class TestMarkHelpers(unittest.TestCase):
 # ============================================================================
 
 class TestCTAnchoring(unittest.TestCase):
-    def _sql_of(self, fn):
-        with patch("artemis.inbox.execute_query", return_value=[]) as q:
+    """WAKE-1: "today" follows the ACTIVE timezone, passed as a parameter."""
+
+    def _call_of(self, fn):
+        with patch("artemis.inbox.execute_query", return_value=[]) as q, \
+             patch("artemis.inbox._tz_param", return_value="Europe/Paris"):
             fn()
-        return q.call_args[0][0]
+        return q.call_args[0]
 
-    def test_due_today_is_ct_anchored(self):
-        self.assertIn("America/Chicago", self._sql_of(inbox.get_due_today))
+    def _sql_of(self, fn):
+        return self._call_of(fn)[0]
 
-    def test_snoozed_due_is_ct_anchored(self):
-        self.assertIn("America/Chicago", self._sql_of(inbox.get_snoozed_due))
+    def _assert_anchored(self, fn):
+        sql, params = self._call_of(fn)
+        self.assertIn("(now() AT TIME ZONE %s)::date", sql)
+        self.assertNotIn("America/Chicago", sql)
+        self.assertEqual(params[0], "Europe/Paris",
+                         "the active timezone must be the FIRST parameter")
 
-    def test_stale_waiting_is_ct_anchored(self):
-        self.assertIn("America/Chicago", self._sql_of(lambda: inbox.get_stale_waiting(3)))
+    def test_due_today_is_anchored_to_the_active_timezone(self):
+        self._assert_anchored(inbox.get_due_today)
+
+    def test_snoozed_due_is_anchored_to_the_active_timezone(self):
+        self._assert_anchored(inbox.get_snoozed_due)
+
+    def test_stale_waiting_is_anchored_to_the_active_timezone(self):
+        self._assert_anchored(lambda: inbox.get_stale_waiting(3))
 
     def test_stale_needs_action_is_NOT_ct_anchored(self):
         sql = self._sql_of(lambda: inbox.get_stale_needs_action(24))

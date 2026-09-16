@@ -102,7 +102,7 @@ class FakeCursor:
             return
 
         if s.startswith("SELECT 1 FROM health.session_log"):
-            plan_id, plan_date = p
+            plan_id, _tz, plan_date = p
             hit = any(l["plan_id"] == plan_id and l["logged_via"] != "inferred"
                       and l["ct_date"] >= plan_date for l in self.db.logs)
             self._rows = [(1,)] if hit else []

@@ -10,7 +10,7 @@ artemis.db has no writers. The two audit helpers that historically lived here on
 that hub (log_claude_call, log_calendar_action) keep their import surface but now
 write the existing acos audit tables (acos.audit_log / acos.calendar_audit).
 
-"Today"-relative due-date logic is anchored to America/Chicago — the box runs UTC
+"Today"-relative due-date logic is anchored to the ACTIVE timezone — the box runs UTC
 (a day ahead of CT after ~19:00), so bare current_date would flag due/overdue a
 day early.
 """
@@ -25,7 +25,13 @@ from knowledge.db import execute_one, execute_query, execute_write
 logger = logging.getLogger(__name__)
 
 # CT anchor for every "today"-relative due-date comparison.
-_CT_TODAY_SQL = "(now() AT TIME ZONE 'America/Chicago')::date"
+# Parameterized so the anchor follows the ACTIVE timezone; never interpolated.
+_TODAY_SQL = "(now() AT TIME ZONE %s)::date"
+
+
+def _tz_param() -> str:
+    from artemis.quiet_hours import get_active_timezone
+    return get_active_timezone()
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +131,9 @@ def get_due_soon(days: int = 3) -> list[dict]:
     return execute_query(
         f"""SELECT * FROM acos.commitments
             WHERE status = 'active'
-              AND due_date <= {_CT_TODAY_SQL} + %s
+              AND due_date <= {_TODAY_SQL} + %s
             ORDER BY due_date""",
-        (days,),
+        (_tz_param(), days),
     )
 
 
@@ -139,8 +145,9 @@ def get_start_alerts() -> list[dict]:
     return execute_query(
         f"""SELECT * FROM acos.commitments
             WHERE status = 'active'
-              AND (due_date - {_CT_TODAY_SQL}) <= effort_days
-            ORDER BY due_date"""
+              AND (due_date - {_TODAY_SQL}) <= effort_days
+            ORDER BY due_date""",
+        (_tz_param(),),
     )
 
 

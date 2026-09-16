@@ -127,7 +127,7 @@ class TestTimezoneCRUD(unittest.TestCase):
     def test_set_override_on_conflict_and_tzaware_expiry(self):
         with patch("artemis.quiet_hours.execute_write") as w, \
              patch("artemis.quiet_hours.get_tz_abbrev", return_value="CET"):
-            quiet_hours.set_timezone_override("Europe/Paris", "Paris", days=7)
+            quiet_hours.set_timezone_override("Europe/Paris", "Paris")
         sql, params = w.call_args[0]
         self.assertIn("acos.timezone_overrides", sql)
         self.assertIn("ON CONFLICT (id) DO UPDATE", sql)
@@ -278,7 +278,7 @@ class TestLiveQuietHours(unittest.TestCase):
         self.assertEqual(st["override_active"], 0)
 
     def test_timezone_override_set_clear(self):
-        quiet_hours.set_timezone_override("Europe/Paris", "Paris", days=7)
+        quiet_hours.set_timezone_override("Europe/Paris", "Paris")
         self.assertEqual(quiet_hours.get_active_timezone(), "Europe/Paris")
         self.assertIn("Paris", quiet_hours.quiet_hours_status())
         quiet_hours.clear_timezone_override()
@@ -300,7 +300,7 @@ class TestLiveQuietHours(unittest.TestCase):
         self.assertIsNone(quiet_hours.check_expired_overrides())
 
     def test_active_override_not_swept(self):
-        quiet_hours.set_timezone_override("Europe/Paris", "Paris", days=7)
+        quiet_hours.set_timezone_override("Europe/Paris", "Paris")
         self.assertIsNone(quiet_hours.check_expired_overrides())     # not expired
         self.assertEqual(quiet_hours.get_active_timezone(), "Europe/Paris")
 

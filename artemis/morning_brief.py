@@ -30,7 +30,11 @@ from artemis.utils import abbr_date, describe_due
 
 logger = logging.getLogger(__name__)
 
-_CT = ZoneInfo("America/Chicago")
+def _local_tz():
+    """Active timezone (WAKE-1) — resolved per call, so a timezone override
+    applies to every "today" this module computes."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
 
 # ── P7 reminder-backoff policy (shared with scheduler.job_action_item_reminders) ──
 # Kept here so both the reminder loop and the brief's "Stale items" demotion line
@@ -69,7 +73,7 @@ def reminder_due(*, sent_count: int, reminders_today: int,
 def ct_today() -> date:
     """The single CT-anchored 'today' seam for the brief. The box runs UTC (a day
     ahead of Central after ~19:00 CT), so every brief date funnels through here."""
-    return datetime.now(_CT).date()
+    return datetime.now(_local_tz()).date()
 
 
 def full_date(d: date) -> str:

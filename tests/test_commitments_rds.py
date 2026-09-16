@@ -79,20 +79,26 @@ class TestCrud(unittest.TestCase):
 # ============================================================================
 
 class TestCTAnchoring(unittest.TestCase):
-    def test_due_soon_ct_anchored(self):
-        with patch("artemis.commitments.execute_query", return_value=[]) as q:
+    """WAKE-1: "today" follows the ACTIVE timezone, passed as a parameter."""
+
+    def test_due_soon_anchored_to_the_active_timezone(self):
+        with patch("artemis.commitments.execute_query", return_value=[]) as q, \
+             patch("artemis.commitments._tz_param", return_value="Europe/Paris"):
             cm.get_due_soon(3)
         sql, params = q.call_args[0]
-        self.assertIn("America/Chicago", sql)
+        self.assertIn("(now() AT TIME ZONE %s)::date", sql)
+        self.assertNotIn("America/Chicago", sql)
         self.assertNotIn("current_date", sql.lower())
-        self.assertEqual(params, (3,))
+        self.assertEqual(params, ("Europe/Paris", 3))
 
-    def test_start_alerts_ct_anchored(self):
-        with patch("artemis.commitments.execute_query", return_value=[]) as q:
+    def test_start_alerts_anchored_to_the_active_timezone(self):
+        with patch("artemis.commitments.execute_query", return_value=[]) as q, \
+             patch("artemis.commitments._tz_param", return_value="Europe/Paris"):
             cm.get_start_alerts()
-        sql = q.call_args[0][0]
-        self.assertIn("America/Chicago", sql)
+        sql, params = q.call_args[0]
+        self.assertIn("(now() AT TIME ZONE %s)::date", sql)
         self.assertIn("<= effort_days", sql)
+        self.assertEqual(params, ("Europe/Paris",))
 
     def test_close_uses_now_not_a_date_comparison(self):
         with patch("artemis.commitments.list_commitments",

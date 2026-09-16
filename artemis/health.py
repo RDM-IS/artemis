@@ -22,11 +22,21 @@ from zoneinfo import ZoneInfo
 import anthropic
 from pydantic import BaseModel, Field, ValidationError
 
+from artemis import config
+
 from artemis import health_office as _office
 
 logger = logging.getLogger(__name__)
 
-CT = ZoneInfo("America/Chicago")
+# Back-compat export only (tests import health.CT). Everything in this module
+# anchors to the ACTIVE timezone via _local_tz() — see WAKE-1.
+CT = ZoneInfo(config.HOME_TIMEZONE)
+
+
+def _local_tz():
+    """Active timezone (WAKE-1) — override-aware, home by default."""
+    from artemis.quiet_hours import local_tz
+    return local_tz()
 
 
 # ============================================================================
@@ -440,7 +450,7 @@ def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseR
 def get_today_plan() -> dict | None:
     """Fetch today's plan from health.plan (CT date). Returns None if absent."""
     from knowledge.db import execute_one
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     return execute_one(
         """SELECT plan_id, plan_date, phase, week_num, session_type,
                   target_rpe, target_hr_zone, est_duration_min, blocks, is_skipped
@@ -453,7 +463,7 @@ def upsert_daily_state(state: MorningState) -> None:
     """UPSERT health.daily_state for today (CT)."""
     from knowledge.db import execute_write
 
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     soreness_json = json.dumps(state.soreness) if state.soreness else None
 
     execute_write(
@@ -678,7 +688,7 @@ def store_capture_pending(channel_id: str, reports: list["ExerciseReport"],
     payload = {
         "rows": [_report_to_dict(r) for r in reports],
         "plan_id": plan_id,
-        "created_at": datetime.now(CT).isoformat(),
+        "created_at": datetime.now(_local_tz()).isoformat(),
     }
     set_system_value(_capture_pending_key(channel_id), json.dumps(payload))
 
@@ -696,7 +706,7 @@ def load_capture_pending(channel_id: str, max_age_sec: int = 600) -> dict | None
     created = payload.get("created_at")
     if created:
         try:
-            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            age = (datetime.now(_local_tz()) - datetime.fromisoformat(created)).total_seconds()
             if age > max_age_sec:
                 return None
         except (ValueError, TypeError):
@@ -715,7 +725,7 @@ def build_and_store_proposal(message: str, channel_id: str) -> str:
     """Parse a capture paste, resolve plan_id (CT), store the durable pending
     payload, and return the proposal text. Writes NOTHING to session_log.
 
-    plan_id is resolved from health.plan for *today in America/Chicago* — never
+    plan_id is resolved from health.plan for *today in the ACTIVE timezone* — never
     UTC (the date-reasoning bug). A missing plan row → plan_id=NULL, noted in the
     proposal so a gap day still logs.
     """
@@ -736,7 +746,7 @@ def build_and_store_proposal(message: str, channel_id: str) -> str:
         return "Couldn't parse that workout paste — check the format and try again."
 
     plan_id = plan.get("plan_id") if plan else None
-    today_ct = datetime.now(CT).date().isoformat()
+    today_ct = datetime.now(_local_tz()).date().isoformat()
     plan_note = "" if plan_id is not None else (
         f"No plan seeded for today (CT {today_ct}) — logging with plan_id=NULL."
     )
@@ -1156,7 +1166,7 @@ def run_nag_check() -> Optional[str]:
     """
     from knowledge.db import execute_one, execute_query
 
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
 
     plan = execute_one(
         "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan WHERE plan_date = %s",
@@ -1195,7 +1205,7 @@ def insert_inferred_summary() -> bool:
     """
     from knowledge.db import execute_one, execute_write
 
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
 
     plan = execute_one(
         "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan WHERE plan_date = %s",
@@ -1363,7 +1373,7 @@ def _next_cardio_date(today: date | None = None) -> date:
     """
     from knowledge.db import execute_one
 
-    base = today or datetime.now(CT).date()
+    base = today or datetime.now(_local_tz()).date()
     row = execute_one(
         """SELECT plan_date FROM health.plan
            WHERE plan_date >= %s
@@ -1496,7 +1506,7 @@ def already_prompted_today(slot: str, today: date | None = None) -> bool:
     """
     from artemis.quiet_hours import get_system_value
 
-    d = today or datetime.now(CT).date()
+    d = today or datetime.now(_local_tz()).date()
     key = f"health_prompt:{slot}:{d.isoformat()}"
     return bool(get_system_value(key))
 
@@ -1505,15 +1515,15 @@ def mark_prompted(slot: str, today: date | None = None) -> None:
     """Record that a given prompt slot has fired today."""
     from artemis.quiet_hours import set_system_value
 
-    d = today or datetime.now(CT).date()
+    d = today or datetime.now(_local_tz()).date()
     key = f"health_prompt:{slot}:{d.isoformat()}"
-    set_system_value(key, datetime.now(CT).isoformat())
+    set_system_value(key, datetime.now(_local_tz()).isoformat())
 
 
 def get_today_state() -> dict | None:
     """Fetch today's morning daily_state row (CT). Returns None if absent."""
     from knowledge.db import execute_one
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     return execute_one(
         """SELECT state_date, weight_lbs, sleep_hrs, energy, soreness,
                   resting_hr, free_text
@@ -1553,7 +1563,7 @@ _NON_WORKOUT_SESSIONS = ("rest_mobility", "walk")
 # ----------------------------------------------------------------------------
 
 def _session_state_key(d: date | None = None) -> str:
-    d = d or datetime.now(CT).date()
+    d = d or datetime.now(_local_tz()).date()
     return f"health_session:{d.isoformat()}"
 
 
@@ -1692,7 +1702,7 @@ def last_time(exercise: str, session_type: str | None = None) -> dict | None:
     so we don't hard-restrict to one session_type.
     """
     from knowledge.db import execute_query
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
 
     base_sql = """
         SELECT p.plan_date, p.session_type, sl.set_num, sl.reps_done,
@@ -2271,7 +2281,7 @@ def handle_rest_day(message: str) -> str | None:
     if not q or not any(kw in q for kw in _REST_DAY_PHRASES):
         return None
     from knowledge.db import execute_write
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     try:
         execute_write(
             "UPDATE health.plan SET is_skipped = TRUE WHERE plan_date = %s",
@@ -2342,7 +2352,7 @@ def _format_plan_overview(plan: dict, today: date) -> str:
 
 def _query_next_workout() -> str:
     from knowledge.db import execute_one
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     row = execute_one(
         """SELECT * FROM health.plan
            WHERE plan_date >= %s AND is_skipped = FALSE
@@ -2357,7 +2367,7 @@ def _query_next_workout() -> str:
 
 def _query_day(target: date) -> str:
     from knowledge.db import execute_one
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     row = execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (target,))
     if not row:
         return f"No plan for {target.strftime('%A %b %-d')}."
@@ -2365,14 +2375,14 @@ def _query_day(target: date) -> str:
 
 
 def _query_weekday_workout(weekday_idx: int) -> str:
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     delta = (weekday_idx - today.weekday()) % 7  # next occurrence (today counts)
     return _query_day(today + timedelta(days=delta))
 
 
 def _query_last_workout() -> str:
     from knowledge.db import execute_one, execute_query
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     plan = execute_one(
         """SELECT p.plan_id, p.plan_date, p.session_type
            FROM health.plan p
@@ -2484,7 +2494,7 @@ def handle_plan_query(message: str) -> str | None:
     if workout_noun and re.search(
         r"\b(next|today'?s|todays|tomorrow'?s|tomorrows|upcoming|what'?s|whats|what\s+is|my)\b", q
     ):
-        today = datetime.now(CT).date()
+        today = datetime.now(_local_tz()).date()
         if re.search(r"\btomorrow", q):
             return _query_day(today + timedelta(days=1))
         if re.search(r"\btoday", q):
@@ -2498,7 +2508,7 @@ def handle_plan_query(message: str) -> str | None:
 # PB-009 plan_lookup — the routing-bug fix.
 #
 # get_plan_lookup() is the dedicated handler for the 'plan_lookup' intent. It:
-#   * anchors ALL date math to America/Chicago (CT) — never naive date.today()
+#   * anchors ALL date math to the ACTIVE timezone — never naive date.today()
 #     / UTC, which is what mislabeled Saturday as Jun 7 and shifted the week;
 #   * reads health.plan for the requested range and returns session_type + the
 #     REAL exercise names from blocks.exercises (and the finisher if present);
@@ -2581,7 +2591,7 @@ def get_plan_lookup(message: str) -> str:
     "No plan seeded for <date>.".
     """
     q = (message or "").lower()
-    today = datetime.now(CT).date()  # CT-anchored — the bug fix
+    today = datetime.now(_local_tz()).date()  # CT-anchored — the bug fix
 
     header: str | None = None
     m = re.search(r"next\s+(\d+)\s+days?", q)
@@ -2888,7 +2898,7 @@ def get_plan_detail(message: str) -> str:
     returns a non-empty string.
     """
     q = (message or "").lower()
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
 
     if "tomorrow" in q:
         target = today + timedelta(days=1)
@@ -2991,7 +3001,7 @@ def build_context_slice(days_ahead: int = 3, recent: int = 3) -> str:
     error — never raises into the mention path."""
     try:
         from knowledge.db import execute_query
-        today = datetime.now(CT).date()
+        today = datetime.now(_local_tz()).date()
 
         plan_rows = execute_query(
             "SELECT plan_date, session_type, blocks FROM health.plan "
@@ -3207,7 +3217,7 @@ def _nutrition_target_pending_key(channel_id: str) -> str:
 def store_nutrition_target_pending(channel_id: str, target: NutritionTarget) -> None:
     from artemis.quiet_hours import set_system_value
     payload = target.model_dump()
-    payload["created_at"] = datetime.now(CT).isoformat()
+    payload["created_at"] = datetime.now(_local_tz()).isoformat()
     set_system_value(_nutrition_target_pending_key(channel_id), json.dumps(payload))
 
 
@@ -3223,7 +3233,7 @@ def load_nutrition_target_pending(channel_id: str, max_age_sec: int = 900) -> di
     created = payload.get("created_at")
     if created:
         try:
-            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            age = (datetime.now(_local_tz()) - datetime.fromisoformat(created)).total_seconds()
             if age > max_age_sec:
                 return None
         except (ValueError, TypeError):
@@ -3237,7 +3247,7 @@ def clear_nutrition_target_pending(channel_id: str) -> None:
 
 
 def format_target_proposal(target: NutritionTarget) -> str:
-    eff = target.effective_from or datetime.now(CT).date().isoformat()
+    eff = target.effective_from or datetime.now(_local_tz()).date().isoformat()
     macros = [f"{target.kcal} kcal", f"{target.protein_g}g protein"]
     if target.carb_g is not None:
         macros.append(f"{target.carb_g}g carb")
@@ -3285,7 +3295,7 @@ def insert_nutrition_target_tx(target: NutritionTarget) -> int:
     """Close the prior open target and insert the new one (+ any meals) in ONE
     transaction, so the one_open_target index never sees two open rows."""
     from knowledge.db import get_connection
-    eff_from = target.effective_from or datetime.now(CT).date().isoformat()
+    eff_from = target.effective_from or datetime.now(_local_tz()).date().isoformat()
     with get_connection() as conn:
         with conn.cursor() as cur:
             # Close the prior open target the day before the new one starts.
@@ -3332,7 +3342,7 @@ def commit_nutrition_target(channel_id: str) -> str:
         logger.exception("Nutrition target commit failed")
         return "⚠️ Couldn't write the target — check DB. Nothing changed."
     clear_nutrition_target_pending(channel_id)
-    eff = target.effective_from or datetime.now(CT).date().isoformat()
+    eff = target.effective_from or datetime.now(_local_tz()).date().isoformat()
     extra = f" + {len(target.meals)} meal(s)" if target.meals else ""
     return (f"Set. Target #{new_id} live from {eff}: "
             f"{target.kcal} kcal, {target.protein_g}g protein{extra}. Prior target closed.")
@@ -3361,7 +3371,7 @@ def _match_onplan_slot(message: str) -> str | None:
 
 def _log_onplan(meal: dict, description: str) -> str:
     from knowledge.db import execute_write
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     execute_write(
         "INSERT INTO health.nutrition_log "
         "(logged_date, meal_id, description, kcal, protein_g, carb_g, fat_g, fiber_g, estimated) "
@@ -3388,7 +3398,7 @@ def _log_offplan(description: str) -> str:
         logger.exception("Off-plan estimate failed (unknown)")
         return "Couldn't estimate that right now — try again."
     from knowledge.db import execute_write
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     execute_write(
         "INSERT INTO health.nutrition_log "
         "(logged_date, meal_id, description, kcal, protein_g, carb_g, fat_g, fiber_g, "
@@ -3464,7 +3474,7 @@ def _budget_nudge(row: dict) -> str:
 def nutrition_status() -> str:
     """Trainer-voice remaining-budget reply + one actionable nudge."""
     from knowledge.db import execute_one
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     try:
         row = execute_one("SELECT * FROM health.remaining_budget(%s)", (today,))
     except Exception:
@@ -3821,7 +3831,7 @@ def resolve_swap_target(today: date | None = None) -> tuple[date | None, dict | 
       - today is rest / no plan                → (next_cardio_date, row, None)
     The day-ahead bug is impossible here: today_ct is CT-anchored, never UTC.
     """
-    base = today or datetime.now(CT).date()
+    base = today or datetime.now(_local_tz()).date()
     row = _fetch_swap_plan_row(base)
     st = (row or {}).get("session_type")
     if st in _SWAP_ELIGIBLE:
@@ -3860,7 +3870,7 @@ def load_swap_pending(channel_id: str, max_age_sec: int = 600) -> dict | None:
     created = payload.get("created_at")
     if created:
         try:
-            age = (datetime.now(CT) - datetime.fromisoformat(created)).total_seconds()
+            age = (datetime.now(_local_tz()) - datetime.fromisoformat(created)).total_seconds()
             if age > max_age_sec:
                 return None
         except (ValueError, TypeError):
@@ -3886,7 +3896,7 @@ def _session_summary_line(row: dict) -> str:
 
 def _format_swap_proposal(target_date: date, row: dict, target: str,
                           reason: str | None) -> str:
-    today = datetime.now(CT).date()
+    today = datetime.now(_local_tz()).date()
     day = _relative_day_label(target_date, today)
     old_blocks = _coerce_blocks(row.get("blocks"))
     new_blocks = translate_blocks(
@@ -3929,7 +3939,7 @@ def propose_modality_swap(message: str, channel_id: str) -> str:
     if refusal:
         return refusal
     if target_date is None or row is None:
-        return _no_plan_message(target_date or datetime.now(CT).date())
+        return _no_plan_message(target_date or datetime.now(_local_tz()).date())
 
     payload = {
         "kind": "swap",
@@ -3938,7 +3948,7 @@ def propose_modality_swap(message: str, channel_id: str) -> str:
         "plan_id": row.get("plan_id"),
         "plan_date": target_date.isoformat(),
         "session_type": row.get("session_type"),
-        "created_at": datetime.now(CT).isoformat(),
+        "created_at": datetime.now(_local_tz()).isoformat(),
     }
     try:
         store_swap_pending(channel_id, payload)
@@ -3961,7 +3971,7 @@ def propose_swap_revert(channel_id: str) -> str:
         return "No swapped session to revert."
     blocks = _coerce_blocks(row.get("blocks"))
     if not isinstance(blocks.get("pre_swap"), dict):
-        day = _relative_day_label(target_date, datetime.now(CT).date())
+        day = _relative_day_label(target_date, datetime.now(_local_tz()).date())
         return f"{day}'s session isn't swapped — nothing to revert."
 
     restored = revert_modality_swap(blocks)
@@ -3973,14 +3983,14 @@ def propose_swap_revert(channel_id: str) -> str:
         "plan_id": row.get("plan_id"),
         "plan_date": target_date.isoformat(),
         "session_type": row.get("session_type"),
-        "created_at": datetime.now(CT).isoformat(),
+        "created_at": datetime.now(_local_tz()).isoformat(),
     }
     try:
         store_swap_pending(channel_id, payload)
     except Exception:
         logger.exception("Failed to store pending revert")
         return "⚠️ Couldn't stage the revert — check DB. Nothing changed."
-    day = _relative_day_label(target_date, datetime.now(CT).date())
+    day = _relative_day_label(target_date, datetime.now(_local_tz()).date())
     cur_name = blocks.get("display_name") or "current swap"
     return (
         f"**Revert {day}'s swap:**\n"
@@ -4051,7 +4061,7 @@ def commit_modality_swap(channel_id: str, reason_override: str | None = None,
     swap_meta = {
         "reason": reason,
         "requested_via": "mattermost",
-        "at": datetime.now(CT).isoformat(),
+        "at": datetime.now(_local_tz()).isoformat(),
         "message_id": message_id,
     }
     new_blocks = apply_modality_swap(

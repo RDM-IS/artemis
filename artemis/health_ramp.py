@@ -38,9 +38,12 @@ import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from artemis import config
+
 logger = logging.getLogger(__name__)
 
-CT = ZoneInfo("America/Chicago")
+# Dormant module (retired by HEALTH-2) — home-anchored. See RAMP-RETIRE.
+CT = ZoneInfo(config.HOME_TIMEZONE)
 
 # The initial ramp is phase 1 (reintroduction). generated_by is CHECK-constrained
 # to (baseline|autoreg_morning|autoreg_evening|manual); a tool-run reseed is a
@@ -560,8 +563,8 @@ def _is_completed(cur, plan_id: int, plan_date: date) -> bool:
     cur.execute(
         "SELECT 1 FROM health.session_log "
         "WHERE plan_id = %s AND logged_via <> 'inferred' "
-        "AND (logged_at AT TIME ZONE 'America/Chicago')::date >= %s LIMIT 1",
-        (plan_id, plan_date),
+        "AND (logged_at AT TIME ZONE %s)::date >= %s LIMIT 1",
+        (plan_id, config.HOME_TIMEZONE, plan_date),
     )
     return cur.fetchone() is not None
 

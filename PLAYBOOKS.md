@@ -245,36 +245,34 @@ or `acos` writes.
 
 ### Triggers — proactive (scheduled jobs)
 
-All scheduled jobs guard with `self._is_quiet()` at the top. Quiet
-hours 22:00-04:00 CT.
+Health-tier jobs post in the **wake** and **open** phases; in **quiet** they
+are held durably and flushed at the next wake (WAKE-1 — see the day-phase
+section in `docs/ARTEMIS_STATE.md`). All times are local wall-clock in the
+**active** timezone, which follows `set timezone to <place>`.
 
-**`job_morning_prompt`** — daily morning survey + workout calibration.
-> TODO (HEALTH-2): these times assume the old home-gym mornings. They depend on
-> Ryan's office arrival time, which is not yet confirmed — revisit once it is.
+**The wake post (04:30 local, `job_wake` → `artemis/wake.py`)** — there is no
+separate morning-prompt cron any more. One post carries: today's session
+(name, duration, `Where:` from `blocks.location`, equipment, first lift,
+warmup), the morning survey, any held health notices, and pre-departure
+(checklist, first event, weather, `depart:` commitments).
 
-- Tue 04:01 CT — strength_a workout day, AM only
-- Wed 07:00 CT — logging-only (no workout calibration; PM workout)
-- Thu 04:01 CT — workout day, PM allowed
-- Fri 04:01 CT — workout day, AM only
-- Sat 07:00 CT — logging-only (no workout calibration; PM workout)
-- Sun 07:00 CT — workout day, PM allowed
-- Mon 07:00 CT — workout day, PM allowed
+The survey variant comes from the **plan row**, never the weekday
+(`wake.prompt_type_for`): `rest_mobility`/`walk` → logging-only, everything
+else → `workout_am`. Ryan replies via the existing `log_morning_state` intent;
+after the `daily_state` row writes, the calibrated plan posts ~15 min later
+(`job_health_calibration_followup`, scheduled as a one-shot at wake time).
 
-Posts the morning survey questions (sleep hrs, energy 1-5, soreness
-by region, weight, resting HR). User replies with answers via existing
-`log_morning_state` intent. After `daily_state` row writes, post the
-calibrated workout plan reply (~15 min after first prompt) including
-session_type, equipment list, and location (`Where: office gym` — read from the
-plan row's `blocks.location`).
+> The old weekday table (Tue 04:01 / Wed 07:00 / …) is gone: it encoded the
+> home-gym AM/PM split. Workouts are now AM at the office gym, so the plan row
+> is the only thing that decides.
 
-**`job_evening_prompt`** — Wed/Sat at 16:30 CT — same shape as morning
-prompt but for the PM workout.
+**`job_health_nag`** — 16:30 local, daily. Fires only if today's plan has no
+`session_log` row. Suppressed on `rest_mobility` and `walk`. It moved off
+21:00 because 21:00 now sits inside the quiet window (17:00–04:30) and would
+never post.
 
-**`job_health_nag`** — 21:00 CT, daily. Fires only if today's plan has
-no `session_log` row AND today is not "no PM" (Tue/Fri). Suppressed on
-rest_mobility and walk session_types.
-
-**`job_health_inferred_summary`** — 21:50 CT, daily. Backstop. If the
+**`job_health_inferred_summary`** — 21:50 local, daily. Backstop, writes
+only — it posts nothing, so the quiet window does not apply. If the
 plan exists, isn't rest/walk/skipped, and still has no log, write a
 placeholder `session_summary` row with `logged_via='inferred'` and
 `notes='no debrief — assumed at baseline'`. Autoregulator treats these
@@ -547,7 +545,9 @@ detects, and PROPOSES; Ryan approves, names, blesses. Nothing extraction produce
 auto-writes to a system-of-record table — on approval only, a proposal is written
 through the EXISTING creation paths (commitment creation, dossier draft-approval).
 
-**Sync (one job, two triggers):** 04:00 CT cron + on-demand `vault sync` / `digest`.
+**Sync (one job, two triggers):** 03:30 local cron + on-demand `vault sync` /
+`digest`. It moved off 04:00 so the ingest finishes before the 04:30 wake post
+reads from it; it writes only and posts nothing.
 Read-only git mirror (shallow clone, fetch + reset --hard); PAT used at fetch time
 only, never on disk. Upsert notes → recompute `[[wikilinks]]` → throttled extraction
 pass → proposals.
