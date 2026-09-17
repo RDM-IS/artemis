@@ -647,6 +647,15 @@ the Lambda directly; the Function requires a Cloudflare Access JWT, answers
 only on `gym.rdm.is` and `*.gym-display.pages.dev`, and attaches `X-API-Key`
 server-side (see gym-display `docs/API_AUTH.md`). A lapsed Access session shows
 a "Session expired — tap to sign in" banner; unsynced sets stay queued.
+**Tomorrow / Week (GD-WEEK).** `GET /api/health/plan?from=&to=` (inclusive,
+≤ 14 days, dates in the active timezone; defaults today..today+6) returns each
+day's stored blocks (adjustment included), `location`, `adjusted`, the
+per-exercise sets actually logged (past/today), and a derived `status`:
+`done` (real summary — flow "complete" — all planned sets, plan.status
+completed, or a past rest day), `partial` (some real logs; flow "partial"),
+`missed` (past training day, no real logs — inferred rows don't count, a
+missed flow is missed), `today`, `upcoming`. gym-display shows it read-only
+from the Setup screen's Tomorrow and Week buttons.
 Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
 `ryan@rdm.is`. Frontend repo: `RDM-IS/gym-display`.
 

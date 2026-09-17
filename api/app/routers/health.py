@@ -5,6 +5,8 @@ GET  /api/health/today/logged   → which exercises today already have logs
 GET  /api/health/last_logged    → batch: most-recent prior set per exercise
                                   (used by gym-display to pre-fill steppers)
 GET  /api/health/status         → windowed status payload for /status page
+GET  /api/health/plan           → read-only plan range (≤ 14 days) with a
+                                  derived status per day (Tomorrow / Week)
 GET  /api/health/sessions       → per-day plan + per-set rows + computed
                                   aggregates + outlier flags for the
                                   Status page facts read-back (no
@@ -33,7 +35,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Security, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -1162,3 +1164,227 @@ def get_sessions(
         window_end=window_end,
         days=out_days,
     )
+
+
+# ---------------------------------------------------------------------------
+# /plan — GET: read-only plan range for gym-display Tomorrow / Week (GD-WEEK)
+# ---------------------------------------------------------------------------
+#
+#   GET /api/health/plan?from=YYYY-MM-DD&to=YYYY-MM-DD   (inclusive, ≤ 14 days)
+#
+# `from` defaults to today and `to` to from+6, both in the ACTIVE timezone
+# (acos.timezone_overrides, else home). Each day carries the stored blocks
+# (adjustment included) and a status derived from session_log + plan.status:
+#
+#   done      a finished session: a real session_summary (flow: "complete"),
+#             all planned sets logged, plan.status='completed', or a rest day
+#             that has passed
+#   partial   some real logs but not finished (flow: a "partial" summary)
+#   missed    a past training day with no real logs (inferred rows don't count)
+#   today     today, nothing logged yet
+#   upcoming  a future day
+#
+# Past and current days also return `logged` — per-exercise sets actually done.
+
+PLAN_RANGE_MAX_DAYS = 14
+PLAN_STATUSES = ("done", "partial", "missed", "upcoming", "today")
+HOME_TIMEZONE = "America/Chicago"   # mirrors artemis.config.HOME_TIMEZONE
+
+
+class LoggedExercise(BaseModel):
+    exercise: str
+    log_type: str
+    sets: int
+    reps: list[Optional[int]] = Field(default_factory=list)
+    top_weight_lbs: Optional[float] = None
+    duration_sec: Optional[int] = None
+    skipped: int = 0
+
+
+class PlanDay(BaseModel):
+    plan_id: int
+    plan_date: date
+    session_type: str
+    display_name: Optional[str] = None
+    phase: int
+    week_num: int
+    target_rpe: Optional[float] = None
+    est_duration_min: Optional[int] = None
+    location: Optional[str] = None
+    is_skipped: bool = False
+    adjusted: bool = False
+    status: str
+    blocks: dict[str, Any]
+    logged: list[LoggedExercise] = Field(default_factory=list)
+    summary_notes: Optional[str] = None
+
+
+class PlanRangeResponse(BaseModel):
+    today: date
+    timezone: str
+    range_from: date
+    range_to: date
+    days: list[PlanDay]
+
+
+def _active_timezone(db: Session) -> str:
+    """Override if set and unexpired (same rule as artemis.quiet_hours), else home."""
+    try:
+        row = db.execute(
+            text("SELECT timezone FROM acos.timezone_overrides "
+                 "WHERE id = 1 AND expires_at > now()")
+        ).mappings().first()
+        if row and row.get("timezone"):
+            ZoneInfo(row["timezone"])
+            return row["timezone"]
+    except Exception:  # missing table, bad zone name — fall back to home
+        pass
+    return HOME_TIMEZONE
+
+
+def _is_rest_day(session_type: Optional[str], blocks: Any) -> bool:
+    """A true rest day (incl. a check-in day off) — never 'missed'. A Recovery
+    Flow is a session, even on a rest_mobility row."""
+    b = blocks if isinstance(blocks, dict) else {}
+    if b.get("type") == "recovery_flow" or session_type == "recovery_flow":
+        return False
+    return session_type == "rest_mobility" or b.get("type") == "mobility"
+
+
+def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: date) -> str:
+    """Pure: one day's status from its plan row and session_log rows."""
+    real = [r for r in logs if r.get("logged_via") != "inferred"]
+    summaries = [r for r in real if r["log_type"] == "session_summary"]
+    notes = [(r.get("notes") or "") for r in summaries]
+    work = [r for r in real if r["log_type"] in ("strength_set", "cardio_block")]
+    done_sets = [r for r in work if not r.get("is_skipped")]
+    blocks = plan.get("blocks") if isinstance(plan.get("blocks"), dict) else {}
+    d = plan["plan_date"]
+
+    if any(n.startswith("recovery_flow: complete") for n in notes):
+        return "done"
+    if plan.get("status") == "completed":
+        return "done"
+    if summaries and not all(n.startswith("recovery_flow: partial") for n in notes):
+        return "done"
+    planned = _planned_set_count(blocks)
+    if work:
+        return "done" if planned and len(done_sets) >= planned else "partial"
+    if summaries:            # only flow "partial" summaries
+        return "partial"
+    if d > today:
+        return "upcoming"
+    if d == today:
+        return "today"
+    if _is_rest_day(plan.get("session_type"), blocks) and not plan.get("is_skipped"):
+        return "done"
+    return "missed"
+
+
+def summarize_logs(logs: list[dict[str, Any]]) -> list[LoggedExercise]:
+    """Per-exercise sets actually logged (inferred rows excluded), in log order."""
+    out: dict[str, dict[str, Any]] = {}
+    for r in logs:
+        if r.get("logged_via") == "inferred" or r["log_type"] not in ("strength_set", "cardio_block"):
+            continue
+        key = r.get("exercise") or r["log_type"]
+        e = out.setdefault(key, {"exercise": key, "log_type": r["log_type"], "sets": 0,
+                                 "reps": [], "top_weight_lbs": None, "duration_sec": None,
+                                 "skipped": 0})
+        if r.get("is_skipped"):
+            e["skipped"] += 1
+            continue
+        e["sets"] += 1
+        e["reps"].append(r.get("reps_done"))
+        w = r.get("weight_lbs")
+        if w is not None and (e["top_weight_lbs"] is None or float(w) > e["top_weight_lbs"]):
+            e["top_weight_lbs"] = float(w)
+        if r.get("duration_sec"):
+            e["duration_sec"] = (e["duration_sec"] or 0) + int(r["duration_sec"])
+    return [LoggedExercise(**e) for e in out.values()]
+
+
+def _parse_day(value: Optional[str], name: str) -> Optional[date]:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"error": "bad_date", "param": name})
+
+
+@router.get("/plan", response_model=PlanRangeResponse)
+def get_plan_range(
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """Plan rows for [from, to] with derived status. Read-only.
+
+    400 → {"error": "range_too_large", "max_days": 14} | {"error": "bad_range"}
+          | {"error": "bad_date", "param": ...}
+    """
+    tz_name = _active_timezone(db)
+    today = datetime.now(ZoneInfo(tz_name)).date()
+    start = _parse_day(from_, "from") or today
+    end = _parse_day(to, "to") or (start + timedelta(days=6))
+    if end < start:
+        raise HTTPException(status_code=400, detail={"error": "bad_range"})
+    if (end - start).days + 1 > PLAN_RANGE_MAX_DAYS:
+        raise HTTPException(status_code=400,
+                            detail={"error": "range_too_large", "max_days": PLAN_RANGE_MAX_DAYS})
+
+    plan_rows = db.execute(
+        text("""
+            SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
+                   target_rpe, est_duration_min, is_skipped, status
+            FROM health.plan
+            WHERE plan_date BETWEEN :s AND :e
+            ORDER BY plan_date
+        """),
+        {"s": start, "e": end},
+    ).mappings().all()
+    plans = [dict(r) for r in plan_rows]
+    pids = [p["plan_id"] for p in plans]
+
+    logs_by_plan: dict[int, list[dict[str, Any]]] = {}
+    if pids:
+        for r in db.execute(
+            text("""
+                SELECT plan_id, log_type, exercise, set_num, reps_done, weight_lbs,
+                       duration_sec, notes, is_skipped, logged_via
+                FROM health.session_log
+                WHERE plan_id = ANY(:pids)
+                ORDER BY plan_id, log_id
+            """),
+            {"pids": pids},
+        ).mappings().all():
+            logs_by_plan.setdefault(r["plan_id"], []).append(dict(r))
+
+    days: list[PlanDay] = []
+    for p in plans:
+        blocks = p["blocks"] if isinstance(p["blocks"], dict) else {}
+        logs = logs_by_plan.get(p["plan_id"], [])
+        summary = next((r.get("notes") for r in reversed(logs)
+                        if r["log_type"] == "session_summary" and r.get("logged_via") != "inferred"),
+                       None)
+        days.append(PlanDay(
+            plan_id=p["plan_id"],
+            plan_date=p["plan_date"],
+            session_type=p["session_type"],
+            display_name=_display_name(blocks, p["session_type"]),
+            phase=p["phase"],
+            week_num=p["week_num"],
+            target_rpe=float(p["target_rpe"]) if p["target_rpe"] is not None else None,
+            est_duration_min=p["est_duration_min"],
+            location=blocks.get("location"),
+            is_skipped=bool(p["is_skipped"]),
+            adjusted=isinstance(blocks.get("adjustment"), dict),
+            status=derive_day_status(p, logs, today),
+            blocks=blocks,
+            logged=summarize_logs(logs) if p["plan_date"] <= today else [],
+            summary_notes=summary if p["plan_date"] <= today else None,
+        ))
+    return PlanRangeResponse(today=today, timezone=tz_name, range_from=start,
+                             range_to=end, days=days)
