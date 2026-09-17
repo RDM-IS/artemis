@@ -656,6 +656,19 @@ completed, or a past rest day), `partial` (some real logs; flow "partial"),
 `missed` (past training day, no real logs — inferred rows don't count, a
 missed flow is missed), `today`, `upcoming`. gym-display shows it read-only
 from the Setup screen's Tomorrow and Week buttons.
+**Status page (STATUS-1).** `GET /api/health/overview` returns the whole page
+in one read, in the active timezone: `program` (name, phase, week of
+weeks_total, anchor, deload week, sessions done/planned this Wed–Tue week),
+`week_days` (the `/plan` status derivation), `today` (session, progress in
+sets / minutes / rest, this morning's check-in, the adjustment), a
+`strength_progress` row per program exercise (last / previous / best top set
+by load × reps, trend ↑→↓ at ±2%, latest `setting=`), `checkins_14d`, open
+`patterns` (empty until migration 032), plain-language `flags` (missed,
+partial, RPE over cap, pain chips and pain-keyword notes), and `weight_30d`
+with a first/latest/change summary. Everything except body weight is scoped
+to `plan_date >= program.anchor`. The program comes from
+`acos.system_state.health_program` (written by every office reseed), else it
+is derived from the plan rows. `/status` stays for the Today→Status redirect.
 Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
 `ryan@rdm.is`. Frontend repo: `RDM-IS/gym-display`.
 

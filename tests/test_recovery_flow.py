@@ -6,6 +6,7 @@ Run:
 """
 
 import copy
+import json
 import importlib.util
 import sys
 import unittest
@@ -120,6 +121,21 @@ class TestBuilder(unittest.TestCase):
         self.assertEqual((ROWS[THU]["est_duration_min"], ROWS[SAT]["est_duration_min"]), (38, 30))
 
 
+class TestProgramState(unittest.TestCase):
+    def test_program_state_for_the_status_page(self):
+        self.assertEqual(office.program_state(), {
+            "name": "Foundation", "phase": 1, "anchor": "2026-09-16", "weeks_total": 7,
+            "deload_week": 7, "end": "2026-11-03"})
+
+    def test_written_with_the_reseed(self):
+        cur = MagicMock()
+        office.write_program_state(cur)
+        sql, params = cur.execute.call_args.args
+        self.assertIn("acos.system_state", sql)
+        self.assertEqual(params[0], "health_program")
+        self.assertEqual(json.loads(params[1])["anchor"], "2026-09-16")
+
+
 class TestSideValidator(unittest.TestCase):
     def test_real_flow_passes(self):
         office.validate_flow(ROWS[THU]["blocks"])
@@ -179,7 +195,8 @@ class TestReseedDiff(unittest.TestCase):
         self.assertIn("2026-09-19 Sat p1 wk1  rest_mobility  Rest / Mobility", lines[2])
         self.assertIn("recovery_flow  Recovery Flow · home · 30 min · RPE 2", lines[2])
         self.assertIn("Recovery Flow · office gym · 38 min · RPE 2", lines[3])
-        self.assertEqual(lines[-1], "13 Recovery Flow rows rewritten; no other dates touched.")
+        self.assertEqual(lines[-2], "13 Recovery Flow rows rewritten; no other dates touched.")
+        self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
     def test_preflight_needs_migration_033(self):
         rs = _reseed()
