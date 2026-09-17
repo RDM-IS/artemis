@@ -37,6 +37,39 @@ def _override_header() -> str | None:
         return f"\U0001f30d {label} time"
 
 
+def _mmss(sec: int) -> str:
+    m, s = divmod(int(sec), 60)
+    return f"{m} min" if not s else f"{m}:{s:02d}"
+
+
+def flow_lines(blocks: dict, name: str = "Recovery Flow") -> list[str]:
+    """YOGA-1 — plan-exact Recovery Flow: every step with side and hold, the
+    round-2 doubling, and the total. Read only from the plan row."""
+    from artemis.health_office import flow_step_holds, flow_total_sec
+
+    total = flow_total_sec(blocks)
+    where = f" ({blocks['location']})" if blocks.get("location") else ""
+    out = [f"\U0001f9d8 Today: **{name}**{where} — {_mmss(total)} total, hands-free."]
+    for p in blocks.get("pre") or []:
+        out.append(f"· {p['name']} — {_mmss(p['duration_sec'])}: {p.get('cue') or ''}".rstrip(": "))
+    r1 = flow_step_holds(blocks, 1)
+    steps = []
+    for st, hold in zip(blocks.get("flow") or [], r1):
+        side = f" {st['side']}" if st.get("side") else ""
+        steps.append(f"{st['name']}{side} {hold}s")
+    rounds = int(blocks.get("rounds") or 1)
+    out.append(f"· Round 1 ({_mmss(sum(r1))}): " + " · ".join(steps))
+    for r in range(2, rounds + 1):
+        hr = flow_step_holds(blocks, r)
+        doubled = [st["name"] for st, a, b in zip(blocks["flow"], r1, hr) if b != a]
+        extra = (f"; {doubled[0].lower()} → {doubled[-1].lower()} held 2×" if doubled else "")
+        out.append(f"· Round {r} ({_mmss(sum(hr))}): same order{extra}")
+    close = blocks.get("close")
+    if close:
+        out.append(f"· Close: {close['name'].lower()} — {_mmss(close['duration_sec'])}")
+    return out
+
+
 def _workout_section(plan: dict | None) -> list[str]:
     """Today's session. Light days (rest/walk) get one line."""
     from artemis.health import (
@@ -58,6 +91,9 @@ def _workout_section(plan: dict | None) -> list[str]:
     name = blocks.get("display_name") or _session_pretty_name(session_type)
     duration = plan.get("est_duration_min")
     duration_str = f" — {duration} min" if duration else ""
+
+    if blocks.get("type") == "recovery_flow":
+        return flow_lines(blocks, name)
 
     if session_type in _LIGHT_SESSIONS:
         note = blocks.get("notes") or blocks.get("setup_notes") or ""
@@ -92,10 +128,15 @@ def _workout_section(plan: dict | None) -> list[str]:
 
 
 def prompt_type_for(plan: dict | None) -> str:
-    """Survey variant from the PLAN, never the day of week (WAKE-1 §F.2)."""
+    """Survey variant from the PLAN, never the day of week (WAKE-1 §F.2).
+    A Recovery Flow (YOGA-1) is not a workout-later day either."""
     if not plan:
         return "logging_only"
-    return "logging_only" if plan.get("session_type") in _LIGHT_SESSIONS else "workout_am"
+    blocks = plan.get("blocks")
+    flow = isinstance(blocks, dict) and blocks.get("type") == "recovery_flow"
+    if flow or plan.get("session_type") in _LIGHT_SESSIONS + ("recovery_flow",):
+        return "logging_only"
+    return "workout_am"
 
 
 def _checkin_section(plan: dict | None) -> list[str]:

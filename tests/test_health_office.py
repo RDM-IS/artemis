@@ -64,8 +64,9 @@ class TestSchedule(unittest.TestCase):
     def test_rest_days_are_thu_and_sat(self):
         for r in _ROWS:
             wd = r["plan_date"].weekday()
-            if r["session_type"] == "rest_mobility":
-                self.assertIn(wd, (3, 5), f"{r['plan_date']} rest on weekday {wd}")
+            if r["session_type"] == "recovery_flow":
+                self.assertIn(wd, (3, 5), f"{r['plan_date']} flow on weekday {wd}")
+            self.assertNotEqual(r["session_type"], "rest_mobility")
             if r["session_type"].startswith("strength"):
                 self.assertIn(wd, (0, 2, 4), "strength must fall on a weekday")
 
@@ -78,7 +79,7 @@ class TestSchedule(unittest.TestCase):
 
     def test_weekly_pattern_and_weeks(self):
         # Wed..Tue
-        pattern = ["strength_a", "rest_mobility", "strength_b", "rest_mobility",
+        pattern = ["strength_a", "recovery_flow", "strength_b", "recovery_flow",
                    "walk", "strength_c", "cardio_z2"]
         for wk in range(1, 8):
             for wd, st in enumerate(pattern):
@@ -160,7 +161,7 @@ class TestSchedule(unittest.TestCase):
         w = _BY_DATE[_wk_date(3, 4)]          # Sun walk
         self.assertEqual(w["blocks"]["location"], "outside")
         self.assertEqual(w["est_duration_min"], 30)
-        self.assertEqual(_BY_DATE[_wk_date(3, 1)]["blocks"]["type"], "mobility")   # Thu
+        self.assertEqual(_BY_DATE[_wk_date(3, 1)]["blocks"]["type"], "recovery_flow")   # Thu
 
 
 class TestRegressionNoRetiredEquipment(unittest.TestCase):

@@ -146,6 +146,7 @@ _LEGACY_PRETTY = {
     "cardio_z2": "Cardio Zone 2",
     "walk": "Walk + mobility",
     "rest_mobility": "Rest / Mobility",
+    "recovery_flow": "Recovery Flow",
 }
 
 
@@ -970,7 +971,7 @@ def _planned_set_count(blocks: Any) -> int:
         exs = blocks.get("exercises")
         n = len(exs) if isinstance(exs, list) else 0
         total += rounds * n
-    elif t in ("intervals", "steady", "walk", "mobility"):
+    elif t in ("intervals", "steady", "walk", "mobility", "recovery_flow"):
         total += 1
     fin = blocks.get("finisher")
     if isinstance(fin, dict):

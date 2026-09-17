@@ -15,13 +15,21 @@ written without --commit.
     /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --commit     # WRITE
     /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --self-test   # no DB
 
+YOGA-1 — rewrite ONLY the Recovery Flow days (Thu office / Sat home) from a date:
+
+    /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --flow-days --from 2026-09-19
+    /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --flow-days --from 2026-09-19 --commit
+
+It needs migration 033 (session_type CHECK allows 'recovery_flow'), refuses any
+date that already has a real session_log row, and touches no other day.
+
 Retired (HEALTH-2):
   * the legacy v2 whole-table home-gym reseed (PowerBlocks / TRX / rower / bike),
   * --ramp (feat/health-ramp weeks 1-7, 7/25-9/11). Its delete-forward from 7/25
     would wipe the office plan, so it refuses to run.
 
 CONSTRAINTS (live RDS): session_type CHECK (strength_a/b/c, cardio_intervals,
-cardio_z2, walk, rest_mobility); week_num CHECK 1..19; phase CHECK 1..4;
+cardio_z2, walk, rest_mobility, recovery_flow [033]); week_num CHECK 1..19; phase CHECK 1..4;
 generated_by CHECK (baseline|autoreg_morning|autoreg_evening|manual) — a
 human-run reseed writes 'manual' and the CHECK is NOT expanded.
 
@@ -42,6 +50,7 @@ import argparse
 import json
 import os
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -267,6 +276,88 @@ def reseed_office(dry_run: bool) -> int:
         return len(rows)
 
 
+def flow_rows(start: date) -> list[dict]:
+    """The Recovery Flow rows from `start` through the program end."""
+    rows = [r for r in office.build_rows()
+            if r["session_type"] == "recovery_flow" and start <= r["plan_date"] <= office.OFFICE_END]
+    for r in rows:
+        office.validate_flow(r["blocks"])
+    return rows
+
+
+def _flow_preflight(cur) -> tuple[bool, str]:
+    cur.execute(
+        """SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c
+           JOIN pg_class t ON t.oid = c.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+           WHERE n.nspname='health' AND t.relname='plan'
+             AND c.conname = 'plan_session_type_check'""")
+    row = cur.fetchone()
+    if row and "recovery_flow" not in row[0]:
+        return False, "session_type CHECK lacks 'recovery_flow' — apply migration 033 first."
+    return True, "session_type CHECK permits 'recovery_flow'."
+
+
+def flow_diff_lines(existing: dict, rows: list[dict]) -> list[str]:
+    out = [f"{'DATE':<11}{'WD':<4}{'CURRENT':<52}NEW", "-" * 120]
+    for r in rows:
+        d = r["plan_date"]
+        old = existing.get(d)
+        old_s = _row_label(old) if old else "(no row)"
+        b = r["blocks"]
+        new_s = (f"{_row_label({'phase': r['phase'], 'week_num': r['week_num'], 'session_type': r['session_type'], 'display_name': b['display_name']})}"
+                 f" · {b['location']} · {r['est_duration_min']} min · RPE {r['target_rpe']:g}")
+        out.append(f"{d.isoformat():<11}{d.strftime('%a'):<4}{old_s:<52}{new_s}")
+    out.append("-" * 120)
+    out.append(f"{len(rows)} Recovery Flow rows rewritten; no other dates touched.")
+    return out
+
+
+def reseed_flow_days(start: date, dry_run: bool) -> int:
+    _load_dotenv()
+    rows = flow_rows(start)
+    with _connect() as conn:
+        cur = conn.cursor()
+        ok, msg = _flow_preflight(cur)
+        print(f"[preflight] {msg}")
+        if not ok:
+            conn.rollback()
+            raise SystemExit(f"[ABORT] {msg}")
+        dates = [r["plan_date"] for r in rows]
+        cur.execute(
+            "SELECT p.plan_date, count(*) FROM health.session_log sl "
+            "JOIN health.plan p ON p.plan_id = sl.plan_id "
+            "WHERE p.plan_date = ANY(%s) AND sl.logged_via <> 'inferred' GROUP BY 1",
+            (dates,))
+        logged = cur.fetchall()
+        if logged:
+            conn.rollback()
+            raise SystemExit(f"[ABORT] Recovery Flow dates already have real logs: {logged}")
+        print("\n".join(flow_diff_lines(_read_existing(cur), rows)))
+        if dry_run:
+            conn.rollback()
+            print("[DRY-RUN] (default) No rows written. Re-run with --commit to write.")
+            return 0
+        try:
+            for r in rows:
+                cur.execute(office._UPSERT_SQL, (
+                    r["plan_date"], r["phase"], r["week_num"], r["session_type"],
+                    json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
+                    r["est_duration_min"], r["generated_by"], r["notes"]))
+            cur.execute(
+                "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
+                "outcome, token_count, api_cost_usd, metadata) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                ("health_office", None, "recovery_flow_reseed", "health", None, "executed",
+                 0, 0.0, json.dumps({"from": start.isoformat(), "dates": [d.isoformat() for d in dates]})))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        print(f"[OK] Wrote {len(rows)} Recovery Flow rows + audit row.")
+        return len(rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reseed health.plan (HEALTH-2 office gym).")
     ap.add_argument("--office", action="store_true",
@@ -275,12 +366,21 @@ def main() -> None:
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true", help="No DB. Print the schedule.")
     ap.add_argument("--ramp", action="store_true", help="RETIRED — refuses to run.")
+    ap.add_argument("--flow-days", action="store_true",
+                    help="YOGA-1: rewrite only the Thu/Sat Recovery Flow rows (with --from).")
+    ap.add_argument("--from", dest="start", type=date.fromisoformat,
+                    help="First date for --flow-days (YYYY-MM-DD).")
     args = ap.parse_args()
 
     if args.ramp:
         raise SystemExit(RAMP_RETIRED_MSG)
     if not args.office:
         ap.error("choose a mode: --office (the legacy v2 home-gym reseed is retired)")
+    if args.flow_days:
+        if not args.start:
+            ap.error("--flow-days needs --from YYYY-MM-DD")
+        reseed_flow_days(args.start, dry_run=not args.commit)
+        return
     if args.self_test:
         office_self_test()
         return

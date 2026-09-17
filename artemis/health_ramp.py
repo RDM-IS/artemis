@@ -368,7 +368,7 @@ def validate_ramp_rows(rows: list[dict]) -> None:
     """Cheap structural asserts so a bad edit fails loudly (mirrors the reseed
     script's _validate)."""
     legal = {"strength_a", "strength_b", "strength_c",
-             "cardio_intervals", "cardio_z2", "walk", "rest_mobility"}
+             "cardio_intervals", "cardio_z2", "walk", "rest_mobility", "recovery_flow"}
     dates = [r["plan_date"] for r in rows]
     assert len(dates) == len(set(dates)), "duplicate plan_date in ramp rows"
     for r in rows:
@@ -552,7 +552,13 @@ def _load_ramp_rows(cur) -> list[dict]:
         (RAMP_START,),
     )
     cols = [c[0] for c in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    # YOGA-1: a Recovery Flow is logged but never part of progression or
+    # slides — it can't be completed, slid, or missed as far as the ramp knows.
+    return [r for r in rows if r.get("session_type") not in RAMP_EXCLUDED_TYPES]
+
+
+RAMP_EXCLUDED_TYPES = ("recovery_flow",)
 
 
 def _is_completed(cur, plan_id: int, plan_date: date) -> bool:
