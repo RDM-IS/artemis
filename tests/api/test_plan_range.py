@@ -257,6 +257,13 @@ class TestStatus(Base):
         self.assertEqual(derive_day_status(plan(2, TODAY, "rest_mobility", {"type": "mobility"}), [], TODAY), "today")
 
 
+class TestFlowPlannedSets(unittest.TestCase):
+    def test_a_flow_plans_no_sets(self):
+        from api.app.routers.health import _planned_set_count
+        self.assertEqual(_planned_set_count({"type": "recovery_flow", "rounds": 2, "flow": [{}] * 20}), 0)
+        self.assertEqual(_planned_set_count({"type": "mobility"}), 1)
+
+
 class TestProxyAllowsPlan(unittest.TestCase):
     def test_route_is_registered_under_health(self):
         try:

@@ -973,8 +973,10 @@ def _planned_set_count(blocks: Any) -> int:
         exs = blocks.get("exercises")
         n = len(exs) if isinstance(exs, list) else 0
         total += rounds * n
-    elif t in ("intervals", "steady", "walk", "mobility", "recovery_flow"):
+    elif t in ("intervals", "steady", "walk", "mobility"):
         total += 1
+    # recovery_flow: 0 — a flow logs one session_summary, never sets, so a
+    # planned set would read "0 of 1" on the Status page for a finished flow.
     fin = blocks.get("finisher")
     if isinstance(fin, dict):
         f_rounds = max(1, int(fin.get("rounds") or 1))
