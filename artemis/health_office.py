@@ -497,6 +497,25 @@ ON CONFLICT (plan_date) DO UPDATE SET
 """
 
 
+# The current program, as the Status page reads it (acos.system_state
+# `health_program`, STATUS-1). Written with every office reseed.
+PROGRAM_STATE_KEY = "health_program"
+DELOAD_WEEK = 7
+
+
+def program_state() -> dict:
+    weeks = max(RAMP)
+    return {"name": "Foundation", "phase": PHASE, "anchor": WEEK1_START.isoformat(),
+            "weeks_total": weeks, "deload_week": DELOAD_WEEK, "end": OFFICE_END.isoformat()}
+
+
+def write_program_state(cur) -> None:
+    cur.execute(
+        "INSERT INTO acos.system_state (key, value, updated_at) VALUES (%s, %s, now()) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        (PROGRAM_STATE_KEY, json.dumps(program_state())))
+
+
 def write_rows(cur, rows: list[dict]) -> int:
     """UPSERT every office row and audit it through the same cursor. Does NOT
     commit."""
@@ -515,4 +534,5 @@ def write_rows(cur, rows: list[dict]) -> int:
          json.dumps({"from": OFFICE_START.isoformat(), "to": OFFICE_END.isoformat(),
                      "rows": len(rows)})),
     )
+    write_program_state(cur)
     return len(rows)

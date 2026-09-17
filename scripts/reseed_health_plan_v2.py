@@ -310,6 +310,7 @@ def flow_diff_lines(existing: dict, rows: list[dict]) -> list[str]:
         out.append(f"{d.isoformat():<11}{d.strftime('%a'):<4}{old_s:<52}{new_s}")
     out.append("-" * 120)
     out.append(f"{len(rows)} Recovery Flow rows rewritten; no other dates touched.")
+    out.append(f"acos.system_state {office.PROGRAM_STATE_KEY} := {json.dumps(office.program_state())}")
     return out
 
 
@@ -350,6 +351,7 @@ def reseed_flow_days(start: date, dry_run: bool) -> int:
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                 ("health_office", None, "recovery_flow_reseed", "health", None, "executed",
                  0, 0.0, json.dumps({"from": start.isoformat(), "dates": [d.isoformat() for d in dates]})))
+            office.write_program_state(cur)
             conn.commit()
         except Exception:
             conn.rollback()

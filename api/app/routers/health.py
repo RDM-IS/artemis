@@ -7,6 +7,10 @@ GET  /api/health/last_logged    → batch: most-recent prior set per exercise
 GET  /api/health/status         → windowed status payload for /status page
 GET  /api/health/plan           → read-only plan range (≤ 14 days) with a
                                   derived status per day (Tomorrow / Week)
+GET  /api/health/overview       → Status page (STATUS-1): program, this week,
+                                  today's progress + check-in, strength
+                                  progress, check-in trends, patterns, flags,
+                                  body weight — scoped to the current program
 GET  /api/health/sessions       → per-day plan + per-set rows + computed
                                   aggregates + outlier flags for the
                                   Status page facts read-back (no
@@ -31,6 +35,8 @@ api/app/models.py from flat file → package, which would break every
 existing import.
 """
 
+import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -1315,28 +1321,10 @@ def _parse_day(value: Optional[str], name: str) -> Optional[date]:
         raise HTTPException(status_code=400, detail={"error": "bad_date", "param": name})
 
 
-@router.get("/plan", response_model=PlanRangeResponse)
-def get_plan_range(
-    from_: Optional[str] = Query(default=None, alias="from"),
-    to: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db),
-    _api_key: str = Depends(verify_health_api_key),
-):
-    """Plan rows for [from, to] with derived status. Read-only.
-
-    400 → {"error": "range_too_large", "max_days": 14} | {"error": "bad_range"}
-          | {"error": "bad_date", "param": ...}
-    """
-    tz_name = _active_timezone(db)
-    today = datetime.now(ZoneInfo(tz_name)).date()
-    start = _parse_day(from_, "from") or today
-    end = _parse_day(to, "to") or (start + timedelta(days=6))
-    if end < start:
-        raise HTTPException(status_code=400, detail={"error": "bad_range"})
-    if (end - start).days + 1 > PLAN_RANGE_MAX_DAYS:
-        raise HTTPException(status_code=400,
-                            detail={"error": "range_too_large", "max_days": PLAN_RANGE_MAX_DAYS})
-
+def _plan_days(db: Session, start: date, end: date,
+               today: date) -> tuple[list["PlanDay"], dict[int, list[dict[str, Any]]]]:
+    """Plan rows in [start, end] as PlanDay (shared status derivation), plus
+    the raw session_log rows per plan_id. Used by /plan and /overview."""
     plan_rows = db.execute(
         text("""
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
@@ -1355,7 +1343,7 @@ def get_plan_range(
         for r in db.execute(
             text("""
                 SELECT plan_id, log_type, exercise, set_num, reps_done, weight_lbs,
-                       duration_sec, notes, is_skipped, logged_via
+                       duration_sec, rpe_actual, notes, is_skipped, logged_via
                 FROM health.session_log
                 WHERE plan_id = ANY(:pids)
                 ORDER BY plan_id, log_id
@@ -1388,5 +1376,550 @@ def get_plan_range(
             logged=summarize_logs(logs) if p["plan_date"] <= today else [],
             summary_notes=summary if p["plan_date"] <= today else None,
         ))
+    return days, logs_by_plan
+
+
+@router.get("/plan", response_model=PlanRangeResponse)
+def get_plan_range(
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """Plan rows for [from, to] with derived status. Read-only.
+
+    400 → {"error": "range_too_large", "max_days": 14} | {"error": "bad_range"}
+          | {"error": "bad_date", "param": ...}
+    """
+    tz_name = _active_timezone(db)
+    today = datetime.now(ZoneInfo(tz_name)).date()
+    start = _parse_day(from_, "from") or today
+    end = _parse_day(to, "to") or (start + timedelta(days=6))
+    if end < start:
+        raise HTTPException(status_code=400, detail={"error": "bad_range"})
+    if (end - start).days + 1 > PLAN_RANGE_MAX_DAYS:
+        raise HTTPException(status_code=400,
+                            detail={"error": "range_too_large", "max_days": PLAN_RANGE_MAX_DAYS})
+
+    days, _ = _plan_days(db, start, end, today)
     return PlanRangeResponse(today=today, timezone=tz_name, range_from=start,
                              range_to=end, days=days)
+
+
+
+# ---------------------------------------------------------------------------
+# /overview — GET: the Status page (STATUS-1)
+# ---------------------------------------------------------------------------
+#
+# Everything except body weight is scoped to the CURRENT program
+# (plan_date >= program.anchor). The program comes from acos.system_state
+# key `health_program` (written by the reseed script); without it, it is
+# derived from the plan rows: the earliest week-1 row of today's phase within
+# this program's span. Day status reuses the /plan derivation (_plan_days).
+
+PROGRAM_STATE_KEY = "health_program"
+OVERVIEW_CHECKIN_DAYS = 14
+OVERVIEW_WEIGHT_DAYS = 30
+TREND_TOLERANCE = 0.02          # ±2% of load × reps counts as flat
+
+_PAIN_NOTE_RE = re.compile(r"(?:^|;)\s*pain=([a-z][a-z ]*?)\s*:\s*(\d)\s*(?=;|$)", re.I)
+_SETTING_NOTE_RE = re.compile(r"(?:^|;)\s*setting=(-?\d+(?:\.\d+)?)\s*(?=;|$)")
+
+
+class ProgramInfo(BaseModel):
+    name: Optional[str] = None
+    phase: int
+    week: int
+    weeks_total: int
+    anchor: date
+    deload_week: Optional[int] = None
+    weeks_to_deload: Optional[int] = None
+    week_start: date
+    week_end: date
+    sessions_done: int = 0
+    sessions_planned: int = 0
+    source: str = "state"          # "state" | "derived"
+
+
+class ProgressOut(BaseModel):
+    unit: str                      # "sets" | "minutes" | "rest"
+    done: Optional[float] = None
+    planned: Optional[float] = None
+
+
+class CheckinOut(BaseModel):
+    date: date
+    sleep_hrs: Optional[float] = None
+    energy: Optional[int] = None
+    weight_lbs: Optional[float] = None
+    resting_hr: Optional[int] = None
+    soreness: dict[str, int] = Field(default_factory=dict)
+    pain: dict[str, int] = Field(default_factory=dict)
+
+
+class AdjustmentOut(BaseModel):
+    summary: list[str] = Field(default_factory=list)
+    rules_fired: list[str] = Field(default_factory=list)
+
+
+class TodayOverview(BaseModel):
+    date: date
+    day: Optional[PlanDay] = None
+    progress: Optional[ProgressOut] = None
+    checkin: Optional[CheckinOut] = None
+    adjustment: Optional[AdjustmentOut] = None
+
+
+class TopSet(BaseModel):
+    date: date
+    weight_lbs: Optional[float] = None
+    reps: Optional[int] = None
+    score: float
+
+
+class StrengthProgressRow(BaseModel):
+    exercise: str
+    sessions: int = 0
+    last: Optional[TopSet] = None
+    previous: Optional[TopSet] = None
+    best: Optional[TopSet] = None
+    trend: Optional[str] = None     # "up" | "flat" | "down"
+    setting: Optional[float] = None
+
+
+class PatternOut(BaseModel):
+    id: int
+    exercise: str
+    region: str
+    hits: int
+    exposures: int
+    text: str
+    last_reflection_at: Optional[datetime] = None
+
+
+class FlagOut(BaseModel):
+    date: date
+    kind: str                       # "rpe" | "pain" | "missed" | "partial"
+    text: str
+
+
+class WeightSummary(BaseModel):
+    first: TrendPoint
+    latest: TrendPoint
+    change: float
+
+
+class OverviewResponse(BaseModel):
+    date: date
+    timezone: str
+    program: Optional[ProgramInfo] = None
+    week_days: list[PlanDay] = Field(default_factory=list)
+    today: TodayOverview
+    strength_progress: list[StrengthProgressRow] = Field(default_factory=list)
+    checkins_14d: list[CheckinOut] = Field(default_factory=list)
+    patterns: list[PatternOut] = Field(default_factory=list)
+    flags: list[FlagOut] = Field(default_factory=list)
+    weight_30d: list[TrendPoint] = Field(default_factory=list)
+    weight_summary: Optional[WeightSummary] = None
+    previous_program_end: Optional[date] = None
+
+
+def _md(d: date) -> str:
+    return f"{d.month}/{d.day}"
+
+
+def _num(x: float) -> str:
+    return str(int(x)) if float(x) == int(x) else f"{x:g}"
+
+
+def _program(db: Session, today: date) -> Optional[dict[str, Any]]:
+    """{name, phase, anchor, weeks_total, deload_week, source} or None."""
+    row = db.execute(
+        text("SELECT value FROM acos.system_state WHERE key = :k"),
+        {"k": PROGRAM_STATE_KEY},
+    ).mappings().first()
+    if row and row.get("value"):
+        try:
+            v = json.loads(row["value"])
+            return {"name": v.get("name"), "phase": int(v["phase"]),
+                    "anchor": date.fromisoformat(v["anchor"]),
+                    "weeks_total": int(v["weeks_total"]),
+                    "deload_week": v.get("deload_week"), "source": "state"}
+        except (ValueError, KeyError, TypeError):
+            pass
+    ref = db.execute(
+        text("""
+            SELECT phase, week_num, plan_date FROM health.plan
+            WHERE plan_date <= :t ORDER BY plan_date DESC LIMIT 1
+        """),
+        {"t": today},
+    ).mappings().first()
+    if ref is None:
+        return None
+    lo = ref["plan_date"] - timedelta(days=7 * int(ref["week_num"]) + 7)
+    anchor = db.execute(
+        text("""
+            SELECT min(plan_date) AS anchor FROM health.plan
+            WHERE phase = :p AND week_num = 1 AND plan_date > :lo AND plan_date <= :t
+        """),
+        {"p": ref["phase"], "lo": lo, "t": ref["plan_date"]},
+    ).mappings().first()
+    if not anchor or anchor["anchor"] is None:
+        return None
+    total = db.execute(
+        text("""
+            SELECT max(week_num) AS weeks FROM health.plan
+            WHERE phase = :p AND plan_date >= :a
+        """),
+        {"p": ref["phase"], "a": anchor["anchor"]},
+    ).mappings().first()
+    name = db.execute(
+        text("SELECT phase_name FROM health.phase_config WHERE phase = :p"),
+        {"p": ref["phase"]},
+    ).mappings().first()
+    weeks = int(total["weeks"]) if total and total["weeks"] else int(ref["week_num"])
+    return {"name": name["phase_name"] if name else None, "phase": int(ref["phase"]),
+            "anchor": anchor["anchor"], "weeks_total": weeks, "deload_week": weeks,
+            "source": "derived"}
+
+
+def _scores(soreness: Any) -> tuple[dict[str, int], dict[str, int]]:
+    if isinstance(soreness, str):
+        try:
+            soreness = json.loads(soreness)
+        except ValueError:
+            soreness = {}
+    if not isinstance(soreness, dict):
+        return {}, {}
+    sore = {k: int(v) for k, v in soreness.items()
+            if k != "pain" and isinstance(v, (int, float)) and not isinstance(v, bool)}
+    pain_src = soreness.get("pain") if isinstance(soreness.get("pain"), dict) else {}
+    pain = {k: int(v) for k, v in pain_src.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return sore, pain
+
+
+def _checkin(r: dict[str, Any]) -> CheckinOut:
+    sore, pain = _scores(r.get("soreness"))
+    return CheckinOut(
+        date=r["state_date"],
+        sleep_hrs=float(r["sleep_hrs"]) if r.get("sleep_hrs") is not None else None,
+        energy=r.get("energy"),
+        weight_lbs=float(r["weight_lbs"]) if r.get("weight_lbs") is not None else None,
+        resting_hr=r.get("resting_hr"),
+        soreness=sore,
+        pain=pain,
+    )
+
+
+def _real(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in logs if r.get("logged_via") != "inferred"]
+
+
+def progress_for(day: "PlanDay", logs: list[dict[str, Any]]) -> ProgressOut:
+    """Today's progress in the unit that fits the session."""
+    b = day.blocks or {}
+    t = b.get("type")
+    real = _real(logs)
+    if _is_rest_day(day.session_type, b):
+        return ProgressOut(unit="rest")
+    if t == "recovery_flow":
+        planned_sec = b.get("total_sec") or (day.est_duration_min or 0) * 60
+        done_sec = max([int(r.get("duration_sec") or 0) for r in real
+                        if r["log_type"] == "session_summary"
+                        and (r.get("notes") or "").startswith("recovery_flow")] or [0])
+        return ProgressOut(unit="minutes", done=round(done_sec / 60), planned=round(planned_sec / 60))
+    if t == "circuit":
+        done = sum(1 for r in real if r["log_type"] == "strength_set" and not r.get("is_skipped"))
+        return ProgressOut(unit="sets", done=done, planned=_planned_set_count(b))
+    done_sec = sum(int(r.get("duration_sec") or 0) for r in real
+                   if r["log_type"] == "cardio_block" and not r.get("is_skipped"))
+    return ProgressOut(unit="minutes", done=round(done_sec / 60), planned=day.est_duration_min)
+
+
+def trend_of(last: Optional[TopSet], prev: Optional[TopSet]) -> Optional[str]:
+    """↑ / → / ↓ by estimated load × reps (±2% is flat)."""
+    if last is None or prev is None:
+        return None
+    if prev.score <= 0:
+        return "up" if last.score > 0 else "flat"
+    change = (last.score - prev.score) / prev.score
+    if change > TREND_TOLERANCE:
+        return "up"
+    if change < -TREND_TOLERANCE:
+        return "down"
+    return "flat"
+
+
+def _score(weight: Any, reps: Any) -> float:
+    r = int(reps or 0)
+    return float(weight) * r if weight else float(r)
+
+
+def strength_progress(names: list[str], rows: list[dict[str, Any]]) -> list[StrengthProgressRow]:
+    """Pure: rows = [{exercise, plan_date, weight_lbs, reps_done, notes}] (real,
+    non-skipped strength sets in the program window)."""
+    by_ex: dict[str, dict[date, dict[str, Any]]] = {}
+    settings: dict[str, tuple[date, float]] = {}
+    for r in rows:
+        ex, d = r["exercise"], r["plan_date"]
+        sc = _score(r.get("weight_lbs"), r.get("reps_done"))
+        cur = by_ex.setdefault(ex, {}).get(d)
+        if cur is None or sc > cur["score"]:
+            by_ex[ex][d] = {"date": d, "weight_lbs": float(r["weight_lbs"]) if r.get("weight_lbs") is not None else None,
+                            "reps": r.get("reps_done"), "score": sc}
+        m = _SETTING_NOTE_RE.search(r.get("notes") or "")
+        if m and (ex not in settings or d >= settings[ex][0]):
+            settings[ex] = (d, float(m.group(1)))
+    out = []
+    for name in names:
+        sessions = sorted(by_ex.get(name, {}).values(), key=lambda x: x["date"])
+        last = TopSet(**sessions[-1]) if sessions else None
+        prev = TopSet(**sessions[-2]) if len(sessions) > 1 else None
+        best = TopSet(**max(sessions, key=lambda x: (x["score"], x["date"]))) if sessions else None
+        out.append(StrengthProgressRow(
+            exercise=name, sessions=len(sessions), last=last, previous=prev, best=best,
+            trend=trend_of(last, prev), setting=settings.get(name, (None, None))[1]))
+    return out
+
+
+def _exercise_names(days: list["PlanDay"]) -> list[str]:
+    """Strength exercises of the program week as WRITTEN (not check-in swaps)."""
+    names: list[str] = []
+    for d in days:
+        b = d.blocks or {}
+        orig = b.get("original") if isinstance(b.get("original"), dict) else None
+        src = (orig or {}).get("blocks") if orig else b
+        if not isinstance(src, dict) or src.get("type") != "circuit":
+            continue
+        for ex in src.get("exercises") or []:
+            n = ex.get("name")
+            if n and n not in names:
+                names.append(n)
+    return names
+
+
+def _rpe_cap(day: "PlanDay", exercise: str) -> Optional[float]:
+    b = day.blocks or {}
+    for ex in b.get("exercises") or []:
+        if ex.get("name") == exercise and ex.get("rpe_cap") is not None:
+            return float(ex["rpe_cap"])
+    if b.get("rpe_cap") is not None:
+        return float(b["rpe_cap"])
+    return day.target_rpe
+
+
+def build_flags(days: list["PlanDay"], logs_by_plan: dict[int, list[dict[str, Any]]],
+                today: date) -> list[FlagOut]:
+    """Plain-language data flags, newest first. Facts only."""
+    flags: list[FlagOut] = []
+    for day in days:
+        if day.plan_date > today:
+            continue
+        name = day.display_name or day.session_type
+        logs = _real(logs_by_plan.get(day.plan_id, []))
+        if day.status == "missed":
+            flags.append(FlagOut(date=day.plan_date, kind="missed", text=f"Missed: {name} ({_md(day.plan_date)})"))
+        elif day.status == "partial" and day.plan_date < today:
+            p = progress_for(day, logs)
+            unit = "sets" if p.unit == "sets" else "min"
+            flags.append(FlagOut(date=day.plan_date, kind="partial",
+                                 text=f"Partial: {name} ({_md(day.plan_date)}) — "
+                                      f"{_num(p.done or 0)} of {_num(p.planned or 0)} {unit}"))
+        top_rpe: dict[str, float] = {}
+        for r in logs:
+            if r["log_type"] == "strength_set" and r.get("rpe_actual") is not None and r.get("exercise"):
+                top_rpe[r["exercise"]] = max(top_rpe.get(r["exercise"], 0.0), float(r["rpe_actual"]))
+        for ex, rpe in top_rpe.items():
+            cap = _rpe_cap(day, ex)
+            if cap is not None and rpe > cap:
+                flags.append(FlagOut(date=day.plan_date, kind="rpe",
+                                     text=f"RPE {_num(rpe)} on {ex} ({_md(day.plan_date)}), cap was {_num(cap)}"))
+        seen: set[tuple] = set()
+        for r in logs:
+            notes = r.get("notes") or ""
+            chips = [(m.group(1).strip().lower(), int(m.group(2))) for m in _PAIN_NOTE_RE.finditer(notes)]
+            where = f" on {r['exercise']}" if r.get("exercise") else ""
+            if chips:
+                for region, n in chips:
+                    key = (region, n, r.get("exercise"))
+                    if n >= 1 and key not in seen:
+                        seen.add(key)
+                        flags.append(FlagOut(date=day.plan_date, kind="pain",
+                                             text=f"Pain chip: {region} {n}{where} ({_md(day.plan_date)})"))
+            elif _contains_pain_keyword(notes):
+                key = (notes, r.get("exercise"))
+                if key not in seen:
+                    seen.add(key)
+                    flags.append(FlagOut(date=day.plan_date, kind="pain",
+                                         text=f"Pain note{where} ({_md(day.plan_date)}): “{notes}”"))
+    order = {"missed": 0, "partial": 1, "rpe": 2, "pain": 3}
+    flags.sort(key=lambda f: (-f.date.toordinal(), order.get(f.kind, 9), f.text))
+    return flags
+
+
+def weight_summary(points: list[TrendPoint]) -> Optional[WeightSummary]:
+    if not points:
+        return None
+    first, latest = points[0], points[-1]
+    return WeightSummary(first=first, latest=latest, change=round(latest.value - first.value, 1))
+
+
+def _patterns(db: Session) -> list[PatternOut]:
+    """Open pain patterns; [] until migration 032 creates the tables."""
+    exists = db.execute(
+        text("SELECT to_regclass('health.pain_pattern') AS t, to_regclass('health.reflection') AS r")
+    ).mappings().first()
+    if not exists or not exists.get("t"):
+        return []
+    has_reflection = bool(exists.get("r"))
+    rows = db.execute(
+        text("""
+            SELECT p.id, p.exercise, p.region, p.hits, p.exposures, p.evidence,
+                   """ + ("""(SELECT max(r.created_at) FROM health.reflection r
+                    WHERE r.pattern_id = p.id)""" if has_reflection else "NULL") + """ AS last_reflection_at
+            FROM health.pain_pattern p
+            WHERE p.status = 'open' AND p.qualifies
+            ORDER BY p.hits DESC, p.id
+        """)
+    ).mappings().all()
+    out = []
+    for r in rows:
+        ev = r.get("evidence") or {}
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except ValueError:
+                ev = {}
+        shared = ev.get("shared") or []
+        also = f" (also that day: {', '.join(shared)})" if shared else ""
+        out.append(PatternOut(
+            id=r["id"], exercise=r["exercise"], region=r["region"], hits=r["hits"],
+            exposures=r["exposures"], last_reflection_at=r.get("last_reflection_at"),
+            text=f"{r['region']} pain ≥2 after {r['exercise']} — {r['hits']} of {r['exposures']} sessions{also}",
+        ))
+    return out
+
+
+@router.get("/overview", response_model=OverviewResponse)
+def get_overview(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+):
+    """The Status page in one read. Dates in the active timezone."""
+    tz_name = _active_timezone(db)
+    today = datetime.now(ZoneInfo(tz_name)).date()
+    prog = _program(db, today)
+
+    program: Optional[ProgramInfo] = None
+    week_days: list[PlanDay] = []
+    history_days: list[PlanDay] = []
+    logs_by_plan: dict[int, list[dict[str, Any]]] = {}
+    scope_start = today
+    if prog:
+        anchor = prog["anchor"]
+        scope_start = anchor
+        week = max(1, min(prog["weeks_total"], (today - anchor).days // 7 + 1))
+        week_start = anchor + timedelta(days=7 * (week - 1))
+        week_end = week_start + timedelta(days=6)
+        history_days, logs_by_plan = _plan_days(db, anchor, max(today, week_end), today)
+        week_days = [d for d in history_days if week_start <= d.plan_date <= week_end]
+        sessions = [d for d in week_days if not _is_rest_day(d.session_type, d.blocks)]
+        deload = prog.get("deload_week")
+        program = ProgramInfo(
+            name=prog.get("name"), phase=prog["phase"], week=week,
+            weeks_total=prog["weeks_total"], anchor=anchor, deload_week=deload,
+            weeks_to_deload=max(0, deload - week) if deload else None,
+            week_start=week_start, week_end=week_end,
+            sessions_done=sum(1 for d in sessions if d.status == "done"),
+            sessions_planned=len(sessions), source=prog["source"],
+        )
+
+    # Today
+    today_day = next((d for d in history_days if d.plan_date == today), None)
+    if today_day is None and not prog:
+        found, more = _plan_days(db, today, today, today)
+        today_day = found[0] if found else None
+        logs_by_plan.update(more)
+    checkin_row = db.execute(
+        text("""
+            SELECT state_date, sleep_hrs, energy, weight_lbs, resting_hr, soreness
+            FROM health.daily_state WHERE state_date = :d
+        """),
+        {"d": today},
+    ).mappings().first()
+    adj = (today_day.blocks or {}).get("adjustment") if today_day else None
+    today_out = TodayOverview(
+        date=today,
+        day=today_day,
+        progress=progress_for(today_day, logs_by_plan.get(today_day.plan_id, [])) if today_day else None,
+        checkin=_checkin(dict(checkin_row)) if checkin_row else None,
+        adjustment=AdjustmentOut(summary=list(adj.get("summary") or []),
+                                 rules_fired=list(adj.get("rules_fired") or []))
+        if isinstance(adj, dict) else None,
+    )
+
+    # Strength progress (program window only)
+    names = _exercise_names(week_days)
+    set_rows: list[dict[str, Any]] = []
+    if names and prog:
+        set_rows = [dict(r) for r in db.execute(
+            text("""
+                SELECT sl.exercise, p.plan_date, sl.weight_lbs, sl.reps_done, sl.notes
+                FROM health.session_log sl
+                JOIN health.plan p ON p.plan_id = sl.plan_id
+                WHERE sl.log_type = 'strength_set'
+                  AND sl.logged_via <> 'inferred'
+                  AND NOT COALESCE(sl.is_skipped, FALSE)
+                  AND sl.exercise = ANY(:names)
+                  AND p.plan_date BETWEEN :s AND :t
+                ORDER BY p.plan_date, sl.log_id
+            """),
+            {"names": names, "s": scope_start, "t": today},
+        ).mappings().all()]
+
+    # Check-ins (14 days, program window only)
+    ci_start = max(today - timedelta(days=OVERVIEW_CHECKIN_DAYS - 1), scope_start)
+    checkins = [_checkin(dict(r)) for r in db.execute(
+        text("""
+            SELECT state_date, sleep_hrs, energy, weight_lbs, resting_hr, soreness
+            FROM health.daily_state
+            WHERE state_date BETWEEN :s AND :t
+            ORDER BY state_date
+        """),
+        {"s": ci_start, "t": today},
+    ).mappings().all()] if ci_start <= today else []
+
+    # Body weight (30 days, not program-scoped)
+    weight = [TrendPoint(date=r["d"], value=float(r["v"])) for r in db.execute(
+        text("""
+            SELECT state_date AS d, weight_lbs AS v
+            FROM health.daily_state
+            WHERE state_date BETWEEN :s AND :t AND weight_lbs IS NOT NULL
+            ORDER BY state_date
+        """),
+        {"s": today - timedelta(days=OVERVIEW_WEIGHT_DAYS - 1), "t": today},
+    ).mappings().all()]
+
+    previous_end = None
+    if prog:
+        older = db.execute(
+            text("SELECT max(plan_date) AS d FROM health.plan WHERE plan_date < :a"),
+            {"a": prog["anchor"]},
+        ).mappings().first()
+        previous_end = older["d"] if older else None
+
+    return OverviewResponse(
+        date=today,
+        timezone=tz_name,
+        program=program,
+        week_days=week_days,
+        today=today_out,
+        strength_progress=strength_progress(names, set_rows),
+        checkins_14d=checkins,
+        patterns=_patterns(db),
+        flags=build_flags(history_days, logs_by_plan, today),
+        weight_30d=weight,
+        weight_summary=weight_summary(weight),
+        previous_program_end=previous_end,
+    )
