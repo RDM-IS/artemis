@@ -390,7 +390,7 @@ cause and never changes a plan.
 | When | What |
 |---|---|
 | 21:55 daily | `job_pain_pattern_recompute` — silent; refreshes `health.pain_pattern`. New rows are written only for candidates; existing rows are kept current (`qualifies` can go false). |
-| Sun 08:00 | `job_health_review` (health tier, OPEN phase only) — one post per open candidate that is **new or changed** since it was last posted (`surfaced_hits/_exposures`); nothing when nothing changed. |
+| Sun 09:30 | `job_health_review` (health tier, OPEN phase only) — one post per open candidate that is **new or changed** since it was last posted (`surfaced_hits/_exposures`); nothing when nothing changed. |
 | on the check-in | The check-in whose pain completes a candidate (it qualifies now, didn't before, and yesterday is one of its hit days) gets **one extra line**, once ever (`mentioned_at`). |
 
 > Pattern: shoulder pain ≥2 after **incline DB press** — 3 of 4 sessions (also that day: rear delt fly). What do you notice?

@@ -15,7 +15,7 @@ changes a plan.
 
 Surfacing:
   - nightly 21:55 recompute (silent) keeps health.pain_pattern current;
-  - Sunday 08:00 health review posts each new or changed open candidate;
+  - Sunday 09:30 health review (the weekend open) posts each new or changed open candidate;
   - the check-in that completes a candidate mentions it once, in one line.
 
 Ryan's thread reply to a pattern post is stored verbatim in health.reflection.

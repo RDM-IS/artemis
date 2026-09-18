@@ -66,17 +66,18 @@ class TestPhaseBoundaries(PhaseCase):
                 self.assertEqual(self.phase_at(tz, at(tz, 2026, 9, 21, 17, 0)), quiet_hours.PHASE_QUIET)
 
     def test_us_dst_transition_day(self):
-        # 2026-11-01: US falls back. 04:30 local is still the wake boundary.
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 11, 1, 4, 29)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 11, 1, 4, 30)), quiet_hours.PHASE_WAKE)
+        # 2026-11-01 (a Sunday): US falls back. The weekend wake boundary
+        # (07:30 local) still holds on the transition day.
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 11, 1, 7, 29)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 11, 1, 7, 30)), quiet_hours.PHASE_WAKE)
 
     def test_eu_dst_transition_day_differs_from_us(self):
-        # 2026-10-25: the EU falls back a week before the US — the windows are
-        # local wall-clock in each zone, so both still break at 04:30/06:30.
-        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 4, 30)), quiet_hours.PHASE_WAKE)
-        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 6, 30)), quiet_hours.PHASE_OPEN)
+        # 2026-10-25 (a Sunday): the EU falls back a week before the US — the
+        # windows are local wall-clock in each zone (weekend 07:30 / 09:30).
+        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 7, 30)), quiet_hours.PHASE_WAKE)
+        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 9, 30)), quiet_hours.PHASE_OPEN)
         # Same instant in Chicago that morning is still the middle of the night.
-        instant = at(PARIS, 2026, 10, 25, 6, 30).astimezone(ZoneInfo(CHICAGO))
+        instant = at(PARIS, 2026, 10, 25, 9, 30).astimezone(ZoneInfo(CHICAGO))
         self.assertEqual(self.phase_at(CHICAGO, instant), quiet_hours.PHASE_QUIET)
 
     def test_is_open_and_is_quiet_track_the_phase(self):
@@ -86,6 +87,53 @@ class TestPhaseBoundaries(PhaseCase):
              patch.object(quiet_hours, "_get_quiet_row", return_value=None):
             self.assertTrue(quiet_hours.is_open())
             self.assertFalse(quiet_hours.is_quiet())
+
+
+class TestWeekendSchedule(PhaseCase):
+    """Sat/Sun: wake 07:30 · open 09:30 · quiet 22:30. Weekdays unchanged."""
+
+    def test_saturday_and_sunday_boundaries(self):
+        cases = [
+            ((4, 30), quiet_hours.PHASE_QUIET),   # weekday wake time is still night
+            ((7, 29), quiet_hours.PHASE_QUIET),
+            ((7, 30), quiet_hours.PHASE_WAKE),
+            ((9, 29), quiet_hours.PHASE_WAKE),
+            ((9, 30), quiet_hours.PHASE_OPEN),
+            ((17, 0), quiet_hours.PHASE_OPEN),    # weekday quiet time is still open
+            ((22, 29), quiet_hours.PHASE_OPEN),
+            ((22, 30), quiet_hours.PHASE_QUIET),
+        ]
+        for day in (26, 27):  # Sat 9/26, Sun 9/27
+            for (hh, mm), expected in cases:
+                with self.subTest(day=day, time=f"{hh:02d}:{mm:02d}"):
+                    self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, day, hh, mm)), expected)
+
+    def test_friday_night_still_goes_quiet_at_17(self):
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 16, 59)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 17, 0)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 23, 0)), quiet_hours.PHASE_QUIET)
+
+    def test_sunday_night_quiet_to_monday_weekday_wake(self):
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 27, 23, 0)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 29)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 30)), quiet_hours.PHASE_WAKE)
+
+    def test_next_wake_and_next_open(self):
+        tz = ZoneInfo(CHICAGO)
+        fri_eve = at(CHICAGO, 2026, 9, 25, 20, 0).astimezone(tz)
+        self.assertEqual(quiet_hours.next_wake(fri_eve), at(CHICAGO, 2026, 9, 26, 7, 30))
+        self.assertEqual(quiet_hours.next_open(fri_eve), at(CHICAGO, 2026, 9, 26, 9, 30))
+        sun_eve = at(CHICAGO, 2026, 9, 27, 23, 0).astimezone(tz)
+        self.assertEqual(quiet_hours.next_wake(sun_eve), at(CHICAGO, 2026, 9, 28, 4, 30))
+        self.assertEqual(quiet_hours.next_open(sun_eve), at(CHICAGO, 2026, 9, 28, 6, 30))
+
+    def test_friday_goodnight_holds_until_saturday_wake(self):
+        set_at = at(CHICAGO, 2026, 9, 25, 21, 0).astimezone(timezone.utc)
+        state = {"manual_override": 1, "is_quiet": 1, "updated_at": set_at}
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 26, 7, 0), state),
+                         quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 26, 7, 30), state),
+                         quiet_hours.PHASE_WAKE)
 
 
 class TestOverrideMatrix(PhaseCase):

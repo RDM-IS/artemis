@@ -11,6 +11,11 @@ DAY PHASES — local wall-clock in the ACTIVE timezone:
     wake   WAKE_TIME (04:30) .. OPEN_TIME (06:30)          health + pre-departure
     open   OPEN_TIME (06:30) .. QUIET_HOURS_START          everything
 
+Saturday and Sunday use the WEEKEND_* times (wake 07:30, open 09:30, quiet
+22:30). Each boundary belongs to the local date it falls on, so Friday night
+goes quiet at 17:00 and Saturday wakes at 07:30; Sunday night goes quiet at
+22:30 and Monday wakes at 04:30.
+
 Timezone handling is the module's own: get_active_timezone() resolves the
 override (if set and unexpired) else config.HOME_TIMEZONE, and every wall-clock
 window check goes through it. Stored instants are TIMESTAMPTZ, so override-expiry
@@ -439,36 +444,72 @@ def _upsert_quiet_state(**kwargs) -> None:
         logger.exception("Failed to upsert quiet_state")
 
 
-def _in_window(now: time, start: time, end: time) -> bool:
-    """Wrap-around-safe [start, end) membership."""
-    if start <= end:
-        return start <= now < end
-    return now >= start or now < end
+def is_weekend(d: date) -> bool:
+    return d.weekday() in config.WEEKEND_DAYS
+
+
+def wake_time_on(d: date) -> time:
+    """Wake boundary on local date `d` (weekend-aware)."""
+    return _parse_time(config.WEEKEND_WAKE_TIME if is_weekend(d) else config.WAKE_TIME)
+
+
+def open_time_on(d: date) -> time:
+    """Business-open boundary on local date `d` (weekend-aware)."""
+    return _parse_time(config.WEEKEND_OPEN_TIME if is_weekend(d) else config.OPEN_TIME)
+
+
+def quiet_start_on(d: date) -> time:
+    """Quiet-hours start on local date `d` (weekend-aware)."""
+    return _parse_time(config.WEEKEND_QUIET_HOURS_START if is_weekend(d)
+                       else config.QUIET_HOURS_START)
+
+
+def next_wake(now: datetime | None = None) -> datetime:
+    """The next scheduled wake instant (local), weekend-aware."""
+    now = now or local_now()
+    for offset in (0, 1, 2):
+        d = now.date() + timedelta(days=offset)
+        cand = datetime.combine(d, wake_time_on(d), tzinfo=now.tzinfo)
+        if cand > now:
+            return cand
+    raise AssertionError("unreachable")
+
+
+def next_open(now: datetime | None = None) -> datetime:
+    """The next business-open instant (local), weekend-aware."""
+    now = now or local_now()
+    for offset in (0, 1, 2):
+        d = now.date() + timedelta(days=offset)
+        cand = datetime.combine(d, open_time_on(d), tzinfo=now.tzinfo)
+        if cand > now:
+            return cand
+    raise AssertionError("unreachable")
 
 
 def _is_in_time_window() -> bool:
-    """True when the local wall clock is inside the QUIET window."""
-    now = local_now().time()
-    start = _parse_time(config.QUIET_HOURS_START)
-    end = _parse_time(config.WAKE_TIME)
-    return _in_window(now, start, end)
+    """True when the local wall clock is inside the QUIET window.
+
+    Quiet runs from the evening boundary of date D to the wake boundary of D+1,
+    so for a given local date it is: before that date's wake, or at/after that
+    date's quiet start."""
+    now = local_now()
+    t, d = now.time(), now.date()
+    return t < wake_time_on(d) or t >= quiet_start_on(d)
 
 
 def _time_phase() -> str:
     """Phase from the clock alone (no manual/working-session overrides)."""
     if _is_in_time_window():
         return PHASE_QUIET
-    now = local_now().time()
-    return PHASE_WAKE if now < _parse_time(config.OPEN_TIME) else PHASE_OPEN
+    now = local_now()
+    return PHASE_WAKE if now.time() < open_time_on(now.date()) else PHASE_OPEN
 
 
-def _boundaries(state: dict | None) -> list[time]:
-    """Phase boundaries for today, including a goodnight's custom wake time."""
-    bounds = [
-        _parse_time(config.WAKE_TIME),
-        _parse_time(config.OPEN_TIME),
-        _parse_time(config.QUIET_HOURS_START),
-    ]
+def _boundaries(state: dict | None, d: date | None = None) -> list[time]:
+    """Phase boundaries on local date `d` (default today), including a
+    goodnight's custom wake time."""
+    d = d or local_today()
+    bounds = [wake_time_on(d), open_time_on(d), quiet_start_on(d)]
     wake = (state or {}).get("wake_time")
     if wake:
         try:
@@ -498,13 +539,14 @@ def _manual_expired(state: dict) -> bool:
 
     set_local = set_at.astimezone(tz)
     now_local = local_now()
-    for b in _boundaries(state):
-        # The first occurrence of boundary `b` strictly after set_at.
-        candidate = datetime.combine(set_local.date(), b, tzinfo=tz)
-        if candidate <= set_local:
-            candidate += timedelta(days=1)
-        if now_local >= candidate:
-            return True
+    # Any boundary strictly after set_at that has already passed. Boundaries
+    # are per local date (weekends differ), so check the set day and the next.
+    for offset in (0, 1):
+        d = set_local.date() + timedelta(days=offset)
+        for b in _boundaries(state, d):
+            candidate = datetime.combine(d, b, tzinfo=tz)
+            if set_local < candidate <= now_local:
+                return True
     return False
 
 
@@ -523,9 +565,9 @@ def get_phase() -> str:
         if state.get("manual_override") and not _manual_expired(state):
             if state.get("is_quiet"):
                 return PHASE_QUIET
-            # Good morning: wake until OPEN_TIME, then open.
-            now = local_now().time()
-            return PHASE_WAKE if now < _parse_time(config.OPEN_TIME) else PHASE_OPEN
+            # Good morning: wake until the day's open time, then open.
+            now = local_now()
+            return PHASE_WAKE if now.time() < open_time_on(now.date()) else PHASE_OPEN
     return _time_phase()
 
 
@@ -586,7 +628,7 @@ def enter_quiet(manual: bool = False, wake_time: str | None = None) -> str:
             f"I'll resume at {wake_display} {tz_abbrev} or when you say good morning."
         )
 
-    wake_display = _parse_time(config.WAKE_TIME).strftime("%I:%M %p").lstrip("0")
+    wake_display = next_wake().strftime("%I:%M %p").lstrip("0")
     if manual:
         return (
             f"\U0001f319 Goodnight — going quiet. Jobs paused. "
@@ -706,10 +748,11 @@ def update_last_interaction() -> None:
 def phase_summary() -> str:
     """One line describing the phase windows in the active timezone."""
     tz_abbrev = get_tz_abbrev()
-    wake = _parse_time(config.WAKE_TIME).strftime("%H:%M")
-    open_ = _parse_time(config.OPEN_TIME).strftime("%H:%M")
-    quiet = _parse_time(config.QUIET_HOURS_START).strftime("%H:%M")
-    return f"Wake {wake} · business {open_} · quiet {quiet} ({tz_abbrev})"
+    f = lambda v: _parse_time(v).strftime("%H:%M")  # noqa: E731
+    return (f"Weekdays: wake {f(config.WAKE_TIME)} · business {f(config.OPEN_TIME)} · "
+            f"quiet {f(config.QUIET_HOURS_START)} — Sat/Sun: wake {f(config.WEEKEND_WAKE_TIME)} · "
+            f"business {f(config.WEEKEND_OPEN_TIME)} · quiet {f(config.WEEKEND_QUIET_HOURS_START)} "
+            f"({tz_abbrev})")
 
 
 def quiet_hours_status() -> str:

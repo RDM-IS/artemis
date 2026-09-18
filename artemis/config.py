@@ -158,6 +158,14 @@ OPEN_TIME = os.environ.get("OPEN_TIME", "06:30")
 # Back-compat alias: QUIET_HOURS_END is the old name for WAKE_TIME. An explicit
 # QUIET_HOURS_END in the environment still wins so an old .env keeps working.
 QUIET_HOURS_END = os.environ.get("QUIET_HOURS_END", WAKE_TIME)
+# Weekends (Sat + Sun, local) run later: wake 07:30, business 09:30 (the same
+# two health-only hours as weekdays), quiet 22:30. Friday night still goes quiet
+# at the weekday QUIET_HOURS_START; Sunday night at 22:30. Read these through
+# quiet_hours.wake_time_on / open_time_on / quiet_start_on, never directly.
+WEEKEND_DAYS = (5, 6)  # date.weekday(): Sat, Sun
+WEEKEND_WAKE_TIME = os.environ.get("WEEKEND_WAKE_TIME", "07:30")
+WEEKEND_OPEN_TIME = os.environ.get("WEEKEND_OPEN_TIME", "09:30")
+WEEKEND_QUIET_HOURS_START = os.environ.get("WEEKEND_QUIET_HOURS_START", "22:30")
 HOME_TIMEZONE = os.environ.get("HOME_TIMEZONE", "America/Chicago")
 # Home location for weather (West Bend, WI). A timezone override's city wins.
 HOME_LAT = float(os.environ.get("HOME_LAT", "43.4253"))
