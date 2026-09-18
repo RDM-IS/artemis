@@ -1239,10 +1239,11 @@ def insert_inferred_summary() -> bool:
 #
 # Equipment inventory (canonical office gym, all Precor — PB-009):
 #   - Machines: pulldown/seated row, rear delt/pec fly, leg extension/leg curl,
-#     leg press/calf extension, abdominal/back extension
+#     leg press/calf extension, abdominal/back extension (seated — covers back
+#     extensions; there is no 45° back extension / roman chair)
 #   - Cable/rack: S3.23 functional trainer (rope + handles), Icarian Smith machine
 #   - Free weights: hex DBs, Olympic bar + plates, 2 flat benches, 1 adjustable bench
-#   - Bodyweight: captain's chair/dip tower, 45° back extension
+#   - Bodyweight: captain's chair/dip tower
 #   - Cardio: treadmills, ellipticals, upright bike, recumbent bike, stepmill,
 #     Stretch Trainer
 #   - Accessories: stability balls, mats

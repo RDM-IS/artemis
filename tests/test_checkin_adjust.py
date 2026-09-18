@@ -34,7 +34,7 @@ from artemis.health_guard import Evidence, find_violations  # noqa: E402
 FRI = date(2026, 9, 18)
 CT = ZoneInfo("America/Chicago")
 B_NAMES = ["DB goblet squat", "Seated cable row", "Incline DB press", "Leg extension",
-           "Rear delt fly", "Cable Pallof press", "45° back extension"]
+           "Rear delt fly", "Cable Pallof press", "Seated back extension"]
 
 
 def office_row(d: date, plan_id: int = 105) -> dict:
@@ -242,7 +242,7 @@ class TestSessionBScenarios(unittest.TestCase):
         got = names(self.db)
         for gone in ("DB goblet squat", "Seated cable row", "Incline DB press", "Rear delt fly"):
             self.assertNotIn(gone, got)
-        for kept in ("Leg extension", "Cable Pallof press", "45° back extension"):
+        for kept in ("Leg extension", "Cable Pallof press", "Seated back extension"):
             self.assertIn(kept, got)
         added = [n for n in got if n not in B_NAMES]
         self.assertEqual(added, ["Leg press", "Seated leg curl", "Calf press",
@@ -280,7 +280,7 @@ class TestSessionBScenarios(unittest.TestCase):
             self.assertEqual(by[n]["rpe_cap"], 5.0, n)
             self.assertTrue(by[n]["notes"].startswith("1×"), by[n]["notes"])
         for n in ("Seated cable row", "Incline DB press", "Rear delt fly",
-                  "Cable Pallof press", "45° back extension"):
+                  "Cable Pallof press", "Seated back extension"):
             self.assertNotIn("sets", by[n], n)
             self.assertNotIn("rpe_cap", by[n], n)
         self.assertEqual(names(self.db), B_NAMES)
@@ -619,7 +619,19 @@ class TestRegionMap(unittest.TestCase):
         self.assertTrue({"shoulder", "biceps"} <= s)
         self.assertIn("legs", regions.regions_for("Leg press")[0])
         self.assertEqual(regions.regions_for("Cable Pallof press")[0], frozenset({"core"}))
-        self.assertEqual(regions.regions_for("45° back extension")[0], frozenset({"low back"}))
+        self.assertEqual(regions.regions_for("Seated back extension")[0], frozenset({"low back"}))
+
+    def test_back_extension_is_the_seated_precor_machine(self):
+        # There is no 45° back extension / roman chair in the office gym.
+        self.assertEqual(regions.equipment_class("Seated back extension"), "machine")
+        self.assertIn("Seated back extension", regions.SUBSTITUTION_POOL)
+        for r in office.build_rows():
+            blob = json.dumps(r["blocks"], ensure_ascii=False)
+            self.assertNotIn("45°", blob, r["plan_date"])
+            for ex in r["blocks"].get("exercises") or []:
+                if ex["name"] == "Seated back extension":
+                    self.assertEqual(ex["equipment_class"], "machine")
+                    self.assertIn(office.EQ_BACK_EXT, r["blocks"]["equipment"])
 
     def test_cardio_and_mobility_are_mapped(self):
         for name in ("Zone 2 Cardio", "Recovery Z2 + Mobility", "Walk", "Rest / Mobility",

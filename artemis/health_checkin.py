@@ -760,7 +760,7 @@ def _equipment_for(exercises, fallback) -> list:
         "Leg press": office.EQ_LEG_PRESS, "Seated leg curl": office.EQ_LEG_CURL,
         "Leg extension": office.EQ_LEG_EXT, "Calf press": office.EQ_CALF_PRESS,
         "Captain's chair knee raise": office.EQ_CAPTAINS,
-        "45° back extension": office.EQ_BACK_EXT, "Cable Pallof press": office.EQ_CABLE,
+        "Seated back extension": office.EQ_BACK_EXT, "Cable Pallof press": office.EQ_CABLE,
     }
     out = list(fallback)
     for ex in exercises:

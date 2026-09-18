@@ -23,6 +23,17 @@ YOGA-1 — rewrite ONLY the Recovery Flow days (Thu office / Sat home) from a da
 It needs migration 033 (session_type CHECK allows 'recovery_flow'), refuses any
 date that already has a real session_log row, and touches no other day.
 
+Rewrite ONLY the strength rows whose canonical blocks changed (e.g. an exercise
+rename), from a date. Prints a per-row JSON diff; rows already matching the
+builder are left alone:
+
+    /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --strength-days --from 2026-09-18
+    /usr/bin/python3.11 scripts/reseed_health_plan_v2.py --office --strength-days --from 2026-09-18 --allow-logged --commit
+
+It refuses a row carrying a check-in adjustment, an override, or a different
+session_type, and refuses a date with real session_log rows unless
+--allow-logged (the logs keep their plan_id; only the plan row is rewritten).
+
 Retired (HEALTH-2):
   * the legacy v2 whole-table home-gym reseed (PowerBlocks / TRX / rower / bike),
   * --ramp (feat/health-ramp weeks 1-7, 7/25-9/11). Its delete-forward from 7/25
@@ -360,6 +371,113 @@ def reseed_flow_days(start: date, dry_run: bool) -> int:
         return len(rows)
 
 
+_ROW_FIELDS = ("session_type", "week_num", "phase", "target_rpe", "target_hr_zone",
+               "est_duration_min", "notes")
+
+
+def _live_rows(cur, dates) -> dict:
+    cur.execute(
+        "SELECT plan_date, session_type, week_num, phase, target_rpe, target_hr_zone, "
+        "est_duration_min, notes, blocks, is_override FROM health.plan "
+        "WHERE plan_date = ANY(%s)", (list(dates),))
+    out = {}
+    for d, st, wk, ph, rpe, zone, est, notes, blocks, override in cur.fetchall():
+        b = json.loads(blocks) if isinstance(blocks, str) else (blocks or {})
+        out[d] = {"session_type": st, "week_num": wk, "phase": ph,
+                  "target_rpe": float(rpe) if rpe is not None else None,
+                  "target_hr_zone": zone, "est_duration_min": est, "notes": notes,
+                  "blocks": b, "is_override": override}
+    return out
+
+
+def strength_changes(live: dict, rows: list[dict]) -> tuple[list[dict], list[str]]:
+    """(rows whose live copy differs from the builder, refusal reasons)."""
+    changed, refusals = [], []
+    for r in rows:
+        d = r["plan_date"]
+        cur = live.get(d)
+        if cur is None:
+            refusals.append(f"{d}: no live row")
+            continue
+        if cur["session_type"] != r["session_type"]:
+            refusals.append(f"{d}: live session_type {cur['session_type']} != {r['session_type']}")
+        elif cur["is_override"] or "adjustment" in cur["blocks"] or "original" in cur["blocks"]:
+            refusals.append(f"{d}: live row carries an override / check-in adjustment")
+        elif cur["blocks"] != r["blocks"] or any(
+                cur[k] != (float(r[k]) if k == "target_rpe" and r[k] is not None else r[k])
+                for k in _ROW_FIELDS):
+            changed.append(r)
+    return changed, refusals
+
+
+def strength_diff_lines(live: dict, rows: list[dict]) -> list[str]:
+    import difflib
+    out = []
+    for r in rows:
+        d = r["plan_date"]
+        old = live[d]
+        a = {k: old[k] for k in _ROW_FIELDS} | {"blocks": old["blocks"]}
+        b = {k: r[k] for k in _ROW_FIELDS} | {"blocks": r["blocks"]}
+        out.append(f"=== {d.isoformat()} {d.strftime('%a')} {r['session_type']} wk{r['week_num']}")
+        out.extend(difflib.unified_diff(
+            json.dumps(a, indent=1, ensure_ascii=False, sort_keys=True, default=str).splitlines(),
+            json.dumps(b, indent=1, ensure_ascii=False, sort_keys=True, default=str).splitlines(),
+            "live", "new", n=1, lineterm=""))
+    return out
+
+
+def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
+    _load_dotenv()
+    rows = [r for r in office.build_rows()
+            if r["session_type"].startswith("strength") and start <= r["plan_date"] <= office.OFFICE_END]
+    office.validate_rows(office.build_rows())
+    with _connect() as conn:
+        cur = conn.cursor()
+        live = _live_rows(cur, [r["plan_date"] for r in rows])
+        changed, refusals = strength_changes(live, rows)
+        if refusals:
+            conn.rollback()
+            raise SystemExit("[ABORT] " + "; ".join(refusals))
+        dates = [r["plan_date"] for r in changed]
+        cur.execute(
+            "SELECT p.plan_date, count(*) FROM health.session_log sl "
+            "JOIN health.plan p ON p.plan_id = sl.plan_id "
+            "WHERE p.plan_date = ANY(%s) AND sl.logged_via <> 'inferred' GROUP BY 1 ORDER BY 1",
+            (dates,))
+        logged = cur.fetchall()
+        print("\n".join(strength_diff_lines(live, changed)))
+        print(f"\n{len(changed)} of {len(rows)} strength rows from {start} differ from the "
+              f"builder; no other dates touched.")
+        if logged:
+            print(f"Logged dates in the set (logs keep their plan_id): {logged}")
+            if not allow_logged:
+                conn.rollback()
+                raise SystemExit("[ABORT] re-run with --allow-logged to rewrite logged dates.")
+        if dry_run or not changed:
+            conn.rollback()
+            print("[DRY-RUN] (default) No rows written. Re-run with --commit to write.")
+            return 0
+        try:
+            for r in changed:
+                cur.execute(office._UPSERT_SQL, (
+                    r["plan_date"], r["phase"], r["week_num"], r["session_type"],
+                    json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
+                    r["est_duration_min"], r["generated_by"], r["notes"]))
+            cur.execute(
+                "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
+                "outcome, token_count, api_cost_usd, metadata) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                ("health_office", None, "strength_days_reseed", "health", None, "executed",
+                 0, 0.0, json.dumps({"from": start.isoformat(),
+                                     "dates": [d.isoformat() for d in dates]})))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        print(f"[OK] Wrote {len(changed)} strength rows + audit row.")
+        return len(changed)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Reseed health.plan (HEALTH-2 office gym).")
     ap.add_argument("--office", action="store_true",
@@ -370,8 +488,12 @@ def main() -> None:
     ap.add_argument("--ramp", action="store_true", help="RETIRED — refuses to run.")
     ap.add_argument("--flow-days", action="store_true",
                     help="YOGA-1: rewrite only the Thu/Sat Recovery Flow rows (with --from).")
+    ap.add_argument("--strength-days", action="store_true",
+                    help="Rewrite only strength rows that differ from the builder (with --from).")
+    ap.add_argument("--allow-logged", action="store_true",
+                    help="--strength-days: also rewrite dates that already have real logs.")
     ap.add_argument("--from", dest="start", type=date.fromisoformat,
-                    help="First date for --flow-days (YYYY-MM-DD).")
+                    help="First date for --flow-days / --strength-days (YYYY-MM-DD).")
     args = ap.parse_args()
 
     if args.ramp:
@@ -382,6 +504,11 @@ def main() -> None:
         if not args.start:
             ap.error("--flow-days needs --from YYYY-MM-DD")
         reseed_flow_days(args.start, dry_run=not args.commit)
+        return
+    if args.strength_days:
+        if not args.start:
+            ap.error("--strength-days needs --from YYYY-MM-DD")
+        reseed_strength_days(args.start, dry_run=not args.commit, allow_logged=args.allow_logged)
         return
     if args.self_test:
         office_self_test()
