@@ -151,7 +151,7 @@ class TestLadder(Base):
         b = row["blocks"]
         self.assertEqual(b["adjustment"]["rules_fired"], ["pain_mobility", "pain_substitute"])
         self.assertEqual(names(self.db), ["Leg press", "Seated leg curl", "Leg extension",
-                                          "Cable Pallof press", "45° back extension"])
+                                          "Cable Pallof press", "Seated back extension"])
         by = self.by_name()
         self.assertEqual((by["Leg press"]["added_by"], by["Leg press"]["replaces"]),
                          ("checkin", "DB goblet squat"))
@@ -159,7 +159,7 @@ class TestLadder(Base):
         for sub in ("Leg press", "Seated leg curl"):
             self.assertFalse(hr.uses_any(sub, ["shoulder"]), sub)
             self.assertTrue(by[sub]["notes"].startswith("2×"), by[sub]["notes"])
-        for kept in ("Leg extension", "Cable Pallof press", "45° back extension"):
+        for kept in ("Leg extension", "Cable Pallof press", "Seated back extension"):
             self.assertNotIn("added_by", by[kept])
         self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["shoulder"], 10))
         self.assertIn("leg press", b["equipment"])
@@ -183,7 +183,7 @@ class TestLadder(Base):
                                           "Rear delt fly", "Cable Pallof press"])
         self.assertFalse(any(e.get("added_by") for e in b["exercises"]))
         self.assertEqual((b["mobility_focus"], b["mobility_min"]), (["hip"], 10))
-        self.assertTrue(reply.startswith("Pain hip 3/5 → removed DB goblet squat and 45° back "
+        self.assertTrue(reply.startswith("Pain hip 3/5 → removed DB goblet squat and seated back "
                                          "extension. Added 10 min hip mobility"), reply)
 
     def test_p3_secondary_only_region_needs_no_mobility_block(self):
@@ -220,7 +220,7 @@ class TestLadder(Base):
         self.assertIn("Stretch Trainer", b["equipment"])
         self.assertIn("mat", b["equipment"])
         self.assertEqual(b["mobility_notes"], hr.MOBILITY["low back"])
-        self.assertEqual(reply, "Pain low back 3/5 → removed 45° back extension. Added 10 min "
+        self.assertEqual(reply, "Pain low back 3/5 → removed seated back extension. Added 10 min "
                                 "low back mobility (Stretch Trainer + mat). Swapped DB goblet "
                                 "squat → leg press.\nReply `original` to undo.")
         self.assertEqual(self.row()["session_type"], "strength_b")
@@ -243,7 +243,7 @@ class TestLadder(Base):
         for ex in self.row()["blocks"]["exercises"]:
             if ex.get("added_by") == "checkin":
                 self.assertFalse(hr.uses_any(ex["name"], ["low back", "triceps"]), ex["name"])
-        self.assertNotIn("45° back extension", got, "pain-removed exercise must not come back")
+        self.assertNotIn("Seated back extension", got, "pain-removed exercise must not come back")
 
     def test_p4_pain_2_lighter_from_last_logged_load(self):
         prev = date(2026, 9, 11)
@@ -292,11 +292,10 @@ class TestLadder(Base):
         self.assertEqual(reply, "Pain knee 2/5 — noted.\nCheck-in logged — run Session B as written.")
         self.assertNotIn("adjustment", self.row()["blocks"])
 
-    def test_p4_bodyweight_primary_is_not_given_a_load(self):
+    def test_p4_seated_back_extension_is_a_machine_and_goes_lighter(self):
         self.checkin("low back pain 2")
-        ext = self.by_name()["45° back extension"]
-        self.assertNotIn("load_note", ext)
-        self.assertNotIn("load_from", ext)
+        ext = self.by_name()["Seated back extension"]
+        self.assertTrue("load_note" in ext or "load_from" in ext, ext)
 
     def test_p4_and_soreness_lighten_stack(self):
         reply = self.checkin("shoulder pain 2, legs sore 3")
@@ -899,6 +898,16 @@ class TestLighterLoad(unittest.TestCase):
                         self.assertLess(got, last)
                     else:
                         self.assertEqual(got, floor)
+
+
+class BodyweightOnA(Base):
+    day = date(2026, 9, 23)   # Wed — Strength A carries the captain's chair
+
+    def test_p4_bodyweight_primary_is_not_given_a_load(self):
+        self.checkin("core pain 2")
+        knee_raise = self.by_name()["Captain's chair knee raise"]
+        self.assertNotIn("load_note", knee_raise)
+        self.assertNotIn("load_from", knee_raise)
 
 
 if __name__ == "__main__":

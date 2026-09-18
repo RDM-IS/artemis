@@ -50,7 +50,9 @@ EQ_DBS = "DBs"
 EQ_FLAT_BENCH = "flat bench"
 EQ_ADJ_BENCH = "adjustable bench"
 EQ_CAPTAINS = "captain's chair"
-EQ_BACK_EXT = "45° back extension"
+# The Precor Abdominal / Back Extension machine (seated) — there is no 45°
+# back extension / roman chair in the office gym.
+EQ_BACK_EXT = "back extension machine"
 EQ_TREADMILL = "treadmill"
 EQ_ELLIPTICAL = "elliptical"
 EQ_UPRIGHT = "upright bike"
@@ -103,7 +105,7 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
         ("Leg extension", "10-12", 12, False, True),
         ("Rear delt fly", "12-15", 15, False, True),
         ("Cable Pallof press", "10", 10, True, False),
-        ("45° back extension", "10-12", 12, False, False),
+        ("Seated back extension", "10-12", 12, False, True),
     ],
     "strength_c": [
         ("DB Romanian deadlift", "8-12", 12, False, False),
@@ -114,6 +116,10 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
         ("Ab machine crunch", "10-12", 12, False, True),
     ],
 }
+
+# Explicit blocks.exercises[].equipment_class for names the keyword rules
+# once read differently ("back extension" used to mean bodyweight).
+EQUIPMENT_CLASS = {"Seated back extension": "machine"}
 
 _DISPLAY = {
     "strength_a": "Office Strength A",
@@ -154,6 +160,8 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
         notes.append("alt: Smith squat")
     ex = {"name": name, "format": "reps", "target_reps": top, "rest_after_sec": 60,
           "notes": "; ".join(notes)}
+    if name in EQUIPMENT_CLASS:
+        ex["equipment_class"] = EQUIPMENT_CLASS[name]
     if week_num <= 2:
         ex["target_load_lbs"] = None  # finding weights
     return ex

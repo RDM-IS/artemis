@@ -68,7 +68,7 @@ _reg("Incline DB press", {"chest", "shoulder", "triceps"})
 _reg("Leg extension", {"legs", "quads"}, {"knee"})
 _reg("Rear delt fly", {"shoulder"}, {"back"})
 _reg("Cable Pallof press", {"core"})
-_reg("45° back extension", {"low back"}, {"hamstrings", "hip"})
+_reg("Seated back extension", {"low back"}, {"hamstrings", "hip"})
 # ── Office Strength C ──
 _reg("DB Romanian deadlift", {"legs", "hamstrings", "low back"}, {"hip", "back"})
 _reg("Pec fly", {"chest"}, {"shoulder"})
@@ -99,7 +99,7 @@ SUBSTITUTION_POOL = (
     "Leg extension",
     "Calf press",
     "Captain's chair knee raise",
-    "45° back extension",
+    "Seated back extension",
     "Cable Pallof press",
 )
 
@@ -141,14 +141,14 @@ STACK_STEP = 10            # machines + functional trainer, until measured
 _EXACT_CLASS = {"seated cable row": "machine"}
 _CLASS_RULES = (
     ("smith", ("smith",)),
-    ("bodyweight", ("captain's chair", "captains chair", "back extension", "plank",
+    ("bodyweight", ("captain's chair", "captains chair", "plank",
                     "push-up", "pushup", "dead bug", "bird dog", "hollow",
                     "mountain climber", "glute bridge")),
     ("cable", ("cable", "rope", "pallof", "face pull")),
     ("dumbbell", ("db ", "dumbbell", "goblet")),
     ("barbell", ("barbell", "back squat", "front squat")),
     ("machine", ("leg press", "pulldown", "row", "leg curl", "leg extension", "pec fly",
-                 "rear delt", "calf press", "ab crunch", "ab machine")),
+                 "rear delt", "calf press", "ab crunch", "ab machine", "back extension")),
 )
 
 

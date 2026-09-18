@@ -44,7 +44,7 @@ GENERIC_EXERCISES = (
     "db row", "dumbbell row", "t-bar row", "trx row", "inverted row",
     "leg press", "leg extension", "leg curl", "seated leg curl", "lying leg curl",
     "calf raise", "calf press", "lunge", "reverse lunge", "walking lunge", "step-up",
-    "back extension", "45° back extension",
+    "back extension", "seated back extension",
     "pallof press", "plank", "side plank", "dead bug", "bird dog", "hollow hold",
     "crunch", "ab crunch", "ab machine crunch", "knee raise", "leg raise",
     "hanging leg raise", "captain's chair", "russian twist", "woodchop",

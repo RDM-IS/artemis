@@ -304,7 +304,7 @@ long sleep never adds work — progression belongs to the program.
 | 3 | **pain 3** in the **primary** region of **≥ 50%** of today's exercises (a Z2/walk block counts as one, by its primary region) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). Secondary use doesn't count toward the 50%: shoulder pain 3 on Session B (primary on 2 of 7) is rule 5, not a mobility day. |
 | 4 | 2+ **soreness** regions at 4–5 | Day swap → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility. |
 | 5 | **pain 3** (under 50%) | Exercises with the region as **primary** are removed and replaced by a **mobility block** for it: `mobility_focus`, `mobility_min` (10 min for one region, 15 for several), `mobility_notes` from the region→mobility map in `health_regions.py`; Stretch Trainer + mat added to equipment. Exercises with it as **secondary only** are **swapped** for the first pool exercise (list in rule 6) that avoids every sore and painful region and isn't already in the session; if none fits, that exercise goes to the mobility block instead. A finisher using the region is dropped. |
-| 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, 45° back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed or added. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
+| 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, seated back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed or added. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
 | 7 | **pain 2** | Exercises with that **primary** region get a lighter target: `target_load_lbs` = 80% of the **last logged load** (top set of the exercise's most recent earlier session; skipped and inferred rows ignored), rounded **down** to a load the office can make (DBs 5–45 by 5; machines/cables by 10; Smith/bar = bar + 2 × a subset of 45/35/25/10/5 per side), never above the last load; `load_from` records it. No history → target stays null and the exercise notes say "go lighter than last time". Bodyweight work is left alone. |
 | 8 | **soreness 2–3** | Exercises with that **primary** region: −1 set (min 1), RPE cap −1. |
 | 9 | sleep < 6 or energy ≤ 2 | RPE cap −1 on everything (stacks with rule 8, floor 1), sets capped at 2, Z2 duration −25%. |
@@ -469,12 +469,15 @@ prefers them. The static `_EQUIPMENT_MAP` (built from
 gym still exists — a row that trains there says so in `blocks.location`.
 
 Office gym inventory (all Precor): pulldown/seated row, rear delt/pec fly, leg
-extension/leg curl, leg press/calf extension, abdominal/back extension machines;
-S3.23 functional trainer (rope + handles); Icarian Smith machine; hex DBs,
-Olympic bar + plates, 2 flat benches, 1 adjustable bench; captain's chair/dip
-tower, 45° back extension; treadmills, ellipticals, upright bike, recumbent bike,
-stepmill, Stretch Trainer; stability balls, mats. The rower and outdoor bike are
-retired from the plan.
+extension/leg curl, leg press/calf extension, abdominal/back extension (seated —
+it covers back extensions; programmed as "Seated back extension", equipment
+class `machine`); S3.23 functional trainer (rope + handles); Icarian Smith
+machine; hex DBs, Olympic bar + plates, 2 flat benches, 1 adjustable bench;
+captain's chair/dip tower; treadmills, ellipticals, upright bike, recumbent
+bike, stepmill, Stretch Trainer; stability balls, mats. There is **no** 45° back
+extension / roman chair. The rower and outdoor bike are retired from the plan.
+This list is Ryan's description, not yet confirmed in person — see OFFICE-WALK
+in `docs/ARTEMIS_STATE.md`.
 
 Fallback map:
 
@@ -482,7 +485,7 @@ Fallback map:
 strength_a       -> office gym: leg press, DBs + flat bench, pulldown, leg curl,
                     functional trainer (rope), captain's chair   (first lift: Leg press)
 strength_b       -> office gym: DBs, seated row, adjustable bench, leg extension,
-                    rear delt fly, functional trainer, 45° back ext (first: DB goblet squat)
+                    rear delt fly, functional trainer, back ext machine (first: DB goblet squat)
 strength_c       -> office gym: DBs, pec fly, functional trainer, adjustable bench,
                     calf press, ab machine                        (first: DB Romanian deadlift)
 cardio_z2        -> office gym: treadmill / elliptical / recumbent / upright bike
