@@ -80,12 +80,10 @@ class TestRegistryShape(unittest.TestCase):
         expect = {
             "wake_weekend": ((7, 30), "wake", "health"),
             "checkin_nudge_weekend": ((8, 15), "checkin_nudge", "health"),
-            "inbox_zero_morning_weekend": ((9, 25), "inbox_zero_morning", "business"),
-            "open_weekend": ((9, 30), "open", "business"),
-            "morning_brief_weekend": ((9, 30), "morning_brief", "business"),
+            "inbox_zero_morning_weekend": ((8, 25), "inbox_zero_morning", "business"),
+            "open_weekend": ((8, 30), "open", "business"),
+            "morning_brief_weekend": ((8, 30), "morning_brief", "business"),
             "quiet_hours_start_weekend": ((22, 30), "quiet_hours_start", "business"),
-            "ssl_check_weekend": ((9, 35), "ssl_check", "business"),
-            "domain_check_weekend": ((9, 40), "domain_check", "business"),
         }
         for sid, (hm, twin, tier) in expect.items():
             with self.subTest(job=sid):
@@ -99,7 +97,13 @@ class TestRegistryShape(unittest.TestCase):
 
     def test_sunday_health_review_runs_after_the_weekend_open(self):
         hr_ = {s.id: s for s in self.s.cron_specs()}["health_review"]
-        self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week), (9, 30, "sun"))
+        self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week), (8, 30, "sun"))
+
+    def test_ssl_and_domain_checks_are_weekday_only(self):
+        by_id = {s.id: s for s in self.s.cron_specs()}
+        for sid in ("ssl_check", "domain_check"):
+            self.assertEqual(by_id[sid].day_of_week, "mon-fri")
+            self.assertNotIn(f"{sid}_weekend", by_id)
 
     def test_wake_is_health_tier_and_business_jobs_are_not(self):
         by_id = {s.id: s for s in self.s.cron_specs()}

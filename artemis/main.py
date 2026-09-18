@@ -3060,7 +3060,7 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
 
         exit_quiet()
 
-        # Before the day's open (06:30; Sat/Sun 09:30) this is a WAKE, not an
+        # Before the day's open (06:30; Sat/Sun 08:30) this is a WAKE, not an
         # open: the wake post only. Email/inbox/meetings wait for job_open.
         _now = local_now()
         if _now.time() < open_time_on(_now.date()):

@@ -189,7 +189,7 @@ class ArtemisScheduler:
             CronSpec("checkin_nudge_weekend", "job_checkin_nudge",
                      *_plus_minutes(we_wake_h, we_wake_m, config.CHECKIN_NUDGE_OFFSET_MIN), WE,
                      tier="health", guard="checkin_nudge"),
-            # 06:25 / 06:30 (Sat/Sun 09:25 / 09:30) — open: business holds
+            # 06:25 / 06:30 (Sat/Sun 08:25 / 08:30) — open: business holds
             # flush, then the brief.
             CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m, WD),
             CronSpec("inbox_zero_morning_weekend", "job_inbox_zero_morning",
@@ -199,14 +199,9 @@ class ArtemisScheduler:
             CronSpec("morning_brief", "job_morning_brief", brief_h, brief_m, WD),
             CronSpec("morning_brief_weekend", "job_morning_brief", we_open_h, we_open_m, WE,
                      guard="morning_brief"),
-            # 08:00 / 08:05 — open-only checks; on weekends 08:00 is still the
-            # wake window, so the weekend runs follow the 09:30 open.
+            # 08:00 / 08:05 — weekdays only (open-only checks).
             CronSpec("ssl_check", "job_ssl_check", 8, 0, WD),
-            CronSpec("ssl_check_weekend", "job_ssl_check",
-                     *_plus_minutes(we_open_h, we_open_m, 5), WE, guard="ssl_check"),
             CronSpec("domain_check", "job_domain_check", 8, 5, WD),
-            CronSpec("domain_check_weekend", "job_domain_check",
-                     *_plus_minutes(we_open_h, we_open_m, 10), WE, guard="domain_check"),
             CronSpec("follow_up_radar", "job_follow_up_radar", 8, 0, "mon-fri"),
             CronSpec("update_check", "job_update_check", 8, 0, "mon"),
             CronSpec("commitment_reminders", "job_commitment_reminders", 8, 15, "mon-fri"),
@@ -222,9 +217,8 @@ class ArtemisScheduler:
             CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
             # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
             CronSpec("pain_pattern_recompute", "job_pain_pattern_recompute", 21, 55),
-            # Sunday at the weekend open (09:30) — weekly health review: new or
-            # changed pain patterns only. It posts in the OPEN phase only, and
-            # 08:00 Sunday is inside the weekend wake window.
+            # Sunday at the weekend open (08:30) — weekly health review: new or
+            # changed pain patterns only. It posts in the OPEN phase only.
             CronSpec("health_review", "job_health_review", we_open_h, we_open_m, "sun",
                      tier="health"),
         ]
@@ -1606,7 +1600,7 @@ class ArtemisScheduler:
             logger.exception("Pain pattern recompute failed")
 
     def job_health_review(self):
-        """Sun 09:30 local (weekend open) — one post per new or changed open pain pattern.
+        """Sun 08:30 local (weekend open) — one post per new or changed open pain pattern.
 
         Posts only in the OPEN phase and only when something is new; replies
         in each post's thread become reflections (main._handle_pattern_thread).

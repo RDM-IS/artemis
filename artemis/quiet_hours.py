@@ -11,7 +11,7 @@ DAY PHASES — local wall-clock in the ACTIVE timezone:
     wake   WAKE_TIME (04:30) .. OPEN_TIME (06:30)          health + pre-departure
     open   OPEN_TIME (06:30) .. QUIET_HOURS_START          everything
 
-Saturday and Sunday use the WEEKEND_* times (wake 07:30, open 09:30, quiet
+Saturday and Sunday use the WEEKEND_* times (wake 07:30, open 08:30, quiet
 22:30). Each boundary belongs to the local date it falls on, so Friday night
 goes quiet at 17:00 and Saturday wakes at 07:30; Sunday night goes quiet at
 22:30 and Monday wakes at 04:30.
