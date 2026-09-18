@@ -99,6 +99,9 @@ class CronSpec:
     day_of_week: str | None = None
     #  health   → posts in wake + open      business → posts in open only
     tier: str = "business"
+    # Once-per-local-day guard key. A weekend twin shares its weekday job's key
+    # so the two can never both fire on one date (e.g. after a custom wake).
+    guard: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -163,23 +166,42 @@ class ArtemisScheduler:
         quiet_h, quiet_m = _hhmm(config.QUIET_HOURS_START)
         brief_h, brief_m = _hhmm(config.MORNING_BRIEF_TIME)
         pre_h, pre_m = _minus_minutes(brief_h, brief_m, 5)
+        # Weekends (Sat/Sun): wake, open and quiet move; the morning brief rides
+        # on open (it is 06:30 = OPEN_TIME on weekdays).
+        we_wake_h, we_wake_m = _hhmm(config.WEEKEND_WAKE_TIME)
+        we_open_h, we_open_m = _hhmm(config.WEEKEND_OPEN_TIME)
+        we_quiet_h, we_quiet_m = _hhmm(config.WEEKEND_QUIET_HOURS_START)
+        we_pre_h, we_pre_m = _minus_minutes(we_open_h, we_open_m, 5)
+        WD, WE = "mon-fri", "sat,sun"
 
         specs = [
             # 03:30 — silent vault ingest, before the wake window.
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
-            # 04:30 — wake: health holds flush + the wake post.
-            CronSpec("wake", "job_wake", wake_h, wake_m, tier="health"),
-            # 05:15 — one nudge if no check-in arrived (FRIDAY-1). Event-driven
-            # adjustment replaced the fixed 04:45 calibration post.
+            # 04:30 (Sat/Sun 07:30) — wake: health holds flush + the wake post.
+            CronSpec("wake", "job_wake", wake_h, wake_m, WD, tier="health"),
+            CronSpec("wake_weekend", "job_wake", we_wake_h, we_wake_m, WE,
+                     tier="health", guard="wake"),
+            # wake + 45 min — one nudge if no check-in arrived (FRIDAY-1).
+            # Event-driven adjustment replaced the fixed 04:45 calibration post.
             CronSpec("checkin_nudge", "job_checkin_nudge",
-                     *_plus_minutes(wake_h, wake_m, config.CHECKIN_NUDGE_OFFSET_MIN),
+                     *_plus_minutes(wake_h, wake_m, config.CHECKIN_NUDGE_OFFSET_MIN), WD,
                      tier="health"),
-            # 06:25 / 06:30 — open: business holds flush, then the brief.
-            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m),
-            CronSpec("open", "job_open", open_h, open_m),
-            CronSpec("morning_brief", "job_morning_brief", brief_h, brief_m),
-            CronSpec("ssl_check", "job_ssl_check", 8, 0),
-            CronSpec("domain_check", "job_domain_check", 8, 5),
+            CronSpec("checkin_nudge_weekend", "job_checkin_nudge",
+                     *_plus_minutes(we_wake_h, we_wake_m, config.CHECKIN_NUDGE_OFFSET_MIN), WE,
+                     tier="health", guard="checkin_nudge"),
+            # 06:25 / 06:30 (Sat/Sun 08:25 / 08:30) — open: business holds
+            # flush, then the brief.
+            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m, WD),
+            CronSpec("inbox_zero_morning_weekend", "job_inbox_zero_morning",
+                     we_pre_h, we_pre_m, WE, guard="inbox_zero_morning"),
+            CronSpec("open", "job_open", open_h, open_m, WD),
+            CronSpec("open_weekend", "job_open", we_open_h, we_open_m, WE, guard="open"),
+            CronSpec("morning_brief", "job_morning_brief", brief_h, brief_m, WD),
+            CronSpec("morning_brief_weekend", "job_morning_brief", we_open_h, we_open_m, WE,
+                     guard="morning_brief"),
+            # 08:00 / 08:05 — weekdays only (open-only checks).
+            CronSpec("ssl_check", "job_ssl_check", 8, 0, WD),
+            CronSpec("domain_check", "job_domain_check", 8, 5, WD),
             CronSpec("follow_up_radar", "job_follow_up_radar", 8, 0, "mon-fri"),
             CronSpec("update_check", "job_update_check", 8, 0, "mon"),
             CronSpec("commitment_reminders", "job_commitment_reminders", 8, 15, "mon-fri"),
@@ -187,13 +209,18 @@ class ArtemisScheduler:
             # (which would sit inside the 17:00 quiet window and never fire).
             CronSpec("health_nag", "job_health_nag", 16, 30, tier="health"),
             CronSpec("vault_coverage", "job_vault_coverage", 16, 30, "mon-fri"),
-            CronSpec("quiet_hours_start", "job_quiet_hours_start", quiet_h, quiet_m),
+            # 17:00 (Sat/Sun 22:30) — quiet.
+            CronSpec("quiet_hours_start", "job_quiet_hours_start", quiet_h, quiet_m, WD),
+            CronSpec("quiet_hours_start_weekend", "job_quiet_hours_start",
+                     we_quiet_h, we_quiet_m, WE, guard="quiet_hours_start"),
             # 21:50 — silent DB backstop; writes only, posts nothing.
             CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
             # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
             CronSpec("pain_pattern_recompute", "job_pain_pattern_recompute", 21, 55),
-            # Sun 08:00 — weekly health review: new/changed pain patterns only.
-            CronSpec("health_review", "job_health_review", 8, 0, "sun", tier="health"),
+            # Sunday at the weekend open (08:30) — weekly health review: new or
+            # changed pain patterns only. It posts in the OPEN phase only.
+            CronSpec("health_review", "job_health_review", we_open_h, we_open_m, "sun",
+                     tier="health"),
         ]
         if config.FOCUS_CLIENT:
             specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
@@ -204,7 +231,7 @@ class ArtemisScheduler:
         func = getattr(self, spec.func_name)
 
         def runner():
-            if not self._once_per_local_day(spec.id):
+            if not self._once_per_local_day(spec.guard or spec.id):
                 return
             func()
 
@@ -369,7 +396,7 @@ class ArtemisScheduler:
         set_system_value(checkin_key(_local_today()), "open")
 
     def job_wake(self):
-        """04:30 local — wake. Health only; business waits for 06:30."""
+        """04:30 local (Sat/Sun 07:30) — wake. Health only; business waits for open."""
         try:
             from artemis.quiet_hours import get_quiet_state
             state = get_quiet_state()
@@ -1573,7 +1600,7 @@ class ArtemisScheduler:
             logger.exception("Pain pattern recompute failed")
 
     def job_health_review(self):
-        """Sun 08:00 local — one post per new or changed open pain pattern.
+        """Sun 08:30 local (weekend open) — one post per new or changed open pain pattern.
 
         Posts only in the OPEN phase and only when something is new; replies
         in each post's thread become reflections (main._handle_pattern_thread).

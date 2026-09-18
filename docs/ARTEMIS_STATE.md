@@ -84,11 +84,13 @@ Capture (dumb, immutable) → Surface (synthesis surfacer detects high-surprise 
 The day has three phases, evaluated on the **local wall clock in the active
 timezone** (`artemis/quiet_hours.py`):
 
-| phase | window | what may post |
-|---|---|---|
-| `quiet` | 17:00 → 04:30 | nothing proactive; posts are **held**, not dropped |
-| `wake` | 04:30 → 06:30 | health tier only — the wake post + pre-departure |
-| `open` | 06:30 → 17:00 | everything |
+| phase | Mon–Fri | Sat/Sun | what may post |
+|---|---|---|---|
+| `quiet` | 17:00 → 04:30 | 22:30 → 07:30 | nothing proactive; posts are **held**, not dropped |
+| `wake` | 04:30 → 06:30 | 07:30 → 08:30 | health tier only — the wake post + pre-departure |
+| `open` | 06:30 → 17:00 | 08:30 → 22:30 | everything |
+
+Each boundary belongs to the local date it falls on: Friday night goes quiet at 17:00 and Saturday wakes at 07:30; Sunday night goes quiet at 22:30 and Monday wakes at 04:30. Weekend times are `WEEKEND_WAKE_TIME` / `WEEKEND_OPEN_TIME` / `WEEKEND_QUIET_HOURS_START`, read through `quiet_hours.wake_time_on` / `open_time_on` / `quiet_start_on`. Time-bound crons have `*_weekend` twins (`sat,sun`) that share the weekday job's once-per-day guard; the Sunday health review runs at the weekend open (08:30). The SSL and domain checks are weekday-only.
 
 - **Posting tiers.** Every *scheduled* post goes through `posting.post_or_hold(mm, channel, text, tier)`. `health` posts in wake+open, `business` in open only. A held post is appended to a durable JSON list in `acos.system_state` (`held_posts:health` / `held_posts:business`), so a restart between hold and flush keeps it. `job_wake` folds held health notices into the wake post; `job_open` flushes business FIFO. Replies to Ryan's own messages are never held.
 - **One cron registry.** `ArtemisScheduler.cron_specs()` is the single source of truth for every cron job (id, method, local h:mm, optional day-of-week, tier). `apply_timezone(tz)` is the **only** registration path — a test asserts no `add_job(..., "cron", ...)` exists outside it. `job_dump()` prints every job's next fire in local + CT and is the verify surface.
@@ -120,7 +122,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **FRIDAY-1 — check-in-driven morning (2026-09-17).** The fixed 04:45 calibration post is retired. The 04:30 wake post is plan-exact and opens the check-in; the reply is parsed deterministically and adjusts today's `health.plan` row by fixed rules (`blocks.original` + `blocks.adjustment`, `original` to undo), with a 05:15 nudge if nothing arrives. Short morning replies are answered from the DB, and the LLM fallback gets no business data outside the OPEN phase. A plan-claim guard rejects invented exercises, loads, or "last session" figures. Flag: `CHECKIN_ADJUST`. See PB-009.
 
-**PAIN-1 — pain ladder + pattern surfacing (`feat/pain-ladder`, gym-display `feat/pain-chip`; target live before 04:30 Mon 2026-09-21).** Pain gets its own ladder ahead of the soreness rules: pain 4–5 or rising pain (1→2→3 over three consecutive check-in days, each naming the region; a rise from 0 only adds a "rising:" note) → day off; pain 3 → the region's exercises become a mobility block (whole day Mobility / Yoga when the region is primary on ≥ 50% of the session); pain 2 → 80% of the last logged load, rounded down to a reachable load; pain 0–1 → noted. gym-display adds a Pain chip (`pain=<region>:<n>` in set notes). A nightly 21:55 recompute finds exercise × region patterns (≥ 3 hits, ≥ 60%, 8 weeks); the Sunday 08:00 health review posts new/changed ones, the completing check-in mentions it once, and thread replies are stored verbatim as reflections (`dismiss` / `resolved`). Migration 032 (`health.pain_pattern`, `health.reflection`). See PB-009.
+**PAIN-1 — pain ladder + pattern surfacing (`feat/pain-ladder`, gym-display `feat/pain-chip`; target live before 04:30 Mon 2026-09-21).** Pain gets its own ladder ahead of the soreness rules: pain 4–5 or rising pain (1→2→3 over three consecutive check-in days, each naming the region; a rise from 0 only adds a "rising:" note) → day off; pain 3 → the region's exercises become a mobility block (whole day Mobility / Yoga when the region is primary on ≥ 50% of the session); pain 2 → 80% of the last logged load, rounded down to a reachable load; pain 0–1 → noted. gym-display adds a Pain chip (`pain=<region>:<n>` in set notes). A nightly 21:55 recompute finds exercise × region patterns (≥ 3 hits, ≥ 60%, 8 weeks); the Sunday 08:30 health review (weekend open) posts new/changed ones, the completing check-in mentions it once, and thread replies are stored verbatim as reflections (`dismiss` / `resolved`). Migration 032 (`health.pain_pattern`, `health.reflection`). See PB-009.
 
 **YOGA-1 — Recovery Flow (2026-09-16).** Thu (office) and Sat (home) become `recovery_flow` days: a hands-free two-round mobility flow in gym-display (auto-advance, switch-sides cue, voice, automatic complete/partial logging). Artemis: builder + side validator, day-off-only check-in rules, nudge on, no nag / inferred miss, excluded from the ramp, plan-exact wake post. Migration 033 widens the `session_type` CHECK. Thu 9/17 went live as a `rest_mobility` row carrying flow blocks (the running box predates the new type); 9/19 → 11/03 reseed to `recovery_flow` with the PAIN-1 deploy. See PB-009.
 

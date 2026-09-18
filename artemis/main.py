@@ -77,6 +77,7 @@ from artemis.quiet_hours import (
     get_timezone_override,
     local_now,
     local_today,
+    next_open,
     parse_date_token,
     phase_summary,
     resolve_place_timezone,
@@ -325,7 +326,8 @@ def _build_mention_context(post: dict, gmail: GmailClient, calendar: CalendarCli
     # FRIDAY-1: outside the OPEN phase the general fallback gets no business
     # data at all — no Gmail, calendar, commitments or inbox.
     if get_phase() != PHASE_OPEN:
-        parts.append(f"\n**Business data held until {config.OPEN_TIME}** (wake/quiet phase).")
+        parts.append(f"\n**Business data held until {next_open().strftime('%H:%M')}** "
+                     "(wake/quiet phase).")
         try:
             from artemis.health import build_context_slice
             health_slice = build_context_slice()
@@ -2692,16 +2694,12 @@ def _apply_tz_now() -> None:
 
 def _next_wake_line(tz_name: str) -> str:
     """Next wake fire time in local time and in CT."""
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
-    from artemis.quiet_hours import _parse_time
+    from artemis.quiet_hours import next_wake
 
     tz = _ZI(tz_name)
-    now = _dt.now(tz)
-    wake_t = _parse_time(config.WAKE_TIME)
-    nxt = _dt.combine(now.date(), wake_t, tzinfo=tz)
-    if nxt <= now:
-        nxt += _td(days=1)
+    nxt = next_wake(_dt.now(tz))
     home = _ZI(config.HOME_TIMEZONE)
     return (
         f"Next wake: {nxt.strftime('%a %H:%M %Z')} "
@@ -3058,13 +3056,14 @@ def _handle_quiet_command(post: dict, question: str) -> bool:
 
     # ── Good morning ──
     if q_lower in ("good morning", "morning", "gm", "goodmorning"):
-        from artemis.quiet_hours import _parse_time as _pt
+        from artemis.quiet_hours import open_time_on
 
         exit_quiet()
 
-        # Before 06:30 this is a WAKE, not an open: the wake post only (workout,
-        # check-in, pre-departure). Email/inbox/meetings wait for job_open.
-        if local_now().time() < _pt(config.OPEN_TIME):
+        # Before the day's open (06:30; Sat/Sun 08:30) this is a WAKE, not an
+        # open: the wake post only. Email/inbox/meetings wait for job_open.
+        _now = local_now()
+        if _now.time() < open_time_on(_now.date()):
             from artemis import wake as wake_mod
             from artemis.posting import take_holds
             reply = wake_mod.build_wake_message(
@@ -4584,7 +4583,7 @@ def _handle_mention(post: dict, thread: list[dict]):
         elif phase == PHASE_WAKE:
             response += (
                 f"\n\n\U0001f305 _Wake window \u2014 health only until "
-                f"{config.OPEN_TIME}; email and triage hold until then._"
+                f"{next_open().strftime('%H:%M')}; email and triage hold until then._"
             )
 
         _mm.post_to_channel_id(channel_id, response, root_id=root_id)

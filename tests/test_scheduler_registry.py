@@ -75,6 +75,36 @@ class TestRegistryShape(unittest.TestCase):
         # The debrief nag must sit OUTSIDE the quiet window.
         self.assertLess(by_id["health_nag"].hour, 17)
 
+    def test_weekend_twins_move_wake_open_brief_and_quiet(self):
+        by_id = {s.id: s for s in self.s.cron_specs()}
+        expect = {
+            "wake_weekend": ((7, 30), "wake", "health"),
+            "checkin_nudge_weekend": ((8, 15), "checkin_nudge", "health"),
+            "inbox_zero_morning_weekend": ((8, 25), "inbox_zero_morning", "business"),
+            "open_weekend": ((8, 30), "open", "business"),
+            "morning_brief_weekend": ((8, 30), "morning_brief", "business"),
+            "quiet_hours_start_weekend": ((22, 30), "quiet_hours_start", "business"),
+        }
+        for sid, (hm, twin, tier) in expect.items():
+            with self.subTest(job=sid):
+                spec = by_id[sid]
+                self.assertEqual((spec.hour, spec.minute), hm)
+                self.assertEqual(spec.day_of_week, "sat,sun")
+                self.assertEqual(spec.guard, twin)
+                self.assertEqual(spec.func_name, by_id[twin].func_name)
+                self.assertEqual(spec.tier, tier)
+                self.assertEqual(by_id[twin].day_of_week, "mon-fri")
+
+    def test_sunday_health_review_runs_after_the_weekend_open(self):
+        hr_ = {s.id: s for s in self.s.cron_specs()}["health_review"]
+        self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week), (8, 30, "sun"))
+
+    def test_ssl_and_domain_checks_are_weekday_only(self):
+        by_id = {s.id: s for s in self.s.cron_specs()}
+        for sid in ("ssl_check", "domain_check"):
+            self.assertEqual(by_id[sid].day_of_week, "mon-fri")
+            self.assertNotIn(f"{sid}_weekend", by_id)
+
     def test_wake_is_health_tier_and_business_jobs_are_not(self):
         by_id = {s.id: s for s in self.s.cron_specs()}
         self.assertEqual(by_id["wake"].tier, "health")
@@ -199,6 +229,14 @@ class TestDuplicateGuard(unittest.TestCase):
         self.assertTrue(self.s._once_per_local_day("wake"))
         self.today = date(2026, 9, 24)
         self.assertTrue(self.s._once_per_local_day("wake"))
+
+    def test_weekend_twin_and_weekday_job_share_one_run_per_day(self):
+        calls = []
+        with patch.object(self.s, "job_wake", side_effect=lambda: calls.append(1)):
+            specs = {s.id: s for s in self.s.cron_specs()}
+            self.s._wrap_cron(specs["wake"])()
+            self.s._wrap_cron(specs["wake_weekend"])()
+        self.assertEqual(len(calls), 1, "wake fired twice on one local day")
 
     def test_jobs_are_guarded_independently(self):
         self.assertTrue(self.s._once_per_local_day("wake"))

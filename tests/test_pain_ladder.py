@@ -850,7 +850,7 @@ class TestJobs(PatternDB):
         rc = by_id["pain_pattern_recompute"]
         self.assertEqual((rc.hour, rc.minute, rc.day_of_week), (21, 55, None))
         hr_ = by_id["health_review"]
-        self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week, hr_.tier), (8, 0, "sun", "health"))
+        self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week, hr_.tier), (8, 30, "sun", "health"))
 
     def test_recompute_job_is_silent(self):
         self.seed_candidate(3, 4)
