@@ -47,6 +47,7 @@ EXERCISE_ALIASES = {"45° back extension": "Seated back extension"}
 FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
               "strength_c": "DB Romanian deadlift"}
 REST_TYPES = {"rest_mobility"}
+PROGRAM_START_FALLBACK = date(2026, 9, 16)   # health_office.WEEK1_START
 
 
 # ============================================================================
@@ -64,6 +65,20 @@ class Data:
     prior_logs: list[dict] = field(default_factory=list)  # the 7 days before start
     patterns: list[dict] = field(default_factory=list)    # open pain patterns
     program: dict | None = None                           # acos.system_state health_program
+
+    @property
+    def anchor(self) -> date:
+        """First day of the current program. Plan rows before it belong to an
+        older program (e.g. the phase-3 home plan) and are never counted."""
+        a = (self.program or {}).get("anchor")
+        return date.fromisoformat(a) if a else PROGRAM_START_FALLBACK
+
+    def program_week(self, d: date) -> int | None:
+        if d < self.anchor:
+            return None
+        wk = (d - self.anchor).days // 7 + 1
+        total = (self.program or {}).get("weeks_total")
+        return min(wk, total) if total else wk
 
 
 def _blocks(v) -> dict:
@@ -138,6 +153,8 @@ def is_done(data: Data, plan: dict) -> bool:
 
 
 def day_status(data: Data, plan: dict) -> str:
+    if plan["plan_date"] < data.anchor:
+        return "pre-program"
     if plan["session_type"] in REST_TYPES:
         return "rest"
     if is_done(data, plan):
@@ -162,7 +179,7 @@ def adherence(data: Data) -> tuple[int, int, int]:
     done = due = upcoming = 0
     for p in data.plans:
         st = day_status(data, p)
-        if st == "rest":
+        if st in ("rest", "pre-program"):
             continue
         if st == "done":
             done += 1
@@ -353,6 +370,12 @@ def _header(data: Data, title: str, generated: datetime | None) -> list:
     return blocks
 
 
+def _pre_program_note(data: Data) -> str:
+    n = sum(1 for p in data.plans if p["plan_date"] < data.anchor)
+    return (f" · {n} day(s) before the program start ({data.anchor:%-m/%-d}) not counted"
+            if n else "")
+
+
 def _set_table(sets: list[dict]) -> tuple:
     rows = []
     for l in sets:
@@ -409,7 +432,7 @@ def build_daily(data: Data, generated: datetime | None = None) -> list:
 
 def build_weekly(data: Data, generated: datetime | None = None) -> list:
     blocks = _header(data, f"Weekly training report — week of {data.start:%b %-d, %Y}", generated)
-    wk = sorted({p["week_num"] for p in data.plans})
+    wk = sorted({w for p in data.plans if (w := data.program_week(p["plan_date"]))})
     if wk:
         blocks.append(("p", f"Program week {', '.join(map(str, wk))}"
                             + (f" of {data.program['weeks_total']}" if data.program else "")))
@@ -417,7 +440,8 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
     blocks += [("h2", "Adherence"),
                ("p", f"**{done} of {due}** training sessions due so far completed"
                      + (f" · {upcoming} still upcoming" if upcoming else "")
-                     + f" · {sum(1 for p in data.plans if p['session_type'] in REST_TYPES)} rest day(s)")]
+                     + f" · {sum(1 for p in data.plans if day_status(data, p) == 'rest')} rest day(s)"
+                     + _pre_program_note(data))]
 
     rows = []
     for p in data.plans:
@@ -484,7 +508,7 @@ def build_monthly(data: Data, generated: datetime | None = None) -> list:
     planned = done + (due - done) + upcoming
     blocks += [("h2", "Sessions"),
                ("p", f"**{done}** done · {due - done} missed · {upcoming} still upcoming · "
-                     f"{planned} planned in the month")]
+                     f"{planned} planned in the month" + _pre_program_note(data))]
 
     lifts = []
     for st, lift in FIRST_LIFT.items():
@@ -511,12 +535,13 @@ def build_monthly(data: Data, generated: datetime | None = None) -> list:
         wline = "no weigh-ins"
     blocks += [("h2", "Body weight"), ("p", wline)]
 
-    weeks = sorted({p["week_num"] for p in data.plans if p["plan_date"] <= data.today})
     prog = data.program or {}
+    wk = data.program_week(min(data.today, data.end))
     blocks += [("h2", "Phase and week"),
                ("p", (f"{prog.get('name', 'Program')} phase {prog.get('phase', '—')} · "
-                      f"week {weeks[-1] if weeks else '—'} of {prog.get('weeks_total', '—')} "
-                      f"(deload week {prog.get('deload_week', '—')}, ends {prog.get('end', '—')})"))]
+                      f"week {wk or '—'} of {prog.get('weeks_total', '—')} "
+                      f"(started {data.anchor:%-m/%-d}, deload week {prog.get('deload_week', '—')}, "
+                      f"ends {prog.get('end', '—')})"))]
 
     hl = [f"{done} session(s) completed"]
     by_day: dict[str, dict[date, float]] = {}   # exercise -> day -> top set

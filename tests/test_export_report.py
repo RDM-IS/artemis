@@ -108,6 +108,21 @@ class TestDailyAndMonthly(unittest.TestCase):
         self.assertIn("## Check-in\n\nno check-in", out)
         self.assertIn("## Watch data (average / max heart rate, calories)\n\nnot yet tracked", out)
 
+    def test_rows_before_the_program_start_are_not_counted(self):
+        old = [{"plan_id": 1 + i, "plan_date": date(2026, 9, 10) + timedelta(days=i), "phase": 3,
+                "week_num": 14, "session_type": "strength_b", "blocks": {"display_name": "old"},
+                "target_rpe": 7, "est_duration_min": 50} for i in range(6)]
+        prog = {"name": "Foundation", "phase": 1, "anchor": "2026-09-16", "weeks_total": 7,
+                "deload_week": 7, "end": "2026-11-03"}
+        data = er.Data(date(2026, 9, 1), date(2026, 9, 30), date(2026, 9, 18), old + plans(),
+                       [s(100, WED, "Leg press", 1, 160)], {}, [], [], prog)
+        self.assertEqual(er.day_status(data, old[0]), "pre-program")
+        self.assertEqual(er.adherence(data)[0:2], (1, 1))      # 9/18 not logged yet
+        out = er.md(er.build_monthly(data, GEN))
+        self.assertIn("**1** done · 0 missed", out)
+        self.assertIn("6 day(s) before the program start (9/16) not counted", out)
+        self.assertIn("week 1 of 7 (started 9/16", out)
+
     def test_monthly_main_lift_start_vs_end(self):
         logs = [s(100, WED, "Leg press", 1, 130), s(100, WED, "Leg press", 2, 160),
                 s(107, WED + timedelta(days=7), "Leg press", 1, 180)]
