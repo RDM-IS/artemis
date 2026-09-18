@@ -148,7 +148,153 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 - **Interim (shipped on feat/health-ramp):** `ramp_confirm` matches **only** the qualified `yes ramp`/`no ramp` and never a bare control word — it removes ramp from the bare-`yes` contention entirely. The *general* race (debrief↔swap↔nutrition↔rule↔disposition ordering) remains.
 - **Fix (this item):** a shared `_count_open_pendings(channel_id)` helper over all stores; when **>1** pending is open and a bare control word arrives, reply with a disambiguation prompt (`reply `yes ramp` or `yes rule``) and consume the word safely instead of first-match-wins; teach each confirm handler to also accept its qualified form. Keep first-match-wins when exactly one pending is open.
 
-**RAMP-RETIRE — delete the dormant feat/health-ramp engine (medium — the confirm route is live).** HARDEN-1's dry run showed the engine cannot be re-pointed as-is: Sun–Sat windows, Sunday-night evaluation, rest days counted and marked missed, a 5/5 threshold the 4-session office week can never meet, and a restart proposal that re-seeds the home-gym program — accepting it with `yes ramp` deletes the office plan. If adherence evaluation is wanted, write a small new evaluator on `health_office.WEEK1_START` (Wed–Tue, training days only, report-only) and decide the thresholds first. Original note: HEALTH-2 unregistered the nightly job and made `--ramp` refuse, but `artemis/health_ramp.py`, `_handle_ramp_confirm` (+ its chain entry and routing-gate tests), `tests/test_health_ramp.py`, and the `health.ramp_state` table (migration 030) remain. Nothing writes `ramp_state.pending_payload` any more, so `yes ramp` is inert. Remove them (drop-table migration, migrate-first) or re-point the engine at the office program. With ramp gone, CONFIRM-ARB's worst case (never-expiring ramp pending) no longer applies.
+**RAMP-RETIRE — delete the dormant feat/health-ramp engine (medium — the confirm route is live).** HARDEN-1's dry run showed the engine cannot be re-pointed as-is: Sun–Sat windows, Sunday-night evaluation, rest days counted and marked missed, a 5/5 threshold the 4-session office week can never meet, and a restart proposal that re-seeds the home-gym program — accepting it with `yes ramp` deletes the office plan. Adherence evaluation is EVAL-1 (report-only, below), not a re-pointed engine. Original note: HEALTH-2 unregistered the nightly job and made `--ramp` refuse, but `artemis/health_ramp.py`, `_handle_ramp_confirm` (+ its chain entry and routing-gate tests), `tests/test_health_ramp.py`, and the `health.ramp_state` table (migration 030) remain. Nothing writes `ramp_state.pending_payload` any more, so `yes ramp` is inert. Remove them (drop-table migration, migrate-first) or re-point the engine at the office program. With ramp gone, CONFIRM-ARB's worst case (never-expiring ramp pending) no longer applies.
+
+**WATCH-1 — Apple Watch ingest via Health Auto Export (medium; before REPORT-1 so reports can include watch data).**
+- **Endpoint:** `POST /api/health/ingest` on the Lambda (`api/app/routers/health.py`), accepting the Health Auto Export JSON payload (`data.metrics[]` + `data.workouts[]`). It has **its own key** in Secrets Manager via `knowledge/secrets.py`, checked on its own dependency. Never the display key, and the display key must not work here.
+- **Idempotent** by (metric, timestamp); workouts by (workout, start). A re-sent or overlapping export is a no-op, and the response reports inserted/duplicate counts.
+- **Payload limits:** a large backfill can exceed the Lambda payload limit and the stage throttle (5 req/s, burst 10), so the export is configured in batches.
+- **Store:** one table in `health`, with a row per sample: metric, timestamp (UTC), numeric value, unit, and the raw JSON kept. It covers:
+  - sleep hours and phases (deep/REM/core/awake)
+  - resting heart rate, HRV, weight
+  - workout records: type, start, duration, average and max heart rate, calories
+- **Migration: propose first.** The DDL and the unique key go to Ryan for review before anything is written. Deploy migrate-first.
+- **Morning check-in pre-fill:** sleep, resting heart rate and weight come from last night's data, where "last night" is anchored to the active timezone (`quiet_hours.local_now()`), never UTC. Ryan only fills in energy and soreness. A value he types always wins over the watch. The reply says which values came from the watch, and when there's no watch data it says so plainly instead of guessing. Pre-fill stays deterministic and must not change intent routing.
+- **Workout match:** a watch workout attaches to the logged session by time overlap with that day's `session_log`. It fills `session_log.hr_avg` / `hr_peak`; calories come from the watch table. With no overlap there's no match, and it's never attached by date alone.
+
+**EVAL-1 — read-only weekly evaluator (medium; before REPORT-1).**
+- **Scope:** read-only. It makes **no plan changes and no recommendations**, and holds no confirm routes or pending state. It's the small report-only evaluator RAMP-RETIRE calls for, and it doesn't reuse `health_ramp.py`.
+- **Week and timezone:** weeks are the office Wed–Tue windows counted from `health_office.WEEK1_START`. Dates come from the active timezone.
+- **Inputs:** the week's `health.plan` rows and `health.session_log` rows (`logged_via <> 'inferred'`).
+- **Output**, as one structured result:
+  - sessions done vs planned (training days only; rest days are neither done nor missed)
+  - per-exercise load change vs the prior week (top logged weight per exercise; an exercise with no load either week is reported as such, not as 0)
+  - average RPE (`session_log.rpe_actual`) vs the cap (`plan.target_rpe`)
+  - missed sessions
+  - adjustments applied (`blocks.adjustment`: date, rules fired, reason)
+- **Consumers:**
+  - the weekly report (REPORT-1): the full Wed–Tue week, Tuesday evening.
+  - a Sunday post: Sunday falls mid-week, so it covers the week to date (Wed–Sat) and is **labelled partial**.
+- **Tests:** a full week, a partial week, a week with a missed session, a week with adjustments, an empty week, and an exercise renamed between weeks (no false "new exercise" load change).
+
+**REPORT-1 — PDF training reports (medium; after STATUS-1, WATCH-1 and EVAL-1).**
+- **Prerequisites.** These are numbered steps, each verified on the box or in AWS before any report work starts:
+  1. **WeasyPrint + pango on the box.** Install pango (and its cairo/harfbuzz dependencies) with `dnf`, and `weasyprint` for `/usr/bin/python3.11`. Add both to the deploy path. **Verify:** a test HTML page renders to a PDF on the box with fonts and CSS applied.
+  2. **S3 bucket and permissions.** Create a private bucket (no public access, encrypted). Give the EC2 role put/get on the reports prefix and the Lambda role get plus signing. **Verify:** the box writes an object, the Lambda signs a link to it, the link downloads, and the same object is not reachable without a signature.
+  3. **Mattermost upload call.** Add file upload to `artemis/mattermost.py` (`POST /files`, then a post carrying `file_ids`). **Verify:** a test PDF posts to `#artemis-ryan` as an attachment. **If upload proves awkward, post a signed S3 link instead. Don't block REPORT-1 on it.**
+- **Rendering:** PDFs generated on the box with WeasyPrint from HTML/CSS templates, styled to match gym-display. No new services (prerequisite 1).
+- **Daily** (after a session, 1 page):
+  - the session and every set: weight × reps and effort
+  - machine settings, total time
+  - the check-in and any adjustment
+  - watch data when available: average and max heart rate, calories
+  - Machine settings are shown only when logged; today they're never captured (HARDEN-1 follow-up).
+- **Weekly** (Tuesday evening, closing the Wed–Tue week; 2 pages):
+  - adherence and all sessions
+  - weight progress per exercise, with the change from last week
+  - check-in trends, body weight
+  - pain and soreness summary, open patterns (`health_patterns`)
+  - the EVAL-1 result for the week, as data. Without EVAL-1 the section is omitted, never filled in.
+- **Monthly** (1 page, less detail, no per-set detail):
+  - sessions done vs planned
+  - main lifts start vs end (proposed: each session's first lift — leg press, DB goblet squat, DB Romanian deadlift)
+  - body weight trend, phase and week progress
+  - a highlights list
+- **Storage:** S3 (prerequisite 2), keyed by type and date (e.g. `reports/{daily|weekly|monthly}/{period}.pdf`), served by signed link.
+- **Idempotent per period:** re-running replaces the object and never duplicates it. It posts once per period unless forced.
+- **Delivery:**
+  - Posted to Mattermost as an attachment when generated (prerequisite 3; a signed S3 link is the fallback).
+  - Downloadable from the Status page: a "Reports" section showing the last 12, backed by a Lambda endpoint that lists and signs links on request. Signed links are generated per request, never stored.
+- **Timezone:** all period boundaries use the active timezone (`local_today()`; SQL with `get_active_timezone()` passed as a parameter).
+- **Tests:**
+  - a golden-file layout for each type
+  - an empty period
+  - a partial week
+  - a period with check-in adjustments
+
+**DIET-1 — nutrition logging, rollup and dietitian reports (medium; after WATCH-1 for energy out, and extends REPORT-1).**
+- **Existing code this replaces (coverage-check first):** a nutrition subsystem is already live from migration 016.
+  - Tables `health.nutrition_target`, `health.meal`, `health.nutrition_log`: all empty in RDS as of 2026-09-18.
+  - A `nutrition_budget` function.
+  - Intents `set_nutrition_target` / `log_nutrition` / `nutrition_status` in `artemis/health.py`.
+  - The `health.meal` → `acos.grocery_list` staples write in `artemis/life_ops.py`.
+  - DIET-1 moves nutrition to a `nutrition` schema. Per "one system of record" the `health.*` tables are retired, not kept alongside. Map every capability above (the staples write included) to its new home before dropping anything, and stop on any capability with no home.
+  - The `nutrition_budget` default hard-codes `'America/Chicago'`. That violates the timezone discipline and is fixed in the move.
+- **Schema (propose the migration first):**
+  - `nutrition.food`: saved foods with macros, source and source ID.
+  - `nutrition.entry`: date, meal, food, quantity, macros, source, source ID, confidence.
+  - `nutrition.target`: calories, protein, carbs, fat, effective date, set by the dietitian.
+  - Deploy migrate-first.
+- **Recording is default-to-plan; logging is by exception.**
+  - **00:15 local pre-fill:** plan days are pre-filled from the Notion meal plan. Meals stay `assumed`. **There is no prompt and no nudge**, and no scheduled nutrition post of any kind in quiet hours. If Notion is unreachable, nothing is pre-filled and the day says so; no plan is invented.
+  - **Morning check-in line:** the check-in reply appends one line: "Yesterday logged as planned — reply `fix` to correct." It's omitted when the previous day had corrections or had no plan. It's part of the reply, not a separate post, and it must not change check-in intent routing (HEALTH-1).
+  - **`fix`** opens a correction for the **previous** day.
+    - It routes deterministically, and only when that day is still open. It's added to the bare-control-word inventory in CONFIRM-ARB.
+    - Corrections are accepted any time within **48 hours of the day's end** (local midnight in the active timezone). After that the day locks and a correction is refused with a plain reply.
+  - **Status is separate from confidence.**
+    - Entry status: `assumed` | `corrected`.
+    - Day status: `assumed` | `corrected` | `locked_unconfirmed`, one row per day. A still-`assumed` day becomes `locked_unconfirmed` at the 48-hour lock; a `corrected` day stays `corrected`.
+    - Reports show all three day statuses. Both go in the schema proposal.
+- **Deviations, one line each:** "lunch: chipotle chicken bowl", "skipped breakfast", "+2 beers". Each is parsed into entries against the source order: saved foods → USDA FoodData Central (API key in Secrets Manager) → Open Food Facts. Every entry stores its source and ID.
+- **Confidence tiers:**
+  - `exact`: plan, barcode or saved food.
+  - `matched`: database lookup.
+  - `estimated`: a photo, or text that is still vague after the one question.
+  - Macros are never invented silently. An unmatched food first gets exactly one question ("how big was the portion?" or "which brand?"). Only if the answer is still vague is it stored as `estimated`.
+  - `estimated` is always visibly marked in every report.
+  - The existing `estimate_nutrition()` (a Claude estimator writing `estimated=TRUE`) is replaced by this tiered path, not kept alongside.
+- **Photo:** a photo posted to Mattermost with no text returns a best guess and a portion question, stored `confidence=estimated`. Being a model's guess, it's labelled as a guess in the reply and never presented as a lookup.
+- **Voice:**
+  - iOS dictation into Mattermost needs no build.
+  - Also provide an Apple Shortcut, "Log meal", that takes dictation and posts to a new `POST /api/nutrition/log` on the Lambda. It has **its own key** (Secrets Manager, stored only in the Shortcut) and goes through the same parser. That lets it work from the Home Screen and the watch.
+  - Deliver the Shortcut as documented build steps: Shortcuts files are signed and can't be generated from the repo.
+- **Barcode:** `gym.rdm.is/scan` in gym-display. The camera scans the barcode → Open Food Facts → confirm the portion → log.
+  - It must work on iPhone Safari. iOS Safari has no `BarcodeDetector`, so it needs a JS decoder (e.g. ZXing), `getUserMedia` over HTTPS, and a manual-entry fallback.
+  - It logs through gym-display's same-origin `/api` proxy behind Cloudflare Access. **It must not use the Shortcut key; no key in the bundle** (the HARDEN-1 lesson).
+- **Notion meal plan:** read the meal plan database, and **report its exact property names to Ryan before building**. "as planned" logs that meal's macros. Notion is the meal-plan source; `health.meal` retires with the other tables and no copy is kept in RDS, which would be a second store.
+- **Logging:** extend the existing nutrition handler (deterministic intent routing is unchanged).
+  - One-line entries in Mattermost.
+  - A same-day `undo last`.
+- **Shortcuts:**
+  - Any food logged twice becomes a one-word shortcut. Reserved words (`yes`, `no`, `undo`, `fix`, command verbs) are never shortcuts.
+  - "usual breakfast" (and the same for other meals) resolves to that meal's most frequent entry over the last 14 days; a tie goes to the most recent. With no history, Artemis says so rather than picking one.
+- **Daily rollup (21:50 local, silent, no post):**
+  - totals in
+  - energy out = baseline + watch active energy
+  - net
+  - the 7-day weight average
+  - **Baseline is not defined yet.** Ryan decides whether it's the watch's basal energy or a fixed number he or the dietitian provides. Artemis never estimates it.
+  - With no watch data, net is reported as baseline-only and flagged, not left blank or estimated.
+- **Reports (extend REPORT-1):**
+  - **Daily:** meals, totals, comparison to target.
+  - **Weekly:** daily averages, protein per day, net per day, weight trend, workout summary.
+  - **Monthly for the dietitian:** one page, clinical tone, data only, with no advice or judgment language. It covers:
+    - daily average intake and macros, protein per day
+    - weight start/end/trend
+    - sessions completed, activity minutes
+    - logging completeness (days logged out of days, split into `assumed` / `corrected` / `locked_unconfirmed` days)
+    - the percentage of intake from each confidence tier (`exact` / `matched` / `estimated`)
+  - **Email:** the monthly PDF can be emailed as an attachment, but by the Brad Spaits rule Artemis only prepares a Gmail **draft**. Ryan sends it.
+- **Provisional seed:** 2,100 calories and 175 g protein, marked "provisional — pending dietitian", with an effective date. Ryan chose these values; it's a human-run seed, not an Artemis decision. The dietitian's target later closes it cleanly by effective date.
+- **Targets:** `@artemis set nutrition target calories 2200 protein 180 …` writes `nutrition.target` with an effective date. It keeps the existing propose-then-confirm flow. Artemis never sets or changes a target itself and never recommends a deficit. The existing target parser is a Claude call; replace it with a deterministic parse (targets are numbers Ryan typed).
+- **Tests:**
+  - parsing with and without a plan match
+  - an unmatched food asks rather than guesses
+  - `undo last`
+  - rollup math
+  - PDF golden files
+  - missing-watch-data fallback
+  - a guard that no code path writes macros without a source ID, except `estimated` entries, which carry their tier and origin (photo / vague text)
+  - a day with a correction (status `corrected`)
+  - a `locked_unconfirmed` day in the report, alongside `assumed` and `corrected` days
+  - the barcode path
+  - a photo marked estimated
+  - "usual breakfast" resolution
+  - the tier percentages
+  - the morning line appears only when relevant (a plan day with no corrections), and is absent after a corrected day or a day with no plan
+  - `fix` corrects the previous day, not today
+  - a correction at 47 h after the day's end works; at 49 h it is refused and the day is `locked_unconfirmed`
+  - no scheduled nutrition post exists in quiet hours (registry check)
 
 **PB9-CRON — morning prompt times vs office arrival (low).** The PB-009 morning prompt schedule predates the office gym; retime once Ryan's office arrival time is confirmed (TODO in PLAYBOOKS.md).
 
