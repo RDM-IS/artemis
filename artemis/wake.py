@@ -216,9 +216,30 @@ def _depart_commitments() -> list[str]:
     return out
 
 
-def _departure_section(calendar) -> list[str]:
-    lines = ["", "**Before you leave**"]
-    if config.DEPARTURE_CHECKLIST:
+OFFICE_LOCATION = "office gym"   # health_office.LOCATION
+
+
+def _is_office_day(plan: dict | None) -> bool:
+    """A training day at the office gym (plan blocks.location). Rest days never
+    are, even when the row carries office blocks."""
+    if not plan or plan.get("session_type") == "rest_mobility":
+        return False
+    blocks = plan.get("blocks") or {}
+    if isinstance(blocks, str):
+        import json
+        try:
+            blocks = json.loads(blocks)
+        except ValueError:
+            return False
+    return blocks.get("location") == OFFICE_LOCATION
+
+
+def _departure_section(calendar, plan: dict | None = None) -> list[str]:
+    """Office days get the DEPARTURE_CHECKLIST; home, outside and rest days
+    don't. The first event, weather and `depart:` commitments show on any day.
+    Nothing to say -> no block at all."""
+    lines = []
+    if _is_office_day(plan) and config.DEPARTURE_CHECKLIST:
         lines.append("· " + ", ".join(config.DEPARTURE_CHECKLIST))
     first_event = _first_event_line(calendar)
     if first_event:
@@ -227,7 +248,7 @@ def _departure_section(calendar) -> list[str]:
     if weather:
         lines.append(f"· {weather}")
     lines.extend(_depart_commitments())
-    return lines
+    return ["", "**Before you leave**", *lines] if lines else []
 
 
 def build_wake_message(calendar=None, held_health: list[str] | None = None) -> str:
@@ -250,5 +271,5 @@ def build_wake_message(calendar=None, held_health: list[str] | None = None) -> s
     lines.extend(_checkin_section(plan))
     for notice in held_health or []:
         lines.extend(["", notice])
-    lines.extend(_departure_section(calendar))
+    lines.extend(_departure_section(calendar, plan))
     return "\n".join(lines)

@@ -319,6 +319,63 @@ class TestWakeMessage(unittest.TestCase):
         self.assertNotIn("Where:", msg)
         self.assertNotIn("First lift", msg)
 
+    # ── Departure block is location-aware ──
+    HOME_FLOW = {"plan_id": 3, "session_type": "recovery_flow", "est_duration_min": 30,
+                 "blocks": {"type": "recovery_flow", "display_name": "Recovery Flow",
+                            "location": "home", "rounds": 2, "total_sec": 1770,
+                            "flow": [], "pre": [], "close": {"name": "Easy pose breathing",
+                                                              "duration_sec": 180}}}
+
+    def _depart(self, plan, *, event=True, weather=True, commitments=()):
+        from artemis import wake as wake_mod
+        cal = MagicMock()
+        cal.service = True
+        cal.get_today_events.return_value = (
+            [{"summary": "Standup", "start": "2026-09-19T09:00:00-05:00"}] if event else [])
+        with patch.object(wake_mod, "_weather_line",
+                          return_value="Weather: 72°/54°F · clear" if weather else None), \
+             patch.object(wake_mod, "_depart_commitments", return_value=list(commitments)):
+            return wake_mod._departure_section(cal, plan)
+
+    def test_office_day_shows_the_checklist(self):
+        lines = self._depart(self.PLAN)
+        self.assertIn("**Before you leave**", lines)
+        self.assertIn("· gym bag, badge, lunch, iPad", lines)
+
+    def test_home_saturday_has_no_checklist_but_keeps_event_and_weather(self):
+        text = "\n".join(self._depart(self.HOME_FLOW))
+        self.assertNotIn("gym bag", text)
+        self.assertIn("**Before you leave**", text)
+        self.assertIn("First event", text)
+        self.assertIn("Weather:", text)
+
+    def test_outside_walk_and_rest_days_follow_the_home_rule(self):
+        walk = {"session_type": "walk", "blocks": {"location": "outside"}}
+        rest_with_office_blocks = {"session_type": "rest_mobility",
+                                   "blocks": {"location": "office gym"}}
+        for plan in (walk, rest_with_office_blocks, None):
+            with self.subTest(plan=plan):
+                self.assertNotIn("gym bag", "\n".join(self._depart(plan)))
+
+    def test_depart_commitment_shows_on_a_home_day(self):
+        lines = self._depart(self.HOME_FLOW, event=False, weather=False,
+                             commitments=["· drop off dry cleaning"])
+        self.assertEqual(lines, ["", "**Before you leave**", "· drop off dry cleaning"])
+
+    def test_block_disappears_when_empty(self):
+        self.assertEqual(self._depart(self.HOME_FLOW, event=False, weather=False), [])
+        msg_plan = dict(self.HOME_FLOW)
+        from artemis import wake as wake_mod
+        with patch("artemis.health.get_today_plan", return_value=msg_plan), \
+             patch.object(wake_mod, "_weather_line", return_value=None), \
+             patch.object(wake_mod, "_depart_commitments", return_value=[]), \
+             patch.object(wake_mod, "get_timezone_override", return_value=None), \
+             patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 19, 7, 30)), \
+             patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 19)):
+            msg = wake_mod.build_wake_message(calendar=None, held_health=[])
+        self.assertIn("Recovery Flow", msg)
+        self.assertNotIn("Before you leave", msg)
+
     def test_prompt_type_comes_from_the_plan_not_the_weekday(self):
         from artemis import wake as wake_mod
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "strength_b"}), "workout_am")
