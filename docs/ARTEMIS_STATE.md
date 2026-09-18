@@ -177,6 +177,14 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
   - a Sunday post: Sunday falls mid-week, so it covers the week to date (Wed–Sat) and is **labelled partial**.
 - **Tests:** a full week, a partial week, a week with a missed session, a week with adjustments, an empty week, and an exercise renamed between weeks (no false "new exercise" load change).
 
+**EXPORT-1 — `scripts/export_report.py` (small; ahead of REPORT-1; built).**
+- **Usage:** `--daily YYYY-MM-DD`, `--weekly <week start>`, `--monthly YYYY-MM` on the box. It writes `/tmp/artemis-report-<type>-<period>.md` and a plain `.html`; open the HTML in a browser and print to PDF.
+- **Reads only:** `health.plan`, `health.session_log` (inferred rows excluded), `health.daily_state`, `health.pain_pattern`, and `acos.system_state.health_program`. No WeasyPrint, no S3, no new dependencies.
+- **Contents** follow the REPORT-1 spec. Watch data, nutrition and the weekly evaluation print "not yet tracked", as does machine settings until any are logged.
+- **Pre-program rows:** plan rows before the program anchor (the old phase-3 home plan) are listed as not counted, never as missed.
+- **Renamed exercise:** 45° back extension logs are grouped under Seated back extension for comparisons, with a footnote.
+- REPORT-1 replaces the output step, and the builders carry over.
+
 **REPORT-1 — PDF training reports (medium; after STATUS-1, WATCH-1 and EVAL-1).**
 - **Prerequisites.** These are numbered steps, each verified on the box or in AWS before any report work starts:
   1. **WeasyPrint + pango on the box.** Install pango (and its cairo/harfbuzz dependencies) with `dnf`, and `weasyprint` for `/usr/bin/python3.11`. Add both to the deploy path. **Verify:** a test HTML page renders to a PDF on the box with fonts and CSS applied.
