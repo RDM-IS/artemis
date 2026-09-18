@@ -211,6 +211,12 @@ def exercises_logged(logs: list[dict]) -> list[str]:
     return seen
 
 
+def no_load_label(name: str | None) -> str:
+    """Why a set has no weight: bodyweight by equipment class, else not logged."""
+    from artemis.health_regions import equipment_class
+    return "bodyweight" if equipment_class(name or "") == "bodyweight" else "no load logged"
+
+
 def settings_in(notes: str | None) -> str | None:
     for part in (notes or "").split(";"):
         part = part.strip()
@@ -354,7 +360,7 @@ def _set_table(sets: list[dict]) -> tuple:
         if canon(name) != name:
             name = f"{name} *"
         rows.append([name, fmt(l["set_num"]), fmt(l["weight_lbs"], " lb") if l["weight_lbs"] is not None
-                     else "bodyweight", fmt(l["reps_done"]), fmt(l["rpe_actual"]),
+                     else no_load_label(canon(l["exercise"])), fmt(l["reps_done"]), fmt(l["rpe_actual"]),
                      "skipped" if l["is_skipped"] else (l["notes"] or "")])
     return ("table", ["Exercise", "Set", "Weight", "Reps", "Effort (RPE)", "Notes"], rows)
 
@@ -429,7 +435,7 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
     for name in exercises_logged(data.logs):
         cur, prev = now_w.get(name), prev_w.get(name)
         if cur is None:
-            change = "bodyweight"
+            change = no_load_label(name)
         elif prev is None:
             change = "first week"
         else:

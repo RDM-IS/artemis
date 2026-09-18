@@ -75,6 +75,11 @@ class TestWeekly(unittest.TestCase):
         self.assertIn("| Seated back extension | 60 lb | 50 lb | +10 lb |", out)
         self.assertIn("| Leg extension | 110 lb | — | first week |", out)
 
+    def test_a_machine_with_no_weight_is_no_load_logged_not_bodyweight(self):
+        logs = [s(102, WED + timedelta(days=2), "Seated back extension", 1, None)]
+        out = er.md(er.build_weekly(week(date(2026, 9, 18), logs), GEN))
+        self.assertIn("| Seated back extension | — | — | no load logged |", out)
+
     def test_bodyweight_sets_are_not_a_zero_load(self):
         logs = [s(100, WED, "Captain's chair knee raise", 1, None, reps=15)]
         out = er.md(er.build_weekly(week(WED, logs), GEN))
@@ -97,7 +102,7 @@ class TestDailyAndMonthly(unittest.TestCase):
         d = WED + timedelta(days=2)
         data = er.Data(d, d, d, [plans()[2]], [s(102, d, "45° back extension", 1, None)], {}, [], [], None)
         out = er.md(er.build_daily(data, GEN))
-        self.assertIn("| 45° back extension * | 1 | bodyweight |", out)
+        self.assertIn("| 45° back extension * | 1 | no load logged |", out)
         self.assertIn("counted as Seated back extension", out)
         self.assertIn("## Machine settings\n\nnot yet tracked", out)
         self.assertIn("## Check-in\n\nno check-in", out)
