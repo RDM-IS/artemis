@@ -50,6 +50,66 @@ for _name in _STUBS:
     sys.modules.setdefault(_name, MagicMock())
 
 from artemis import main  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+import knowledge.db as _db  # noqa: E402
+
+# ── No RDS, ever ────────────────────────────────────────────────────────────
+# os.environ.setdefault above keeps a REAL RDS_HOST when .env is sourced (on the
+# box), and this module drives code that audits calendar confirms and logs
+# guardrail violations — so it used to write test rows into production. Every
+# knowledge.db helper opens its connection through get_connection(), so an
+# in-memory stand-in there covers them all: reads come back empty, writes are
+# recorded in FAKE_DB_WRITES and go nowhere.
+FAKE_DB_WRITES: list[str] = []
+
+
+class _FakeCursor:
+    description = None
+    rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        head = " ".join(str(sql).split()).upper()
+        if head.startswith(("INSERT", "UPDATE", "DELETE")):
+            FAKE_DB_WRITES.append(" ".join(str(sql).split())[:120])
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+
+class _FakeConn:
+    def cursor(self, *a, **kw):
+        return _FakeCursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+@contextmanager
+def _fake_get_connection():
+    yield _FakeConn()
+
+
+_db_patch = patch.object(_db, "get_connection", _fake_get_connection)
+
+
+def setUpModule():
+    _db_patch.start()
+
+
+def tearDownModule():
+    _db_patch.stop()
 
 
 def _post(message: str, channel: str = "chanA") -> dict:
@@ -219,6 +279,13 @@ class TestDispatchShortCircuit(_Base):
             main._handle_mention(_post("confirm"), [])
         routed.assert_called_once()
         self.assertFalse(self._cal.create_event.called)
+
+
+
+class TestNeverTouchesRds(unittest.TestCase):
+    def test_db_is_the_in_memory_fake(self):
+        with _db.get_connection() as conn:
+            self.assertIsInstance(conn, _FakeConn)
 
 
 if __name__ == "__main__":

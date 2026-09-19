@@ -19,6 +19,16 @@ from unittest.mock import patch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+# Lives in tests/, not artemis/: run as a script from artemis/, the package dir
+# lands first on sys.path and artemis/calendar.py shadows the stdlib `calendar`
+# (http.client → circular import). `requests` is stubbed only when it isn't
+# installed (a bare local interpreter); the box uses the real one.
+try:
+    import requests  # noqa: F401
+except ImportError:  # pragma: no cover - environment-dependent
+    from unittest.mock import MagicMock
+    sys.modules["requests"] = MagicMock()
+
 os.environ.setdefault("RDS_HOST", "test-host")
 os.environ.setdefault("RDS_DB", "test-db")
 
