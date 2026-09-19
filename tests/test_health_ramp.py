@@ -11,6 +11,8 @@ Run per-file (unittest), never via discover:
     python3 -m unittest tests.test_health_ramp -v
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import contextlib
 import json
 import unittest

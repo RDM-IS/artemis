@@ -37,6 +37,8 @@ def get_connection():
         print(f"ERROR: Failed to get RDS credentials: {e}")
         sys.exit(1)
 
+    from knowledge.dbguard import refuse_real_db
+    refuse_real_db("run_migrations")
     return psycopg2.connect(
         host=host,
         port=5432,

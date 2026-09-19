@@ -4,6 +4,8 @@ Run:
     python3.11 tests/test_export_report.py
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone

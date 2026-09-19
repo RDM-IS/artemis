@@ -6,6 +6,8 @@ Run:
     python3 -m knowledge.test_google_clients
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import socket
 import ssl
 import sys

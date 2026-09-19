@@ -4,6 +4,8 @@ The parser and matcher are pure; the DB layer (execute_*) is stubbed so these ru
 without RDS. Run:  python tests/test_playbook_rules.py
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import os
 import sys
 import types

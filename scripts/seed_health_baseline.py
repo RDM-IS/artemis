@@ -55,6 +55,8 @@ def get_connection():
     functions can be tested without boto3/psycopg2 installed."""
     import psycopg2
     from knowledge.secrets import get_rds_credentials
+    from knowledge.dbguard import refuse_real_db
+    refuse_real_db("seed_health_baseline")
 
     host = os.environ.get("RDS_HOST")
     db = os.environ.get("RDS_DB", "crm")

@@ -100,8 +100,10 @@ def _connect():
     """Yield a psycopg2 connection. Prefer DATABASE_URL; otherwise use the
     knowledge.db pool (EC2 path). The caller controls the transaction."""
     import psycopg2
+    from knowledge.dbguard import refuse_real_db
     url = os.environ.get("DATABASE_URL")
     if url:
+        refuse_real_db(__name__ + "._connect")
         conn = psycopg2.connect(url, connect_timeout=10)
         try:
             yield conn

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Mattermost connection test — validates bot credentials and channel access via Secrets Manager."""
+"""Mattermost connection check — validates bot credentials and channel access
+via Secrets Manager. A manual ops script, not a test: it talks to the live
+server. Read-only by default; the "post a message" step runs only with --post,
+because it posts to the bot's real channel.
+
+    /usr/bin/python3.11 scripts/check_mattermost.py          # read-only checks
+    /usr/bin/python3.11 scripts/check_mattermost.py --post   # + one real post
+"""
 
 import sys
 import os
@@ -69,8 +76,11 @@ def main():
         results.append((test_name, False))
         print(f"  FAIL  {test_name} — {exc}")
 
-    # ── Test 4: Post message ──────────────────────────────────────────
+    # ── Test 4: Post message — opt-in, it is a real post ─────────────
     test_name = "Post message to channel"
+    if "--post" not in sys.argv[1:]:
+        print(f"  SKIP  {test_name} — read-only run (pass --post to send one)")
+        return _summary(results)
     try:
         payload = {
             "channel_id": channel_id,
@@ -93,7 +103,10 @@ def main():
         results.append((test_name, False))
         print(f"  FAIL  {test_name} — {exc}")
 
-    # ── Summary ───────────────────────────────────────────────────────
+    return _summary(results)
+
+
+def _summary(results):
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
     print(f"\n{'=' * 40}")

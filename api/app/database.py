@@ -9,6 +9,7 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 from knowledge.secrets import get_rds_credentials
+from knowledge.dbguard import refuse_real_db
 
 
 def build_database_url() -> str:
@@ -23,6 +24,7 @@ _SessionLocal = None
 def get_engine():
     global _engine
     if _engine is None:
+        refuse_real_db("api.app.database.get_engine")
         _engine = create_engine(build_database_url(), pool_pre_ping=True)
     return _engine
 
