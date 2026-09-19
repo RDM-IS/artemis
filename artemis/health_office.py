@@ -295,12 +295,33 @@ FLOW_STEPS = [
 FLOW_ROUNDS = 2
 FLOW_DOUBLE_ROUND = 2            # round whose holds double …
 FLOW_DOUBLE_STEPS = (10, 16)     # … on steps 10-16 (by step number)
-FLOW_CLOSE = {"name": "Easy pose breathing", "side": None, "duration_sec": 180,
-              "cue": "Easy pose. Slow, even breaths."}
+# YOGA-3 (Ryan, 9/19): open with 1 min seated meditation; close with 3 min
+# savasana (seated breathing stays inside the rounds as step 16).
+FLOW_MEDITATION = {"name": "Seated meditation", "side": None, "duration_sec": 60,
+                   "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated"}
+FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180,
+              "cue": "Lie on your back, arms by your sides, let everything go.", "posture": "supine"}
 FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
-                        "cue": "Follow the 8 placard stretches"}
-FLOW_PREVIEW_SEC = 5
+                        "cue": "Follow the 8 placard stretches", "posture": "standing"}
 FLOW_TARGET_RPE = 2.0
+
+# Body position of every pose. The transition before a pose depends on the
+# change: 3 s when it's the same position or floor-to-floor, 5 s when you have
+# to get up or down (into/out of standing, or supine <-> seated).
+FLOW_POSTURE = {
+    "Child's pose": "kneeling", "Cobra": "prone", "Downward dog": "quadruped",
+    "Standing forward bend": "standing", "High lunge": "standing", "Crescent lunge": "standing",
+    "Extended puppy": "kneeling", "Bridge": "supine", "Supine twist": "supine",
+    "Wind release": "supine", "Seated side bend": "seated", "Seated twist": "seated",
+    "Seated mountain": "seated", "Easy pose": "seated",
+}
+FLOW_POSTURES = ("standing", "kneeling", "quadruped", "prone", "supine", "seated")
+# How the voice says a pose, where it differs from the written name.
+FLOW_SPOKEN = {"Downward dog": "Downward facing dog"}
+FLOW_TRANSITION_SHORT_SEC = 3
+FLOW_TRANSITION_LONG_SEC = 5
+FLOW_LEADIN_SEC = 3            # the "Next we'll move into …" lead-in, before the hold ends
+FLOW_START_POSTURE = "standing"   # at the iPad when Start is tapped
 
 
 def _step_no(step: str) -> int:
@@ -315,11 +336,52 @@ def flow_step_holds(blocks: dict, round_num: int) -> list[int]:
             for s in blocks["flow"]]
 
 
+def transition_sec(prev: str | None, nxt: str | None, short: int = FLOW_TRANSITION_SHORT_SEC,
+                   long: int = FLOW_TRANSITION_LONG_SEC) -> int:
+    """Seconds to move from one body position to the next (YOGA-3).
+
+    Short when nothing changes or it's floor to floor; long only when you have
+    to get up or down — into or out of standing, or supine <-> seated. An
+    unknown posture gets the long transition."""
+    if prev not in FLOW_POSTURES or nxt not in FLOW_POSTURES:
+        return long
+    if prev == nxt:
+        return short
+    if "standing" in (prev, nxt) or {prev, nxt} == {"supine", "seated"}:
+        return long
+    return short
+
+
+def flow_sequence(blocks: dict) -> list[dict]:
+    """Every timed item in play order — pre, each round, close — with its hold,
+    posture and the transition before it (the first one is from standing at
+    the iPad)."""
+    items = [dict(p) for p in blocks.get("pre") or []]
+    for r in range(1, int(blocks.get("rounds") or 1) + 1):
+        for st, hold in zip(blocks.get("flow") or [], flow_step_holds(blocks, r)):
+            items.append({**st, "duration_sec": hold, "round": r})
+    if blocks.get("close"):
+        items.append(dict(blocks["close"]))
+    short = blocks.get("transition_short_sec", FLOW_TRANSITION_SHORT_SEC)
+    long = blocks.get("transition_long_sec", FLOW_TRANSITION_LONG_SEC)
+    prev = blocks.get("start_posture", FLOW_START_POSTURE)
+    for it in items:
+        it["transition_sec"] = transition_sec(prev, it.get("posture"), short, long)
+        prev = it.get("posture")
+    return items
+
+
+def flow_hold_sec(blocks: dict) -> int:
+    return sum(i["duration_sec"] for i in flow_sequence(blocks))
+
+
+def flow_transition_total_sec(blocks: dict) -> int:
+    return sum(i["transition_sec"] for i in flow_sequence(blocks))
+
+
 def flow_total_sec(blocks: dict) -> int:
-    pre = sum(p["duration_sec"] for p in blocks.get("pre") or [])
-    rounds = sum(sum(flow_step_holds(blocks, r)) for r in range(1, int(blocks["rounds"]) + 1))
-    close = (blocks.get("close") or {}).get("duration_sec", 0)
-    return pre + rounds + close
+    """Holds plus the transitions between them — the time the flow really takes."""
+    return sum(i["duration_sec"] + i["transition_sec"] for i in flow_sequence(blocks))
 
 
 class FlowError(ValueError):
@@ -354,12 +416,20 @@ def validate_flow(blocks: dict) -> None:
                 raise FlowError(f"{g}: missing side {sorted({'R', 'L'} - seen)[0]}")
             if sides["R"] != sides["L"]:
                 raise FlowError(f"{g}: R {sides['R']}s ≠ L {sides['L']}s (round {r})")
+    for it in [*(blocks.get("pre") or []), *flow, *([blocks["close"]] if blocks.get("close") else [])]:
+        if it.get("posture") not in FLOW_POSTURES:
+            raise FlowError(f"{it.get('step') or it.get('name')}: posture {it.get('posture')!r} "
+                            f"is not one of {', '.join(FLOW_POSTURES)}")
 
 
 def _flow_step(spec) -> dict:
     step, name, side, hold, group, label, cue, easier = spec
-    return {"step": step, "name": name, "side": side, "side_label": label,
-            "duration_sec": hold, "mirror_group": group, "cue": cue, "easier": easier}
+    out = {"step": step, "name": name, "side": side, "side_label": label,
+           "duration_sec": hold, "mirror_group": group, "cue": cue, "easier": easier,
+           "posture": FLOW_POSTURE.get(name)}
+    if name in FLOW_SPOKEN:
+        out["spoken"] = FLOW_SPOKEN[name]
+    return out
 
 
 def _recovery_flow(weekday: int):
@@ -372,17 +442,21 @@ def _recovery_flow(weekday: int):
         "rounds": FLOW_ROUNDS,
         "double_round": FLOW_DOUBLE_ROUND,
         "double_steps": list(FLOW_DOUBLE_STEPS),
-        "preview_sec": FLOW_PREVIEW_SEC,
-        "pre": [dict(FLOW_STRETCH_TRAINER)] if office else [],
+        "transition_short_sec": FLOW_TRANSITION_SHORT_SEC,
+        "transition_long_sec": FLOW_TRANSITION_LONG_SEC,
+        "leadin_sec": FLOW_LEADIN_SEC,
+        "start_posture": FLOW_START_POSTURE,
+        "pre": [dict(FLOW_MEDITATION)] + ([dict(FLOW_STRETCH_TRAINER)] if office else []),
         "flow": [_flow_step(s) for s in FLOW_STEPS],
         "close": dict(FLOW_CLOSE),
         "equipment": [EQ_MAT, EQ_STRETCH] if office else [EQ_MAT],
     }
     total = flow_total_sec(blocks)
     blocks["total_sec"] = total
-    blocks["notes"] = (("8 min Stretch Trainer, then " if office else "")
+    blocks["notes"] = ("1 min seated meditation, "
+                       + ("8 min Stretch Trainer, " if office else "")
                        + f"2 rounds of {len({_step_no(s[0]) for s in FLOW_STEPS})} poses (round 2 holds 2× from bridge on), "
-                       + "3 min easy-pose breathing")
+                       + "3 min savasana; 3–5 s to move between poses")
     validate_flow(blocks)
     return blocks, FLOW_TARGET_RPE, None, -(-total // 60)
 

@@ -45,7 +45,7 @@ def _mmss(sec: int) -> str:
 def flow_lines(blocks: dict, name: str = "Recovery Flow") -> list[str]:
     """YOGA-1 — plan-exact Recovery Flow: every step with side and hold, the
     round-2 doubling, and the total. Read only from the plan row."""
-    from artemis.health_office import flow_step_holds, flow_total_sec
+    from artemis.health_office import flow_step_holds, flow_total_sec, flow_transition_total_sec
 
     total = flow_total_sec(blocks)
     where = f" ({blocks['location']})" if blocks.get("location") else ""
@@ -67,6 +67,9 @@ def flow_lines(blocks: dict, name: str = "Recovery Flow") -> list[str]:
     close = blocks.get("close")
     if close:
         out.append(f"· Close: {close['name'].lower()} — {_mmss(close['duration_sec'])}")
+    moving = flow_transition_total_sec(blocks)
+    if moving:
+        out.append(f"· Moving between poses: {_mmss(moving)} in all (included in the total)")
     return out
 
 
