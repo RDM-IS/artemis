@@ -6,7 +6,7 @@ Two tiers (mirrors tests/test_inbox_rds.py / test_quiet_hours_rds.py):
     RETURNING-id insert, ILIKE client match, the CT-anchoring of get_due_soon /
     get_start_alerts (and that close uses now()), the fuzzy close logic, the
     format_* helpers against TIMESTAMPTZ datetimes, and the audit repoints
-    (log_claude_call→acos.audit_log, log_calendar_action→acos.calendar_audit).
+    (log_claude_call→acos.audit_log).
 
   * LIVE integration tests (skipped unless a local Postgres is reachable) —
     migration 020 applies clean and the real functions round-trip against
@@ -187,19 +187,9 @@ class TestAuditRepoints(unittest.TestCase):
         with patch("knowledge.db.log_audit", side_effect=RuntimeError("down")):
             cm.log_claude_call("m", "h", 1)   # must not raise
 
-    def test_log_calendar_action_routes_to_acos_calendar_audit(self):
-        with patch("knowledge.db.log_calendar_audit") as cal:
-            cm.log_calendar_action("create", "evt1", summary="Sync",
-                                   attendees="a@x.com, b@y.com", user_approved=True)
-        kw = cal.call_args.kwargs
-        self.assertEqual(kw["action"], "create")
-        self.assertEqual(kw["title"], "Sync")
-        self.assertEqual(kw["attendees"], ["a@x.com", "b@y.com"])  # string → list
-        self.assertEqual(kw["approved_by"], "ryan")               # user_approved → approved_by
-
-    def test_log_calendar_action_best_effort(self):
-        with patch("knowledge.db.log_calendar_audit", side_effect=RuntimeError("down")):
-            cm.log_calendar_action("draft", "pending")   # must not raise
+    def test_log_calendar_action_is_gone(self):
+        # CAL-1: acos.calendar_audit has one writer, main._audit_calendar_write.
+        self.assertFalse(hasattr(cm, "log_calendar_action"))
 
 
 # ============================================================================

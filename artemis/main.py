@@ -34,7 +34,6 @@ from artemis.commitments import (
     format_commitments_list,
     list_commitments,
     get_commitments_for_client,
-    log_calendar_action,
     parse_close_title,
 )
 from artemis.crm_client import CRMClient
@@ -1840,13 +1839,10 @@ def _process_calendar_events(response: str, channel_id: str = "") -> str:
                     f"for **{summary}** on {date_str} {start_time}–{end_time}.\n"
                     f"> Reply `confirm` to send or `cancel` to discard.\n"
                 )
-                log_calendar_action(
-                    action="draft",
-                    event_id="pending",
-                    summary=summary,
-                    attendees=attendee_str,
-                    user_approved=False,
-                    notes="Awaiting user confirmation for external attendees",
+                from artemis.guardrails import get_external_attendees
+                _audit_calendar_write(
+                    "draft", "pending", title=summary, start_ts=start_dt.isoformat(),
+                    attendees=attendees, has_external=bool(get_external_attendees(attendees)),
                 )
                 response = response[:match.start()] + replacement + response[match.end():]
                 continue
@@ -2060,11 +2056,6 @@ def _create_calendar_from_data(
         attendees=attendees, has_external=has_external,
         approved_by=approved_by, dup_override=dup_override,
     )
-    log_calendar_action(
-        action="create", event_id=event_id, summary=summary, attendees=attendee_str,
-        user_approved=user_approved_external,
-        notes="dup_override create" if dup_override else "confirmed create",
-    )
 
     meet_link = ""
     try:
@@ -2168,11 +2159,11 @@ def _handle_calendar_confirm(post: dict, question: str) -> bool:
             ext = get_external_attendees(data.get("attendees") or [])
             if ext:
                 log_violation(data.get("summary", ""), ext, "denied")
-        log_calendar_action(
-            action="cancelled",
-            event_id="pending",
-            summary=data.get("summary", ""),
-            notes="User cancelled/denied pending event",
+        attendees = data.get("attendees") or []
+        from artemis.guardrails import get_external_attendees as _ext
+        _audit_calendar_write(
+            "cancelled", "pending", title=data.get("summary", ""),
+            attendees=attendees, has_external=bool(_ext(attendees)),
         )
         if _mm:
             _mm.post_to_channel_id(channel_id, "Calendar event cancelled.", root_id=root_id)
@@ -2287,13 +2278,6 @@ def _handle_delete_confirm(post: dict, question: str) -> bool:
     if decision == "confirm":
         success = _calendar.delete_event(data["event_id"])
         if success:
-            log_calendar_action(
-                action="delete",
-                event_id=data["event_id"],
-                summary=data["summary"],
-                user_approved=True,
-                notes="Deleted by user via @mention",
-            )
             _audit_calendar_write(
                 "delete", data["event_id"], title=data.get("summary", ""),
                 start_ts=data.get("start"), approved_by="ryan",
@@ -2339,13 +2323,6 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
                 for ev in events:
                     ok = _calendar.delete_event(ev["event_id"])
                     if ok:
-                        log_calendar_action(
-                            action="delete",
-                            event_id=ev["event_id"],
-                            summary=ev["summary"],
-                            user_approved=True,
-                            notes="Bulk convert to task",
-                        )
                         _audit_calendar_write(
                             "delete", ev["event_id"], title=ev.get("summary", ""),
                             approved_by="ryan",

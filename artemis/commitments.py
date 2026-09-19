@@ -7,8 +7,9 @@ which crm_query / the scheduler radar / `crm status` read; see migration 020.
 
 No SQLite remains: this was the last module on the shared SQLite hub, so after it
 artemis.db has no writers. The two audit helpers that historically lived here on
-that hub (log_claude_call, log_calendar_action) keep their import surface but now
-write the existing acos audit tables (acos.audit_log / acos.calendar_audit).
+that hub now write the existing acos tables: log_claude_call → acos.audit_log.
+Calendar audit rows have ONE writer, main._audit_calendar_write → acos.calendar_audit
+(CAL-1, 2026-09-19; log_calendar_action was deleted).
 
 "Today"-relative due-date logic is anchored to the ACTIVE timezone — the box runs UTC
 (a day ahead of CT after ~19:00), so bare current_date would flag due/overdue a
@@ -299,37 +300,6 @@ def log_claude_call(model: str, prompt_hash: str, response_length: int) -> None:
         )
     except Exception:
         logger.debug("log_claude_call audit write failed", exc_info=True)
-
-
-def log_calendar_action(
-    action: str,
-    event_id: str,
-    summary: str = "",
-    attendees: str = "",
-    user_approved: bool = False,
-    auto_created: bool = False,
-    notes: str = "",
-) -> None:
-    """Record a calendar write/lifecycle action to acos.calendar_audit (was the
-    SQLite calendar_audit_log table).
-
-    Maps summary→title and the comma-string attendees→the JSONB list; user_approved
-    → approved_by. acos.calendar_audit has no notes/auto_created columns, so those
-    descriptive fields are not persisted (flagged in the migration PR). Captures the
-    'draft'/'cancelled' lifecycle actions that _audit_calendar_write does not.
-    """
-    try:
-        from knowledge.db import log_calendar_audit
-        attendee_list = [a.strip() for a in attendees.split(",") if a.strip()] if attendees else []
-        log_calendar_audit(
-            action=action,
-            event_id=event_id,
-            title=summary,
-            attendees=attendee_list,
-            approved_by="ryan" if user_approved else None,
-        )
-    except Exception:
-        logger.debug("log_calendar_action audit write failed", exc_info=True)
 
 
 def _cli():
