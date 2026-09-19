@@ -775,10 +775,15 @@ def write_program_state(cur) -> None:
         (PROGRAM_STATE_KEY, json.dumps(program_state())))
 
 
-def write_rows(cur, rows: list[dict]) -> int:
+def write_rows(cur, rows: list[dict], validate: list[dict] | None = None) -> int:
     """UPSERT every office row and audit it through the same cursor. Does NOT
-    commit."""
-    duration_notes = validate_rows(rows)
+    commit.
+
+    `validate` is the row set to check — pass the WHOLE program when `rows` is
+    a targeted subset (reseed --only), since validate_rows asserts full-window
+    coverage and the per-week lift counts.
+    """
+    duration_notes = validate_rows(validate if validate is not None else rows)
     for r in rows:
         cur.execute(_UPSERT_SQL, (
             r["plan_date"], r["phase"], r["week_num"], r["session_type"],
