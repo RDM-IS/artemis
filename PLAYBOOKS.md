@@ -826,4 +826,4 @@ commands — and writes an `acos.audit_log` row; unknown failures surface the ra
 labeled `unclassified`.
 
 **Testing:** `python3.11 -m artemis.test_vault` (mocked + LIVE Postgres tiers) and
-`python3.11 -m artemis.test_opsdiag` (runbook classification + version truth).
+`python3.11 tests/test_opsdiag.py` (runbook classification + version truth).

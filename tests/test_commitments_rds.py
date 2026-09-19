@@ -47,7 +47,17 @@ class TestCrud(unittest.TestCase):
         sql, params = w.call_args[0]
         self.assertIn("INSERT INTO acos.commitments", sql)
         self.assertIn("RETURNING id", sql)
-        self.assertEqual(params, ("Ship it", "2026-07-01", 2, "Acme"))
+        # PB-010: status / dossier_id / meeting_id ride along with defaults;
+        # PB-011 `context` is only in the INSERT when a value is passed.
+        self.assertEqual(params, ("Ship it", "2026-07-01", 2, "Acme", "active", None, None))
+        self.assertNotIn("context", sql)
+
+    def test_add_with_context_includes_the_column(self):
+        with patch("artemis.commitments.execute_write", return_value={"id": 8}) as w:
+            cm.add_commitment("Tag it", None, context="fca")
+        sql, params = w.call_args[0]
+        self.assertIn("context", sql)
+        self.assertEqual(params, ("Tag it", None, 1, "", "active", None, None, "fca"))
 
     def test_add_no_row_returns_zero(self):
         with patch("artemis.commitments.execute_write", return_value=None):
@@ -139,15 +149,16 @@ class TestClose(unittest.TestCase):
 
 class TestFormat(unittest.TestCase):
     def test_commitments_list_with_datetime_created_at(self):
-        c = {"title": "Ship", "client": "Acme", "due_date": "2026-07-01",
+        c = {"id": 12, "title": "Ship", "client": "Acme", "due_date": "2026-07-01",
              "created_at": datetime(2026, 6, 20, 14, 30, tzinfo=timezone.utc)}
         out = cm.format_commitments_list([c])
-        self.assertIn("**Ship** (Acme)", out)
+        self.assertIn("**Ship** (#12) (Acme)", out)
         self.assertIn("due 2026-07-01", out)
         self.assertIn("created 2026-06-20", out)     # str(datetime)[:10]
 
     def test_close_result_strings(self):
-        self.assertIn("closed", cm.format_close_result({"status": "closed", "title": "T"}))
+        self.assertIn("closed", cm.format_close_result({"status": "closed", "title": "T", "id": 3}))
+        self.assertIn("(#3)", cm.format_close_result({"status": "closed", "title": "T", "id": 3}))
         self.assertEqual(cm.format_close_result({"status": "not_found", "open": []}),
                          "No open commitments.")
 
@@ -250,6 +261,14 @@ def setUpModule():
         with conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS acos")
             cur.execute(_MIG_020)
+            # The later acos.commitments changes, without their FK targets:
+            # 024 (dossier provenance, nullable due_date) and 028 (context).
+            cur.execute(
+                "ALTER TABLE acos.commitments "
+                "ADD COLUMN IF NOT EXISTS dossier_id INT, "
+                "ADD COLUMN IF NOT EXISTS meeting_id INT, "
+                "ADD COLUMN IF NOT EXISTS context TEXT, "
+                "ALTER COLUMN due_date DROP NOT NULL")
         conn.close()
         _LIVE = True
     except Exception as e:
