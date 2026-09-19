@@ -138,6 +138,9 @@ class CheckIn:
     soreness: dict = field(default_factory=dict)      # region -> 0..5 (None = unscored)
     pain: dict = field(default_factory=dict)          # region -> 0..5 (None = unscored)
     unknown_regions: dict = field(default_factory=dict)
+    # region -> "left" | "right" | "unspecified", for soreness and pain apart.
+    sides: dict = field(default_factory=dict)
+    pain_sides: dict = field(default_factory=dict)
     free_text: str | None = None
     rating_error: bool = False
 
@@ -157,7 +160,18 @@ class CheckIn:
             out[r] = sc
         if self.pain:
             out["pain"] = dict(self.pain)
+        # Side per region ({"knee": "right"}); readers that only want scores
+        # (the Lambda overview) skip these non-numeric maps.
+        sides = {r: self.sides.get(r, hr.UNSPECIFIED) for r in self.soreness if r in hr.REGIONS}
+        if sides:
+            out["sides"] = sides
+        if self.pain:
+            out["pain_sides"] = {r: self.pain_sides.get(r, hr.UNSPECIFIED) for r in self.pain}
         return out
+
+    def all_sides(self) -> dict:
+        """{region: side} across soreness and pain (pain wins on a clash)."""
+        return {**self.sides, **self.pain_sides}
 
 
 def normalize_score(value: float, scale: str | None) -> int:
@@ -207,6 +221,27 @@ def _find_regions(clause: str) -> tuple[list[str], list[str]]:
     return found, unknown
 
 
+_SIDE_WORD_RE = re.compile(r"\b(left|right|both|bilateral)\b", re.I)
+
+
+def _side_words(part: str) -> set:
+    return {w.lower() for w in _SIDE_WORD_RE.findall(part)}
+
+
+def _part_side(words: set) -> str:
+    """The side a clause names: one of left/right, else unspecified ("both",
+    both words, a plural like "knees", or no side at all)."""
+    if len(words) == 1 and words <= set(hr.SIDES):
+        return words.pop()
+    return hr.UNSPECIFIED
+
+
+def _set_side(sides: dict, region: str, side: str) -> None:
+    """Two different sides for one region in one check-in -> unspecified."""
+    prev = sides.get(region)
+    sides[region] = side if prev in (None, side) else hr.UNSPECIFIED
+
+
 def parse_checkin(text: str) -> CheckIn:
     """Deterministic check-in parser. Never raises; an out-of-range rating sets
     `rating_error` (the caller replies RATINGS_ERROR and stores nothing)."""
@@ -241,11 +276,20 @@ def parse_checkin(text: str) -> CheckIn:
             for sentence in _SENTENCE_SPLIT.split(work):
                 pending: list[tuple[str, bool]] = []
                 pending_unknown: list[str] = []
+                carried_sides: set = set()   # "left and right knee": "left" has no region
                 for part in _AND_SPLIT.split(sentence):
                     if not part.strip():
                         continue
                     regions, unknown = _find_regions(part)
                     is_pain = any(re.search(rf"\b{w}\b", part, re.I) for w in PAIN_WORDS)
+                    words = _side_words(part)
+                    if not regions and not unknown:
+                        carried_sides |= words
+                    else:
+                        side = _part_side(words | carried_sides)
+                        carried_sides = set()
+                        for r in regions:
+                            _set_side(ci.pain_sides if is_pain else ci.sides, r, side)
                     sm = _SCORE_RE.search(part)
                     score = normalize_score(float(sm.group(1)), sm.group(2)) if sm else None
                     pending += [(r, is_pain) for r in regions]
@@ -359,9 +403,17 @@ class Adjustment:
     notes: list = field(default_factory=list)      # pain that changed nothing
 
 
-def _fmt(scores: dict, regions, word: str = "") -> str:
+def _label(region: str, sides: dict | None) -> str:
+    """"right knee" when the check-in named a side, else the region."""
+    return hr.side_key(region, (sides or {}).get(region))
+
+
+def _fmt(scores: dict, regions, word: str = "", sides: dict | None = None) -> str:
     w = f" {word}" if word else ""
-    return " + ".join(f"{r.title()}{w} {scores[r]}/5" for r in regions)
+    def cap(r):
+        lab = _label(r, sides)
+        return lab[0].upper() + lab[1:] if lab != r else r.title()
+    return " + ".join(f"{cap(r)}{w} {scores[r]}/5" for r in regions)
 
 
 def _cap(value, base):
@@ -374,9 +426,9 @@ def _scored(d: dict) -> dict:
     return {r: v for r, v in d.items() if r in hr.REGIONS and isinstance(v, int)}
 
 
-def _fmt_pain(pain: dict, regions) -> str:
-    """"Pain shoulder 4/5" / "Pain shoulder 4/5 + legs 5/5"."""
-    return "Pain " + " + ".join(f"{r} {pain[r]}/5" for r in regions)
+def _fmt_pain(pain: dict, regions, sides: dict | None = None) -> str:
+    """"Pain shoulder 4/5" / "Pain right knee 3/5 + legs 5/5"."""
+    return "Pain " + " + ".join(f"{_label(r, sides)} {pain[r]}/5" for r in regions)
 
 
 DAY_OFF_BLOCKS = {
@@ -445,6 +497,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
 
     sore = _scored(ci.soreness)
     pain = _scored(ci.pain)
+    sides = ci.all_sides()
     # Regions keep the order Ryan wrote them in.
     sore_heavy = [r for r, v in sore.items() if v >= 4]
     sore_mid = [r for r, v in sore.items() if 2 <= v <= 3]
@@ -455,7 +508,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
 
     # ── 1. Pain 4-5 -> day off ──────────────────────────────────────────────
     if pain_off:
-        return _day_off(adj, "pain_day_off", f"{_fmt_pain(pain, pain_off)} → day off.")
+        return _day_off(adj, "pain_day_off", f"{_fmt_pain(pain, pain_off, sides)} → day off.")
 
     # ── 2. Rising pain -> day off (only when the chain starts at >= 1) ──────
     rising_off = {r: seq for r, seq in rising.items() if seq[0] >= 1}
@@ -467,14 +520,14 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
         # A walk or a Recovery Flow only yields to the day-off rules: pain 2-3
         # changes nothing (it is already mobility) and soreness/recovery rules
         # don't apply.
-        adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3) + rising_notes
+        adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3, sides) + rising_notes
         return adj
 
     blocks = adj.blocks
 
     # ── 3. Pain 3 as the PRIMARY region of >= half of today's work ──────────
     units = _units(blocks)
-    hit = [u for u in units if pain_3 and hr.uses_any(u, pain_3, primary_only=True)]
+    hit = [u for u in units if pain_3 and hr.uses_any(u, pain_3, primary_only=True, sides=sides)]
     if units and hit and 2 * len(hit) >= len(units):
         adj.rules_fired.append("pain_mobility_day")
         adj.session_type = "rest_mobility"
@@ -492,9 +545,9 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
         }
         if base.get("location"):
             adj.blocks["location"] = base["location"]
-        adj.lines.append(f"{_fmt_pain(pain, pain_3)} → today is Mobility / Yoga: "
+        adj.lines.append(f"{_fmt_pain(pain, pain_3, sides)} → today is Mobility / Yoga: "
                          f"{MOBILITY_DAY_MIN} min, Stretch Trainer + mat.")
-        adj.notes = _pain_notes(pain, pain_low) + rising_notes
+        adj.notes = _pain_notes(pain, pain_low, sides) + rising_notes
         adj.changed = True
         adj.reason = " ".join(adj.lines)
         return adj
@@ -526,7 +579,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
         }
         adj.est_duration_min = minutes + 10
         adj.lines.append(
-            f"{_fmt(sore, sore_heavy)} → today is Recovery Z2 + Mobility: "
+            f"{_fmt(sore, sore_heavy, sides=sides)} → today is Recovery Z2 + Mobility: "
             f"{minutes} min recumbent bike, then 10 min mobility.")
 
     exercises = blocks.get("exercises") or []
@@ -535,13 +588,13 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # ── 5. Pain 3 -> primary: mobility block; secondary only: substitute ────
     if pain_3 and not swapped and exercises:
         present = {e["name"] for e in exercises} | set(adj.removed)
-        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected)]
+        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected, sides=sides)]
         out_list, to_mobility, swaps = [], [], []
         for ex in exercises:
             name = ex["name"]
-            if not hr.uses_any(name, pain_3):
+            if not hr.uses_any(name, pain_3, sides=sides):
                 out_list.append(ex)
-            elif hr.uses_any(name, pain_3, primary_only=True):
+            elif hr.uses_any(name, pain_3, primary_only=True, sides=sides):
                 to_mobility.append(name)
             else:
                 sub = next((x for x in pool if x not in present), None)
@@ -584,16 +637,16 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             adj.removed += to_mobility + [a for a, _ in swaps]
             adj.added += [b for _, b in swaps]
             text = " ".join(parts)
-            adj.lines.append(f"{_fmt_pain(pain, pain_3)} → {text[0].lower() + text[1:]}")
-        _drop_finisher(adj, blocks, pain_3)
+            adj.lines.append(f"{_fmt_pain(pain, pain_3, sides)} → {text[0].lower() + text[1:]}")
+        _drop_finisher(adj, blocks, pain_3, sides)
 
     # ── 6. Soreness 4-5 -> replace from the pool ────────────────────────────
     if sore_heavy and not swapped and exercises:
         present = {e["name"] for e in exercises} | set(adj.removed)
-        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected)]
+        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected, sides=sides)]
         out_list, removed, added = [], [], []
         for ex in exercises:
-            if hr.uses_any(ex["name"], sore_heavy):
+            if hr.uses_any(ex["name"], sore_heavy, sides=sides):
                 removed.append(ex["name"])
                 sub = next((x for x in pool if x not in present), None)
                 if sub is not None:
@@ -611,14 +664,14 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             adj.rules_fired.append("replace")
             adj.removed += removed
             adj.added += added
-            line = f"{_fmt(sore, sore_heavy)} → removed {_join(removed)}."
+            line = f"{_fmt(sore, sore_heavy, sides=sides)} → removed {_join(removed)}."
             if added:
                 line += f" Added {_join(added)}."
             if len(added) < len(removed):
                 n = len(removed) - len(added)
                 line += f" No substitute left for {n} slot{'s' if n != 1 else ''}."
             adj.lines.append(line)
-        _drop_finisher(adj, blocks, sore_heavy)
+        _drop_finisher(adj, blocks, sore_heavy, sides)
 
     # ── 7. Pain 2 -> lighter load on PRIMARY exercises ──────────────────────
     lightened_pain = []
@@ -626,7 +679,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
         parts = []
         for ex in exercises:
             name = ex["name"]
-            if ex.get("added_by") == "checkin" or not hr.uses_any(name, pain_2, primary_only=True):
+            if ex.get("added_by") == "checkin" or not hr.uses_any(name, pain_2, primary_only=True, sides=sides):
                 continue
             if hr.equipment_class(name) == "bodyweight":
                 continue
@@ -647,13 +700,13 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
                 adj.eased.append(name)
         if parts:
             adj.rules_fired.append("pain_lighter")
-            adj.lines.append(f"{_fmt_pain(pain, pain_2)} → {'; '.join(parts)}.")
+            adj.lines.append(f"{_fmt_pain(pain, pain_2, sides)} → {'; '.join(parts)}.")
 
     # ── 8. Soreness 2-3 -> lighten PRIMARY exercises ────────────────────────
     if sore_mid and exercises and not swapped:
         names = []
         for ex in exercises:
-            if ex.get("added_by") != "checkin" and hr.uses_any(ex["name"], sore_mid, primary_only=True):
+            if ex.get("added_by") != "checkin" and hr.uses_any(ex["name"], sore_mid, primary_only=True, sides=sides):
                 s_ = max(1, exercise_sets(ex, blocks) - 1)
                 ex["sets"] = s_
                 _set_note_sets(ex, s_)
@@ -666,7 +719,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             first = _by_name(exercises, names[0])
             n_sets = exercise_sets(first, blocks)
             cap = f", RPE ≤{_n(first['rpe_cap'])}" if first.get("rpe_cap") is not None else ""
-            adj.lines.append(f"{_fmt(sore, sore_mid)} → {_join(names)}: "
+            adj.lines.append(f"{_fmt(sore, sore_mid, sides=sides)} → {_join(names)}: "
                              f"{n_sets} set{'s' if n_sets != 1 else ''}{cap}.")
 
     # ── 9. Global recovery ──────────────────────────────────────────────────
@@ -711,7 +764,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # Pain that changed nothing is stored and noted — pain 0-1 always, pain 2
     # when no primary exercise could be lightened (e.g. knee 2 on Session B).
     quiet = pain_low + [r for r in pain_2 if not lightened_pain]
-    adj.notes = _pain_notes(pain, quiet) + rising_notes
+    adj.notes = _pain_notes(pain, quiet, sides) + rising_notes
     adj.changed = bool(adj.rules_fired)
     adj.reason = " ".join(adj.lines)
     return adj
@@ -724,14 +777,14 @@ def _trend(seqs: dict) -> str:
     return " + ".join(f"{r} {'→'.join(str(v) for v in seq)}" for r, seq in seqs.items())
 
 
-def _pain_notes(pain: dict, regions) -> list[str]:
+def _pain_notes(pain: dict, regions, sides: dict | None = None) -> list[str]:
     regions = [r for r in pain if r in regions]
-    return [f"{_fmt_pain(pain, regions)} — noted."] if regions else []
+    return [f"{_fmt_pain(pain, regions, sides)} — noted."] if regions else []
 
 
-def _drop_finisher(adj: Adjustment, blocks: dict, regions) -> None:
+def _drop_finisher(adj: Adjustment, blocks: dict, regions, sides: dict | None = None) -> None:
     fin = blocks.get("finisher")
-    if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), regions)
+    if isinstance(fin, dict) and any(hr.uses_any(e.get("name", ""), regions, sides=sides)
                                      for e in fin.get("exercises") or []):
         blocks.pop("finisher")
         adj.rules_fired.append("drop_finisher")
@@ -983,7 +1036,7 @@ def _pain_primary_names(plan: dict, ci: CheckIn) -> list[str]:
         return []
     _, blocks = _written(plan)
     return [e["name"] for e in blocks.get("exercises") or []
-            if hr.uses_any(e["name"], regions, primary_only=True)]
+            if hr.uses_any(e["name"], regions, primary_only=True, sides=ci.all_sides())]
 
 
 def process_checkin(cur, text: str, day: date, *, checkin_id: str,

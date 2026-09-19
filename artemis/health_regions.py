@@ -212,7 +212,41 @@ def regions_for(exercise: str) -> tuple[frozenset, frozenset]:
     return EXERCISE_REGIONS.get(exercise, (frozenset(), frozenset()))
 
 
-def uses_any(exercise: str, regions, *, primary_only: bool = False) -> bool:
+# ── Sides (soreness / pain "right knee") ─────────────────────────────────────
+# A check-in region carries a side: left, right or unspecified. A sided region
+# narrows the match only for an exercise that loads ONE side; every office
+# exercise is bilateral or worked on both sides, so none are listed and a
+# sided region counts as the whole region for all of them.
+SIDES = ("left", "right")
+UNSPECIFIED = "unspecified"
+EXERCISE_SIDE: dict[str, str] = {}
+
+
+def side_applies(exercise: str, side: str | None) -> bool:
+    ex_side = EXERCISE_SIDE.get(exercise)
+    return side not in SIDES or ex_side is None or ex_side == side
+
+
+def side_key(region: str, side: str | None) -> str:
+    """"right knee" for a sided region, "knee" otherwise — the pattern key."""
+    return f"{side} {region}" if side in SIDES else region
+
+
+def split_side_key(key: str) -> tuple[str, str]:
+    """"right knee" -> ("knee", "right"); "knee" -> ("knee", "unspecified")."""
+    for side in SIDES:
+        if key.startswith(side + " "):
+            return key[len(side) + 1:], side
+    return key, UNSPECIFIED
+
+
+def uses_any(exercise: str, regions, *, primary_only: bool = False,
+             sides: dict | None = None) -> bool:
+    """True when the exercise uses any of `regions` (family-expanded).
+    `sides` {region: side} drops a sided region for an exercise that loads only
+    the other side."""
+    if sides:
+        regions = [r for r in regions if side_applies(exercise, sides.get(r))]
     primary, secondary = regions_for(exercise)
     tags = primary if primary_only else (primary | secondary)
     return bool(tags & expand(regions))

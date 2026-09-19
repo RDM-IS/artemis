@@ -242,6 +242,14 @@ def settings_in(notes: str | None) -> str | None:
     return None
 
 
+_SIDE_MAPS = ("pain", "sides", "pain_sides")
+
+
+def _sided(region: str, sides: dict) -> str:
+    side = (sides or {}).get(region)
+    return f"{side} {region}" if side in ("left", "right") else region
+
+
 def soreness_text(sore) -> str:
     sore = _blocks(sore)
     if not sore:
@@ -249,11 +257,11 @@ def soreness_text(sore) -> str:
     parts = []
     pain = sore.get("pain") or {}
     for k, v in sore.items():
-        if k == "pain":
+        if k in _SIDE_MAPS:
             continue
-        parts.append(f"{k} {v}")
+        parts.append(f"{_sided(k, sore.get('sides'))} {v}")
     for k, v in pain.items():
-        parts.append(f"pain {k} {v}")
+        parts.append(f"pain {_sided(k, sore.get('pain_sides'))} {v}")
     return ", ".join(parts) or "—"
 
 
@@ -266,9 +274,10 @@ def pain_summary(data: Data) -> list[str]:
             if k == "pain":
                 for region, n in (v or {}).items():
                     if isinstance(n, int):
-                        agg.setdefault(("pain", region), []).append((d, n))
-            elif isinstance(v, int) and v > 0:
-                agg.setdefault(("soreness", k), []).append((d, v))
+                        key = _sided(region, sore.get("pain_sides"))
+                        agg.setdefault(("pain", key), []).append((d, n))
+            elif k not in _SIDE_MAPS and isinstance(v, int) and v > 0:
+                agg.setdefault(("soreness", _sided(k, sore.get("sides"))), []).append((d, v))
     lines = []
     for (kind, region), vals in sorted(agg.items()):
         peak = max(n for _, n in vals)
