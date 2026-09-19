@@ -378,6 +378,19 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("Recovery Flow", msg)
         self.assertNotIn("Before you leave", msg)
 
+    def test_estimate_wording_tilde_only_over_45(self):
+        from artemis import wake as wake_mod
+        for est, want, absent in ((44, "— 44 min", "~44"), (45, "— 45 min", "~45"),
+                                  (52, "— ~52 min", None), (62, "— ~62 min", None)):
+            with self.subTest(est=est):
+                plan = dict(self.PLAN, est_duration_min=est)
+                text = "\n".join(wake_mod._workout_section(plan))
+                self.assertIn(want, text)
+                if absent:
+                    self.assertNotIn(absent, text)
+                for word in ("over", "long", "sorry", "warning", "target"):
+                    self.assertNotIn(word, text.lower())
+
     def test_prompt_type_comes_from_the_plan_not_the_weekday(self):
         from artemis import wake as wake_mod
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "strength_b"}), "workout_am")

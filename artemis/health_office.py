@@ -23,7 +23,10 @@ date mid-run is never orphaned. generated_by='manual' (CHECK-legal); week_num is
 
 import copy
 import json
+import logging
 from datetime import date, timedelta
+
+logger = logging.getLogger(__name__)
 
 LOCATION = "office gym"
 PHASE = 1
@@ -448,6 +451,53 @@ def build_rows() -> list[dict]:
 # Validation
 # ============================================================================
 
+# ── TIME-CAP (Ryan, 2026-09-19): 45 min is a target, not a limit ────────────
+# 45-59 min is fine and gets a note (reseed diff + log); never auto-cut. 60+
+# is rejected — except the program slots in CALIBRATION_PENDING, whose
+# estimate (10 + sets x exercises x 2.5 min) is 60+ while weeks 3-6 stay as
+# planned. They warn until ~2 weeks of logged sessions recalibrate the
+# per-set estimate (the reports show planned vs logged span); empty the set
+# then and the hard reject applies to them too.
+TARGET_MIN = 45
+HARD_MAX_MIN = 60
+CALIBRATION_PENDING = {("strength_b", w) for w in (3, 4, 5, 6)} | {("strength_c", 5), ("strength_c", 6)}
+
+
+def duration_verdict(session_type: str, week_num, est) -> tuple[str, str]:
+    """("ok" | "note" | "pending" | "reject", message) for one planned session."""
+    if est is None:
+        return "ok", ""
+    est = int(est)
+    if est >= HARD_MAX_MIN:
+        if (session_type, week_num) in CALIBRATION_PENDING:
+            return "pending", (f"~{est} min — {HARD_MAX_MIN}+ allowed until the estimate "
+                               f"is recalibrated")
+        return "reject", f"~{est} min — {HARD_MAX_MIN}+ is rejected"
+    if est >= TARGET_MIN:
+        return "note", f"~{est} min — target {TARGET_MIN} min"
+    return "ok", ""
+
+
+def duration_findings(rows) -> tuple[list[str], list[str]]:
+    """(rejects, notes) for planned rows, each "YYYY-MM-DD Dow type wkN: message"."""
+    rejects, notes = [], []
+    for r in rows:
+        kind, msg = duration_verdict(r["session_type"], r.get("week_num"), r.get("est_duration_min"))
+        if kind == "ok":
+            continue
+        line = f"{r['plan_date']} {r['plan_date']:%a} {r['session_type']} wk{r.get('week_num')}: {msg}"
+        (rejects if kind == "reject" else notes).append(line)
+    return rejects, notes
+
+
+def format_estimate(minutes) -> str:
+    """"40 min", or "~52 min" once it's over the 45 min target. No warnings."""
+    if minutes is None:
+        return ""
+    m = int(minutes)
+    return f"~{m} min" if m > TARGET_MIN else f"{m} min"
+
+
 LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_intervals",
                        "cardio_z2", "walk", "rest_mobility", "recovery_flow"}
 
@@ -458,8 +508,10 @@ def forbidden_hits(blocks) -> list[str]:
     return [t for t in FORBIDDEN_TOKENS if t in blob]
 
 
-def validate_rows(rows: list[dict]) -> None:
-    """Structural asserts so a bad edit fails loudly."""
+def validate_rows(rows: list[dict]) -> list[str]:
+    """Structural asserts so a bad edit fails loudly. Returns the TIME-CAP
+    notes (45-59 min, and the CALIBRATION_PENDING 60+ rows); a 60+ row
+    outside CALIBRATION_PENDING fails the assert."""
     dates = [r["plan_date"] for r in rows]
     assert len(dates) == len(set(dates)), "duplicate plan_date"
     expected = [OFFICE_START + timedelta(days=i) for i in range((OFFICE_END - OFFICE_START).days + 1)]
@@ -478,6 +530,11 @@ def validate_rows(rows: list[dict]) -> None:
         if r["session_type"] == "recovery_flow":
             assert b["type"] == "recovery_flow"
             validate_flow(b)
+    rejects, notes = duration_findings(rows)
+    assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)
+    for n in notes:
+        logger.warning("TIME-CAP: %s", n)
+    return notes
 
 
 # ============================================================================
@@ -527,7 +584,7 @@ def write_program_state(cur) -> None:
 def write_rows(cur, rows: list[dict]) -> int:
     """UPSERT every office row and audit it through the same cursor. Does NOT
     commit."""
-    validate_rows(rows)
+    duration_notes = validate_rows(rows)
     for r in rows:
         cur.execute(_UPSERT_SQL, (
             r["plan_date"], r["phase"], r["week_num"], r["session_type"],
@@ -540,7 +597,7 @@ def write_rows(cur, rows: list[dict]) -> int:
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
         ("health_office", None, "office_plan_reseed", "health", None, "executed", 0, 0.0,
          json.dumps({"from": OFFICE_START.isoformat(), "to": OFFICE_END.isoformat(),
-                     "rows": len(rows)})),
+                     "rows": len(rows), "duration_notes": duration_notes})),
     )
     write_program_state(cur)
     return len(rows)

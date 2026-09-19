@@ -87,10 +87,11 @@ def load_live() -> dict[date, dict]:
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT plan_date, phase, week_num, session_type, blocks FROM health.plan "
-            "WHERE plan_date >= %s ORDER BY plan_date", (office.OFFICE_START,))
-        rows = {d: {"phase": ph, "week_num": wk, "session_type": st, "blocks": _coerce_blocks(b)}
-                for d, ph, wk, st, b in cur.fetchall()}
+            "SELECT plan_date, phase, week_num, session_type, blocks, est_duration_min "
+            "FROM health.plan WHERE plan_date >= %s ORDER BY plan_date", (office.OFFICE_START,))
+        rows = {d: {"phase": ph, "week_num": wk, "session_type": st, "blocks": _coerce_blocks(b),
+                    "est_duration_min": est}
+                for d, ph, wk, st, b, est in cur.fetchall()}
         conn.rollback()
         return rows
 
@@ -99,8 +100,8 @@ def evaluate(live: dict[date, dict]) -> list[dict]:
     expected = {r["plan_date"]: r for r in office.build_rows()}
     results: list[dict] = []
 
-    def add(d, cat, ok, reason=""):
-        results.append({"date": d, "category": cat, "ok": ok, "reason": reason})
+    def add(d, cat, ok, reason="", note=""):
+        results.append({"date": d, "category": cat, "ok": ok, "reason": reason, "note": note})
 
     for d, exp in sorted(expected.items()):
         row = live.get(d)
@@ -126,6 +127,9 @@ def evaluate(live: dict[date, dict]) -> list[dict]:
             f"display_name={b.get('display_name')!r}, expected {eb['display_name']!r}")
         add(d, "LOCATION", b.get("location") == eb.get("location"),
             f"location={b.get('location')!r}, expected {eb.get('location')!r}")
+        # TIME-CAP: 60+ fails (unless CALIBRATION_PENDING); 45-59 is a note.
+        kind, msg = office.duration_verdict(session_type, row["week_num"], row.get("est_duration_min"))
+        add(d, "DURATION", kind != "reject", msg, note=msg if kind in ("note", "pending") else "")
 
     for d in sorted(live):
         hits = office.forbidden_hits(live[d]["blocks"])
@@ -148,6 +152,11 @@ def report(results: list[dict]) -> int:
         print(f"  [{'PASS' if not fails else 'FAIL'}] {cat:<14} {len(subset) - len(fails)}/{len(subset)}"
               + (f"   ({len(fails)} fail)" if fails else ""))
     fails = [r for r in results if not r["ok"]]
+    notes = [r for r in results if r["ok"] and r.get("note")]
+    if notes:
+        print(f"\nNOTES (target {office.TARGET_MIN} min, never auto-cut):")
+        for r in notes:
+            print(f"  {r['date'].isoformat()} {r['category']:<14} {r['note']}")
     print("\n" + "=" * 70)
     if fails:
         print("FAILURES:")
@@ -161,9 +170,12 @@ def report(results: list[dict]) -> int:
 def selftest_live(fault: bool) -> dict[date, dict]:
     live = {r["plan_date"]: {"phase": r["phase"], "week_num": r["week_num"],
                              "session_type": r["session_type"],
-                             "blocks": copy.deepcopy(r["blocks"])}
+                             "blocks": copy.deepcopy(r["blocks"]),
+                             "est_duration_min": r["est_duration_min"]}
             for r in office.build_rows()}
     if fault:
+        # a 61-min week-1 Strength C (not CALIBRATION_PENDING) must fail DURATION
+        live[office.WEEK1_START + timedelta(days=5)]["est_duration_min"] = 61
         live[office.WEEK1_START]["blocks"]["equipment"].append("water rower")
         live[office.WEEK1_START + timedelta(days=1)]["session_type"] = "cardio_intervals"
         live.pop(office.WEEK1_START + timedelta(days=3))

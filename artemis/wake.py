@@ -90,7 +90,9 @@ def _workout_section(plan: dict | None) -> list[str]:
     session_type = plan.get("session_type", "")
     name = blocks.get("display_name") or _session_pretty_name(session_type)
     duration = plan.get("est_duration_min")
-    duration_str = f" — {duration} min" if duration else ""
+    # TIME-CAP: "~52 min" once the estimate is over the 45 min target; no warnings.
+    from artemis.health_office import format_estimate
+    duration_str = f" — {format_estimate(duration)}" if duration else ""
 
     if blocks.get("type") == "recovery_flow":
         return flow_lines(blocks, name)
