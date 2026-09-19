@@ -1,0 +1,244 @@
+"""EVAL-1 — read-only weekly evaluator.
+
+Counts what happened in one office week; it never changes a plan, never
+recommends, and holds no pending state or confirm routes. It is the report-only
+evaluator RAMP-RETIRE called for (health_ramp.py is not reused).
+
+  Week       the office Wed-Tue window counted from health_office.WEEK1_START,
+             in the ACTIVE timezone (quiet_hours.local_today()).
+  Inputs     the week's health.plan rows, and health.session_log rows (the week
+             plus the 7 days before it, for load change), logged_via <> 'inferred'.
+  Output     one dict (evaluate()): sessions done vs planned, missed sessions,
+             average session RPE vs the plan's cap (target_rpe), per-exercise
+             top-set load change vs the prior week, adjustments applied.
+
+Training days are every plan row except rest_mobility; rest days are neither
+done nor missed. A day before the program anchor is pre-program and ignored.
+
+Consumers: the weekly report (scripts/export_report.py) and the Sunday post
+(scheduler.job_weekly_eval — the week to date, labelled partial).
+
+    python3.11 -m artemis.health_eval --week 2026-09-16      # print one week
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, timedelta
+
+from artemis import health_office as office
+from artemis import health_regions as hr
+
+REST_TYPES = {"rest_mobility"}
+
+# Names logged before a correction, grouped under the current name so a rename
+# never reads as a new exercise. session_log 123/129 (9/18) predate the fix.
+EXERCISE_ALIASES = {"45° back extension": "Seated back extension"}
+
+
+def canon(name: str | None) -> str | None:
+    return EXERCISE_ALIASES.get(name, name) if name else name
+
+
+def week_of(day: date, anchor: date = office.WEEK1_START) -> tuple[date, date]:
+    """The Wed-Tue office week containing `day`."""
+    start = anchor + timedelta(days=7 * ((day - anchor).days // 7))
+    return start, start + timedelta(days=6)
+
+
+def _num(v):
+    return None if v is None else float(v)
+
+
+def _blocks(v) -> dict:
+    if isinstance(v, str):
+        try:
+            return json.loads(v or "{}")
+        except ValueError:
+            return {}
+    return v or {}
+
+
+def _top_weights(logs) -> dict[str, float | None]:
+    """Top set per (canonical) exercise; None when it was logged with no load."""
+    out: dict[str, float | None] = {}
+    for l in logs:
+        if l["log_type"] != "strength_set" or l.get("is_skipped"):
+            continue
+        name = canon(l["exercise"])
+        if not name:
+            continue
+        w = _num(l.get("weight_lbs"))
+        prev = out.get(name)
+        out[name] = w if prev is None else (prev if w is None else max(prev, w))
+    return out
+
+
+def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
+             anchor: date = office.WEEK1_START) -> dict:
+    """Pure. `plans`: health.plan rows for start..end; `logs`: real session_log
+    rows for start..end (with plan_date, plan_id); `prior_logs`: the same for
+    the 7 days before `start`."""
+    by_plan: dict[int, list] = {}
+    for l in logs:
+        by_plan.setdefault(l["plan_id"], []).append(l)
+
+    sessions, missed, adjustments = [], [], []
+    done = due = upcoming = 0
+    rpe_pairs = []
+    for p in sorted(plans, key=lambda r: r["plan_date"]):
+        d = p["plan_date"]
+        if d < anchor:
+            continue
+        b = _blocks(p.get("blocks"))
+        adj = b.get("adjustment")
+        if isinstance(adj, dict):
+            adjustments.append({"date": d.isoformat(), "rules": list(adj.get("rules_fired") or []),
+                                "reason": adj.get("reason") or ""})
+        st = p["session_type"]
+        if st in REST_TYPES:
+            status = "rest"
+        else:
+            real = [l for l in by_plan.get(p["plan_id"], []) if not l.get("is_skipped")]
+            if real:
+                status = "done"
+            elif d > today:
+                status = "upcoming"
+            elif d == today:
+                status = "today"
+            else:
+                status = "missed"
+        sets = [l for l in by_plan.get(p["plan_id"], []) if l["log_type"] == "strength_set"]
+        summ = [_num(l.get("rpe_actual")) for l in by_plan.get(p["plan_id"], [])
+                if l["log_type"] == "session_summary" and l.get("rpe_actual") is not None]
+        set_rpes = [_num(l["rpe_actual"]) for l in sets if l.get("rpe_actual") is not None]
+        rpe = summ[-1] if summ else (round(sum(set_rpes) / len(set_rpes), 1) if set_rpes else None)
+        cap = _num(p.get("target_rpe"))
+        label = b.get("display_name") or st
+        sessions.append({"date": d.isoformat(), "session_type": st, "label": label,
+                         "status": status, "sets": len(sets), "rpe": rpe, "cap": cap})
+        if status == "done":
+            done += 1
+            due += 1
+            if rpe is not None and cap is not None:
+                rpe_pairs.append((rpe, cap, d.isoformat(), label))
+        elif status == "missed":
+            due += 1
+            missed.append({"date": d.isoformat(), "label": label})
+        elif status in ("upcoming", "today"):
+            upcoming += 1
+
+    now_w, prev_w = _top_weights(logs), _top_weights(prior_logs)
+    loads = []
+    for name, cur in now_w.items():
+        prev = prev_w.get(name, "absent")
+        if cur is None:
+            note = "bodyweight" if hr.equipment_class(name) == "bodyweight" else "no load logged"
+            change = None
+        elif prev == "absent":
+            note, change = "first week", None
+        elif prev is None:
+            note, change = "no load last week", None
+        else:
+            change = round(cur - prev, 1)
+            note = "same" if change == 0 else None
+        loads.append({"exercise": name, "this_week": cur,
+                      "last_week": None if prev == "absent" else prev,
+                      "change": change, "note": note})
+
+    rpe = None
+    if rpe_pairs:
+        rpe = {"avg_session_rpe": round(sum(r for r, *_ in rpe_pairs) / len(rpe_pairs), 1),
+               "avg_cap": round(sum(c for _, c, *_ in rpe_pairs) / len(rpe_pairs), 1),
+               "over_cap": [{"date": d, "label": lab, "rpe": r, "cap": c}
+                            for r, c, d, lab in rpe_pairs if r > c]}
+    program_week = (start - anchor).days // 7 + 1 if start >= anchor else None
+    return {
+        "week": {"start": start.isoformat(), "end": end.isoformat(), "program_week": program_week,
+                 "through": min(today, end).isoformat(), "partial": end > today},
+        "counts": {"planned": sum(1 for s in sessions if s["status"] != "rest"),
+                   "done": done, "due": due, "missed": len(missed), "upcoming": upcoming},
+        "sessions": sessions,
+        "missed": missed,
+        "rpe": rpe,
+        "loads": loads,
+        "adjustments": adjustments,
+    }
+
+
+# ── Loading (read-only) ─────────────────────────────────────────────────────
+
+def load(start: date, end: date, today: date | None = None) -> dict:
+    """Read the week from RDS and evaluate it. SELECTs only."""
+    from knowledge.db import execute_query
+    from artemis.quiet_hours import local_today
+
+    today = today or local_today()
+    plans = execute_query(
+        "SELECT plan_id, plan_date, session_type, week_num, target_rpe, blocks "
+        "FROM health.plan WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date", (start, end))
+    sql = ("SELECT p.plan_date, sl.plan_id, sl.log_type, sl.exercise, sl.weight_lbs, "
+           "sl.reps_done, sl.rpe_actual, sl.is_skipped "
+           "FROM health.session_log sl JOIN health.plan p ON p.plan_id = sl.plan_id "
+           "WHERE p.plan_date BETWEEN %s AND %s AND sl.logged_via <> 'inferred' "
+           "ORDER BY p.plan_date, sl.log_id")
+    logs = execute_query(sql, (start, end))
+    prior = execute_query(sql, (start - timedelta(days=7), start - timedelta(days=1)))
+    return evaluate([dict(r) for r in plans], [dict(r) for r in logs], [dict(r) for r in prior],
+                    start=start, end=end, today=today)
+
+
+# ── Rendering (data only — no advice) ───────────────────────────────────────
+
+def _d(iso: str) -> str:
+    d = date.fromisoformat(iso)
+    return f"{d:%a} {d.month}/{d.day}"
+
+
+def _n(x) -> str:
+    return "—" if x is None else (f"{x:g}")
+
+
+def render_lines(ev: dict) -> list[str]:
+    """The evaluation as short plain lines (the Sunday post, the weekly report)."""
+    w, c = ev["week"], ev["counts"]
+    head = f"Week {w['program_week']}" if w["program_week"] else "Week"
+    span = f"{_d(w['start'])} – {_d(w['through'] if w['partial'] else w['end'])}"
+    lines = [f"{head} ({span}{', partial' if w['partial'] else ''}): "
+             f"{c['done']} of {c['due']} sessions due done"
+             + (f" · {c['upcoming']} still to come" if c["upcoming"] else "")
+             + f" · {c['planned']} planned"]
+    lines.append("Missed: " + (", ".join(f"{_d(m['date'])} {m['label']}" for m in ev["missed"])
+                               if ev["missed"] else "none"))
+    r = ev["rpe"]
+    if r:
+        over = "; ".join(f"{_d(o['date'])} {_n(o['rpe'])} vs {_n(o['cap'])}" for o in r["over_cap"])
+        lines.append(f"Effort: average session RPE {_n(r['avg_session_rpe'])} vs cap "
+                     f"{_n(r['avg_cap'])}" + (f" (over cap: {over})" if over else ""))
+    else:
+        lines.append("Effort: no session RPE logged")
+    changed = [l for l in ev["loads"] if l["change"] not in (None, 0)]
+    firsts = [l for l in ev["loads"] if l["note"] == "first week"]
+    if changed:
+        lines.append("Loads vs last week: " + ", ".join(
+            f"{l['exercise'].lower()} {l['change']:+g} lb" for l in changed))
+    elif ev["loads"]:
+        lines.append("Loads vs last week: " + (
+            "no change" if not firsts else
+            f"{len(firsts)} exercise(s) in their first week, nothing to compare"))
+    lines.append("Adjustments: " + ("; ".join(
+        f"{_d(a['date'])} {', '.join(a['rules']) or 'adjusted'}" for a in ev["adjustments"])
+        if ev["adjustments"] else "none"))
+    return lines
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Print one office week's evaluation (read-only).")
+    ap.add_argument("--week", type=date.fromisoformat, help="any day in the week (default: today)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    from artemis.quiet_hours import local_today
+    s, e = week_of(args.week or local_today())
+    result = load(s, e)
+    print(json.dumps(result, indent=1, default=str) if args.json else "\n".join(render_lines(result)))

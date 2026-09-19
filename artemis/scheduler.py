@@ -221,6 +221,9 @@ class ArtemisScheduler:
             # changed pain patterns only. It posts in the OPEN phase only.
             CronSpec("health_review", "job_health_review", we_open_h, we_open_m, "sun",
                      tier="health"),
+            # Sunday 08:35 — EVAL-1: the week so far, data only, labelled partial.
+            CronSpec("weekly_eval", "job_weekly_eval", *_plus_minutes(we_open_h, we_open_m, 5),
+                     "sun", tier="health"),
         ]
         if config.FOCUS_CLIENT:
             specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
@@ -1623,6 +1626,23 @@ class ArtemisScheduler:
                 logger.info("Health review posted %d pattern(s)", len(rows))
         except Exception:
             logger.exception("Health review failed")
+
+    def job_weekly_eval(self):
+        """Sun 08:35 local — the EVAL-1 week-so-far post (Wed-Sat, partial).
+
+        Read-only and data only: counts, effort vs cap, load change, missed
+        sessions, adjustments. No recommendations. Open phase only."""
+        if not self._is_open():
+            logger.info("Weekly eval: phase not open — skipping")
+            return
+        try:
+            from artemis import health_eval
+            start, end = health_eval.week_of(_local_today())
+            result = health_eval.load(start, end)
+            self.mm.post_message(config.CHANNEL_OPS,
+                                 "\U0001f4ca " + "\n".join(health_eval.render_lines(result)))
+        except Exception:
+            logger.exception("Weekly eval failed")
 
     def job_health_evening_prompt(self):
         """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.
