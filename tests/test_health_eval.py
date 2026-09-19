@@ -120,6 +120,19 @@ class TestWeek(unittest.TestCase):
 
 
 class TestSundaySpan(unittest.TestCase):
+    def test_week_number_comes_from_the_program(self):
+        """SCHEDULE-2: the 9/16 stub is week 1; 9/20 starts week 2."""
+        r1 = ev.evaluate(plans(start=date(2026, 9, 16)), [], [],
+                         start=date(2026, 9, 16), end=date(2026, 9, 19), today=date(2026, 9, 19))
+        self.assertEqual(r1["week"]["program_week"], 1)
+        r2 = ev.evaluate(plans(start=date(2026, 9, 20)), [], [],
+                         start=date(2026, 9, 20), end=date(2026, 9, 26), today=date(2026, 9, 26))
+        self.assertEqual(r2["week"]["program_week"], 2)
+        # a week still ahead names its real end, not a "through" before it began
+        r3 = ev.evaluate([], [], [], start=date(2026, 9, 20), end=date(2026, 9, 26),
+                         today=date(2026, 9, 19))
+        self.assertIn("Sun 9/20 – Sat 9/26", ev.render_lines(r3)[0])
+
     def test_sunday_post_covers_the_week_that_just_ended(self):
         """SCHEDULE-2: weeks are Sun..Sat, so the Sunday 08:35 post reports the
         COMPLETE week that ended yesterday — not a partial."""

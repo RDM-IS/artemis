@@ -158,7 +158,9 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
                "avg_cap": round(sum(c for _, c, *_ in rpe_pairs) / len(rpe_pairs), 1),
                "over_cap": [{"date": d, "label": lab, "rpe": r, "cap": c}
                             for r, c, d, lab in rpe_pairs if r > c]}
-    program_week = (start - anchor).days // 7 + 1 if start >= anchor else None
+    # SCHEDULE-2: week 1 is the 9/16..9/19 stub, weeks 2+ are Sun..Sat from
+    # WEEK2_START. office.week_num_for is the one definition of that.
+    program_week = office.week_num_for(start) if start >= office.WEEK1_START else None
     return {
         "week": {"start": start.isoformat(), "end": end.isoformat(), "program_week": program_week,
                  "through": min(today, end).isoformat(), "partial": end > today},
@@ -211,7 +213,9 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
     Wed–Sat: at 08:35 Sunday's own session hasn't happened)."""
     w, c = ev["week"], ev["counts"]
     head = f"Week {w['program_week']}" if w["program_week"] else "Week"
-    last = through.isoformat() if through else (w["through"] if w["partial"] else w["end"])
+    # A week entirely in the future has nothing "through" yet — name its real end.
+    last = through.isoformat() if through else (
+        w["through"] if w["partial"] and w["through"] >= w["start"] else w["end"])
     span = f"{_d(w['start'])} – {_d(last)}"
     lines = [f"{head} ({span}{', partial' if w['partial'] else ''}): "
              f"{c['done']} of {c['due']} sessions due done"
