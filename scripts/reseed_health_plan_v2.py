@@ -292,7 +292,7 @@ def reseed_office(dry_run: bool, only: str | None = None) -> int:
 
         try:
             n_deleted = 0 if only else _delete_tail(cur)
-            office.write_rows(cur, rows)
+            office.write_rows(cur, rows, validate=all_rows)
             conn.commit()
             if n_deleted:
                 print(f"[OK] Deleted {n_deleted} row(s) past {office.OFFICE_END}.")

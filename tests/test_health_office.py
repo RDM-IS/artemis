@@ -201,6 +201,24 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual(f["blocks"]["type"], "recovery_flow")
 
 
+class TestTargetedReseed(unittest.TestCase):
+    """reseed --only SESSION_TYPE writes a subset but validates the program."""
+
+    def test_write_rows_validates_the_whole_program_not_the_subset(self):
+        from unittest.mock import MagicMock
+        subset = [r for r in _ROWS if r["session_type"] == "cardio_z2"]
+        self.assertEqual(len(subset), 6)
+        # the subset alone can't satisfy full-window coverage
+        with self.assertRaises(AssertionError):
+            office.validate_rows(subset)
+        # …but writing it while validating the program does
+        cur = MagicMock()
+        office.write_rows(cur, subset, validate=_ROWS)
+        written = [c.args[1][0] for c in cur.execute.call_args_list
+                   if c.args[1] and hasattr(c.args[1][0], "isoformat")]
+        self.assertEqual(written, [r["plan_date"] for r in subset])
+
+
 class TestRegressionNoRetiredEquipment(unittest.TestCase):
     def test_no_rower_or_bike_on_trainer_at_the_office(self):
         """The retired kit stays out of OFFICE rows. Richfield really has a
