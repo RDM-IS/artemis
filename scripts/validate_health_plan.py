@@ -174,11 +174,18 @@ def selftest_live(fault: bool) -> dict[date, dict]:
                              "est_duration_min": r["est_duration_min"]}
             for r in office.build_rows()}
     if fault:
-        # a 61-min week-1 Strength C (not CALIBRATION_PENDING) must fail DURATION
-        live[office.WEEK1_START + timedelta(days=5)]["est_duration_min"] = 61
-        live[office.WEEK1_START]["blocks"]["equipment"].append("water rower")
-        live[office.WEEK1_START + timedelta(days=1)]["session_type"] = "cardio_intervals"
-        live.pop(office.WEEK1_START + timedelta(days=3))
+        # SCHEDULE-2: rows start at WEEK2_START (week 1 is the un-regenerated stub).
+        start = office.WEEK2_START
+        # a 61-min week-2 Strength C (not CALIBRATION_PENDING) must fail DURATION
+        c_day = next(d for d in sorted(live)
+                     if live[d]["session_type"] == "strength_c")
+        live[c_day]["est_duration_min"] = 61
+        office_day = next(d for d in sorted(live)
+                          if live[d]["blocks"].get("location") == office.LOCATION
+                          and live[d]["blocks"].get("equipment"))
+        live[office_day]["blocks"]["equipment"].append("water rower")
+        live[start + timedelta(days=1)]["session_type"] = "cardio_intervals"
+        live.pop(start + timedelta(days=3))
         live[office.OFFICE_END + timedelta(days=1)] = {
             "phase": 1, "week_num": 7, "session_type": "cardio_z2",
             "blocks": {"type": "steady", "equipment": ["bike on trainer"]}}

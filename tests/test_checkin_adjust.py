@@ -33,7 +33,8 @@ from artemis import health_office as office  # noqa: E402
 from artemis import health_regions as regions  # noqa: E402
 from artemis.health_guard import Evidence, find_violations  # noqa: E402
 
-FRI = date(2026, 9, 18)
+# SCHEDULE-2: Strength B moved off Friday. This is the week-2 B day (Wed).
+FRI = date(2026, 9, 23)
 CT = ZoneInfo("America/Chicago")
 B_NAMES = ["DB goblet squat", "Seated cable row", "Incline DB press", "Leg extension",
            "Rear delt fly", "Cable Pallof press", "Seated back extension"]
@@ -401,7 +402,7 @@ class TestSessionBScenarios(unittest.TestCase):
     def test_nudge_skips_rest_and_walk_days(self):
         from artemis.scheduler import ArtemisScheduler
         for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),
-                       (date(2026, 9, 20), office_row(date(2026, 9, 20), plan_id=107))):
+                       (date(2026, 9, 28), office_row(date(2026, 9, 28), plan_id=107))):
             db = FakeDB(row)
 
             @contextmanager
@@ -480,13 +481,13 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertNotIn("adjustment", db.plan[thu]["blocks"])
 
     def test_z2_day_recovery_cuts_duration(self):
-        tue = date(2026, 9, 22)
+        tue = date(2026, 9, 22)   # SCHEDULE-2: Z2 is the office Tuesday
         db = FakeDB(office_row(tue, plan_id=109))
         hc.process_checkin(db.cursor(), "slept 4 energy 3", tue, checkin_id="x", adjust=True)
         self.assertEqual(db.plan[tue]["blocks"]["duration_min"], 15)   # 20 → 15
 
     def test_monday_c_week5_legs_heavy_drops_finisher(self):
-        mon = date(2026, 10, 19)
+        mon = date(2026, 10, 16)   # SCHEDULE-2: the week-5 Strength C day
         row = office_row(mon, plan_id=140)
         self.assertIn("finisher", row["blocks"])
         db = FakeDB(row)
@@ -519,7 +520,7 @@ class TestFlows(unittest.TestCase):
     def test_nudge_text(self):
         self.assertEqual(hc.nudge_text(office_row(FRI)), "No check-in yet — run Session B as written.")
         self.assertIsNone(hc.nudge_text(rest_row(date(2026, 9, 17))))     # rest day
-        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 17))),     # YOGA-1 flow day
+        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 25))),     # YOGA-1 flow day
                          "No check-in yet — run Recovery Flow as written.")
         self.assertIsNone(hc.nudge_text(None))
 
@@ -669,7 +670,7 @@ class TestPlanExactRender(unittest.TestCase):
 
     def test_rest_day_prompt_has_no_workout_later(self):
         from artemis.health import build_morning_survey_prompt
-        text = build_morning_survey_prompt(office_row(date(2026, 9, 17)), "logging_only")
+        text = build_morning_survey_prompt(office_row(date(2026, 9, 22)), "logging_only")
         self.assertNotIn("workout is later", text)
 
 
@@ -695,7 +696,7 @@ class TestSchedulerRegistry(unittest.TestCase):
              patch("artemis.scheduler._local_today", return_value=FRI), \
              patch.object(s.scheduler, "add_job") as add_job:
             s._do_wake()
-        self.assertEqual(kv, {"checkin_open:2026-09-18": "open"})
+        self.assertEqual(kv, {f"checkin_open:{FRI}": "open"})
         add_job.assert_not_called()
 
 
@@ -713,7 +714,7 @@ class TestRouting(unittest.TestCase):
             sys.modules.setdefault(n, MagicMock())
         from artemis import main
         self.main = main
-        self.db = FakeDB(office_row(date(2026, 9, 16), plan_id=103))
+        self.db = FakeDB(office_row(date(2026, 9, 21), plan_id=103))
         self.db.logs.append({"plan_id": 103, "logged_via": "manual",
                              "log_type": "strength_set", "exercise": "Leg press"})
 
@@ -726,7 +727,7 @@ class TestRouting(unittest.TestCase):
             patch.object(main, "_mm", self.mm),
             patch.object(main, "_gmail", self.gmail),
             patch("knowledge.db.get_connection", conn),
-            patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 16)),
+            patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)),
             patch.object(main, "get_phase", return_value="wake"),
             patch.object(main, "update_last_interaction"),
             patch.object(main, "_handle_nutrition", side_effect=AssertionError("nutrition reached")),
@@ -761,7 +762,7 @@ class TestRouting(unittest.TestCase):
     def test_0916_messages_route_to_health_without_gmail(self):
         r1 = self.send("Slept 6.5\nEnergy 5\nSore 0\nWeight 284.5")
         self.assertEqual(r1, "Logged.")                 # sets already logged that morning
-        self.assertEqual(self.db.daily[date(2026, 9, 16)]["soreness"], {"overall": 0})
+        self.assertEqual(self.db.daily[date(2026, 9, 21)]["soreness"], {"overall": 0})
         r2 = self.send("Nope")
         self.assertEqual(r2, "Got it — run Session A as written.")
         r3 = self.send("Workout completed.  Logged in App. ")

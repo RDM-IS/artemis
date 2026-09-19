@@ -33,8 +33,11 @@ PHASE = 1
 GENERATED_BY = "manual"
 
 OFFICE_START = date(2026, 9, 16)   # Wed — week 1, day 1
-WEEK1_START = date(2026, 9, 16)    # weeks run Wed..Tue from here
-OFFICE_END = date(2026, 11, 3)     # Tue — last day of week 7
+WEEK1_START = date(2026, 9, 16)    # Wed — week 1 is the 9/16..9/19 partial stub
+# SCHEDULE-2 (Ryan, 2026-09-19): program weeks are Sun..Sat from 9/20, matching
+# the CYCLE-1 pay period. Week 1 stays the 4-day stub; week 2 starts Sun 9/20.
+WEEK2_START = date(2026, 9, 20)    # Sun — first full Sun..Sat program week
+OFFICE_END = date(2026, 10, 31)    # Sat — last day of week 7 (a week boundary)
 
 # ── Canonical office inventory (PB-009) ─────────────────────────────────────
 EQ_LEG_PRESS = "leg press"
@@ -134,11 +137,82 @@ _DISPLAY = {
     "recovery_flow": "Recovery Flow",
 }
 
-# Mon=0 .. Sun=6. Recovery Flow Thu (office) + Sat (home) — YOGA-1; no two
-# strength days adjacent.
-WEEKLY_PATTERN = {0: "strength_c", 1: "cardio_z2", 2: "strength_a",
-                  3: "recovery_flow", 4: "strength_b", 5: "recovery_flow", 6: "walk"}
-FLOW_LOCATION = {3: LOCATION, 5: "home"}   # weekday -> blocks.location
+# ── CYCLE-1: the 14-day pay period, Sun..Sat x2 from the anchor ─────────────
+CYCLE_ANCHOR = date(2026, 9, 20)   # Sun — week 1, day 1 of the cycle
+# Position 0..13 from the anchor. 8 msp_work, 2 msp_home, 3 wi, 1 travel.
+CYCLE_DAY_TYPES = (
+    "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "wi", "wi",     # wk 1
+    "wi", "travel", "msp_work", "msp_work", "msp_work", "msp_work", "msp_home",  # wk 2
+)
+# Where each day is. Richfield = the farm (LOCATION-1).
+CYCLE_LOCATION = {
+    0: "home", 1: LOCATION, 2: LOCATION, 3: LOCATION, 4: LOCATION,
+    5: "Richfield", 6: "Brown Deer",
+    7: "Richfield", 8: "Richfield", 9: LOCATION, 10: LOCATION, 11: LOCATION,
+    12: LOCATION, 13: "home",
+}
+DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
+
+# SCHEDULE-2: lift on the 1st, 3rd and 4th OFFICE day of each cycle week —
+# wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C in order. That puts B and C
+# back to back once a week; Ryan accepted that deliberately (test asserts
+# exactly 6 such pairs, one per program week). Every other day is
+# a flow, Z2 or a walk, chosen so wi and travel days only ever get sessions
+# that need no gym.
+LIFT_SLOTS = (1, 3, 4)             # 1-based office-day positions within a cycle week
+LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
+# Non-lifting days, by cycle position. Z2 stays at the office (Richfield's
+# rower and trainer could take it — see LOCATION-1 — but nothing depends on
+# that here). Flows need only a mat; walks go outside anywhere.
+# Ryan, 2026-09-19: Z2 sits on the office non-lift days, where the equipment is
+# reliable; the flows sit on the wi days because a mat travels. Richfield's
+# rower and trainer stay available for extra cardio if he wants it — the
+# SEEDED session there is a flow.
+NON_LIFT = {
+    0: "recovery_flow",   # Sun, msp_home — mat
+    2: "cardio_z2",       # Tue, office — treadmill / elliptical
+    5: "recovery_flow",   # Fri, Richfield — mat
+    6: "walk",            # Sat, Brown Deer
+    7: "recovery_flow",   # Sun, Richfield — mat
+    8: "walk",            # Mon, travel — leaves 11:00
+    10: "cardio_z2",      # Wed, office — treadmill / elliptical
+    13: "recovery_flow",  # Sat, msp_home — mat
+}
+
+
+def cycle_pos(d: date) -> int:
+    """0..13 position in the pay period. Derived from the anchor, never stored."""
+    return (d - CYCLE_ANCHOR).days % 14
+
+
+def day_type(d: date) -> str:
+    return CYCLE_DAY_TYPES[cycle_pos(d)]
+
+
+def day_location(d: date) -> str:
+    return CYCLE_LOCATION[cycle_pos(d)]
+
+
+def is_office_day(d: date) -> bool:
+    return day_type(d) == "msp_work"
+
+
+def session_for(d: date) -> str:
+    """The session type for a date under SCHEDULE-2."""
+    pos = cycle_pos(d)
+    week_start = pos - (pos % 7)                       # 0 or 7
+    office = [p for p in range(week_start, week_start + 7)
+              if CYCLE_DAY_TYPES[p] == "msp_work"]
+    if pos in office:
+        slot = office.index(pos) + 1                   # 1-based office day
+        if slot in LIFT_SLOTS:
+            return LIFT_ORDER[LIFT_SLOTS.index(slot)]
+    return NON_LIFT[pos]
+
+
+def flow_variant_location(d: date) -> str:
+    """Recovery Flow location. Only the office has the Stretch Trainer."""
+    return day_location(d)
 
 # week_num -> (sets, target_rpe, z2 minutes (lo, hi))
 RAMP = {
@@ -206,15 +280,17 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False):
     return blocks, rpe, 3, minutes
 
 
-def _z2(week_num: int):
+def _z2(week_num: int, location: str = LOCATION):
     lo, hi = RAMP[week_num][2]
+    office = location == LOCATION
     blocks = {
         "type": "steady",
         "display_name": _DISPLAY["cardio_z2"],
-        "location": LOCATION,
+        "location": location,
         "duration_min": hi,
         "intensity": "Zone 2",
-        "equipment": list(SESSION_EQUIPMENT["cardio_z2"]),
+        "equipment": (list(SESSION_EQUIPMENT["cardio_z2"]) if office
+                      else ["rower", "bike on trainer"]),
         "setup_notes": [Z2_NOTES],
     }
     if lo != hi:
@@ -432,8 +508,7 @@ def _flow_step(spec) -> dict:
     return out
 
 
-def _recovery_flow(weekday: int):
-    location = FLOW_LOCATION.get(weekday, LOCATION)
+def _recovery_flow(location: str = LOCATION):
     office = location == LOCATION
     blocks = {
         "type": "recovery_flow",
@@ -462,13 +537,13 @@ def _recovery_flow(weekday: int):
 
 
 def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: bool = False,
-           weekday: int | None = None):
+           location: str | None = None):
     if session_type == "recovery_flow":
-        return _recovery_flow(weekday if weekday is not None else 3)
+        return _recovery_flow(location or LOCATION)
     if session_type.startswith("strength"):
         return _strength(session_type, week_num, wk0=wk0)
     if session_type == "cardio_z2":
-        return _z2(week_num)
+        return _z2(week_num, location or LOCATION)
     if session_type == "walk":
         return _walk(week_num, recovery=recovery)
     return _rest(week_num)
@@ -478,18 +553,28 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: boo
 # Schedule
 # ============================================================================
 
-def build_schedule() -> list[dict]:
-    """Ordered specs {plan_date, session_type, week_num, wk0} for 9/16-11/03.
+def week_num_for(d: date) -> int:
+    """Program week. Week 1 is the 9/16..9/19 stub; weeks 2+ run Sun..Sat from
+    WEEK2_START, matching the CYCLE-1 pay period (SCHEDULE-2)."""
+    if d < WEEK2_START:
+        return 1
+    return 2 + (d - WEEK2_START).days // 7
 
-    Weeks are Wed-Tue blocks counted off WEEK1_START, so week 1 is
-    9/16..9/22 and week 7 is 10/28..11/03.
+
+def build_schedule() -> list[dict]:
+    """Ordered specs {plan_date, session_type, week_num, location, wk0} from
+    WEEK2_START to OFFICE_END.
+
+    The 9/16..9/19 week-1 stub is NOT regenerated — it is logged history and
+    stays as seeded. Weeks 2..7 are Sun..Sat and the session for each day comes
+    from SCHEDULE-2's office-day rule over the CYCLE-1 day types.
     """
     specs: list[dict] = []
-    d = WEEK1_START
+    d = WEEK2_START
     while d <= OFFICE_END:
-        week_num = (d - WEEK1_START).days // 7 + 1
-        specs.append({"plan_date": d, "session_type": WEEKLY_PATTERN[d.weekday()],
-                      "week_num": week_num, "wk0": False})
+        specs.append({"plan_date": d, "session_type": session_for(d),
+                      "week_num": week_num_for(d), "location": day_location(d),
+                      "day_type": day_type(d), "wk0": False})
         d += timedelta(days=1)
     return specs
 
@@ -498,11 +583,17 @@ def build_row(spec: dict) -> dict:
     wk0 = spec["wk0"]
     week_num = spec["week_num"]
     session_type = spec["session_type"]
+    location = spec.get("location") or LOCATION
     blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0,
                                     recovery=wk0 and session_type == "walk",
-                                    weekday=spec["plan_date"].weekday())
+                                    location=location)
     blocks = copy.deepcopy(blocks)
-    tag = "office wk0 ramp-up" if wk0 else f"office wk{week_num}"
+    # CYCLE-1: every row carries where it happens and the day type it came from.
+    if blocks.get("type") != "steady" or session_type != "walk":
+        blocks["location"] = location
+    if spec.get("day_type"):
+        blocks["day_type"] = spec["day_type"]
+    tag = f"{spec.get('day_type', 'office')} wk{week_num}"
     return {
         "plan_date": spec["plan_date"],
         "phase": PHASE,
@@ -577,8 +668,16 @@ LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_interva
 
 
 def forbidden_hits(blocks) -> list[str]:
-    """Retired home-gym tokens found anywhere in a blocks payload."""
-    blob = json.dumps(blocks if not isinstance(blocks, str) else json.loads(blocks)).lower()
+    """Retired home-gym tokens found anywhere in a blocks payload.
+
+    The ban is about the OFFICE program (HEALTH-2 retired the rower and the
+    outdoor bike from it). A row at another location is checked against that
+    location's own inventory instead — Richfield really does have a rower.
+    """
+    b = blocks if not isinstance(blocks, str) else json.loads(blocks)
+    if (b or {}).get("location") not in (None, LOCATION):
+        return []
+    blob = json.dumps(b).lower()
     return [t for t in FORBIDDEN_TOKENS if t in blob]
 
 
@@ -588,8 +687,8 @@ def validate_rows(rows: list[dict]) -> list[str]:
     outside CALIBRATION_PENDING fails the assert."""
     dates = [r["plan_date"] for r in rows]
     assert len(dates) == len(set(dates)), "duplicate plan_date"
-    expected = [OFFICE_START + timedelta(days=i) for i in range((OFFICE_END - OFFICE_START).days + 1)]
-    assert sorted(dates) == expected, "office rows must cover every day 9/16..11/03"
+    expected = [WEEK2_START + timedelta(days=i) for i in range((OFFICE_END - WEEK2_START).days + 1)]
+    assert sorted(dates) == expected, "office rows must cover every day 9/20..10/31"
     for r in rows:
         b = r["blocks"]
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
@@ -597,13 +696,27 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert b.get("display_name"), "blocks must carry a display_name"
         assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
+        # SCHEDULE-2: a strength session only ever lands on an office day.
         if r["session_type"].startswith("strength"):
+            assert b.get("day_type") == "msp_work", \
+                f"{r['plan_date']}: {r['session_type']} on a {b.get('day_type')} day"
             assert b.get("location") == LOCATION
             assert b.get("warmup") == WARMUP and b.get("cooldown") == COOLDOWN
             assert b["exercises"] and all("name" in e and "format" in e for e in b["exercises"])
         if r["session_type"] == "recovery_flow":
             assert b["type"] == "recovery_flow"
             validate_flow(b)
+    # SCHEDULE-2: exactly 3 lifts per program week, and every row's location is
+    # the one CYCLE-1 derives for that date.
+    from collections import Counter
+    lifts = Counter(r["week_num"] for r in rows if r["session_type"].startswith("strength"))
+    for wk in sorted({r["week_num"] for r in rows}):
+        assert lifts[wk] == 3, f"week {wk} has {lifts[wk]} lifts, expected 3"
+    for r in rows:
+        assert r["blocks"].get("day_type") == day_type(r["plan_date"])
+        if r["session_type"] != "walk":
+            want, got = day_location(r["plan_date"]), r["blocks"].get("location")
+            assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
     rejects, notes = duration_findings(rows)
     assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)
     for n in notes:
