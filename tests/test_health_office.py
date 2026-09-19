@@ -131,7 +131,11 @@ class TestSchedule(unittest.TestCase):
                 self.assertEqual(r["blocks"]["rounds"], sets)
                 self.assertEqual(r["target_rpe"], rpe)
             z = next(r for r in wk_rows if r["session_type"] == "cardio_z2")
-            self.assertEqual(z["est_duration_min"], z2)
+            # office Z2 carries the 5 min Stretch Trainer cooldown
+            self.assertEqual(z["blocks"]["duration_min"], z2)
+            self.assertEqual(z["est_duration_min"], z2 + office.COOLDOWN_MIN)
+            self.assertEqual(z["blocks"]["cooldown"], office.COOLDOWN)
+            self.assertIn(office.EQ_STRETCH, z["blocks"]["equipment"])
             self.assertEqual(z["target_hr_zone"], 2)
             self.assertIn("conversational pace", z["blocks"]["setup_notes"][0])
         wk5_z2 = next(r for r in _ROWS if r["week_num"] == 5 and r["session_type"] == "cardio_z2")

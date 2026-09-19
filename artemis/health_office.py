@@ -91,6 +91,7 @@ FORBIDDEN_TOKENS = ("rower", "bike on trainer", "road bike", "indoor trainer",
 
 WARMUP = "5 min elliptical, easy"
 COOLDOWN = "5 min Stretch Trainer"
+COOLDOWN_MIN = 5
 Z2_NOTES = "treadmill incline walk, elliptical, recumbent, or upright bike — conversational pace"
 MACHINE_NOTE = "log seat + pin setting"
 
@@ -293,9 +294,15 @@ def _z2(week_num: int, location: str = LOCATION):
                       else ["rower", "bike on trainer"]),
         "setup_notes": [Z2_NOTES],
     }
+    if office:
+        # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that
+        # the flows travel. Same cooldown the strength days use.
+        blocks["cooldown"] = COOLDOWN
+        blocks["equipment"].append(EQ_STRETCH)
     if lo != hi:
         blocks["target_range_min"] = [lo, hi]
-    return blocks, 4.0, 2, hi
+    est = hi + (COOLDOWN_MIN if office else 0)
+    return blocks, 4.0, 2, est
 
 
 def _walk(week_num: int, *, recovery: bool = False):
