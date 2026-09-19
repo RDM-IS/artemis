@@ -242,10 +242,20 @@ def office_self_test() -> None:
     print("Office self-test OK.")
 
 
-def reseed_office(dry_run: bool) -> int:
+def _filter_rows(rows: list[dict], only: str | None) -> list[dict]:
+    """Rows of one session type, for a targeted reseed (--only cardio_z2)."""
+    return [r for r in rows if not only or r["session_type"] == only]
+
+
+def reseed_office(dry_run: bool, only: str | None = None) -> int:
     _load_dotenv()
-    rows = office.build_rows()
-    notes = office.validate_rows(rows)
+    all_rows = office.build_rows()
+    notes = office.validate_rows(all_rows)      # always validate the WHOLE program
+    rows = _filter_rows(all_rows, only)
+    if only:
+        print(f"[scope] {len(rows)} {only} row(s) only — no other dates touched.")
+        if not rows:
+            raise SystemExit(f"[ABORT] no rows of type {only!r}")
     with _connect() as conn:
         cur = conn.cursor()
         ok, msg = _preflight(cur)
@@ -264,23 +274,24 @@ def reseed_office(dry_run: bool) -> int:
         print_diff(_read_existing(cur), rows)
         print_duration_notes(notes)
 
-        tail = _read_tail(cur)
+        tail = [] if only else _read_tail(cur)
         if tail:
             print(f"ROWS PAST {office.OFFICE_END} (to DELETE — orphans of the old window):")
             for d, st, n in tail:
                 flag = f"  << {n} REAL session_log row(s)" if n else ""
                 print(f"  {d.isoformat()}  {d.strftime('%a')}  {st}{flag}")
             print(f"  ({len(tail)} row(s) to delete)\n")
-        else:
+        elif not only:
             print(f"No rows past {office.OFFICE_END}.\n")
 
         if dry_run:
             conn.rollback()
-            print("[DRY-RUN] (default) No rows written. Re-run with --office --commit to write.")
+            flag = f" --only {only}" if only else ""
+            print(f"[DRY-RUN] (default) No rows written. Re-run with --office{flag} --commit to write.")
             return 0
 
         try:
-            n_deleted = _delete_tail(cur)
+            n_deleted = 0 if only else _delete_tail(cur)
             office.write_rows(cur, rows)
             conn.commit()
             if n_deleted:
@@ -493,6 +504,9 @@ def main() -> None:
     ap.add_argument("--commit", action="store_true",
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true", help="No DB. Print the schedule.")
+    ap.add_argument("--only", metavar="SESSION_TYPE",
+                    help="With --office: reseed only rows of this session_type "
+                         "(e.g. --only cardio_z2). No tail delete.")
     ap.add_argument("--flow-days", action="store_true",
                     help="YOGA-1: rewrite only the Thu/Sat Recovery Flow rows (with --from).")
     ap.add_argument("--strength-days", action="store_true",
@@ -518,7 +532,7 @@ def main() -> None:
     if args.self_test:
         office_self_test()
         return
-    reseed_office(dry_run=not args.commit)
+    reseed_office(dry_run=not args.commit, only=args.only)
 
 
 if __name__ == "__main__":
