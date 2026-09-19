@@ -737,7 +737,7 @@ class TestRouting(unittest.TestCase):
         # from RDS; with nothing pending they decline, so stub them to decline.
         for name in ("_handle_availability_command", "_handle_duplicate_override",
                      "_handle_calendar_confirm", "_handle_delete_confirm",
-                     "_handle_ramp_confirm", "_handle_debrief_confirm",
+                     "_handle_debrief_confirm",
                      "_handle_swap_confirm", "_handle_nutrition_confirm",
                      "_handle_help_command", "_handle_morning_brief_command",
                      "_handle_version_command", "_handle_vault_command",

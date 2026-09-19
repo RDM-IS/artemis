@@ -558,8 +558,6 @@ A guided, hands-free mobility flow. `blocks.type = recovery_flow`, `target_rpe`
 - **Nudge:** the 05:15 check-in nudge applies. No 16:30 debrief nag and no
   21:50 inferred summary on flow days — gym-display logs the flow itself, and a
   missed flow is never a missed session.
-- **Ramp:** flows are excluded from progression and slides
-  (`health_ramp.RAMP_EXCLUDED_TYPES`).
 - **Wake post:** plan-exact — the Stretch Trainer block, every round-1 step with
   side and hold, the round-2 doubling, the close and the total. The check-in
   prompt has no "workout is later" wording.
@@ -585,14 +583,7 @@ Warmup 5 min elliptical, cooldown 5 min Stretch Trainer.
 > ⚠️ `health.phase_config` caps phase 1 at `max_session_rpe = 7.0`, below the
 > weeks 5–6 target of 7.5. Nothing enforces the cap today; resolve before 10/14.
 
-**Ramp engine — retired, and incompatible.** The feat/health-ramp nightly
-slide/evaluate job is not scheduled and must stay that way. A HARDEN-1 dry run
-against live data showed it groups weeks **Sun–Sat** (it would evaluate
-9/13–9/19, mixing three old phase-3 rows with week 1), evaluates on Sunday
-night rather than Wednesday, counts rest days as sessions (marking them
-`missed`), and requires 5/5 completions — so every scenario ends in a
-**restart proposal** that re-seeds the home-gym program. `yes ramp` would
-delete the office plan. See RAMP-RETIRE in `docs/ARTEMIS_STATE.md`.
+**Progression is manual.** The weekly evaluation (EVAL-1, Sunday post + weekly report) reports; Ryan decides any repeat, restart or change. The ramp engine was deleted in RAMP-RETIRE (2026-09-19).
 
 ### Trainer voice
 
@@ -683,7 +674,7 @@ Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
   mapping
 - `python3.11 tests/test_health_intents.py` — intent detection +
   handlers + nag logic, all DB and Claude calls mocked
-- `python3.11 tests/test_health_office.py` — office schedule/ramp, location
+- `python3.11 tests/test_health_office.py` — office schedule and weekly progression, location
   from blocks, retired bike/trainer/ramp, regression: no row from 2026-09-21
   onward references a rower or bike on trainer
 - `python3.11 tests/test_checkin_adjust.py` — FRIDAY-1 parser, rules, flows,

@@ -1,4 +1,4 @@
-"""YOGA-1 — Recovery Flow: builder, side validator, reseed diff, rules, ramp,
+"""YOGA-1 — Recovery Flow: builder, side validator, reseed diff, rules,
 nudge, nag, wake post. No RDS.
 
 Run:
@@ -251,27 +251,6 @@ class TestRules(unittest.TestCase):
         for text in ("sore shoulder 4 and legs 5", "legs sore 3", "slept 4 energy 1"):
             self.assertEqual(self.checkin(text), "Check-in logged — Recovery Flow as planned.", text)
         self.assertEqual(self.db.plan[THU], self.before)
-
-
-class TestRampIgnoresFlows(unittest.TestCase):
-    def test_a_missed_flow_is_never_loaded_slid_or_missed(self):
-        from artemis import health_ramp as ramp
-        cur = MagicMock()
-        cur.description = [(c,) for c in ("plan_id", "plan_date", "week_num", "session_type",
-                                          "status", "original_date", "blocks")]
-        cur.fetchall.return_value = [
-            (1, date(2026, 9, 16), 1, "strength_a", "completed", None, {}),
-            (2, date(2026, 9, 17), 1, "recovery_flow", "planned", None, {}),
-            (3, date(2026, 9, 18), 1, "strength_b", "planned", None, {}),
-        ]
-        rows = ramp._load_ramp_rows(cur)
-        self.assertEqual([r["plan_id"] for r in rows], [1, 3])
-        with patch.object(ramp, "_set_status") as set_status:
-            actions = ramp.apply_slides(MagicMock(), rows, date(2026, 9, 25))
-        touched = {c.args[1] for c in set_status.call_args_list}
-        self.assertNotIn(2, touched)
-        self.assertTrue(all(a["row"]["session_type"] != "recovery_flow" for a in actions))
-        self.assertIn("recovery_flow", ramp.RAMP_EXCLUDED_TYPES)
 
 
 class TestNudgeAndFollowups(unittest.TestCase):

@@ -34,10 +34,9 @@ It refuses a row carrying a check-in adjustment, an override, or a different
 session_type, and refuses a date with real session_log rows unless
 --allow-logged (the logs keep their plan_id; only the plan row is rewritten).
 
-Retired (HEALTH-2):
-  * the legacy v2 whole-table home-gym reseed (PowerBlocks / TRX / rower / bike),
-  * --ramp (feat/health-ramp weeks 1-7, 7/25-9/11). Its delete-forward from 7/25
-    would wipe the office plan, so it refuses to run.
+Retired (HEALTH-2): the legacy v2 whole-table home-gym reseed (PowerBlocks /
+TRX / rower / bike). The --ramp mode and the ramp engine were deleted in
+RAMP-RETIRE (2026-09-19).
 
 CONSTRAINTS (live RDS): session_type CHECK (strength_a/b/c, cardio_intervals,
 cardio_z2, walk, rest_mobility, recovery_flow [033]); week_num CHECK 1..19; phase CHECK 1..4;
@@ -70,13 +69,6 @@ sys.path.insert(0, str(_REPO_ROOT))
 import artemis.health_office as office  # noqa: E402
 
 GENERATED_BY_DB = office.GENERATED_BY
-
-RAMP_RETIRED_MSG = (
-    "--ramp is retired (HEALTH-2): the weeks 1-7 ramp window (7/25-9/11) passed "
-    "undeployed and its delete-forward would wipe the office plan. "
-    "Use --office."
-)
-
 
 # ---------------------------------------------------------------------------
 # DB plumbing
@@ -501,7 +493,6 @@ def main() -> None:
     ap.add_argument("--commit", action="store_true",
                     help="Actually write rows. Without this the script is a dry-run.")
     ap.add_argument("--self-test", action="store_true", help="No DB. Print the schedule.")
-    ap.add_argument("--ramp", action="store_true", help="RETIRED — refuses to run.")
     ap.add_argument("--flow-days", action="store_true",
                     help="YOGA-1: rewrite only the Thu/Sat Recovery Flow rows (with --from).")
     ap.add_argument("--strength-days", action="store_true",
@@ -512,8 +503,6 @@ def main() -> None:
                     help="First date for --flow-days / --strength-days (YYYY-MM-DD).")
     args = ap.parse_args()
 
-    if args.ramp:
-        raise SystemExit(RAMP_RETIRED_MSG)
     if not args.office:
         ap.error("choose a mode: --office (the legacy v2 home-gym reseed is retired)")
     if args.flow_days:

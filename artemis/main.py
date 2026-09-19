@@ -3989,60 +3989,6 @@ def _handle_swap_confirm(post: dict, question: str) -> bool:
     return True
 
 
-# feat/health-ramp: the ramp proposal is confirmed ONLY by a QUALIFIED control
-# phrase — `yes ramp` / `no ramp` (with `ramp yes`, `confirm ramp`, `cancel ramp`
-# as synonyms). A bare `yes`/`no`/`confirm`/`cancel` is deliberately NOT matched, so
-# it flows on down the chain untouched. Rationale: the ramp pending never expires
-# and can coexist for days with a rule-add / dossier / swap proposal in the same
-# channel; a bare confirm must resolve to those flows (or the LLM), never silently
-# apply a ramp repeat/restart. Disambiguation is mandatory, not first-match-wins.
-_RAMP_CONFIRM_RE = re.compile(
-    r"^\s*(?:@?artemis\s+)?(?:(?:yes|confirm)\s+ramp|ramp\s+(?:yes|confirm))\s*[.!]*\s*$",
-    re.IGNORECASE,
-)
-_RAMP_CANCEL_RE = re.compile(
-    r"^\s*(?:@?artemis\s+)?(?:(?:no|cancel)\s+ramp|ramp\s+(?:no|cancel))\s*[.!]*\s*$",
-    re.IGNORECASE,
-)
-
-
-def _handle_ramp_confirm(post: dict, question: str) -> bool:
-    """Confirm/cancel leg for a pending ramp repeat/restart proposal (feat/health-
-    ramp). Matches ONLY the qualified `yes ramp` / `no ramp` (+ `ramp yes`,
-    `confirm ramp`, `cancel ramp`) — a bare `yes`/`no` is never consumed here and
-    falls through the chain untouched. On a qualified confirm, with a proposal
-    actually staged in health.ramp_state AND the reply in the ops channel, the
-    regenerated rows are written in one transaction and the confirmation is rendered
-    from the WRITTEN rows. Returns True only when it acts."""
-    is_confirm = bool(_RAMP_CONFIRM_RE.match(question))
-    is_cancel = bool(_RAMP_CANCEL_RE.match(question))
-    if not (is_confirm or is_cancel):
-        return False  # bare / unqualified control words are not ours — flow on
-
-    from artemis.health_ramp import (
-        cancel_ramp_proposal, commit_ramp_proposal, load_ramp_pending,
-    )
-    import artemis.config as config
-
-    channel_id = post.get("channel_id", "")
-    if load_ramp_pending(channel_id) is None:
-        return False
-    # Channel-scoped: only act in the ops channel (#artemis-ryan), resolved at read
-    # time. The proposal is only ever posted there.
-    try:
-        ops_channel_id = _mm.get_channel_id(config.CHANNEL_OPS) if _mm else None
-    except Exception:
-        ops_channel_id = None
-    if ops_channel_id is not None and channel_id != ops_channel_id:
-        return False
-
-    reply = commit_ramp_proposal(channel_id) if is_confirm else cancel_ramp_proposal(channel_id)
-    root_id = post.get("root_id") or post["id"]
-    if reply and _mm:
-        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
-    return True
-
-
 def _handle_nutrition_confirm(post: dict, question: str) -> bool:
     """Confirm/cancel leg for the two confirmed nutrition writes:
     a pending nutrition-target change, or a pending grocery-staples batch.
@@ -4176,12 +4122,6 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("duplicate_override", _handle_duplicate_override),
         ("calendar_confirm", _handle_calendar_confirm),
         ("delete_confirm", _handle_delete_confirm),
-        # feat/health-ramp: a ramp repeat/restart proposal is confirmed ONLY by the
-        # qualified `yes ramp` / `no ramp` (never a bare yes/no) — the ramp pending
-        # never expires, so a bare confirm meant for a coexisting rule/dossier/swap
-        # proposal must not trigger a plan rewrite. Placed ahead of swap_confirm so
-        # the qualified form isn't swallowed by swap's greedy `yes <reason>` matcher.
-        ("ramp_confirm", _handle_ramp_confirm),
         ("debrief_confirm", _handle_debrief_confirm),
         # SWAP-2: a pending modality swap/revert consumes its `yes <reason>`/`no`
         # here, ahead of any content router — a confirm must never reach the LLM.
