@@ -58,4 +58,4 @@ Changes go through Claude Code: "read the entire codebase / these specific files
 
 ## Current state
 
-→ See `docs/ARTEMIS_STATE.md` for what's built, in flight, and the prioritized backlog. As of the last update: SQLite retirement complete (7/7); RDS is the single source of truth; the context system is live; HEALTH-1 (morning check-in misroute) is the top open bug.
+→ See `docs/ARTEMIS_STATE.md` for what's built, in flight, and the prioritized backlog. As of the last update (2026-09-19): SQLite retirement complete (7/7); RDS is the single source of truth; the context system is live; HEALTH-1 is closed; next builds are WATCH-1 → EVAL-1 → REPORT-1 → DIET-1.

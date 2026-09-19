@@ -258,9 +258,9 @@ The morning is **event-driven**; the fixed 04:45 calibration post and its
 
 | When | What |
 |---|---|
-| 04:30 | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>`. |
+| 04:30 (Sat/Sun 07:30) | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>`. |
 | on the check-in reply | Parsed **deterministically** (`artemis/health_checkin.py`, no LLM) and stored in `health.daily_state`. **No sets logged today** → the rules run and today's plan row is rewritten; the reply is the plan-exact diff. **Sets already logged** → stored only, reply `Logged.` |
-| 05:15 | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): **training days only**, if no check-in and no sets — one post, "No check-in yet — run Session X as written." Nothing on rest/walk days; never repeats. |
+| 05:15 (Sat/Sun 08:15) | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): **training days only**, if no check-in and no sets — one post, "No check-in yet — run Session X as written." Nothing on rest/walk days; never repeats. |
 
 Prompt text:
 
@@ -271,7 +271,7 @@ Prompt text:
 LLM. It claims check-in-shaped text, ack words (`nope`, `all good`), done words
 (`done`, `workout completed`, `logged in app`) and `original` — nothing else
 (`ok`, `thanks`, `done <thread-id>` are not claimed). A claimed message never
-reaches an LLM or Gmail. Before 06:30 (phase ≠ open) the general LLM fallback
+reaches an LLM or Gmail. Before 06:30 — Sat/Sun 08:30 — (phase ≠ open) the general LLM fallback
 gets **no** Gmail, calendar, inbox or notes context.
 
 **Scale — every rating is 0–5** (0 = none, 5 = can't use it): energy, soreness

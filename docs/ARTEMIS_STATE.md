@@ -55,7 +55,7 @@ A medallion over Artemis's **own decisions**:
 - **Gold = soft rules** — observed tendencies, confidence-weighted, context-conditioned; bias defaults, **never auto-act**. Evolution-ready schema: `(rule, context, confidence, last_reinforced_at, evidence_count, supersedes?)`. Accretion + decay + supersession (Ryan adjudicates growth vs drift). Future `/drift` diffs authored gold vs observed gold.
 - **Actionable gold** = self-proposed-but-human-approved playbooks; activation always gated.
 
-> **Note (HEALTH-1 relevance):** a premature, half-built "learning"/`add_note` stub is currently live in routing and confabulating ("I've learned that…"). The cognition layer above is the *correct* version, built deliberately and gated. The stub must come out of live routing — see backlog.
+> **Note (HEALTH-1, closed 2026-09-19):** the premature "learning"/`add_note` stub is out of live routing (HEALTH-1 A1/A2); only the unrouted `_handle_correction` function remains (see CORRECTION-DEADCODE). The cognition layer above is still the *correct* version, built deliberately and gated.
 
 ---
 
@@ -104,7 +104,17 @@ Each boundary belongs to the local date it falls on: Friday night goes quiet at 
 
 ## 5. In flight 🚧
 
-Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
+Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in order: **WATCH-1 → EVAL-1 → REPORT-1 → DIET-1** (backlog).
+
+**Shipped 2026-09-17 → 09-19** (all merged and live; details in the PRs):
+- **STATUS-1** — the Status page rebuild: `GET /health/overview` on the Lambda (#98, key-gated, reads `acos.system_state.health_program` with a plan-row fallback) and gym-display #10.
+- **Seated back extension** (#100, gym-display #11) — no 45° back extension in the office gym; Strength B rows 9/18 → 10/30 reseeded. `session_log` 123 and 129 (9/18) predate the correction and are left as logged.
+- **Recovery Flow rows** — the 13 Thu (office) / Sat (home) rows 9/19 → 10/31 reseeded to `recovery_flow`; migrations 032 + 033 applied.
+- **EXPORT-1** (#101) — `scripts/export_report.py`.
+- **Weekend schedule** (#102) — Sat/Sun wake 07:30, business 08:30, quiet 22:30; the Sunday health review at 08:30. First live weekend 9/19: wake 07:30, nudge 08:15, open 08:30.
+- **Location-aware departure block** (#103) — the wake-post checklist on office days only.
+- **YOGA-2** (gym-display #12) — original SVG pose figures in the Recovery Flow (active pose, 5 s preview, switch card, ready list).
+- **TEST-STUBS** (#104) — the three pre-existing test failures fixed; `test_confirm_dispatch` no longer writes to production.
 
 **HEALTH-2 — office gym rebuild (`feat/health-office-gym`).** Ryan trains at the office gym (all Precor); the rower and outdoor bike are retired from the plan. Location is now plan data (`blocks.location` / `blocks.equipment`, static map is fallback); bike branch, `trainer set` override, and cardio weather removed (weather stays for `walk`); modality swap retargeted to office machines; office program seeded via `reseed_health_plan_v2.py --office`. The feat/health-ramp nightly job and `--ramp` reseed are retired (window 7/25-9/11 passed undeployed; it would slide/re-propose over the office plan). **Live since 2026-09-16** (#85, #88): phase 1 anchored Wed 9/16, Wed–Tue week windows, 9/16 → 11/03, pattern Wed A · Thu rest · Fri B · Sat rest · Sun walk · Mon C · Tue Z2, all at the office gym. Inventory correction (2026-09-18): there is no 45° back extension / roman chair — back extensions run on the seated Precor Abdominal / Back Extension machine ("Seated back extension", class `machine`); Strength B rows from 9/18 reseeded. The inventory is unverified in person (OFFICE-WALK). `session_log` 123 and 129 (9/18, "45° back extension", 12 reps, no load) predate the correction and are left as logged; they were done on the seated machine. Day phases per WAKE-1 (wake post 04:30, business 06:30, quiet 17:00).
 
@@ -115,7 +125,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 | 1b Access JWT on `/api` | PR gym-display #3 — needs `ACCESS_AUD_PRODUCTION` / `ACCESS_AUD_PREVIEW` set before merge |
 | 2 tampering audit | done — no suspect `session_log` rows; see backlog for the 7/19 read flood |
 | 3 log redaction / 5 free OWM endpoints | PR #89, deployed on the box pre-merge, weather live |
-| 3 key rotations | **pending (Ryan)** — OpenWeatherMap key (24 journal lines) and the health API key (was in the public bundle) |
+| 3 key rotations | ✅ done 2026-09-16 — OpenWeatherMap and health API keys (Secrets Manager `LastChangedDate` 9/16) |
 | 4 9/16 workout check | clean — 12 sets + summary, no duplicates; no `setting=` notes captured |
 | 6 session-expired banner | in gym-display #3 |
 | 8 ramp dry run | engine incompatible with the office program — keep retired (see RAMP-RETIRE) |
@@ -132,7 +142,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 ## 6. Backlog (prioritized)
 
-**HEALTH-1 (high) — morning check-in misroute + confabulation loop.** A health check-in ("sleep 7 energy 5 …") is not logged. `detect_health_intent` correctly returns `log_morning_state` and `handle_morning_intent` works (verified: writes `health.daily_state`, returns "Logged: …"). But the LLM classifier returns `general_reply` (0.95), a "Correction re-route" sends it to a confabulating `add_note` path that "learns" fake rules (including rules about its own errors) and captures the wrong message as the note. **Root causes:** (a) deterministic health intent not short-circuiting the LLM classifier; (b) a premature `add_note`/"learning" stub live in routing with no backing store. **Fix:** make positive `detect_health_intent` unoverridable → `handle_morning_intent`; disable/gate the `add_note` stub out of live routing. Verify by re-sending the check-in via Mattermost.
+**HEALTH-1 — morning check-in misroute + confabulation loop — CLOSED 2026-09-19.** Fixed by HEALTH-1 A1/A2 (`add_note` and the "I've learned…" correction re-route removed from live routing) and FRIDAY-1 (the deterministic `morning_flow` handler ahead of the LLM). Verified on a real message: the 9/19 08:12 check-in ("Sleep 9, energy 4, sore 1 right knee, …") was dispatched to `morning_flow` and stored in `health.daily_state` in ~75 ms, no classifier involved; the 08:15 nudge then correctly stayed silent. 9/18 has no check-in because none arrived (only the 05:15 nudge is logged), not a misroute. Follow-ups: CHECKIN-TEXT, CORRECTION-DEADCODE.
 
 **CONFIRM-ARB — confirm-handler arbitration / bare-`yes` disambiguation (medium; own future branch off `main` after feat/health-ramp merges).** Multiple flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its *own* pending-state, and those states are **independent** — several can be live at once. A bare control word is then resolved by fixed `deterministic_chain` order (first-match-wins), which is deterministic but **not** intent-aware: a `yes` meant for flow A can silently execute flow B.
 
@@ -308,7 +318,7 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **OFFICE-WALK — confirm the office-gym inventory in person (medium; blocks the `TODO(office)` values).** The PB-009 inventory came from Ryan's description and has never been checked on the floor — the 45° back extension was listed and doesn't exist. Walk the gym once and confirm every entry against PB-009 / `health_office.py` / gym-display `src/lib/equipment.ts`: each Precor machine exists (and which are combo stations), the Precor pin-stack step per machine (default 10 lb; record overrides in `STEP_OVERRIDES` and `health_regions.STACK_STEP`), the S3.23 functional trainer stack step, the Icarian Smith effective bar weight (`SMITH_BAR_LBS`, currently 0), the Olympic bar weight, the hex dumbbell range (5–45 assumed), the plate set (one each 45/35/25/10/5 per side assumed), benches, captain's chair/dip tower, cardio pieces, Stretch Trainer, balls and mats. Fix anything wrong in code and docs, then reseed the affected rows.
 
-**PB9-CRON — morning prompt times vs office arrival (low).** The PB-009 morning prompt schedule predates the office gym; retime once Ryan's office arrival time is confirmed (TODO in PLAYBOOKS.md).
+**PB9-CRON — weekday morning times vs office arrival (low; Ryan's decision).** The morning is event-driven since FRIDAY-1 and the PLAYBOOKS TODO is gone. What's left: whether the weekday wake (04:30) and check-in nudge (05:15) suit Ryan's office arrival time. Both are config (`WAKE_TIME`, `CHECKIN_NUDGE_OFFSET_MIN`); weekends are already 07:30 / 08:15.
 
 **CRM-2 / COMMIT-1 — two-store seams (medium).** Two contact stores: `public.contacts`/`organizations` (CRM API) vs `public.persons`/`companies` (Write Guard, PB-008). Two commitment stores: `acos.commitments` (personal tracker) vs `public.commitments` (CRM contact/deal-scoped). Both intentional/legitimate, but the boundaries need documenting before the cognition layer reasons over them. `crm status` reads only the `contacts`/`public.commitments` side.
 
@@ -318,7 +328,13 @@ Nothing mid-migration. Next build is **HEALTH-1** (below) — top of backlog.
 
 **CAL-1 — double calendar-audit write (low).** Three create/delete sites now write `acos.calendar_audit` twice (`log_calendar_action` + `_audit_calendar_write`). Dedupe; decide canonical writer.
 
-**SCHEMA-DRIFT — deploy must run migrations (process).** Merging a migration doesn't apply it (016/017 were unapplied for weeks). Add `run_migrations.py` to the deploy path or a scheduled drift check (it's idempotent-safe).
+**SCHEMA-DRIFT — deploy must run migrations (process) — mostly done.** `scripts/deploy.sh` (STAB-1 A5) runs `run_migrations.py` before every restart (032/033 applied that way on 9/18). Left: an optional scheduled drift check for a merge that's never deployed.
+
+**TEST-DB-GUARD — no test may reach production (high, small).** `test_confirm_dispatch` wrote test rows into live `acos.calendar_audit` / `acos.guardrail_violations` whenever run on the box: `os.environ.setdefault("RDS_HOST", …)` keeps the real host once `.env` is sourced (fixed in #104). Ten more test files use the same `setdefault` with no visible DB stub (archive_gate, compound_dispositions, filing_invariant, health_office, log_redaction, opsdiag, scheduler_registry, timezone_command, wake_window, weather) — unproven either way. Fix once for all: `knowledge.db.get_connection` refuses when a test flag is set (set by every test module, or a shared `tests/_db_guard.py`), and a test fails if any test module imports artemis without it.
+
+**CHECKIN-TEXT — check-in free text keeps the leftovers (low).** The 9/19 check-in stored `free_text = ", , sore 1 right knee,"` (9/17: `", , ,"`): separators survive, the soreness phrase is duplicated into free text, and "right" is dropped from the structured `{'knee': 1}`. Strip consumed tokens and separators; decide whether a side belongs in the soreness JSON.
+
+**CORRECTION-DEADCODE — remove `_handle_correction` (low).** Unrouted since HEALTH-1 A2 but still in `artemis/main.py`, including an INSERT into `acos.data_vault_satellites` and the "I've learned that…" reply. Delete it with the tests that reference it.
 
 **VAULT-UNAPPROVE — gated `unapprove <n>` reversal (low).** A gated reversal of an approved vault proposal using its `target_ref` (`commitment:N` / `dossier_entry:N` / `org_note:N`): flip the proposal back to pending and undo/retire the written row. Human-gated (propose-then-confirm); do not build the auto-path. Deferred from OPS-1.
 
