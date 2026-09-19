@@ -163,6 +163,26 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **MAKEUP-1 — a missed session has no path back (small; not urgent).** Since RAMP-RETIRE nothing slides a missed session. Options to spec later: leave it missed (current behaviour), an explicit `@artemis makeup <date>` that moves it to a chosen day, or nothing at all.
 
+**CYCLE-1 — the 14-day location cycle (entry created 2026-09-19).** No CYCLE-1 entry existed in the repo; this one records what Ryan dictated on 2026-09-19, nothing more. Everything below is his, and the open questions at the end are genuinely unanswered — don't fill them in by inference.
+- **Day types and counts per 14 days:** `msp_work` 8, `msp_home` 2, `wi` 3, `travel` 1 (14 total).
+- **The Wisconsin stretch runs continuously** from Thursday evening of week 1 through Monday midday of week 2:
+  | day | where |
+  |---|---|
+  | Thu (wk 1) | office day; leaves in the evening |
+  | Fri | farm (`wi`) |
+  | Sat | Brown Deer (`wi`) |
+  | Sun (wk 2) | Brown Deer → Richfield 17:00 (`wi`) — **Richfield, not MSP** |
+  | Mon (wk 2) | travel Richfield → MSP, leaving 11:00 (`travel`) |
+- **Tue / Wed / Thu are the only days that are office days in both weeks.** That bears on the deferred plan decision.
+- **Overrides:** a date range can set a day type for consecutive days (e.g. Thanksgiving week 2026 = all `wi`), not just single dates. An override **wins over the derived cycle position**, and the cycle **resumes afterwards with no drift**, because position is derived from the anchor rather than counted forward.
+- **Farm gym — a `wi` equipment location:** PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer. The ceiling is **6.5 ft**, which rules out standing overhead work.
+- **Open — ask Ryan, don't infer:**
+  - What CYCLE-1 drives beyond day types (plan seeding, the wake post, the departure checklist, or something else).
+  - The cycle anchor date, and which calendar day is position 0.
+  - What the "deferred plan decision" is.
+  - Which days are the 2 `msp_home` days, and whether Brown Deer and Richfield have equipment of their own or are rest/`wi` days without a gym.
+  - How a `wi` or `travel` day interacts with the Wed–Tue office program week (this is what TRAVEL-1 is about).
+
 **TRAVEL-1 — no travel handling in the office program (small; revisit by early November).** The ramp's travel-week templates are gone and the office program has none. The Paris trip is around Thanksgiving (note: Thanksgiving is Thu 2026-11-26, after this program's 11/03 end, so it lands in the next phase). A travel week needs a hand-chosen substitute: a bodyweight/hotel variant of Strength A/B/C, or Recovery Flows plus walks.
 
 **WATCH-1 — Apple Watch ingest via Health Auto Export (medium; before REPORT-1 so reports can include watch data).**
