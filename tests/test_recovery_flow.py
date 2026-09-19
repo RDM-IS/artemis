@@ -58,10 +58,11 @@ class TestBuilder(unittest.TestCase):
             self.assertEqual(r["blocks"]["close"]["duration_sec"], 180)
         self.assertEqual(thu["blocks"]["location"], "office gym")
         self.assertEqual(sat["blocks"]["location"], "home")
-        self.assertEqual(thu["blocks"]["pre"], [{"name": "Stretch Trainer", "side": None,
-                                                  "duration_sec": 480,
+        self.assertEqual(thu["blocks"]["pre"], [office.FLOW_MEDITATION,
+                                                 {"name": "Stretch Trainer", "side": None,
+                                                  "duration_sec": 480, "posture": "standing",
                                                   "cue": "Follow the 8 placard stretches"}])
-        self.assertEqual(sat["blocks"]["pre"], [])
+        self.assertEqual(sat["blocks"]["pre"], [office.FLOW_MEDITATION])
         self.assertIn("Stretch Trainer", thu["blocks"]["equipment"])
         self.assertNotIn("Stretch Trainer", sat["blocks"]["equipment"])
 
@@ -117,10 +118,72 @@ class TestBuilder(unittest.TestCase):
         self.assertEqual((sum(r1), sum(r2)), (630, 960))
 
     def test_totals(self):
-        # Two full rounds (Ryan, 9/16: time doesn't matter).
-        self.assertEqual(office.flow_total_sec(ROWS[THU]["blocks"]), 2250)   # 37.5 min
-        self.assertEqual(office.flow_total_sec(ROWS[SAT]["blocks"]), 1770)   # 29.5 min
-        self.assertEqual((ROWS[THU]["est_duration_min"], ROWS[SAT]["est_duration_min"]), (38, 30))
+        # Two full rounds (Ryan, 9/16) + 1 min meditation, 3 min savasana and
+        # the transitions (YOGA-3, 9/19).
+        thu, sat = ROWS[THU]["blocks"], ROWS[SAT]["blocks"]
+        self.assertEqual((office.flow_hold_sec(thu), office.flow_transition_total_sec(thu)), (2310, 157))
+        self.assertEqual((office.flow_hold_sec(sat), office.flow_transition_total_sec(sat)), (1830, 150))
+        self.assertEqual(office.flow_total_sec(thu), 2467)   # 41:07
+        self.assertEqual(office.flow_total_sec(sat), 1980)   # 33:00
+        self.assertEqual((thu["total_sec"], sat["total_sec"]), (2467, 1980))
+        self.assertEqual((ROWS[THU]["est_duration_min"], ROWS[SAT]["est_duration_min"]), (42, 33))
+
+
+class TestTransitions(unittest.TestCase):
+    """YOGA-3: 3 s when the body position doesn't change (or floor to floor),
+    5 s when you have to get up or down."""
+
+    def pair(self, a, b):
+        return office.transition_sec(office.FLOW_POSTURE[a], office.FLOW_POSTURE[b])
+
+    def test_named_pairs(self):
+        self.assertEqual(self.pair("Supine twist", "Supine twist"), 3)          # mirror swap
+        self.assertEqual(self.pair("Seated twist", "Seated twist"), 3)
+        self.assertEqual(self.pair("Standing forward bend", "High lunge"), 3)
+        self.assertEqual(self.pair("High lunge", "Crescent lunge"), 3)
+        self.assertEqual(self.pair("Crescent lunge", "Extended puppy"), 5)
+        self.assertEqual(self.pair("Bridge", "Seated side bend"), 5)
+        self.assertEqual(self.pair("Child's pose", "Cobra"), 3)
+        self.assertEqual(self.pair("Cobra", "Child's pose"), 3)                 # prone → kneeling
+        self.assertEqual(self.pair("Child's pose", "Downward dog"), 3)          # kneeling → quadruped
+        self.assertEqual(self.pair("Downward dog", "Standing forward bend"), 5)
+        self.assertEqual(office.transition_sec("seated", "supine"), 5)          # into savasana
+        self.assertEqual(office.transition_sec("seated", "kneeling"), 3)        # round 2 start
+        self.assertEqual(office.transition_sec(None, "seated"), 5)              # unknown → long
+
+    def test_every_pair_in_both_flows_is_3_or_5(self):
+        for day in (THU, SAT):
+            seq = office.flow_sequence(ROWS[day]["blocks"])
+            self.assertTrue(all(i["posture"] in office.FLOW_POSTURES for i in seq))
+            self.assertEqual({i["transition_sec"] for i in seq}, {3, 5})
+        thu = office.flow_sequence(ROWS[THU]["blocks"])
+        self.assertEqual([(i["name"], i["transition_sec"]) for i in thu[:3]],
+                         [("Seated meditation", 5), ("Stretch Trainer", 5), ("Child's pose", 5)])
+        r2 = next(i for i in thu if i.get("round") == 2)
+        self.assertEqual((r2["name"], r2["transition_sec"]), ("Child's pose", 3))  # easy pose → child's
+        self.assertEqual((thu[-1]["name"], thu[-1]["transition_sec"]), ("Savasana", 5))
+        sat = office.flow_sequence(ROWS[SAT]["blocks"])
+        self.assertEqual([(i["name"], i["transition_sec"]) for i in sat[:2]],
+                         [("Seated meditation", 5), ("Child's pose", 3)])
+
+    def test_meditation_first_savasana_last_breathing_stays_in_rounds(self):
+        for day in (THU, SAT):
+            b = ROWS[day]["blocks"]
+            self.assertEqual(b["pre"][0]["name"], "Seated meditation")
+            self.assertEqual(b["pre"][0]["duration_sec"], 60)
+            self.assertEqual((b["close"]["name"], b["close"]["duration_sec"]), ("Savasana", 180))
+            self.assertEqual(b["flow"][-1]["name"], "Easy pose")
+            self.assertEqual((b["transition_short_sec"], b["transition_long_sec"], b["leadin_sec"]), (3, 5, 3))
+        self.assertEqual(next(s for s in ROWS[SAT]["blocks"]["flow"] if s["step"] == "3")["spoken"],
+                         "Downward facing dog")
+
+    def test_a_pose_without_a_posture_fails_validation(self):
+        import copy
+        b = copy.deepcopy(ROWS[SAT]["blocks"])
+        b["flow"][0]["posture"] = None
+        with self.assertRaises(office.FlowError) as cm:
+            office.validate_flow(b)
+        self.assertIn("posture", str(cm.exception))
 
 
 class TestProgramState(unittest.TestCase):
@@ -195,8 +258,8 @@ class TestReseedDiff(unittest.TestCase):
                                      "display_name": "Rest / Mobility"} for r in rows}
         lines = rs.flow_diff_lines(existing, rows)
         self.assertIn("2026-09-19 Sat p1 wk1  rest_mobility  Rest / Mobility", lines[2])
-        self.assertIn("recovery_flow  Recovery Flow · home · 30 min · RPE 2", lines[2])
-        self.assertIn("Recovery Flow · office gym · 38 min · RPE 2", lines[3])
+        self.assertIn("recovery_flow  Recovery Flow · home · 33 min · RPE 2", lines[2])
+        self.assertIn("Recovery Flow · office gym · 42 min · RPE 2", lines[3])
         self.assertEqual(lines[-2], "13 Recovery Flow rows rewritten; no other dates touched.")
         self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
@@ -301,15 +364,18 @@ class TestWakePost(unittest.TestCase):
     def test_plan_exact_list_with_total(self):
         from artemis import wake
         lines = wake.flow_lines(ROWS[THU]["blocks"])
-        self.assertEqual(lines[0], "\U0001f9d8 Today: **Recovery Flow** (office gym) — 37:30 total, hands-free.")
-        self.assertEqual(lines[1], "· Stretch Trainer — 8 min: Follow the 8 placard stretches")
-        self.assertTrue(lines[2].startswith("· Round 1 (10:30): Child's pose 30s · Cobra 30s · Downward dog 60s"))
-        self.assertIn("High lunge R 30s", lines[2])
-        self.assertIn("Seated side bend L 30s · Seated side bend R 30s", lines[2])
-        self.assertEqual(lines[3], "· Round 2 (16 min): same order; bridge → easy pose held 2×")
-        self.assertEqual(lines[4], "· Close: easy pose breathing — 3 min")
+        self.assertEqual(lines[0], "\U0001f9d8 Today: **Recovery Flow** (office gym) — 41:07 total, hands-free.")
+        self.assertEqual(lines[1], "· Seated meditation — 1 min: Sit tall and comfortable, eyes soft, slow breaths.")
+        self.assertEqual(lines[2], "· Stretch Trainer — 8 min: Follow the 8 placard stretches")
+        self.assertTrue(lines[3].startswith("· Round 1 (10:30): Child's pose 30s · Cobra 30s · Downward dog 60s"))
+        self.assertIn("High lunge R 30s", lines[3])
+        self.assertIn("Seated side bend L 30s · Seated side bend R 30s", lines[3])
+        self.assertEqual(lines[4], "· Round 2 (16 min): same order; bridge → easy pose held 2×")
+        self.assertEqual(lines[5], "· Close: savasana — 3 min")
+        self.assertEqual(lines[6], "· Moving between poses: 2:37 in all (included in the total)")
         home = wake.flow_lines(ROWS[SAT]["blocks"])
-        self.assertEqual(home[0], "\U0001f9d8 Today: **Recovery Flow** (home) — 29:30 total, hands-free.")
+        self.assertEqual(home[0], "\U0001f9d8 Today: **Recovery Flow** (home) — 33 min total, hands-free.")
+        self.assertEqual(home[-1], "· Moving between poses: 2:30 in all (included in the total)")
         self.assertFalse(any("Stretch Trainer" in l for l in home))
 
     def test_wake_message_has_no_workout_later_wording(self):
@@ -318,7 +384,7 @@ class TestWakePost(unittest.TestCase):
         from zoneinfo import ZoneInfo
         for row in (ROWS[THU],
                     # Tonight's 9/17 row: rest_mobility carrying flow blocks.
-                    {**rest_row(THU), "blocks": ROWS[THU]["blocks"], "est_duration_min": 38}):
+                    {**rest_row(THU), "blocks": ROWS[THU]["blocks"], "est_duration_min": 42}):
             with patch("artemis.health.get_today_plan", return_value=row), \
                  patch.object(wake, "_weather_line", return_value=None), \
                  patch.object(wake, "_depart_commitments", return_value=[]), \
@@ -327,7 +393,7 @@ class TestWakePost(unittest.TestCase):
                               return_value=dt(2026, 9, 17, 4, 30, tzinfo=ZoneInfo("America/Chicago"))), \
                  patch.object(wake, "local_today", return_value=THU):
                 text = wake.build_wake_message(calendar=None, held_health=[])
-            self.assertIn("**Recovery Flow** (office gym) — 37:30 total", text)
+            self.assertIn("**Recovery Flow** (office gym) — 41:07 total", text)
             self.assertIn("Round 2 (16 min)", text)
             self.assertNotIn("workout is later", text.lower())
             self.assertEqual(wake.prompt_type_for(row), "logging_only")
