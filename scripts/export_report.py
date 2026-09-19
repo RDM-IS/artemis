@@ -252,11 +252,9 @@ def no_load_label(name: str | None) -> str:
 
 
 def settings_in(notes: str | None) -> str | None:
-    for part in (notes or "").split(";"):
-        part = part.strip()
-        if part.lower().startswith("setting="):
-            return part.split("=", 1)[1].strip()
-    return None
+    """"seat 4 · pad 3" from a set's notes (legacy ``setting=N`` reads as seat)."""
+    from knowledge.machine_setup import format_setup, parse_setup
+    return format_setup(parse_setup(notes)) or None
 
 
 _SIDE_MAPS = ("pain", "sides", "pain_sides")

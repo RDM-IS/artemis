@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 from artemis import config
 
 from artemis import health_office as _office
+from knowledge.machine_setup import with_setup_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +249,8 @@ Return ONLY valid JSON matching this schema, no other text:
       "hr_peak": int or null,
       "notes": "string or null",
       "user_suggestion": "string or null",
-      "is_skipped": false
+      "is_skipped": false,
+      "source_text": "string or null"
     }
   ],
   "session_summary": {
@@ -281,6 +283,11 @@ RULES:
   HR for the whole session, plus overall RPE and any free-text. If the paste
   gives overall walk RPE + run RPE, put both in notes verbatim
   (e.g. "walk RPE 4, run RPE 9; runs uphill / walks downhill, felt good").
+- source_text: the exact words of the input that are about this row, copied
+  VERBATIM (same spelling, same order), e.g. "leg press 12 at 180 seat 4, pin 7
+  RPE 7". Do not rewrite it.
+- Machine positions ("seat 4", "back pad 3", "pin 7", "range 2") belong in
+  source_text only — do not turn them into numbers anywhere else.
 - User suggestions for plan changes ("next time take it down", "modify reverse
   lunge next time", "60 seconds is too short") → user_suggestion VERBATIM.
 
@@ -401,6 +408,32 @@ def _convert_units(row: dict) -> dict:
     return out
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def _setup_spans(text: str, rows: list[dict]) -> list[str | None]:
+    """The slice of the debrief that belongs to each row, for MACHINE-SETUP.
+
+    Prefers the LLM's ``source_text`` but only when it really occurs in the
+    input; otherwise falls back to the text from where the exercise's name
+    appears up to the next row's name. No span → no setup for that row."""
+    t = _norm(text)
+    starts = [t.find(_norm(r.get("exercise") or "")) if r.get("exercise") else -1 for r in rows]
+    found = sorted(i for i in starts if i >= 0)
+    spans: list[str | None] = []
+    for r, start in zip(rows, starts):
+        src = _norm(r.get("source_text") or "")
+        if src and src in t:
+            spans.append(src)
+        elif start >= 0:
+            end = next((i for i in found if i > start), len(t))
+            spans.append(t[start:end])
+        else:
+            spans.append(None)
+    return spans
+
+
 def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseReport]:
     """Parse free-form workout debrief (strength OR cardio) into structured rows.
 
@@ -423,8 +456,14 @@ def parse_workout_debrief(text: str, plan: dict | None = None) -> list[ExerciseR
     reports: list[ExerciseReport] = []
 
     # Per-exercise / per-segment rows
-    for ex in data.get("exercises", []):
+    rows = data.get("exercises", [])
+    spans = _setup_spans(text, rows)
+    for ex, span in zip(rows, spans):
         ex.setdefault("is_skipped", False)
+        ex.pop("source_text", None)
+        # MACHINE-SETUP: positions are read by regex from the user's own words,
+        # never from a number the LLM produced.
+        ex["notes"] = with_setup_tokens(ex.get("notes"), span)
         reports.append(ExerciseReport(**_convert_units(ex)))
 
     # Session summary row — carries the overall totals (duration/distance/HR).
