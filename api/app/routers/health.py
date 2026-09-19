@@ -48,6 +48,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from knowledge.machine_setup import parse_setup
+
 from ..database import get_db
 
 router = APIRouter()
@@ -826,8 +828,8 @@ class LastLoggedEntry(BaseModel):
     distance_m: Optional[float] = None
     hr_avg: Optional[int] = None
     hr_peak: Optional[int] = None
-    # Per-set notes of that row — gym-display parses `setting=<n>` from it to
-    # prefill the machine seat/pin field.
+    # Per-set notes of that row — gym-display parses `seat=/pad=/range=` (and a
+    # legacy `setting=<n>`) from it to prefill the machine setup fields.
     notes: Optional[str] = None
 
 
@@ -1423,7 +1425,6 @@ OVERVIEW_WEIGHT_DAYS = 30
 TREND_TOLERANCE = 0.02          # ±2% of load × reps counts as flat
 
 _PAIN_NOTE_RE = re.compile(r"(?:^|;)\s*pain=([a-z][a-z ]*?)\s*:\s*(\d)\s*(?=;|$)", re.I)
-_SETTING_NOTE_RE = re.compile(r"(?:^|;)\s*setting=(-?\d+(?:\.\d+)?)\s*(?=;|$)")
 
 
 class ProgramInfo(BaseModel):
@@ -1484,7 +1485,8 @@ class StrengthProgressRow(BaseModel):
     previous: Optional[TopSet] = None
     best: Optional[TopSet] = None
     trend: Optional[str] = None     # "up" | "flat" | "down"
-    setting: Optional[float] = None
+    setting: Optional[float] = None     # = setup["seat"]; kept for older gym-display builds
+    setup: Optional[dict[str, float]] = None   # MACHINE-SETUP: {"seat": 4, "pad": 3, "range": 2}
 
 
 class PatternOut(BaseModel):
@@ -1660,7 +1662,7 @@ def strength_progress(names: list[str], rows: list[dict[str, Any]]) -> list[Stre
     """Pure: rows = [{exercise, plan_date, weight_lbs, reps_done, notes}] (real,
     non-skipped strength sets in the program window)."""
     by_ex: dict[str, dict[date, dict[str, Any]]] = {}
-    settings: dict[str, tuple[date, float]] = {}
+    settings: dict[str, tuple[date, dict[str, float]]] = {}
     for r in rows:
         ex, d = r["exercise"], r["plan_date"]
         sc = _score(r.get("weight_lbs"), r.get("reps_done"))
@@ -1668,18 +1670,19 @@ def strength_progress(names: list[str], rows: list[dict[str, Any]]) -> list[Stre
         if cur is None or sc > cur["score"]:
             by_ex[ex][d] = {"date": d, "weight_lbs": float(r["weight_lbs"]) if r.get("weight_lbs") is not None else None,
                             "reps": r.get("reps_done"), "score": sc}
-        m = _SETTING_NOTE_RE.search(r.get("notes") or "")
-        if m and (ex not in settings or d >= settings[ex][0]):
-            settings[ex] = (d, float(m.group(1)))
+        setup = parse_setup(r.get("notes"))
+        if setup and (ex not in settings or d >= settings[ex][0]):
+            settings[ex] = (d, {k: float(v) for k, v in setup.items()})
     out = []
     for name in names:
         sessions = sorted(by_ex.get(name, {}).values(), key=lambda x: x["date"])
         last = TopSet(**sessions[-1]) if sessions else None
         prev = TopSet(**sessions[-2]) if len(sessions) > 1 else None
         best = TopSet(**max(sessions, key=lambda x: (x["score"], x["date"]))) if sessions else None
+        setup = settings.get(name, (None, None))[1]
         out.append(StrengthProgressRow(
             exercise=name, sessions=len(sessions), last=last, previous=prev, best=best,
-            trend=trend_of(last, prev), setting=settings.get(name, (None, None))[1]))
+            trend=trend_of(last, prev), setup=setup, setting=(setup or {}).get("seat")))
     return out
 
 

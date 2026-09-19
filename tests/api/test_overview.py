@@ -306,6 +306,7 @@ class TestStrengthProgress(Base):
         self.assertIsNone(lp["previous"])
         self.assertIsNone(lp["trend"])
         self.assertEqual(lp["setting"], 4.0)
+        self.assertEqual(lp["setup"], {"seat": 4.0})          # legacy setting=N → seat
         self.assertEqual(rows["Incline DB press"]["setting"], 2.0)
         self.assertEqual(rows["Pec fly"]["sessions"], 0)
         self.assertIsNone(rows["Pec fly"]["last"])
@@ -338,8 +339,27 @@ class TestStrengthProgress(Base):
         self.assertEqual(lp.trend, "down")
         self.assertEqual((lp.best.date, lp.best.score), (d2, 2160.0))
         self.assertEqual(lp.setting, 5.0)
+        self.assertEqual(lp.setup, {"seat": 5.0})
         self.assertEqual(lp.sessions, 3)
         self.assertEqual(out["Captain's chair knee raise"].trend, "up")
+
+
+class TestMachineSetup(unittest.TestCase):
+    def test_named_positions_latest_day_wins(self):
+        from api.app.routers.health import strength_progress
+        d1, d2 = date(2026, 9, 16), date(2026, 9, 23)
+        rows = [
+            {"exercise": "Lat pulldown", "plan_date": d1, "weight_lbs": 70, "reps_done": 12,
+             "notes": "seat=4; pad=2"},
+            {"exercise": "Lat pulldown", "plan_date": d2, "weight_lbs": 75, "reps_done": 12,
+             "notes": "finisher; seat=5; pad=2; range=3; pain=shoulder:2"},
+            {"exercise": "Leg press", "plan_date": d2, "weight_lbs": 180, "reps_done": 12, "notes": "machine taken"},
+        ]
+        out = {r.exercise: r for r in strength_progress(["Lat pulldown", "Leg press"], rows)}
+        self.assertEqual(out["Lat pulldown"].setup, {"seat": 5.0, "pad": 2.0, "range": 3.0})
+        self.assertEqual(out["Lat pulldown"].setting, 5.0)
+        self.assertIsNone(out["Leg press"].setup)
+        self.assertIsNone(out["Leg press"].setting)
 
 
 class TestPatternsFlagsWeight(Base):
