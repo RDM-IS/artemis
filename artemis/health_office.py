@@ -154,7 +154,9 @@ CYCLE_LOCATION = {
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
 
 # SCHEDULE-2: lift on the 1st, 3rd and 4th OFFICE day of each cycle week —
-# wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C in order. Every other day is
+# wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C in order. That puts B and C
+# back to back once a week; Ryan accepted that deliberately (test asserts
+# exactly 6 such pairs, one per program week). Every other day is
 # a flow, Z2 or a walk, chosen so wi and travel days only ever get sessions
 # that need no gym.
 LIFT_SLOTS = (1, 3, 4)             # 1-based office-day positions within a cycle week
@@ -162,14 +164,18 @@ LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
 # Non-lifting days, by cycle position. Z2 stays at the office (Richfield's
 # rower and trainer could take it — see LOCATION-1 — but nothing depends on
 # that here). Flows need only a mat; walks go outside anywhere.
+# Ryan, 2026-09-19: Z2 sits on the office non-lift days, where the equipment is
+# reliable; the flows sit on the wi days because a mat travels. Richfield's
+# rower and trainer stay available for extra cardio if he wants it — the
+# SEEDED session there is a flow.
 NON_LIFT = {
     0: "recovery_flow",   # Sun, msp_home — mat
-    2: "recovery_flow",   # Tue, office — the Stretch Trainer variant
-    5: "cardio_z2",       # Fri, Richfield — rower / bike on the trainer
+    2: "cardio_z2",       # Tue, office — treadmill / elliptical
+    5: "recovery_flow",   # Fri, Richfield — mat
     6: "walk",            # Sat, Brown Deer
-    7: "cardio_z2",       # Sun, Richfield — rower / bike on the trainer
+    7: "recovery_flow",   # Sun, Richfield — mat
     8: "walk",            # Mon, travel — leaves 11:00
-    10: "recovery_flow",  # Wed, office — the Stretch Trainer variant
+    10: "cardio_z2",      # Wed, office — treadmill / elliptical
     13: "recovery_flow",  # Sat, msp_home — mat
 }
 

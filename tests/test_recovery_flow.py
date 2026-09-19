@@ -26,11 +26,15 @@ from test_checkin_adjust import FakeDB, office_row, rest_row  # noqa: E402
 from artemis import health_checkin as hc  # noqa: E402
 from artemis import health_office as office  # noqa: E402
 
-# SCHEDULE-2: the office flow is Tue (Stretch Trainer), the mat flow Sat (home).
-THU = date(2026, 9, 22)   # Tue, office — kept the name to limit churn
-SAT = date(2026, 10, 3)   # Sat, msp_home — the mat flow
+# SCHEDULE-2 (Ryan, 2026-09-19): the flows travel — Richfield and msp_home,
+# mat only. No office flow is scheduled any more, so the Stretch Trainer
+# variant is built directly (OFFICE_FLOW) rather than read off a plan row.
+THU = date(2026, 9, 25)   # Fri, Richfield — mat flow (name kept to limit churn)
+SAT = date(2026, 10, 3)   # Sat, msp_home — mat flow
 NOW = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
 ROWS = {r["plan_date"]: r for r in office.build_rows()}
+# The office (Stretch Trainer) variant, still supported by the builder.
+OFFICE_FLOW = office._recovery_flow(office.LOCATION)[0]
 
 
 def _reseed():
@@ -48,7 +52,7 @@ def flow(**over) -> dict:
 
 
 class TestBuilder(unittest.TestCase):
-    def test_thu_office_and_sat_home(self):
+    def test_flow_variants(self):
         thu, sat = ROWS[THU], ROWS[SAT]
         for r in (thu, sat):
             self.assertEqual(r["session_type"], "recovery_flow")
@@ -57,15 +61,18 @@ class TestBuilder(unittest.TestCase):
             self.assertEqual(r["blocks"]["rounds"], 2)
             self.assertEqual(len(r["blocks"]["flow"]), 20)
             self.assertEqual(r["blocks"]["close"]["duration_sec"], 180)
-        self.assertEqual(thu["blocks"]["location"], "office gym")
+        self.assertEqual(thu["blocks"]["location"], "Richfield")
         self.assertEqual(sat["blocks"]["location"], "home")
-        self.assertEqual(thu["blocks"]["pre"], [office.FLOW_MEDITATION,
-                                                 {"name": "Stretch Trainer", "side": None,
-                                                  "duration_sec": 480, "posture": "standing",
-                                                  "cue": "Follow the 8 placard stretches"}])
-        self.assertEqual(sat["blocks"]["pre"], [office.FLOW_MEDITATION])
-        self.assertIn("Stretch Trainer", thu["blocks"]["equipment"])
-        self.assertNotIn("Stretch Trainer", sat["blocks"]["equipment"])
+        # Both seeded flows are the mat variant; no Stretch Trainer travels.
+        for r in (thu, sat):
+            self.assertEqual(r["blocks"]["pre"], [office.FLOW_MEDITATION])
+            self.assertNotIn("Stretch Trainer", r["blocks"]["equipment"])
+        # …but the office variant still builds, for a flow run at the office.
+        self.assertEqual(OFFICE_FLOW["pre"], [office.FLOW_MEDITATION,
+                                              {"name": "Stretch Trainer", "side": None,
+                                               "duration_sec": 480, "posture": "standing",
+                                               "cue": "Follow the 8 placard stretches"}])
+        self.assertIn("Stretch Trainer", OFFICE_FLOW["equipment"])
 
     def test_flow_days_follow_the_cycle(self):
         """SCHEDULE-2: flows land on the office non-lift day (Stretch Trainer
@@ -82,7 +89,7 @@ class TestBuilder(unittest.TestCase):
         by_type = {}
         for d in ROWS:
             by_type.setdefault(office.day_type(d), set()).add(ROWS[d]["session_type"])
-        self.assertEqual(by_type["wi"], {"cardio_z2", "walk"})
+        self.assertEqual(by_type["wi"], {"recovery_flow", "walk"})
         self.assertEqual(by_type["travel"], {"walk"})
 
     def test_steps_match_the_table(self):
@@ -131,13 +138,14 @@ class TestBuilder(unittest.TestCase):
     def test_totals(self):
         # Two full rounds (Ryan, 9/16) + 1 min meditation, 3 min savasana and
         # the transitions (YOGA-3, 9/19).
-        thu, sat = ROWS[THU]["blocks"], ROWS[SAT]["blocks"]
+        thu, sat = OFFICE_FLOW, ROWS[SAT]["blocks"]
         self.assertEqual((office.flow_hold_sec(thu), office.flow_transition_total_sec(thu)), (2310, 157))
         self.assertEqual((office.flow_hold_sec(sat), office.flow_transition_total_sec(sat)), (1830, 150))
         self.assertEqual(office.flow_total_sec(thu), 2467)   # 41:07
         self.assertEqual(office.flow_total_sec(sat), 1980)   # 33:00
         self.assertEqual((thu["total_sec"], sat["total_sec"]), (2467, 1980))
-        self.assertEqual((ROWS[THU]["est_duration_min"], ROWS[SAT]["est_duration_min"]), (42, 33))
+        # Every seeded flow is now the 33 min mat variant.
+        self.assertEqual((ROWS[THU]["est_duration_min"], ROWS[SAT]["est_duration_min"]), (33, 33))
 
 
 class TestTransitions(unittest.TestCase):
@@ -167,7 +175,7 @@ class TestTransitions(unittest.TestCase):
             seq = office.flow_sequence(ROWS[day]["blocks"])
             self.assertTrue(all(i["posture"] in office.FLOW_POSTURES for i in seq))
             self.assertEqual({i["transition_sec"] for i in seq}, {3, 5})
-        thu = office.flow_sequence(ROWS[THU]["blocks"])
+        thu = office.flow_sequence(OFFICE_FLOW)
         self.assertEqual([(i["name"], i["transition_sec"]) for i in thu[:3]],
                          [("Seated meditation", 5), ("Stretch Trainer", 5), ("Child's pose", 5)])
         r2 = next(i for i in thu if i.get("round") == 2)
@@ -214,7 +222,7 @@ class TestProgramState(unittest.TestCase):
 
 class TestSideValidator(unittest.TestCase):
     def test_real_flow_passes(self):
-        office.validate_flow(ROWS[THU]["blocks"])
+        office.validate_flow(OFFICE_FLOW)
         office.validate_rows(list(ROWS.values()))
 
     def test_rejects_a_missing_side(self):
@@ -262,9 +270,9 @@ class TestReseedDiff(unittest.TestCase):
         rows = rs.flow_rows(date(2026, 9, 19))
         # SCHEDULE-2 flow days: the office non-lift day + the msp_home Sat/Sun.
         self.assertEqual([r["plan_date"].isoformat() for r in rows], [
-            "2026-09-20", "2026-09-22", "2026-09-30", "2026-10-03",
-            "2026-10-04", "2026-10-06", "2026-10-14", "2026-10-17",
-            "2026-10-18", "2026-10-20", "2026-10-28", "2026-10-31"])
+            "2026-09-20", "2026-09-25", "2026-09-27", "2026-10-03",
+            "2026-10-04", "2026-10-09", "2026-10-11", "2026-10-17",
+            "2026-10-18", "2026-10-23", "2026-10-25", "2026-10-31"])
         self.assertTrue(all(office.session_for(r["plan_date"]) == "recovery_flow" for r in rows))
         existing = {r["plan_date"]: {"phase": 1, "week_num": r["week_num"],
                                      "session_type": "rest_mobility",
@@ -272,7 +280,7 @@ class TestReseedDiff(unittest.TestCase):
         lines = rs.flow_diff_lines(existing, rows)
         self.assertIn("2026-09-20 Sun", lines[2])
         self.assertIn("recovery_flow  Recovery Flow · home · 33 min · RPE 2", lines[2])
-        self.assertIn("Recovery Flow · office gym · 42 min · RPE 2", lines[3])
+        self.assertIn("Recovery Flow · Richfield · 33 min · RPE 2", lines[3])
         self.assertEqual(lines[-2], "12 Recovery Flow rows rewritten; no other dates touched.")
         self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
@@ -376,7 +384,7 @@ class TestNudgeAndFollowups(unittest.TestCase):
 class TestWakePost(unittest.TestCase):
     def test_plan_exact_list_with_total(self):
         from artemis import wake
-        lines = wake.flow_lines(ROWS[THU]["blocks"])
+        lines = wake.flow_lines(OFFICE_FLOW)
         self.assertEqual(lines[0], "\U0001f9d8 Today: **Recovery Flow** (office gym) — 41:07 total, hands-free.")
         self.assertEqual(lines[1], "· Seated meditation — 1 min: Sit tall and comfortable, eyes soft, slow breaths.")
         self.assertEqual(lines[2], "· Stretch Trainer — 8 min: Follow the 8 placard stretches")
@@ -406,7 +414,7 @@ class TestWakePost(unittest.TestCase):
                               return_value=dt(2026, 9, 17, 4, 30, tzinfo=ZoneInfo("America/Chicago"))), \
                  patch.object(wake, "local_today", return_value=THU):
                 text = wake.build_wake_message(calendar=None, held_health=[])
-            self.assertIn("**Recovery Flow** (office gym) — 41:07 total", text)
+            self.assertIn("**Recovery Flow** (Richfield) — 33 min total", text)
             self.assertIn("Round 2 (16 min)", text)
             self.assertNotIn("workout is later", text.lower())
             self.assertEqual(wake.prompt_type_for(row), "logging_only")

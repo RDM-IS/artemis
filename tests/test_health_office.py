@@ -90,7 +90,8 @@ class TestSchedule(unittest.TestCase):
 
     def test_exactly_one_back_to_back_pair_per_week(self):
         """SCHEDULE-2's 1st/3rd/4th office-day rule puts two lifts together:
-        Wed+Thu in cycle week 1, Thu+Fri in week 2. Recorded, not accidental."""
+        Wed+Thu in cycle week 1, Thu+Fri in week 2. ACCEPTED AND INTENTIONAL
+        (Ryan, 2026-09-19) — this test pins it so it can't drift silently."""
         pairs = []
         by_date = sorted(_BY_DATE)
         for a, b in zip(by_date, by_date[1:]):
@@ -104,9 +105,9 @@ class TestSchedule(unittest.TestCase):
 
     def test_weekly_pattern_and_weeks(self):
         # Sun..Sat. Odd cycle weeks lift Mon/Wed/Thu, even ones Tue/Thu/Fri.
-        odd = ["recovery_flow", "strength_a", "recovery_flow", "strength_b",
-               "strength_c", "cardio_z2", "walk"]
-        even = ["cardio_z2", "walk", "strength_a", "recovery_flow", "strength_b",
+        odd = ["recovery_flow", "strength_a", "cardio_z2", "strength_b",
+               "strength_c", "recovery_flow", "walk"]
+        even = ["recovery_flow", "walk", "strength_a", "cardio_z2", "strength_b",
                 "strength_c", "recovery_flow"]
         for wk in range(2, 8):
             pattern = odd if (wk % 2 == 0) else even
@@ -243,8 +244,8 @@ class TestResolver(unittest.TestCase):
         r = health.resolve_equipment_and_location(
             "cardio_z2", weather={"temp_f": 20.0, "precip_next_90min": True},
             blocks=next(x for x in _ROWS if x["session_type"] == "cardio_z2")["blocks"])
-        # SCHEDULE-2: Z2 runs at Richfield (rower / bike on the trainer).
-        self.assertEqual(r["location"], "Richfield")
+        # SCHEDULE-2: Z2 runs at the office; the flows are what travel.
+        self.assertEqual(r["location"], "office gym")
         self.assertIsNone(r["notes"])
 
     def test_walk_weather_still_applies(self):

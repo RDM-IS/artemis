@@ -1643,7 +1643,11 @@ class ArtemisScheduler:
             logger.exception("Health review failed")
 
     def job_weekly_eval(self):
-        """Sun 08:35 local — the EVAL-1 week-so-far post (Wed-Sat, partial).
+        """Sun 08:35 local — the EVAL-1 post for the week that just ENDED.
+
+        SCHEDULE-2 moved program weeks to Sun..Sat, so Sunday 08:35 sits just
+        after a week closes: the post covers that complete Sun..Sat week, not
+        a partial. (Before, weeks ran Wed..Tue and Sunday was mid-week.)
 
         Read-only and data only: counts, effort vs cap, load change, missed
         sessions, adjustments. No recommendations. Open phase only."""
@@ -1653,10 +1657,10 @@ class ArtemisScheduler:
         try:
             from artemis import health_eval
             today = _local_today()
-            start, end = health_eval.week_of(today)
+            # The week that ended yesterday (Sat), reported complete.
+            start, end = health_eval.week_of(today - timedelta(days=1))
             result = health_eval.load(start, end, today=today)
-            # Week to date = Wed–Sat: Sunday's session is still ahead at 08:35.
-            lines = health_eval.render_lines(result, through=today - timedelta(days=1))
+            lines = health_eval.render_lines(result)
             self.mm.post_message(config.CHANNEL_OPS, "\U0001f4ca " + "\n".join(lines))
         except Exception:
             logger.exception("Weekly eval failed")

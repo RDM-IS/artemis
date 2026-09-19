@@ -201,7 +201,7 @@ class TestLadder(Base):
         self.assertTrue(reply.startswith("Pain knee 3/5 → swapped DB goblet squat → "), reply)
 
     def test_p3_legs_on_a_z2_day_is_a_mobility_day(self):
-        tue = date(2026, 9, 25)   # SCHEDULE-2: Z2 is the Richfield Friday
+        tue = date(2026, 9, 22)   # SCHEDULE-2: Z2 is the office Tuesday
         self.db = FakeDB(office_row(tue, plan_id=108))
         self.cur = self.db.cursor()
         self.checkin("legs pain 3", day=tue)

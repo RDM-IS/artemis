@@ -481,7 +481,7 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertNotIn("adjustment", db.plan[thu]["blocks"])
 
     def test_z2_day_recovery_cuts_duration(self):
-        tue = date(2026, 9, 25)   # SCHEDULE-2: Z2 is the Richfield Friday
+        tue = date(2026, 9, 22)   # SCHEDULE-2: Z2 is the office Tuesday
         db = FakeDB(office_row(tue, plan_id=109))
         hc.process_checkin(db.cursor(), "slept 4 energy 3", tue, checkin_id="x", adjust=True)
         self.assertEqual(db.plan[tue]["blocks"]["duration_min"], 15)   # 20 → 15
@@ -520,7 +520,7 @@ class TestFlows(unittest.TestCase):
     def test_nudge_text(self):
         self.assertEqual(hc.nudge_text(office_row(FRI)), "No check-in yet — run Session B as written.")
         self.assertIsNone(hc.nudge_text(rest_row(date(2026, 9, 17))))     # rest day
-        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 22))),     # YOGA-1 flow day
+        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 25))),     # YOGA-1 flow day
                          "No check-in yet — run Recovery Flow as written.")
         self.assertIsNone(hc.nudge_text(None))
 

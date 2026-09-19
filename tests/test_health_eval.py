@@ -120,14 +120,16 @@ class TestWeek(unittest.TestCase):
 
 
 class TestSundaySpan(unittest.TestCase):
-    def test_sunday_post_names_wed_to_sat(self):
-        sun = date(2026, 9, 20)
-        r = ev.evaluate(plans(), full_week_logs()[:4], [], start=WED, end=TUE, today=sun)
-        first = ev.render_lines(r, through=sun - timedelta(days=1))[0]
-        self.assertTrue(first.startswith("Week 1 (Wed 9/16 – Sat 9/19, partial)"), first)
-        # Saturday's unlogged flow is missed; Sunday's walk is still to come
-        self.assertEqual(r["missed"], [{"date": "2026-09-19", "label": "recovery_flow"}])
-        self.assertEqual([x["status"] for x in r["sessions"]][4], "today")
+    def test_sunday_post_covers_the_week_that_just_ended(self):
+        """SCHEDULE-2: weeks are Sun..Sat, so the Sunday 08:35 post reports the
+        COMPLETE week that ended yesterday — not a partial."""
+        sun = date(2026, 9, 20)                      # the day the post runs
+        start, end = ev.week_of(sun - timedelta(days=1))
+        self.assertEqual((start, end), (date(2026, 9, 16), date(2026, 9, 19)))
+        # the week is complete when the post runs the day after it ends
+        r = ev.evaluate(plans(start=start), full_week_logs(), [], start=start, end=end, today=sun)
+        self.assertFalse(r["week"]["partial"])       # nothing is still ahead
+        self.assertNotIn("partial", ev.render_lines(r)[0])
 
 
 class TestLoads(unittest.TestCase):
