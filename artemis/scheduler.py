@@ -1111,9 +1111,24 @@ class ArtemisScheduler:
             logger.debug("ws watchdog job failed", exc_info=True)
 
     def job_update_check(self):
-        """Check GitHub for new commits and post if an update is available."""
+        """Mon 08:00 — two independent checks, each silent when all is well:
+        a newer commit on GitHub, and SCHEMA-DRIFT (migrations on disk vs
+        acos.schema_migrations)."""
         if not self._is_open():
             return
+        self._check_github_update()
+        self._check_schema_drift()
+
+    def _check_schema_drift(self):
+        try:
+            from artemis.schema_drift import check
+            msg = check()
+            if msg:
+                self._post(config.CHANNEL_OPS, msg)
+        except Exception:
+            logger.exception("Schema drift check failed")
+
+    def _check_github_update(self):
         try:
             from artemis.version import get_commit_hash, get_latest_github_version
 
