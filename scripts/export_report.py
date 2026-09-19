@@ -41,6 +41,7 @@ NOT_TRACKED = "not yet tracked"
 OUT_DIR = Path("/tmp")
 
 from artemis.health_eval import EXERCISE_ALIASES  # noqa: E402  (one alias list)
+from artemis.health_office import format_estimate  # noqa: E402  (TIME-CAP wording)
 
 FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
               "strength_c": "DB Romanian deadlift"}
@@ -194,6 +195,24 @@ def logged_span_min(logs: list[dict]) -> int | None:
     if len(ts) < 2:
         return None
     return round((max(ts) - min(ts)).total_seconds() / 60)
+
+
+SPAN_NOTE = "logged span = first → last logged entry; excludes warm-up and cool-down"
+
+
+def planned_vs_logged(data: "Data") -> str | None:
+    """TIME-CAP calibration: planned estimate vs logged span over done sessions
+    that have both, so the estimate can be checked against reality."""
+    pairs = []
+    for p in data.plans:
+        span = logged_span_min(logs_for(data, p["plan_id"]))
+        if day_status(data, p) == "done" and span is not None and p.get("est_duration_min"):
+            pairs.append((int(p["est_duration_min"]), span))
+    if not pairs:
+        return None
+    avg = lambda xs: round(sum(xs) / len(xs))  # noqa: E731
+    return (f"Planned vs logged: planned avg {avg([a for a, _ in pairs])} min, logged span avg "
+            f"{avg([b for _, b in pairs])} min over {len(pairs)} session(s) ({SPAN_NOTE})")
 
 
 def session_rpe(logs: list[dict]):
@@ -421,10 +440,11 @@ def build_daily(data: Data, generated: datetime | None = None) -> list:
                ("ul", [f"**{label(plan)}** — {plan['session_type']}, phase {plan['phase']} week {plan['week_num']}",
                        f"Status: {day_status(data, plan)}",
                        f"Planned: {len(b.get('exercises') or [])} exercises × {b.get('rounds') or '—'} rounds"
-                       f" · RPE cap {fmt(plan['target_rpe'])} · est. {fmt(plan['est_duration_min'], ' min')}",
+                       f" · RPE cap {fmt(plan['target_rpe'])}",
                        f"Session RPE: {fmt(session_rpe(logs))} · average set RPE: {fmt(avg_set_rpe(sets))}",
-                       "Total time (first → last logged entry): "
-                       + (f"{logged_span_min(logs)} min" if logged_span_min(logs) is not None else "—")])]
+                       f"Time: planned {format_estimate(plan['est_duration_min']) or '—'} · logged span "
+                       + (f"{logged_span_min(logs)} min" if logged_span_min(logs) is not None else "—")
+                       + f" ({SPAN_NOTE})"])]
     blocks += [("h2", "Sets")]
     blocks += [_set_table(sets)] if sets else [("p", "No sets logged.")]
     blocks += _alias_note(sets)
@@ -457,9 +477,13 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
         span = logged_span_min(logs)
         rows.append([f"{p['plan_date']:%a %-m/%-d}", label(p), day_status(data, p),
                      str(len(sets)) if sets else "—", fmt(session_rpe(logs)), fmt(p["target_rpe"]),
+                     format_estimate(p.get("est_duration_min")) or "—",
                      f"{span} min" if span is not None else "—"])
     blocks += [("h2", "Sessions"),
-               ("table", ["Date", "Session", "Status", "Sets", "Session RPE", "RPE cap", "Logged span"], rows)]
+               ("table", ["Date", "Session", "Status", "Sets", "Session RPE", "RPE cap", "Planned",
+                          "Logged span"], rows)]
+    pvl = planned_vs_logged(data)
+    blocks += [("p", pvl)] if pvl else []
 
     now_w, prev_w = top_weights(data.logs), top_weights(data.prior_logs)
     prow = []
@@ -532,6 +556,8 @@ def build_monthly(data: Data, generated: datetime | None = None) -> list:
         end_w = max(w for d, w in pts if d == last_day)
         lifts.append([lift, f"{start_w:g} lb ({first_day:%-m/%-d})", f"{end_w:g} lb ({last_day:%-m/%-d})",
                       f"{end_w - start_w:+g} lb" if last_day != first_day else "one session"])
+    pvl = planned_vs_logged(data)
+    blocks += [("p", pvl)] if pvl else []
     blocks += [("h2", "Main lifts (top set, start vs end)"),
                ("table", ["Lift", "Start", "End", "Change"], lifts)]
 

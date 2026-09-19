@@ -231,11 +231,21 @@ def print_samples(rows: list[dict]) -> None:
 # Modes
 # ---------------------------------------------------------------------------
 
+def print_duration_notes(notes: list[str]) -> None:
+    """TIME-CAP: 45-59 min (and CALIBRATION_PENDING 60+) rows, noted — never cut."""
+    if notes:
+        print(f"DURATION NOTES (target {office.TARGET_MIN} min; {office.HARD_MAX_MIN}+ rejected):")
+        for n in notes:
+            print(f"  {n}")
+        print()
+
+
 def office_self_test() -> None:
     rows = office.build_rows()
-    office.validate_rows(rows)
+    notes = office.validate_rows(rows)
     print("OFFICE SELF-TEST (no DB)")
     print_diff({}, rows)
+    print_duration_notes(notes)
     print_samples(rows)
     print("Office self-test OK.")
 
@@ -243,7 +253,7 @@ def office_self_test() -> None:
 def reseed_office(dry_run: bool) -> int:
     _load_dotenv()
     rows = office.build_rows()
-    office.validate_rows(rows)
+    notes = office.validate_rows(rows)
     with _connect() as conn:
         cur = conn.cursor()
         ok, msg = _preflight(cur)
@@ -260,6 +270,7 @@ def reseed_office(dry_run: bool) -> int:
         print("[preflight] no logged sessions in the office window.")
 
         print_diff(_read_existing(cur), rows)
+        print_duration_notes(notes)
 
         tail = _read_tail(cur)
         if tail:
@@ -437,6 +448,7 @@ def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
         cur = conn.cursor()
         live = _live_rows(cur, [r["plan_date"] for r in rows])
         changed, refusals = strength_changes(live, rows)
+        _, notes = office.duration_findings(changed)
         if refusals:
             conn.rollback()
             raise SystemExit("[ABORT] " + "; ".join(refusals))
@@ -450,6 +462,7 @@ def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
         print("\n".join(strength_diff_lines(live, changed)))
         print(f"\n{len(changed)} of {len(rows)} strength rows from {start} differ from the "
               f"builder; no other dates touched.")
+        print_duration_notes(notes)
         if logged:
             print(f"Logged dates in the set (logs keep their plan_id): {logged}")
             if not allow_logged:
@@ -471,7 +484,8 @@ def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                 ("health_office", None, "strength_days_reseed", "health", None, "executed",
                  0, 0.0, json.dumps({"from": start.isoformat(),
-                                     "dates": [d.isoformat() for d in dates]})))
+                                     "dates": [d.isoformat() for d in dates],
+                                     "duration_notes": notes})))
             conn.commit()
         except Exception:
             conn.rollback()
