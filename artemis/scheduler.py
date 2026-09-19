@@ -69,6 +69,11 @@ def _local_today():
     return local_today()
 
 
+def _time_parts(t) -> tuple[int, int]:
+    """(hour, minute) from a datetime.time — the cycle module's return shape."""
+    return t.hour, t.minute
+
+
 def _hhmm(value: str) -> tuple[int, int]:
     h, _, m = value.partition(":")
     return int(h), int(m or 0)
@@ -156,21 +161,39 @@ class ArtemisScheduler:
         self._gmail_fail_count: int = 0
         self._calendar_fail_count: int = 0
 
+    @staticmethod
+    def _sample_date(day_type: str) -> date:
+        """A date in the current cycle with this day type — the interim bridge
+        while the registry still has one fixed time per job. The nightly
+        recompute replaces this with tomorrow's real date."""
+        from artemis import cycle
+        base = cycle.anchor()
+        for i in range(cycle.CYCLE_LEN):
+            d = base + timedelta(days=i)
+            if cycle.day_type(d, use_overrides=False) == day_type:
+                return d
+        return base
+
     # ── Cron registry (WAKE-1 §C) ─────────────────────────────────────────
     #  Local wall-clock times. apply_timezone() is the ONLY registration path;
     #  no add_job(..., "cron", ...) call may live outside it.
 
     def cron_specs(self) -> list[CronSpec]:
-        wake_h, wake_m = _hhmm(config.WAKE_TIME)
-        open_h, open_m = _hhmm(config.OPEN_TIME)
-        quiet_h, quiet_m = _hhmm(config.QUIET_HOURS_START)
+        # CYCLE-1: the times come from artemis.cycle — the same resolution the
+        # quiet_hours boundary helpers use, so the registry and those helpers
+        # can never disagree. The weekday specs carry the OFFICE (msp_work)
+        # times and the weekend twins the MSP-home ones; the nightly location
+        # recompute replaces that split next.
+        from artemis import cycle
+        wake_h, wake_m = _time_parts(cycle.wake_on(self._sample_date("msp_work")))
+        open_h, open_m = _time_parts(cycle.open_on(self._sample_date("msp_work")))
+        quiet_h, quiet_m = _time_parts(cycle.quiet_on(self._sample_date("msp_work")))
         brief_h, brief_m = _hhmm(config.MORNING_BRIEF_TIME)
         pre_h, pre_m = _minus_minutes(brief_h, brief_m, 5)
-        # Weekends (Sat/Sun): wake, open and quiet move; the morning brief rides
-        # on open (it is 06:30 = OPEN_TIME on weekdays).
-        we_wake_h, we_wake_m = _hhmm(config.WEEKEND_WAKE_TIME)
-        we_open_h, we_open_m = _hhmm(config.WEEKEND_OPEN_TIME)
-        we_quiet_h, we_quiet_m = _hhmm(config.WEEKEND_QUIET_HOURS_START)
+        home = self._sample_date("msp_home")
+        we_wake_h, we_wake_m = _time_parts(cycle.wake_on(home))
+        we_open_h, we_open_m = _time_parts(cycle.open_on(home))
+        we_quiet_h, we_quiet_m = _time_parts(cycle.quiet_on(home))
         we_pre_h, we_pre_m = _minus_minutes(we_open_h, we_open_m, 5)
         WD, WE = "mon-fri", "sat,sun"
 
