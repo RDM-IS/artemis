@@ -142,6 +142,10 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 ## 6. Backlog (prioritized)
 
+**SCHEDULE-2 — reschedule the lifting days for the cycle (TOP OF BACKLOG, 2026-09-19; not decided).** **Urgent:** with the anchor confirmed, **Fri 2026-09-25 is Richfield** and **Mon 2026-09-28 is a travel day**, and both are seeded with office-equipment strength sessions (B, 7 exercises; C, 6). That's 6 and 9 days out. The plan is Wed A / Fri B / Mon C, but under CYCLE-1 Friday is a `wi` day and Monday is `travel` or Richfield, so two of three lifting days fall outside the office gym. **Tue/Wed/Thu are the only days that are office days in both weeks.** Decide the lifting days first: it shrinks LOCATION-1, because the substitution table then only has to cover what's genuinely needed (mostly the WI days' flows and cardio) instead of every office strength exercise. The conflict repeats every cycle: per 14 days, the `wi` Friday and the `travel` Monday collide with 2 of the 6 lifting sessions. **DECIDED 2026-09-19 and built (#119):** lift on the 1st, 3rd and 4th office day of each cycle week — wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C. Z2 takes the office non-lift days; Recovery Flows take the `wi` days (mat travels); walks cover Brown Deer and the travel Monday. Program weeks moved to Sun–Sat and the program now ends Sat 10/31. The B/C back-to-back pair each week is **accepted and intentional**.
+- **Known gap — wake times are not yet cycle-aware.** SCHEDULE-2 moved the sessions, not the clock: **Fri 9/25 will wake at 04:30 instead of Richfield's 06:00**, and Sat/Sun still use the #102 weekend times, until CYCLE-1's scheduler work ships. **That makes CYCLE-1 the next build after this.**
+- **Consequence:** with the flows on `wi` days, **no flow is scheduled at the office any more, so the Stretch Trainer drops out of the seeded program.** The office variant still builds if a flow is ever put back on an office day.
+
 **HEALTH-1 — morning check-in misroute + confabulation loop — CLOSED 2026-09-19.** Fixed by HEALTH-1 A1/A2 (`add_note` and the "I've learned…" correction re-route removed from live routing) and FRIDAY-1 (the deterministic `morning_flow` handler ahead of the LLM). Verified on a real message: the 9/19 08:12 check-in ("Sleep 9, energy 4, sore 1 right knee, …") was dispatched to `morning_flow` and stored in `health.daily_state` in ~75 ms, no classifier involved; the 08:15 nudge then correctly stayed silent. 9/18 has no check-in because none arrived (only the 05:15 nudge is logged), not a misroute. Follow-ups: CHECKIN-TEXT, CORRECTION-DEADCODE.
 
 **CONFIRM-ARB — confirm-handler arbitration / bare-`yes` disambiguation (medium).** Multiple flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its *own* pending-state, and those states are **independent** — several can be live at once. A bare control word is then resolved by fixed `deterministic_chain` order (first-match-wins), which is deterministic but **not** intent-aware: a `yes` meant for flow A can silently execute flow B.
@@ -162,6 +166,65 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 **RAMP-RETIRE — RETIRED 2026-09-19 (#111).** Deleted the dormant feat/health-ramp engine (`artemis/health_ramp.py`, the `yes ramp` / `no ramp` confirm route, the `--ramp` script flags, their tests). Reason: HARDEN-1's dry run showed it couldn't be re-pointed at the office program (Sun–Sat windows, Sunday-night evaluation, rest days counted as missed, a 5/5 threshold a 4-session week can't meet, a restart that re-seeds the home-gym plan), EVAL-1 now reports on weeks, and the plan is pre-seeded through 11/03. `health.ramp_state` dropped by migration 034 after an export to the box (`~/backups/ramp_state_2026-09-19.json`); `health.plan.status` / `original_date` from migration 030 are **kept** — the Lambda `/plan` and `/overview` read `plan.status`. There was no scheduled ramp job left to remove (HEALTH-2 had unregistered it). **Progression is manual:** the weekly evaluation reports, Ryan decides (PB-009). What the ramp did that nothing does now: slides of missed sessions to makeup slots (→ MAKEUP-1), week classification and repeat/restart proposals (→ manual via EVAL-1), the week-2 revisit prompt, travel-week templates (→ TRAVEL-1).
 
 **MAKEUP-1 — a missed session has no path back (small; not urgent).** Since RAMP-RETIRE nothing slides a missed session. Options to spec later: leave it missed (current behaviour), an explicit `@artemis makeup <date>` that moves it to a chosen day, or nothing at all.
+
+**CYCLE-1 — pay-period day types (created 2026-09-19; nothing was built).** A 14-day pay-period cycle with an **anchor date**. Cycle position is **derived from the anchor**, never stored per day, and must survive DST and holidays.
+- **Four day types, per 14 days:** `msp_work` 8, `msp_home` 2, `wi` 3, `travel` 1.
+
+  | | Week 1 | Week 2 |
+  |---|---|---|
+  | Sun | MSP home | WI (Richfield) |
+  | Mon | MSP work | Travel Richfield → MSP, leave 11:00 |
+  | Tue–Thu | MSP work | MSP work |
+  | Thu eve | drive to the farm, 5 h | — |
+  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 | MSP work |
+  | Sat | WI (Brown Deer) | MSP home |
+
+- **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
+- **Each day type carries:** location, whether a departure checklist applies, and whether meals are pre-filled. **Wake time is not one of them — it follows the location** (below).
+- **Wake time follows the location, not the day type** (corrected 2026-09-19). The travel Monday is a Richfield morning, so keying wake off the day type would need a special case for it; keying off the location doesn't. **The resolver reads the location first, then takes the wake time from it.**
+
+  | location | wake |
+  |---|---|
+  | `office` (`msp_work`) | 04:30 |
+  | `richfield` — any day type: `wi` farm day, the `travel` Monday, and Sunday evening onward | 06:00 |
+  | `brown_deer` (`wi`, non-farm) | 07:30 |
+  | `msp_home` | 07:30 |
+- **Overrides:** a single date **or a date range** can set a day type (e.g. Thanksgiving week 2026 = all `wi`). An override **wins over the derived position**, and the cycle **resumes afterwards with no drift**, because position comes from the anchor rather than being counted forward.
+- **Consumers:** the wake post, the departure block, the plan location/equipment resolver, meal pre-fill, and reports.
+- **Scheduler impact — wake, nudge and quiet hours stop being fixed weekday/weekend crons** and become **derived from tomorrow's location**.
+  - **Reuse WAKE-1's machinery:** the `CronSpec` registry and `ArtemisScheduler.apply_timezone()` (`artemis/scheduler.py`) already rebuild every cron against a new wall-clock basis. Location recompute is the same move with a different input.
+  - **A nightly job** computes tomorrow's location from the cycle, then reschedules the wake, nudge and open jobs to that location's times.
+  - **Drift check:** `job_tz_sync` already runs minutely and re-applies when the active timezone moves away from `_applied_tz`. Either extend it to compare the applied *location* as well, or mirror it as a second minutely check with the same shape.
+  - **The recompute runs during quiet hours, before the next wake, and posts nothing.**
+  - **A manual override (single date or range) takes effect immediately**, rescheduling the same jobs — the way the `set timezone` command calls `job_tz_sync` directly instead of waiting for the next tick.
+  - **The duplicate guard must hold when a reschedule moves a job's time on the same local date** (04:30 → 06:00). `_once_per_local_day()` is keyed on `cron_last_run:{guard or id}` against the local date, so a job that already fired can't fire again after being moved. **Weekend twins today share their weekday job's guard key for exactly this reason** — collapsing to one job per function keeps that property instead of relying on paired keys.
+  - **The weekend schedule (#102) becomes a special case of the location table, not a separate rule.** `msp_home` and `brown_deer` are both 07:30, which is what the weekend times already do, so the two mechanisms collapse into one. **Remove the weekday/weekend split** (`WE` day-of-week specs and the `*_weekend` twins: `wake_weekend`, `checkin_nudge_weekend`, `open_weekend`, `quiet_hours_start_weekend`, `morning_brief_weekend`, `inbox_zero_morning_weekend`) once locations drive the times.
+  - **Tests:** a Friday at Richfield 06:00; the travel Monday 06:00; an office Tuesday 04:30; an override at 22:00 that changes tomorrow's location; and **no double-fire across a reschedule**.
+- **Deferred decision — flag, don't act.** The plan is Wed A / Fri B / Mon C, but Friday is a WI day and Monday is travel or Richfield, so **two of three lifting days fall outside the office gym**. **Tue/Wed/Thu are the only days that are office days in both weeks.** The plan needs rescheduling once CYCLE-1 exists; **don't change it yet.**
+- **Storage:** the **anchor** lives in `acos.system_state` with the locations registry (LOCATION-1). **Overrides get a small table** when CYCLE-1 is built — date ranges and an audit trail are what a table is for.
+- **Anchor (confirmed 2026-09-19): Sunday 2026-09-20 is week 1, day 1.** Verified against the FCA start: 2026-09-20 − 2026-08-09 = 42 days = 3 × 14, and both are Sundays.
+  - **Profile discrepancy — flagged, not resolved:** the profile records the FCA start as **8/8/2026, a Saturday**; Ryan states **Sunday 8/9**. Both can't be right. The anchor above doesn't depend on which it is (42 days either way only works from the Sunday), but the profile should be corrected once Ryan says which is true.
+
+**LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
+- **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, a **wake time** (CYCLE-1: wake follows the location, not the day type), an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
+- **`richfield` is the farm** — one place, not two. There is no fifth WI location.
+- **Day type → location**, from CYCLE-1. **Brown Deer Sunday has a time boundary:** the fitness center before 17:00, then Richfield.
+- **Exercise substitution:** every plan exercise carries a **movement pattern** (squat, hinge, horizontal push/pull, vertical push/pull, carry, core, calf) and a **required equipment class**. A resolver picks the best available match at the day's location, preferring the same pattern, then the same class. **Substitutions are deterministic from a table, never invented.**
+- **Seed table (office → Richfield):** leg press → DB goblet / split squat · lat pulldown → band pulldown or TRX row · seated row → TRX row · leg curl → ball hamstring curl · leg extension → DB step-up · face pull / rear delt → band face pull · pec fly → DB fly · calf press → standing DB calf raise · Pallof → band Pallof · back extension → DB RDL · captain's chair → lying leg raise.
+- **Resolution order: location first, then pain.** The location resolver runs first and produces the session for that day's inventory; the pain / soreness ladder then applies **to the resolved session**.
+  - `SUBSTITUTION_POOL` (`artemis/health_regions.py`) must be **filtered to the location's inventory** before pain picks a replacement.
+  - **A pain removal applies to the location substitute too**, not only to the exercise as written.
+  - **Test to write:** shoulder pain 4 at Richfield removes the *substituted* exercise, and its replacement also comes from Richfield's inventory.
+- **The resolved session is what gym-display and the wake post show**, with a line naming the location and any substitutions.
+- **Weight steps follow the location:** PowerBlocks at Richfield have their own increments, not the office's 5 lb hex steps.
+  - **The per-location load config travels on the plan row**, not as a table shipped to the client.
+  - gym-display's `EquipmentClass` union **grows by `bands` and `trx`**, both with a **no-numeric-load mode** like `bodyweight`.
+  - **Part of the work:** `src/lib/equipment.ts` and `src/lib/weight-step.ts` move from compile-time constants (`LOAD_CONFIG`, `PLATES_PER_SIDE`, `OLYMPIC_BAR_LBS`, `SMITH_BAR_LBS`) to config delivered with the plan. Those constants are read by typed paths (`inferEquipmentClass`, the logger prefill), so it's a refactor, not a config edit.
+- **Richfield inventory** (the farm): PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer; **6.5 ft ceiling → no standing overhead work**.
+- **Storage:** the **registry and the CYCLE-1 anchor live in `acos.system_state`** (same shape as `health_program`) — no migration. Day-type **overrides get their own small table**, built with CYCLE-1.
+- **Unknown — ask Ryan:**
+  - What equipment is at the **MSP home**.
+  - Brown Deer's inventory (it's a fitness center, so probably machines and cables, but nothing is recorded).
 
 **TRAVEL-1 — no travel handling in the office program (small; revisit by early November).** The ramp's travel-week templates are gone and the office program has none. The Paris trip is around Thanksgiving (note: Thanksgiving is Thu 2026-11-26, after this program's 11/03 end, so it lands in the next phase). A travel week needs a hand-chosen substitute: a bodyweight/hotel variant of Strength A/B/C, or Recovery Flows plus walks.
 
