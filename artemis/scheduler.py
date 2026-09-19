@@ -1637,10 +1637,12 @@ class ArtemisScheduler:
             return
         try:
             from artemis import health_eval
-            start, end = health_eval.week_of(_local_today())
-            result = health_eval.load(start, end)
-            self.mm.post_message(config.CHANNEL_OPS,
-                                 "\U0001f4ca " + "\n".join(health_eval.render_lines(result)))
+            today = _local_today()
+            start, end = health_eval.week_of(today)
+            result = health_eval.load(start, end, today=today)
+            # Week to date = Wed–Sat: Sunday's session is still ahead at 08:35.
+            lines = health_eval.render_lines(result, through=today - timedelta(days=1))
+            self.mm.post_message(config.CHANNEL_OPS, "\U0001f4ca " + "\n".join(lines))
         except Exception:
             logger.exception("Weekly eval failed")
 

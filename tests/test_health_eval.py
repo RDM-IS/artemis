@@ -116,6 +116,17 @@ class TestWeek(unittest.TestCase):
         self.assertIn("Loads vs last week: seated back extension +10 lb", ev.render_lines(r))
 
 
+class TestSundaySpan(unittest.TestCase):
+    def test_sunday_post_names_wed_to_sat(self):
+        sun = date(2026, 9, 20)
+        r = ev.evaluate(plans(), full_week_logs()[:4], [], start=WED, end=TUE, today=sun)
+        first = ev.render_lines(r, through=sun - timedelta(days=1))[0]
+        self.assertTrue(first.startswith("Week 1 (Wed 9/16 – Sat 9/19, partial)"), first)
+        # Saturday's unlogged flow is missed; Sunday's walk is still to come
+        self.assertEqual(r["missed"], [{"date": "2026-09-19", "label": "recovery_flow"}])
+        self.assertEqual([x["status"] for x in r["sessions"]][4], "today")
+
+
 class TestLoads(unittest.TestCase):
     def test_no_load_is_reported_as_such_not_zero(self):
         d = WED + timedelta(days=2)

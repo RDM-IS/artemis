@@ -199,11 +199,14 @@ def _n(x) -> str:
     return "—" if x is None else (f"{x:g}")
 
 
-def render_lines(ev: dict) -> list[str]:
-    """The evaluation as short plain lines (the Sunday post, the weekly report)."""
+def render_lines(ev: dict, through: date | None = None) -> list[str]:
+    """The evaluation as short plain lines (the Sunday post, the weekly report).
+    `through` overrides the last day named in the span (the Sunday post says
+    Wed–Sat: at 08:35 Sunday's own session hasn't happened)."""
     w, c = ev["week"], ev["counts"]
     head = f"Week {w['program_week']}" if w["program_week"] else "Week"
-    span = f"{_d(w['start'])} – {_d(w['through'] if w['partial'] else w['end'])}"
+    last = through.isoformat() if through else (w["through"] if w["partial"] else w["end"])
+    span = f"{_d(w['start'])} – {_d(last)}"
     lines = [f"{head} ({span}{', partial' if w['partial'] else ''}): "
              f"{c['done']} of {c['due']} sessions due done"
              + (f" · {c['upcoming']} still to come" if c["upcoming"] else "")

@@ -312,5 +312,33 @@ class TestPhaseGating(unittest.TestCase):
         flush.assert_not_called()
 
 
+
+class TestWeeklyEvalJob(unittest.TestCase):
+    """EVAL-1 Sunday post: Wed–Sat span, open phase only, never a DB write."""
+
+    def _run(self, is_open=True):
+        from artemis import health_eval
+        from artemis import scheduler as sched
+        s = make_scheduler()
+        sun = date(2026, 9, 20)
+        result = health_eval.evaluate([], [], [], start=date(2026, 9, 16), end=date(2026, 9, 22),
+                                      today=sun)
+        with patch.object(sched, "_local_today", return_value=sun), \
+             patch.object(s, "_is_open", return_value=is_open), \
+             patch.object(health_eval, "load", return_value=result) as load:
+            s.job_weekly_eval()
+        return s, load
+
+    def test_posts_the_week_to_date_wed_to_sat(self):
+        s, load = self._run()
+        load.assert_called_once()
+        text = s.mm.post_message.call_args[0][1]
+        self.assertIn("Week 1 (Wed 9/16 – Sat 9/19, partial)", text)
+
+    def test_nothing_outside_the_open_phase(self):
+        s, load = self._run(is_open=False)
+        load.assert_not_called()
+        s.mm.post_message.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
