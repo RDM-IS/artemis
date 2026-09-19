@@ -275,6 +275,29 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - It must work on iPhone Safari. iOS Safari has no `BarcodeDetector`, so it needs a JS decoder (e.g. ZXing), `getUserMedia` over HTTPS, and a manual-entry fallback.
   - It logs through gym-display's same-origin `/api` proxy behind Cloudflare Access. **It must not use the Shortcut key; no key in the bundle** (the HARDEN-1 lesson).
 - **Notion meal plan:** read the meal plan database, and **report its exact property names to Ryan before building**. "as planned" logs that meal's macros. Notion is the meal-plan source; `health.meal` retires with the other tables and no copy is kept in RDS, which would be a second store.
+- **Notion meal plan — decided 2026-09-19** (after the read-only schema report; property names as reported then):
+  - **Databases:** the "— ryan's brain / in the kitchen" copy of `meal planning` is the only meal-plan database, and its `recipes` database is the foods table. Don't create a separate one; this is where "saved foods" in the source order come from. The "— second brain" duplicate is marked archived in Notion (not deleted) so nothing reads it.
+  - **Four meal slots:** `breakfast`, `lunch`, `dinner`, `snacks`, each a link to `recipes`. The 3 pm snack and the 7 pm cottage-cheese bowl both go in `snacks`; there's no dessert slot.
+  - **One recipe per portion as eaten**, e.g. "Overnight oats jar", "3 hard-boiled eggs". A linked recipe means one serving.
+  - **A single "default day" row** in `meal planning`, not dated weeks. The rotation is the same every day, so the 00:15 pre-fill reads that row and only deviations are logged.
+  - **Sauces count:** they're `condiment` recipes linked to lunch.
+  - **Macros come from real labels, or USDA where there's no label**, never from the plan page's headline. The day's total is whatever the foods add up to.
+  - **Target:** 2,100 kcal / 175 g protein (provisional), a goal to aim at, not a number to make the data match. The "the plan — 2100" page is a prose plan and isn't read.
+  - **Confirmed meal set (2026-09-19) — the spec for the `recipes` rows. Not yet written to Notion.** Each is one portion as eaten; `course` in brackets.
+
+    | recipe | kcal | protein | course |
+    |---|---|---|---|
+    | Overnight oats | 520 | 30 g | breakfast |
+    | Chicken wrap | 265 | 25 g | lunch |
+    | Yogurt parfait | 330 | 26 g | lunch |
+    | Protein bar | 240 | 20 g | snack |
+    | Protein coffee | 130 | 30 g | beverage — **work days only, on the commute** |
+    | Patty + veg | 310 | 32 g | dinner |
+    | Cottage cheese bowl | ~220 | ~25 g | snack, evening — **macros pending a label** |
+
+  - **Work-day total ≈ 2,015 kcal / 188 g protein** against the provisional 2,100 / 175.
+  - **Two default days, not one** (amends the single "default day" decision above): the protein coffee is a work-day item, so a non-work day is **1,885 kcal / 158 g protein** — 215 under on calories and **17 g under the protein target**. Whether the non-work day gets a replacement item is open; flagged, not decided.
+  - **Which days are work days comes from CYCLE-1**: the 8 `msp_work` days per pay period. The `wi` Friday is a day off work, and the `travel` Monday and both `msp_home` days aren't work days either — so 8 of 14 days use the work-day default and 6 use the non-work one.
 - **Logging:** extend the existing nutrition handler (deterministic intent routing is unchanged).
   - One-line entries in Mattermost.
   - A same-day `undo last`.
