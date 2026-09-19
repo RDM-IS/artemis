@@ -365,6 +365,13 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **LAMBDA-DRIFT — the health/CRM Lambda deploys by hand and drifts from `main` (small; spec later).** `rdmis-crm-api` only changes when someone runs `api/deploy.sh` from a laptop. Merging to `main` doesn't deploy it, and nothing reports when it's behind. It has drifted twice. Most recently, TEST-DB-GUARD (#106) merged on 9/19 but never reached the Lambda. It shipped unplanned with the 9/19 machine-setup deploy (#114), found only because the pre-deploy diff of the live package against `main` was run by hand.
 - **Record of that deploy:** built from `main` 9734401. Its `api/` and `knowledge/` match that commit, and the live package was diffed against `main` before and verified after. The runtime identity (LastModified / CodeSha256) belongs in the generated snapshot, not here.
+- **Rollback package (the pre-9/19 build):** on the box, at `~/backups/lambda_2026-09-17_7320a28e6924.zip`.
+  - SHA-256: `7320a28e692489ffe7abe469d6280d162bf280081f4e102ea7a8298b13bf68c9`. That's the same digest as the 9/17 build's Lambda `CodeSha256`, `cyCijmkkif/nq+Rp1igNFivygAgfThAup6gpixO/aMk=` (hex vs base64).
+  - The box's role (`acos-ec2-role`) has **no Lambda permissions**, so the rollback runs from a Mac with SSO:
+    - `scp rdmis:backups/lambda_2026-09-17_7320a28e6924.zip /tmp/`
+    - `aws lambda update-function-code --function-name rdmis-crm-api --zip-file fileb:///tmp/lambda_2026-09-17_7320a28e6924.zip --region us-east-1 --profile rdmis-admin`
+  - Then re-run the smoke check.
+  - Replace this package on every deploy: keep the one being replaced.
 - **Option A — deploy from CI on merge:** a GitHub Action builds the package (same Docker image as `deploy.sh`) and runs `update-function-code` on every merge touching `api/` or `knowledge/`, using a narrowly scoped OIDC role. Then run the post-deploy smoke check (`/plan`, `/status`, `/overview` → 200 with the current key; old key → 401). If the check fails, roll back to the previous code.
 - **Option B — flag it in the Monday drift check:** extend SCHEMA-DRIFT's Monday 08:00 check. Download the live package, compare its `app/` + `knowledge/` files with `main`, and post only when they differ, listing the commits in between. It's read-only, and deploying stays manual.
 - **Either way:** add the Lambda's code hash and the matching commit to `context/CONTEXT.generated.md`, so drift is a fact on the snapshot instead of something re-derived each time.
