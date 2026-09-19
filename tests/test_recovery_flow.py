@@ -13,7 +13,7 @@ import importlib.util
 import sys
 import unittest
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, timedelta, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,8 +26,9 @@ from test_checkin_adjust import FakeDB, office_row, rest_row  # noqa: E402
 from artemis import health_checkin as hc  # noqa: E402
 from artemis import health_office as office  # noqa: E402
 
-THU = date(2026, 9, 17)
-SAT = date(2026, 9, 19)
+# SCHEDULE-2: the office flow is Tue (Stretch Trainer), the mat flow Sat (home).
+THU = date(2026, 9, 22)   # Tue, office — kept the name to limit churn
+SAT = date(2026, 10, 3)   # Sat, msp_home — the mat flow
 NOW = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
 ROWS = {r["plan_date"]: r for r in office.build_rows()}
 
@@ -66,13 +67,23 @@ class TestBuilder(unittest.TestCase):
         self.assertIn("Stretch Trainer", thu["blocks"]["equipment"])
         self.assertNotIn("Stretch Trainer", sat["blocks"]["equipment"])
 
-    def test_every_thu_and_sat_is_a_flow(self):
+    def test_flow_days_follow_the_cycle(self):
+        """SCHEDULE-2: flows land on the office non-lift day (Stretch Trainer
+        variant) and the msp_home Saturday / Sunday (mat variant)."""
         for d, r in ROWS.items():
             is_flow = r["session_type"] == "recovery_flow"
-            self.assertEqual(is_flow, d.weekday() in (3, 5), d)
+            self.assertEqual(is_flow, office.session_for(d) == "recovery_flow", d)
             if is_flow:
-                self.assertEqual(r["blocks"]["location"],
-                                 "office gym" if d.weekday() == 3 else "home")
+                loc = office.day_location(d)
+                self.assertEqual(r["blocks"]["location"], loc)
+                # only the office has the Stretch Trainer
+                pre = [p["name"] for p in r["blocks"]["pre"]]
+                self.assertEqual("Stretch Trainer" in pre, loc == "office gym", d)
+        by_type = {}
+        for d in ROWS:
+            by_type.setdefault(office.day_type(d), set()).add(ROWS[d]["session_type"])
+        self.assertEqual(by_type["wi"], {"cardio_z2", "walk"})
+        self.assertEqual(by_type["travel"], {"walk"})
 
     def test_steps_match_the_table(self):
         got = [(s["step"], s["name"], s["side"], s["duration_sec"], s["mirror_group"])
@@ -190,7 +201,7 @@ class TestProgramState(unittest.TestCase):
     def test_program_state_for_the_status_page(self):
         self.assertEqual(office.program_state(), {
             "name": "Foundation", "phase": 1, "anchor": "2026-09-16", "weeks_total": 7,
-            "deload_week": 7, "end": "2026-11-03"})
+            "deload_week": 7, "end": "2026-10-31"})
 
     def test_written_with_the_reseed(self):
         cur = MagicMock()
@@ -246,21 +257,23 @@ class TestSideValidator(unittest.TestCase):
 
 
 class TestReseedDiff(unittest.TestCase):
-    def test_only_thu_and_sat_from_9_19(self):
+    def test_only_flow_days_from_9_19(self):
         rs = _reseed()
         rows = rs.flow_rows(date(2026, 9, 19))
+        # SCHEDULE-2 flow days: the office non-lift day + the msp_home Sat/Sun.
         self.assertEqual([r["plan_date"].isoformat() for r in rows], [
-            "2026-09-19", "2026-09-24", "2026-09-26", "2026-10-01", "2026-10-03",
-            "2026-10-08", "2026-10-10", "2026-10-15", "2026-10-17", "2026-10-22",
-            "2026-10-24", "2026-10-29", "2026-10-31"])
+            "2026-09-20", "2026-09-22", "2026-09-30", "2026-10-03",
+            "2026-10-04", "2026-10-06", "2026-10-14", "2026-10-17",
+            "2026-10-18", "2026-10-20", "2026-10-28", "2026-10-31"])
+        self.assertTrue(all(office.session_for(r["plan_date"]) == "recovery_flow" for r in rows))
         existing = {r["plan_date"]: {"phase": 1, "week_num": r["week_num"],
                                      "session_type": "rest_mobility",
                                      "display_name": "Rest / Mobility"} for r in rows}
         lines = rs.flow_diff_lines(existing, rows)
-        self.assertIn("2026-09-19 Sat p1 wk1  rest_mobility  Rest / Mobility", lines[2])
+        self.assertIn("2026-09-20 Sun", lines[2])
         self.assertIn("recovery_flow  Recovery Flow · home · 33 min · RPE 2", lines[2])
         self.assertIn("Recovery Flow · office gym · 42 min · RPE 2", lines[3])
-        self.assertEqual(lines[-2], "13 Recovery Flow rows rewritten; no other dates touched.")
+        self.assertEqual(lines[-2], "12 Recovery Flow rows rewritten; no other dates touched.")
         self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
     def test_preflight_needs_migration_033(self):
@@ -298,8 +311,8 @@ class TestRules(unittest.TestCase):
         self.assertEqual(self.db.plan[THU]["blocks"]["type"], "recovery_flow")
 
     def test_rising_day_off_overrides_the_flow(self):
-        self.db.daily[date(2026, 9, 15)] = {"soreness": {"pain": {"knee": 1}}}
-        self.db.daily[date(2026, 9, 16)] = {"soreness": {"pain": {"knee": 2}}}
+        self.db.daily[THU - timedelta(days=2)] = {"soreness": {"pain": {"knee": 1}}}
+        self.db.daily[THU - timedelta(days=1)] = {"soreness": {"pain": {"knee": 2}}}
         self.assertIn("(rising) → day off", self.checkin("knee pain 3"))
         self.assertEqual(self.db.plan[THU]["session_type"], "rest_mobility")
 

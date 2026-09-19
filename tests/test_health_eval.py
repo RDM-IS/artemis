@@ -54,10 +54,13 @@ def full_week_logs():
 
 
 class TestWeek(unittest.TestCase):
-    def test_week_of_is_wed_to_tue_from_the_anchor(self):
-        self.assertEqual(ev.week_of(date(2026, 9, 19)), (WED, TUE))
-        self.assertEqual(ev.week_of(date(2026, 9, 22)), (WED, TUE))
-        self.assertEqual(ev.week_of(date(2026, 9, 23)), (date(2026, 9, 23), date(2026, 9, 29)))
+    def test_week_of_is_sun_to_sat_from_the_anchor(self):
+        # SCHEDULE-2: weeks run Sun..Sat from 9/20, matching the CYCLE-1 cycle.
+        self.assertEqual(ev.week_of(date(2026, 9, 20)), (date(2026, 9, 20), date(2026, 9, 26)))
+        self.assertEqual(ev.week_of(date(2026, 9, 26)), (date(2026, 9, 20), date(2026, 9, 26)))
+        self.assertEqual(ev.week_of(date(2026, 9, 27)), (date(2026, 9, 27), date(2026, 10, 3)))
+        # the 9/16..9/19 stub reports as its own partial span
+        self.assertEqual(ev.week_of(date(2026, 9, 19)), (date(2026, 9, 16), date(2026, 9, 19)))
 
     def test_full_week(self):
         r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE, today=TUE + timedelta(days=1))

@@ -40,8 +40,14 @@ def canon(name: str | None) -> str | None:
     return EXERCISE_ALIASES.get(name, name) if name else name
 
 
-def week_of(day: date, anchor: date = office.WEEK1_START) -> tuple[date, date]:
-    """The Wed-Tue office week containing `day`."""
+def week_of(day: date, anchor: date = office.WEEK2_START) -> tuple[date, date]:
+    """The program week containing `day` (SCHEDULE-2).
+
+    Weeks run Sun..Sat from WEEK2_START (2026-09-20), matching the CYCLE-1 pay
+    period. Week 1 is the 9/16..9/19 stub before the anchor, and reports as
+    that partial span rather than a 7-day window."""
+    if day < anchor:
+        return office.WEEK1_START, anchor - timedelta(days=1)
     start = anchor + timedelta(days=7 * ((day - anchor).days // 7))
     return start, start + timedelta(days=6)
 

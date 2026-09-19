@@ -132,7 +132,7 @@ def _logged_in_window(cur) -> list[tuple]:
         "JOIN health.plan p ON p.plan_id = sl.plan_id "
         "WHERE p.plan_date BETWEEN %s AND %s AND sl.logged_via <> 'inferred' "
         "GROUP BY 1 ORDER BY 1",
-        (office.OFFICE_START, office.OFFICE_END))
+        (office.WEEK2_START, office.OFFICE_END))
     return cur.fetchall()
 
 
@@ -166,7 +166,7 @@ def _read_existing(cur) -> dict:
     cur.execute(
         "SELECT plan_date, phase, week_num, session_type, blocks FROM health.plan "
         "WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date",
-        (office.OFFICE_START, office.OFFICE_END))
+        (office.WEEK2_START, office.OFFICE_END))
     out = {}
     for d, phase, wk, st, blocks in cur.fetchall():
         b = json.loads(blocks) if isinstance(blocks, str) else (blocks or {})
@@ -195,7 +195,7 @@ def print_diff(existing: dict, rows: list[dict]) -> None:
         print(f"{d.isoformat():<11}{d.strftime('%a'):<4}{old_s:<52}{_row_label(new)}")
     print("-" * 120)
     n_new = sum(1 for r in rows if r["plan_date"] not in existing)
-    print(f"{len(rows)} office rows {office.OFFICE_START}..{office.OFFICE_END}: "
+    print(f"{len(rows)} office rows {office.WEEK2_START}..{office.OFFICE_END}: "
           f"{len(rows) - n_new} rewritten, {n_new} inserted.\n")
 
 

@@ -28,8 +28,8 @@ from artemis import health_patterns as hp  # noqa: E402
 from artemis import health_regions as hr  # noqa: E402
 
 NOW = datetime(2026, 9, 18, 10, 10, tzinfo=timezone.utc)
-MON = date(2026, 9, 21)
-SUN = date(2026, 9, 20)
+MON = date(2026, 9, 21)   # SCHEDULE-2: Strength A day (office)
+SUN = date(2026, 9, 20)   # msp_home — Recovery Flow
 ADVICE = r"\b(ice|rest it|see a|doctor|physio|advice|careful|stop if|listen to|consult)\b"
 
 
@@ -201,7 +201,7 @@ class TestLadder(Base):
         self.assertTrue(reply.startswith("Pain knee 3/5 → swapped DB goblet squat → "), reply)
 
     def test_p3_legs_on_a_z2_day_is_a_mobility_day(self):
-        tue = date(2026, 9, 22)
+        tue = date(2026, 9, 25)   # SCHEDULE-2: Z2 is the Richfield Friday
         self.db = FakeDB(office_row(tue, plan_id=108))
         self.cur = self.db.cursor()
         self.checkin("legs pain 3", day=tue)
@@ -903,7 +903,7 @@ class TestLighterLoad(unittest.TestCase):
 
 
 class BodyweightOnA(Base):
-    day = date(2026, 9, 23)   # Wed — Strength A carries the captain's chair
+    day = MON   # Mon 9/21 — Strength A carries the captain's chair (SCHEDULE-2)
 
     def test_p4_bodyweight_primary_is_not_given_a_load(self):
         self.checkin("core pain 2")

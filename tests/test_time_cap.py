@@ -69,8 +69,8 @@ class TestValidateRows(unittest.TestCase):
 
     def test_a_60_plus_row_outside_the_pending_slots_fails_the_reseed(self):
         rows = copy.deepcopy(ROWS)
-        wk1_c = next(r for r in rows if r["session_type"] == "strength_c" and r["week_num"] == 1)
-        wk1_c["est_duration_min"] = 61
+        wk_c = next(r for r in rows if r["session_type"] == "strength_c" and r["week_num"] == 2)
+        wk_c["est_duration_min"] = 61
         with self.assertRaises(AssertionError) as cm:
             office.validate_rows(rows)
         self.assertIn("est_duration_min >= 60", str(cm.exception))
