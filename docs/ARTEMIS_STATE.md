@@ -163,25 +163,37 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **MAKEUP-1 — a missed session has no path back (small; not urgent).** Since RAMP-RETIRE nothing slides a missed session. Options to spec later: leave it missed (current behaviour), an explicit `@artemis makeup <date>` that moves it to a chosen day, or nothing at all.
 
-**CYCLE-1 — the 14-day location cycle (entry created 2026-09-19).** No CYCLE-1 entry existed in the repo; this one records what Ryan dictated on 2026-09-19, nothing more. Everything below is his, and the open questions at the end are genuinely unanswered — don't fill them in by inference.
-- **Day types and counts per 14 days:** `msp_work` 8, `msp_home` 2, `wi` 3, `travel` 1 (14 total).
-- **The Wisconsin stretch runs continuously** from Thursday evening of week 1 through Monday midday of week 2:
-  | day | where |
-  |---|---|
-  | Thu (wk 1) | office day; leaves in the evening |
-  | Fri | farm (`wi`) |
-  | Sat | Brown Deer (`wi`) |
-  | Sun (wk 2) | Brown Deer → Richfield 17:00 (`wi`) — **Richfield, not MSP** |
-  | Mon (wk 2) | travel Richfield → MSP, leaving 11:00 (`travel`) |
-- **Tue / Wed / Thu are the only days that are office days in both weeks.** That bears on the deferred plan decision.
-- **Overrides:** a date range can set a day type for consecutive days (e.g. Thanksgiving week 2026 = all `wi`), not just single dates. An override **wins over the derived cycle position**, and the cycle **resumes afterwards with no drift**, because position is derived from the anchor rather than counted forward.
-- **Farm gym — a `wi` equipment location:** PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer. The ceiling is **6.5 ft**, which rules out standing overhead work.
-- **Open — ask Ryan, don't infer:**
-  - What CYCLE-1 drives beyond day types (plan seeding, the wake post, the departure checklist, or something else).
-  - The cycle anchor date, and which calendar day is position 0.
-  - What the "deferred plan decision" is.
-  - Which days are the 2 `msp_home` days, and whether Brown Deer and Richfield have equipment of their own or are rest/`wi` days without a gym.
-  - How a `wi` or `travel` day interacts with the Wed–Tue office program week (this is what TRAVEL-1 is about).
+**CYCLE-1 — pay-period day types (created 2026-09-19; nothing was built).** A 14-day pay-period cycle with an **anchor date**. Cycle position is **derived from the anchor**, never stored per day, and must survive DST and holidays.
+- **Four day types, per 14 days:** `msp_work` 8, `msp_home` 2, `wi` 3, `travel` 1.
+
+  | | Week 1 | Week 2 |
+  |---|---|---|
+  | Sun | MSP home | WI (Richfield) |
+  | Mon | MSP work | Travel Richfield → MSP, leave 11:00 |
+  | Tue–Thu | MSP work | MSP work |
+  | Thu eve | drive to the farm, 5 h | — |
+  | Fri | WI (farm), day off work, → Brown Deer 16:00 | MSP work |
+  | Sat | WI (Brown Deer) | MSP home |
+
+- **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
+- **Each day type carries:** wake time (04:30 MSP work, 05:30 farm), location, whether a departure checklist applies, and whether meals are pre-filled.
+- **Overrides:** a single date **or a date range** can set a day type (e.g. Thanksgiving week 2026 = all `wi`). An override **wins over the derived position**, and the cycle **resumes afterwards with no drift**, because position comes from the anchor rather than being counted forward.
+- **Consumers:** the wake post, the departure block, the plan location/equipment resolver, meal pre-fill, and reports.
+- **Deferred decision — flag, don't act.** The plan is Wed A / Fri B / Mon C, but Friday is a WI day and Monday is travel or Richfield, so **two of three lifting days fall outside the office gym**. **Tue/Wed/Thu are the only days that are office days in both weeks.** The plan needs rescheduling once CYCLE-1 exists; **don't change it yet.**
+- **Unknown — ask Ryan:** the **pay-period anchor date** (and which calendar day is position 0), and wake times for `msp_home`, `travel` and non-farm `wi` days.
+
+**LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
+- **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
+- **Day type → location**, from CYCLE-1. **Brown Deer Sunday has a time boundary:** the fitness center before 17:00, then Richfield.
+- **Exercise substitution:** every plan exercise carries a **movement pattern** (squat, hinge, horizontal push/pull, vertical push/pull, carry, core, calf) and a **required equipment class**. A resolver picks the best available match at the day's location, preferring the same pattern, then the same class. **Substitutions are deterministic from a table, never invented.**
+- **Seed table (office → Richfield):** leg press → DB goblet / split squat · lat pulldown → band pulldown or TRX row · seated row → TRX row · leg curl → ball hamstring curl · leg extension → DB step-up · face pull / rear delt → band face pull · pec fly → DB fly · calf press → standing DB calf raise · Pallof → band Pallof · back extension → DB RDL · captain's chair → lying leg raise.
+- **The resolved session is what gym-display and the wake post show**, with a line naming the location and any substitutions.
+- **Weight steps follow the location:** PowerBlocks at Richfield have their own increments, not the office's 5 lb hex steps.
+- **Farm gym inventory** (as dictated): PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer; **6.5 ft ceiling**.
+- **Unknown — ask Ryan:**
+  - What equipment is at the **MSP home**.
+  - **Is "the farm" the same place as `richfield`?** CYCLE-1 calls Friday "WI (farm)", the registry has no `farm`, and the 6.5 ft ceiling was first given for the farm gym and then for Richfield. If they're one place, the farm inventory above is Richfield's; if not, the registry needs a fifth WI location.
+  - Brown Deer's inventory (it's a fitness center, so probably machines and cables, but nothing is recorded).
 
 **TRAVEL-1 — no travel handling in the office program (small; revisit by early November).** The ramp's travel-week templates are gone and the office program has none. The Paris trip is around Thanksgiving (note: Thanksgiving is Thu 2026-11-26, after this program's 11/03 end, so it lands in the next phase). A travel week needs a hand-chosen substitute: a bodyweight/hotel variant of Strength A/B/C, or Recovery Flows plus walks.
 
