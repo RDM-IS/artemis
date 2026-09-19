@@ -44,9 +44,9 @@ class TestWeekly(unittest.TestCase):
         out = er.md(er.build_weekly(week(WED - timedelta(days=1)), GEN))
         for h in ("Adherence", "Sessions", "Weight progress", "Check-in trends", "Body weight",
                   "Pain and soreness", "Open pain patterns", "Adjustments applied",
-                  "Weekly evaluation", "Watch data", "Nutrition"):
+                  "Weekly evaluation (EVAL-1)", "Watch data", "Nutrition"):
             self.assertIn(f"## {h}", out)
-        self.assertEqual(out.count(er.NOT_TRACKED), 3)   # evaluation, watch, nutrition
+        self.assertEqual(out.count(er.NOT_TRACKED), 2)   # watch, nutrition
         self.assertIn("**0 of 0**", out)
         self.assertIn("No sets logged.", out)
 

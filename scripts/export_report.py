@@ -40,9 +40,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 NOT_TRACKED = "not yet tracked"
 OUT_DIR = Path("/tmp")
 
-# Names logged before a correction, grouped under the current name when
-# comparing weeks. session_log 123/129 (9/18) predate the equipment fix.
-EXERCISE_ALIASES = {"45° back extension": "Seated back extension"}
+from artemis.health_eval import EXERCISE_ALIASES  # noqa: E402  (one alias list)
 
 FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
               "strength_c": "DB Romanian deadlift"}
@@ -505,7 +503,10 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
                ("ul", [f"{p['region']} after {p['exercise']}: {p['hits']} of {p['exposures']} sessions"
                        for p in data.patterns] or ["none"])]
     blocks += [("h2", "Adjustments applied"), ("ul", adjustments(data) or ["none"])]
-    blocks += [("h2", "Weekly evaluation"), ("p", NOT_TRACKED + " (EVAL-1)")]
+    from artemis import health_eval
+    ev = health_eval.evaluate(data.plans, data.logs, data.prior_logs, start=data.start,
+                              end=data.end, today=data.today, anchor=data.anchor)
+    blocks += [("h2", "Weekly evaluation (EVAL-1)"), ("ul", health_eval.render_lines(ev))]
     blocks += [("h2", "Watch data"), ("p", NOT_TRACKED)]
     blocks += [("h2", "Nutrition"), ("p", NOT_TRACKED)]
     return blocks

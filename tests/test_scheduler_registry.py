@@ -97,6 +97,12 @@ class TestRegistryShape(unittest.TestCase):
                 self.assertEqual(spec.tier, tier)
                 self.assertEqual(by_id[twin].day_of_week, "mon-fri")
 
+    def test_weekly_eval_posts_sunday_after_the_review(self):
+        spec = {s.id: s for s in self.s.cron_specs()}["weekly_eval"]
+        self.assertEqual((spec.hour, spec.minute, spec.day_of_week, spec.tier),
+                         (8, 35, "sun", "health"))
+        self.assertTrue(callable(getattr(self.s, spec.func_name)))
+
     def test_sunday_health_review_runs_after_the_weekend_open(self):
         hr_ = {s.id: s for s in self.s.cron_specs()}["health_review"]
         self.assertEqual((hr_.hour, hr_.minute, hr_.day_of_week), (8, 30, "sun"))

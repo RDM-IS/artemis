@@ -174,7 +174,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Morning check-in pre-fill:** sleep, resting heart rate and weight come from last night's data, where "last night" is anchored to the active timezone (`quiet_hours.local_now()`), never UTC. Ryan only fills in energy and soreness. A value he types always wins over the watch. The reply says which values came from the watch, and when there's no watch data it says so plainly instead of guessing. Pre-fill stays deterministic and must not change intent routing.
 - **Workout match:** a watch workout attaches to the logged session by time overlap with that day's `session_log`. It fills `session_log.hr_avg` / `hr_peak`; calories come from the watch table. With no overlap there's no match, and it's never attached by date alone.
 
-**EVAL-1 — read-only weekly evaluator (medium; before REPORT-1).**
+**EVAL-1 — read-only weekly evaluator — BUILT 2026-09-19** (`artemis/health_eval.py`; `python3.11 -m artemis.health_eval --week <day>`). Feeds the weekly report (EXPORT-1's "Weekly evaluation" section) and the Sunday 08:35 post (`job_weekly_eval`, week to date, labelled partial). Spec as written:
 - **Scope:** read-only. It makes **no plan changes and no recommendations**, and holds no confirm routes or pending state. It's the small report-only evaluator RAMP-RETIRE calls for, and it doesn't reuse `health_ramp.py`.
 - **Week and timezone:** weeks are the office Wed–Tue windows counted from `health_office.WEEK1_START`. Dates come from the active timezone.
 - **Inputs:** the week's `health.plan` rows and `health.session_log` rows (`logged_via <> 'inferred'`).
@@ -317,6 +317,8 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - no scheduled nutrition post exists in quiet hours (registry check)
 
 **OFFICE-WALK — confirm the office-gym inventory in person (medium; blocks the `TODO(office)` values).** The PB-009 inventory came from Ryan's description and has never been checked on the floor — the 45° back extension was listed and doesn't exist. Walk the gym once and confirm every entry against PB-009 / `health_office.py` / gym-display `src/lib/equipment.ts`: each Precor machine exists (and which are combo stations), the Precor pin-stack step per machine (default 10 lb; record overrides in `STEP_OVERRIDES` and `health_regions.STACK_STEP`), the S3.23 functional trainer stack step, the Icarian Smith effective bar weight (`SMITH_BAR_LBS`, currently 0), the Olympic bar weight, the hex dumbbell range (5–45 assumed), the plate set (one each 45/35/25/10/5 per side assumed), benches, captain's chair/dip tower, cardio pieces, Stretch Trainer, balls and mats. Fix anything wrong in code and docs, then reseed the affected rows.
+
+**TIME-CAP — weeks 3–6 run over 45 min (decided 2026-09-19, not built).** Ryan's rule, in order: (1) cut the Strength C conditioning finisher first; (2) if still over, cut the lowest-value exercise of that session; (3) **never cut sets**. Applies to the office program builder (`health_office.RAMP` / `_EXERCISES`); reseed the affected rows with `--strength-days` after.
 
 **PB9-CRON — weekday morning times vs office arrival (low; Ryan's decision).** The morning is event-driven since FRIDAY-1 and the PLAYBOOKS TODO is gone. What's left: whether the weekday wake (04:30) and check-in nudge (05:15) suit Ryan's office arrival time. Both are config (`WAKE_TIME`, `CHECKIN_NUDGE_OFFSET_MIN`); weekends are already 07:30 / 08:15.
 
