@@ -282,7 +282,22 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - **A single "default day" row** in `meal planning`, not dated weeks. The rotation is the same every day, so the 00:15 pre-fill reads that row and only deviations are logged.
   - **Sauces count:** they're `condiment` recipes linked to lunch.
   - **Macros come from real labels, or USDA where there's no label**, never from the plan page's headline. The day's total is whatever the foods add up to.
-  - **Target:** 2,100 kcal / 175 g protein, a goal to aim at, not a number to make the data match. The "the plan — 2100" page is a prose plan and isn't read.
+  - **Target:** 2,100 kcal / 175 g protein (provisional), a goal to aim at, not a number to make the data match. The "the plan — 2100" page is a prose plan and isn't read.
+  - **Confirmed meal set (2026-09-19) — the spec for the `recipes` rows. Not yet written to Notion.** Each is one portion as eaten; `course` in brackets.
+
+    | recipe | kcal | protein | course |
+    |---|---|---|---|
+    | Overnight oats | 520 | 30 g | breakfast |
+    | Chicken wrap | 265 | 25 g | lunch |
+    | Yogurt parfait | 330 | 26 g | lunch |
+    | Protein bar | 240 | 20 g | snack |
+    | Protein coffee | 130 | 30 g | beverage — **work days only, on the commute** |
+    | Patty + veg | 310 | 32 g | dinner |
+    | Cottage cheese bowl | ~220 | ~25 g | snack, evening — **macros pending a label** |
+
+  - **Work-day total ≈ 2,015 kcal / 188 g protein** against the provisional 2,100 / 175.
+  - **Two default days, not one** (amends the single "default day" decision above): the protein coffee is a work-day item, so a non-work day is **1,885 kcal / 158 g protein** — 215 under on calories and **17 g under the protein target**. Whether the non-work day gets a replacement item is open; flagged, not decided.
+  - **Which days are work days comes from CYCLE-1**: the 8 `msp_work` days per pay period. The `wi` Friday is a day off work, and the `travel` Monday and both `msp_home` days aren't work days either — so 8 of 14 days use the work-day default and 6 use the non-work one.
 - **Logging:** extend the existing nutrition handler (deterministic intent routing is unchanged).
   - One-line entries in Mattermost.
   - A same-day `undo last`.
