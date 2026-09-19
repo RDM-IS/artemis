@@ -172,27 +172,38 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   | Mon | MSP work | Travel Richfield → MSP, leave 11:00 |
   | Tue–Thu | MSP work | MSP work |
   | Thu eve | drive to the farm, 5 h | — |
-  | Fri | WI (farm), day off work, → Brown Deer 16:00 | MSP work |
+  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 | MSP work |
   | Sat | WI (Brown Deer) | MSP home |
 
 - **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
-- **Each day type carries:** wake time (04:30 MSP work, 05:30 farm), location, whether a departure checklist applies, and whether meals are pre-filled.
+- **Each day type carries:** wake time (04:30 MSP work, 05:30 farm = Richfield), location, whether a departure checklist applies, and whether meals are pre-filled.
 - **Overrides:** a single date **or a date range** can set a day type (e.g. Thanksgiving week 2026 = all `wi`). An override **wins over the derived position**, and the cycle **resumes afterwards with no drift**, because position comes from the anchor rather than being counted forward.
 - **Consumers:** the wake post, the departure block, the plan location/equipment resolver, meal pre-fill, and reports.
 - **Deferred decision — flag, don't act.** The plan is Wed A / Fri B / Mon C, but Friday is a WI day and Monday is travel or Richfield, so **two of three lifting days fall outside the office gym**. **Tue/Wed/Thu are the only days that are office days in both weeks.** The plan needs rescheduling once CYCLE-1 exists; **don't change it yet.**
-- **Unknown — ask Ryan:** the **pay-period anchor date** (and which calendar day is position 0), and wake times for `msp_home`, `travel` and non-farm `wi` days.
+- **Storage:** the **anchor** lives in `acos.system_state` with the locations registry (LOCATION-1). **Overrides get a small table** when CYCLE-1 is built — date ranges and an audit trail are what a table is for.
+- **Unknown — ask Ryan:** the **pay-period anchor date** (and which calendar day is position 0), and wake times for `msp_home` and `travel` days.
+
+**SCHEDULE-2 — reschedule the lifting days for the cycle (ahead of LOCATION-1; not decided).** The plan is Wed A / Fri B / Mon C, but under CYCLE-1 Friday is a `wi` day and Monday is `travel` or Richfield, so two of three lifting days fall outside the office gym. **Tue/Wed/Thu are the only days that are office days in both weeks.** Decide the lifting days first: it shrinks LOCATION-1, because the substitution table then only has to cover what's genuinely needed (mostly the WI days' flows and cardio) instead of every office strength exercise. **Don't decide it yet** — CYCLE-1 comes first, and the anchor date is still unknown.
 
 **LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
 - **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
+- **`richfield` is the farm** — one place, not two. There is no fifth WI location.
 - **Day type → location**, from CYCLE-1. **Brown Deer Sunday has a time boundary:** the fitness center before 17:00, then Richfield.
 - **Exercise substitution:** every plan exercise carries a **movement pattern** (squat, hinge, horizontal push/pull, vertical push/pull, carry, core, calf) and a **required equipment class**. A resolver picks the best available match at the day's location, preferring the same pattern, then the same class. **Substitutions are deterministic from a table, never invented.**
 - **Seed table (office → Richfield):** leg press → DB goblet / split squat · lat pulldown → band pulldown or TRX row · seated row → TRX row · leg curl → ball hamstring curl · leg extension → DB step-up · face pull / rear delt → band face pull · pec fly → DB fly · calf press → standing DB calf raise · Pallof → band Pallof · back extension → DB RDL · captain's chair → lying leg raise.
+- **Resolution order: location first, then pain.** The location resolver runs first and produces the session for that day's inventory; the pain / soreness ladder then applies **to the resolved session**.
+  - `SUBSTITUTION_POOL` (`artemis/health_regions.py`) must be **filtered to the location's inventory** before pain picks a replacement.
+  - **A pain removal applies to the location substitute too**, not only to the exercise as written.
+  - **Test to write:** shoulder pain 4 at Richfield removes the *substituted* exercise, and its replacement also comes from Richfield's inventory.
 - **The resolved session is what gym-display and the wake post show**, with a line naming the location and any substitutions.
 - **Weight steps follow the location:** PowerBlocks at Richfield have their own increments, not the office's 5 lb hex steps.
-- **Farm gym inventory** (as dictated): PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer; **6.5 ft ceiling**.
+  - **The per-location load config travels on the plan row**, not as a table shipped to the client.
+  - gym-display's `EquipmentClass` union **grows by `bands` and `trx`**, both with a **no-numeric-load mode** like `bodyweight`.
+  - **Part of the work:** `src/lib/equipment.ts` and `src/lib/weight-step.ts` move from compile-time constants (`LOAD_CONFIG`, `PLATES_PER_SIDE`, `OLYMPIC_BAR_LBS`, `SMITH_BAR_LBS`) to config delivered with the plan. Those constants are read by typed paths (`inferEquipmentClass`, the logger prefill), so it's a refactor, not a config edit.
+- **Richfield inventory** (the farm): PowerBlocks to 80 lb; curl bar with 70 lb of plates; flat bench; TRX; resistance bands with a wall mount; stability ball; rower; bike on a trainer; **6.5 ft ceiling → no standing overhead work**.
+- **Storage:** the **registry and the CYCLE-1 anchor live in `acos.system_state`** (same shape as `health_program`) — no migration. Day-type **overrides get their own small table**, built with CYCLE-1.
 - **Unknown — ask Ryan:**
   - What equipment is at the **MSP home**.
-  - **Is "the farm" the same place as `richfield`?** CYCLE-1 calls Friday "WI (farm)", the registry has no `farm`, and the 6.5 ft ceiling was first given for the farm gym and then for Richfield. If they're one place, the farm inventory above is Richfield's; if not, the registry needs a fifth WI location.
   - Brown Deer's inventory (it's a fitness center, so probably machines and cables, but nothing is recorded).
 
 **TRAVEL-1 — no travel handling in the office program (small; revisit by early November).** The ramp's travel-week templates are gone and the office program has none. The Paris trip is around Thanksgiving (note: Thanksgiving is Thu 2026-11-26, after this program's 11/03 end, so it lands in the next phase). A travel week needs a hand-chosen substitute: a bodyweight/hotel variant of Strength A/B/C, or Recovery Flows plus walks.
