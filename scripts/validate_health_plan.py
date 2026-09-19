@@ -19,7 +19,7 @@ source — no second copy of the program to drift):
     /usr/bin/python3.11 scripts/validate_health_plan.py --self-test       # no DB
     /usr/bin/python3.11 scripts/validate_health_plan.py --self-test --fault
 
---ramp is retired (HEALTH-2) and refuses to run.
+The ramp engine and its --ramp mode were deleted (RAMP-RETIRE, 2026-09-19).
 """
 
 import sys
@@ -189,10 +189,7 @@ def main():
     ap = argparse.ArgumentParser(description="Validate health.plan against the office program (READ-ONLY).")
     ap.add_argument("--self-test", action="store_true", help="No DB. Validate the builders' own rows.")
     ap.add_argument("--fault", action="store_true", help="With --self-test: inject faults; expect FAIL.")
-    ap.add_argument("--ramp", action="store_true", help="RETIRED — refuses to run.")
     args = ap.parse_args()
-    if args.ramp:
-        sys.exit("--ramp is retired (HEALTH-2); validate the office plan (no flag).")
     live = selftest_live(args.fault) if args.self_test else load_live()
     sys.exit(report(evaluate(live)))
 

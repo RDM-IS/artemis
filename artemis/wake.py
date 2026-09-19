@@ -4,7 +4,7 @@ Exactly five things, and nothing else:
 
   1. today's workout (session, duration, location, equipment, first lift, warmup)
   2. the morning check-in prompt (PB-009 survey)
-  3. held health notices (e.g. an overnight ramp slide)
+  3. held health notices (health-tier posts held overnight)
   4. pre-departure (checklist, first event time, weather, `depart:` commitments)
   5. a one-line header when a timezone override is active
 

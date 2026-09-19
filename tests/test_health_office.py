@@ -265,12 +265,18 @@ class TestRetired(unittest.TestCase):
         self.assertNotIn("job_health_ramp", src)
         self.assertNotIn('id="health_ramp"', src)
 
-    def test_reseed_ramp_refuses(self):
+    def test_reseed_ramp_flag_is_gone(self):
+        # RAMP-RETIRE (2026-09-19): --ramp no longer exists; argparse rejects it.
         import scripts.reseed_health_plan_v2 as reseed
-        with patch.object(sys, "argv", ["reseed", "--ramp", "--commit"]):
+        with patch.object(sys, "argv", ["reseed", "--ramp", "--commit"]), \
+             patch("sys.stderr"):
             with self.assertRaises(SystemExit) as cm:
                 reseed.main()
-        self.assertIn("retired", str(cm.exception.code))
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_ramp_engine_is_deleted(self):
+        import importlib.util
+        self.assertIsNone(importlib.util.find_spec("artemis.health_ramp"))
 
     def test_plan_term_regex_office_terms(self):
         for msg in ("show my leg press", "what's the pulldown weight", "my stepmill intervals"):
