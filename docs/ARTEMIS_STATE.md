@@ -275,6 +275,14 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - It must work on iPhone Safari. iOS Safari has no `BarcodeDetector`, so it needs a JS decoder (e.g. ZXing), `getUserMedia` over HTTPS, and a manual-entry fallback.
   - It logs through gym-display's same-origin `/api` proxy behind Cloudflare Access. **It must not use the Shortcut key; no key in the bundle** (the HARDEN-1 lesson).
 - **Notion meal plan:** read the meal plan database, and **report its exact property names to Ryan before building**. "as planned" logs that meal's macros. Notion is the meal-plan source; `health.meal` retires with the other tables and no copy is kept in RDS, which would be a second store.
+- **Notion meal plan — decided 2026-09-19** (after the read-only schema report; property names as reported then):
+  - **Databases:** the "— ryan's brain / in the kitchen" copy of `meal planning` is the only meal-plan database, and its `recipes` database is the foods table. Don't create a separate one; this is where "saved foods" in the source order come from. The "— second brain" duplicate is marked archived in Notion (not deleted) so nothing reads it.
+  - **Four meal slots:** `breakfast`, `lunch`, `dinner`, `snacks`, each a link to `recipes`. The 3 pm snack and the 7 pm cottage-cheese bowl both go in `snacks`; there's no dessert slot.
+  - **One recipe per portion as eaten**, e.g. "Overnight oats jar", "3 hard-boiled eggs". A linked recipe means one serving.
+  - **A single "default day" row** in `meal planning`, not dated weeks. The rotation is the same every day, so the 00:15 pre-fill reads that row and only deviations are logged.
+  - **Sauces count:** they're `condiment` recipes linked to lunch.
+  - **Macros come from real labels, or USDA where there's no label**, never from the plan page's headline. The day's total is whatever the foods add up to.
+  - **Target:** 2,100 kcal / 175 g protein, a goal to aim at, not a number to make the data match. The "the plan — 2100" page is a prose plan and isn't read.
 - **Logging:** extend the existing nutrition handler (deterministic intent routing is unchanged).
   - One-line entries in Mattermost.
   - A same-day `undo last`.
