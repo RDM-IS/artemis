@@ -166,6 +166,14 @@ class TestSeedAgainstDB(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # TEST-DB-GUARD: seed() inserts the legacy 137-row baseline plan into
+        # whatever database is configured — on the box that is production.
+        # It never runs under the test flag; run the seed script by hand
+        # against a throwaway database instead.
+        from knowledge.dbguard import testing
+        if testing():
+            raise unittest.SkipTest("live seed test — refused by TEST-DB-GUARD (would write "
+                                    "the legacy baseline plan into the configured DB)")
         if not (os.environ.get("RDS_SECRET_ARN") and os.environ.get("RDS_HOST")):
             raise unittest.SkipTest("RDS_SECRET_ARN/RDS_HOST not set")
 

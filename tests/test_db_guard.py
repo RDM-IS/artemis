@@ -37,6 +37,16 @@ class TestEveryTestFileIsGuarded(unittest.TestCase):
                    if p.name not in EXEMPT and "ARTEMIS_TEST_NO_DB" not in p.read_text()]
         self.assertEqual(missing, [], "add the TEST-DB-GUARD line to: " + ", ".join(missing))
 
+    def test_no_test_posts_to_mattermost(self):
+        # tests/test_mattermost.py used to post "ACOS Phase 1 complete…" to the
+        # live channel on every run; it is scripts/check_mattermost.py now.
+        files = [*(_REPO_ROOT / "tests").rglob("test_*.py"),
+                 *(_REPO_ROOT / "artemis").glob("test_*.py"),
+                 *(_REPO_ROOT / "knowledge").glob("test_*.py")]
+        live = [str(p.relative_to(_REPO_ROOT)) for p in files
+                if "/api/v4/posts" in p.read_text() and "mock" not in p.read_text().lower()]
+        self.assertEqual(live, [])
+
     def test_the_guard_module_is_not_itself_a_test(self):
         self.assertFalse((_REPO_ROOT / "knowledge" / "test_guard.py").exists())
 
