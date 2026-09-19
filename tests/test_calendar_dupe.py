@@ -123,7 +123,6 @@ class _MainBase(unittest.TestCase):
         self._p = [
             patch.object(main, "_calendar", self._cal),
             patch.object(main, "_mm", self._mm),
-            patch.object(main, "log_calendar_action", lambda *a, **k: None),
             patch("knowledge.db.log_calendar_audit", self._audit),
         ]
         for p in self._p:
@@ -182,7 +181,7 @@ class TestConfirmPathDuplicate(_MainBase):
         self._cal.create_event.assert_called_once()
         # external approval preserved through the override
         self.assertIs(self._cal.create_event.call_args.kwargs["_user_approved_external"], True)
-        self.assertTrue(self._audit.called)
+        self._audit.assert_called_once()          # CAL-1: one audit row per create
         self.assertTrue(self._audit.call_args.kwargs["dup_override"])
         self.assertEqual(self._audit.call_args.kwargs["action"], "create")
 
@@ -252,7 +251,35 @@ class TestDirectPathDuplicate(_MainBase):
         self._cal.get_events_around.return_value = []
         main._process_calendar_events(_CAL_BLOCK, "chanA")
         self._cal.create_event.assert_called_once()
-        self.assertTrue(self._audit.called)
+        self._audit.assert_called_once()          # CAL-1: one writer, one row
+
+
+class TestOneAuditWriter(_MainBase):
+    """CAL-1: every calendar action writes exactly one acos.calendar_audit row,
+    through main._audit_calendar_write — draft and cancelled included."""
+
+    def test_external_draft_then_cancel_write_one_row_each(self):
+        block = ("Sure.\n```calendar_event\n"
+                 + json.dumps({"summary": "Ext sync", "date": "2026-06-10", "start_time": "14:00",
+                               "end_time": "15:00", "attendees": ["outsider@external.com"]})
+                 + "\n```\n")
+        main._process_calendar_events(block, "chanA")
+        self._cal.create_event.assert_not_called()
+        self._audit.assert_called_once()
+        kw = self._audit.call_args.kwargs
+        self.assertEqual((kw["action"], kw["event_id"], kw["title"]), ("draft", "pending", "Ext sync"))
+        self.assertTrue(kw["has_external"])
+        self.assertTrue(kw["start_ts"].startswith("2026-06-10T14:00"))
+
+        with patch("artemis.guardrails.log_violation"):
+            main._handle_calendar_confirm(self._post("cancel"), "cancel")
+        self.assertEqual(self._audit.call_count, 2)
+        kw = self._audit.call_args.kwargs
+        self.assertEqual((kw["action"], kw["event_id"]), ("cancelled", "pending"))
+        self.assertTrue(kw["has_external"])
+
+    def test_the_second_writer_is_gone(self):
+        self.assertFalse(hasattr(main, "log_calendar_action"))
 
 
 # ============================================================================

@@ -336,7 +336,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **INBOX-1 — triage doesn't populate inbox-zero (medium).** Triage summarizes live but never calls `upsert_thread`, so the snooze/waiting/done lifecycle has no data. Either wire triage to persist threads, or retire the lifecycle if superseded.
 
-**CAL-1 — double calendar-audit write (low).** Three create/delete sites now write `acos.calendar_audit` twice (`log_calendar_action` + `_audit_calendar_write`). Dedupe; decide canonical writer.
+**CAL-1 — double calendar-audit write — FIXED 2026-09-19.** `acos.calendar_audit` has one writer, `main._audit_calendar_write` (it keeps start_ts / has_external / dup_override / approved_by). The draft and cancelled actions moved onto it; the create / delete / bulk-delete sites lost their second write; `commitments.log_calendar_action` was deleted. Tests assert one row per action.
 
 **SCHEMA-DRIFT — deploy must run migrations (process) — mostly done.** `scripts/deploy.sh` (STAB-1 A5) runs `run_migrations.py` before every restart (032/033 applied that way on 9/18). Left: an optional scheduled drift check for a merge that's never deployed.
 
