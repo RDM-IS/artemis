@@ -12,6 +12,8 @@ Shared guarantees:
     and NEITHER branch ever invokes the LLM (coaching or general_reply).
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock

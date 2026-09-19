@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Mattermost connection test — validates bot credentials and channel access via Secrets Manager."""
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import sys
 import os
 

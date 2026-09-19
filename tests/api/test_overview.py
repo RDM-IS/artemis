@@ -6,6 +6,8 @@ Run:
     python tests/api/test_overview.py
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import json
 import os
 import sys

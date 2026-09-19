@@ -19,6 +19,8 @@ Run:
     python3 artemis/test_guardrails.py
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import os
 import sys
 import unittest

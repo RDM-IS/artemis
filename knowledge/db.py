@@ -13,6 +13,8 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 
+from knowledge.dbguard import refuse_real_db
+
 logger = logging.getLogger(__name__)
 
 # Register UUID adapter so psycopg2 handles UUID columns natively
@@ -29,6 +31,7 @@ class PromotionBlockedError(Exception):
 def init_pool(min_conn: int = 2, max_conn: int = 10):
     """Initialize the connection pool. Call once at startup."""
     global _pool
+    refuse_real_db("knowledge.db.init_pool")
     try:
         from knowledge.secrets import get_rds_credentials
         creds = get_rds_credentials()
@@ -60,7 +63,11 @@ def close_pool() -> None:
 
 @contextmanager
 def get_connection():
-    """Context manager that checks out a connection and returns it on exit."""
+    """Context manager that checks out a connection and returns it on exit.
+
+    Refused while a test is running (TEST-DB-GUARD) — tests patch this
+    function with a fake instead."""
+    refuse_real_db("knowledge.db.get_connection")
     if _pool is None:
         init_pool()
     if _pool is None:

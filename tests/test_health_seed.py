@@ -9,6 +9,8 @@ Run directly:
     RDS_SECRET_ARN=... RDS_HOST=... python tests/test_health_seed.py  # all tests
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import json
 import os
 import sys

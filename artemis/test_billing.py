@@ -5,6 +5,8 @@ Usage:
     python -m artemis.test_billing --unit         # run unit tests
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import argparse
 import json
 import logging

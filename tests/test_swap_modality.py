@@ -22,6 +22,8 @@ Run:
     python tests/test_swap_modality.py
 """
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import datetime as _dt
 import json
 import os
