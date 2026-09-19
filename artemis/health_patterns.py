@@ -48,18 +48,19 @@ _PAIN_NOTE_RE = re.compile(r"(?:^|;)\s*pain=([a-z][a-z ]*?)\s*:\s*(\d)\s*(?=;|$)
 
 
 def parse_pain_notes(notes: str | None) -> list[tuple[str, int]]:
-    """[(canonical region, 0-5)] from a session_log notes string.
+    """[(region key, 0-5)] from a session_log notes string. The key carries a
+    side when the note names one (see health_regions.side_key).
 
-    `pain=shoulder:2; pain=low back:3; felt off` -> [("shoulder", 2), ("low back", 3)].
+    `pain=shoulder:2; pain=right knee:3` -> [("shoulder", 2), ("right knee", 3)].
     Unknown regions and ratings above 5 are ignored.
     """
     out = []
     for m in _PAIN_NOTE_RE.finditer(notes or ""):
-        region = hr.canonical_region(m.group(1)) or (
-            m.group(1).strip().lower() if m.group(1).strip().lower() in hr.REGIONS else None)
+        raw, side = hr.split_side_key(m.group(1).strip().lower())
+        region = hr.canonical_region(raw) or (raw if raw in hr.REGIONS else None)
         n = int(m.group(2))
         if region and 0 <= n <= 5:
-            out.append((region, n))
+            out.append((hr.side_key(region, side), n))
     return out
 
 
@@ -94,8 +95,12 @@ def _pain_of(soreness) -> dict:
             soreness = json.loads(soreness)
         except ValueError:
             return {}
-    pain = (soreness or {}).get("pain") if isinstance(soreness, dict) else None
-    return {r: v for r, v in (pain or {}).items() if isinstance(v, int)}
+    if not isinstance(soreness, dict):
+        return {}
+    pain = soreness.get("pain") or {}
+    sides = soreness.get("pain_sides") or {}
+    # Keyed on region + side ("right knee"), so a pattern splits by side.
+    return {hr.side_key(r, sides.get(r)): v for r, v in pain.items() if isinstance(v, int)}
 
 
 def tally(logs, checkins: dict, today: date) -> dict:
@@ -119,14 +124,15 @@ def tally(logs, checkins: dict, today: date) -> dict:
             if not (slot["real"] or slot["notes"]):
                 continue
             exposures.setdefault(exercise, []).append(d)
-            regions = []
-            for region, n in slot["notes"]:
-                if n >= HIT_PAIN and region not in regions:
-                    regions.append(region)
-            for region, n in next_pain.items():
-                if n >= HIT_PAIN and region in hr.REGIONS and region not in regions \
-                        and hr.uses_any(exercise, [region]):
-                    regions.append(region)
+            regions = []   # region keys, side included ("right knee")
+            for key, n in slot["notes"]:
+                if n >= HIT_PAIN and key not in regions:
+                    regions.append(key)
+            for key, n in next_pain.items():
+                base, side = hr.split_side_key(key)
+                if n >= HIT_PAIN and base in hr.REGIONS and key not in regions \
+                        and hr.uses_any(exercise, [base], sides={base: side}):
+                    regions.append(key)
             for region in regions:
                 hits.setdefault((exercise, region), []).append(d)
 
@@ -134,9 +140,11 @@ def tally(logs, checkins: dict, today: date) -> dict:
     for (exercise, region), hit_days in hits.items():
         t = Tally(exercise, region, hits=len(hit_days), exposures=len(exposures[exercise]),
                   hit_days=hit_days, exposure_days=exposures[exercise])
+        base, side = hr.split_side_key(region)
         for d in hit_days:
             for other in days[d]:
-                if other != exercise and other not in t.shared and hr.uses_any(other, [region]):
+                if other != exercise and other not in t.shared \
+                        and hr.uses_any(other, [base], sides={base: side}):
                     t.shared.append(other)
         out[(exercise, region)] = t
     return out

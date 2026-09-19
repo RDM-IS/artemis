@@ -268,11 +268,11 @@ class TestSessionBScenarios(unittest.TestCase):
 
     def test_02_shoulder_4_replaces(self):
         self._assert_shoulder_replace(self.checkin("slept 8, energy 5, sore shoulder 4, weight 283"))
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
 
     def test_03_eight_of_ten_is_four(self):
         self._assert_shoulder_replace(self.checkin("sore shoulder 8/10"))
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
 
     def test_04_legs_3_lightens_goblet_and_extension(self):
         reply = self.checkin("slept 8 energy 5 legs sore 3")
@@ -344,7 +344,7 @@ class TestSessionBScenarios(unittest.TestCase):
         reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 283")
         self.assertEqual(reply, "Logged.")
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
 
     def test_11_original_restores(self):
         before = copy.deepcopy(self.db.plan[FRI])
@@ -421,7 +421,7 @@ class TestSessionBScenarios(unittest.TestCase):
         reply = self.checkin("sore shoulder 4", adjust=False)
         self.assertEqual(reply, "Check-in logged — run Session B as written.")
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
         self.assertEqual(self.db.audit[-1][2], "checkin_adjust_suppressed")
 
     def test_config_flag_default_on(self):
@@ -439,7 +439,7 @@ class TestSessionBScenarios(unittest.TestCase):
         reply = self.checkin("slept 8 energy 5 shoulder a bit sore")
         self.assertEqual(reply, "Check-in logged — run Session B as written.")
         self.assertEqual(self.db.plan[FRI], before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": None})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": None, "sides": {"shoulder": "unspecified"}})
 
     def test_unknown_region_is_named_and_ignored(self):
         before = copy.deepcopy(self.db.plan[FRI])

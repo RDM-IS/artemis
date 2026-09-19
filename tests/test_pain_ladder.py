@@ -315,7 +315,7 @@ class TestLadder(Base):
         self.assertEqual(self.checkin("shoulder pain 0"),
                          "Pain shoulder 0/5 — noted.\nCheck-in logged — run Session B as written.")
         self.assertEqual(self.row(), before)
-        self.assertEqual(self.db.daily[FRI]["soreness"], {"pain": {"shoulder": 0}})
+        self.assertEqual(self.db.daily[FRI]["soreness"], {"pain": {"shoulder": 0}, "pain_sides": {"shoulder": "unspecified"}})
 
     def test_in_session_pain_notes_never_drive_todays_rules(self):
         self.db.plan_dates[90] = date(2026, 9, 17)

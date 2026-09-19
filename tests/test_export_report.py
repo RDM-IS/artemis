@@ -99,6 +99,17 @@ class TestWeekly(unittest.TestCase):
         self.assertIn("| Fri 9/18 | no check-in |", out)
 
 
+class TestSides(unittest.TestCase):
+    def test_sided_soreness_reads_as_right_knee(self):
+        sore = {"knee": 1, "sides": {"knee": "right"}, "pain": {"shoulder": 2},
+                "pain_sides": {"shoulder": "unspecified"}}
+        self.assertEqual(er.soreness_text(sore), "right knee 1, pain shoulder 2")
+        data = week(date(2026, 9, 20), checkins={WED: {"weight_lbs": None, "sleep_hrs": None,
+                    "energy": None, "soreness": sore, "resting_hr": None, "free_text": None}})
+        self.assertEqual(er.pain_summary(data), ["pain — shoulder: peak 2/5 (Wed 9/16 2)",
+                                                 "soreness — right knee: peak 1/5 (Wed 9/16 1)"])
+
+
 class TestDailyAndMonthly(unittest.TestCase):
     def test_daily_flags_the_renamed_exercise_and_untracked_parts(self):
         d = WED + timedelta(days=2)
