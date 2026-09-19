@@ -176,17 +176,25 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   | Sat | WI (Brown Deer) | MSP home |
 
 - **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
-- **Each day type carries:** wake time (04:30 MSP work, 05:30 farm = Richfield), location, whether a departure checklist applies, and whether meals are pre-filled.
+- **Each day type carries:** location, whether a departure checklist applies, and whether meals are pre-filled. **Wake time is not one of them — it follows the location** (below).
+- **Wake time follows the location, not the day type** (corrected 2026-09-19). The travel Monday is a Richfield morning, so keying wake off the day type would need a special case for it; keying off the location doesn't. **The resolver reads the location first, then takes the wake time from it.**
+
+  | location | wake |
+  |---|---|
+  | `office` (`msp_work`) | 04:30 |
+  | `richfield` — any day type: `wi` farm day, the `travel` Monday, and Sunday evening onward | 06:00 |
+  | `brown_deer` (`wi`, non-farm) | 07:30 |
+  | `msp_home` | 07:30 |
 - **Overrides:** a single date **or a date range** can set a day type (e.g. Thanksgiving week 2026 = all `wi`). An override **wins over the derived position**, and the cycle **resumes afterwards with no drift**, because position comes from the anchor rather than being counted forward.
 - **Consumers:** the wake post, the departure block, the plan location/equipment resolver, meal pre-fill, and reports.
 - **Deferred decision — flag, don't act.** The plan is Wed A / Fri B / Mon C, but Friday is a WI day and Monday is travel or Richfield, so **two of three lifting days fall outside the office gym**. **Tue/Wed/Thu are the only days that are office days in both weeks.** The plan needs rescheduling once CYCLE-1 exists; **don't change it yet.**
 - **Storage:** the **anchor** lives in `acos.system_state` with the locations registry (LOCATION-1). **Overrides get a small table** when CYCLE-1 is built — date ranges and an audit trail are what a table is for.
-- **Unknown — ask Ryan:** the **pay-period anchor date** (and which calendar day is position 0), and wake times for `msp_home` and `travel` days.
+- **Unknown — ask Ryan:** the **pay-period anchor date**, and which calendar day is position 0.
 
 **SCHEDULE-2 — reschedule the lifting days for the cycle (ahead of LOCATION-1; not decided).** The plan is Wed A / Fri B / Mon C, but under CYCLE-1 Friday is a `wi` day and Monday is `travel` or Richfield, so two of three lifting days fall outside the office gym. **Tue/Wed/Thu are the only days that are office days in both weeks.** Decide the lifting days first: it shrinks LOCATION-1, because the substitution table then only has to cover what's genuinely needed (mostly the WI days' flows and cardio) instead of every office strength exercise. **Don't decide it yet** — CYCLE-1 comes first, and the anchor date is still unknown.
 
 **LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
-- **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
+- **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, a **wake time** (CYCLE-1: wake follows the location, not the day type), an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
 - **`richfield` is the farm** — one place, not two. There is no fifth WI location.
 - **Day type → location**, from CYCLE-1. **Brown Deer Sunday has a time boundary:** the fitness center before 17:00, then Richfield.
 - **Exercise substitution:** every plan exercise carries a **movement pattern** (squat, hinge, horizontal push/pull, vertical push/pull, carry, core, calf) and a **required equipment class**. A resolver picks the best available match at the day's location, preferring the same pattern, then the same class. **Substitutions are deterministic from a table, never invented.**
