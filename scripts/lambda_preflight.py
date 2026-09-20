@@ -4,7 +4,7 @@ Refuses a Lambda deploy whose code still names a column that a PENDING
 migration drops or renames. That is exactly the 2026-09-20 outage: migration
 039 dropped `health.plan.status`, the deploying code still listed `status` in
 `_plan_days`' SELECT, the deploy went out, the migration ran, and `/plan` and
-`/overview` returned 500 for seven minutes.
+`/overview` returned 500. Two requests failed, 9 s after the drop.
 
 Why a smoke test cannot do this job: it runs while the column still exists, so
 it passes for the wrong reason. Hence COLUMN-GREP in CLAUDE.md, and hence this.

@@ -8,7 +8,7 @@ OVERRIDE_LOG="$HOME/.artemis_lambda_deploy.log"
 #
 # It refuses when the code being shipped still names a column that a PENDING
 # migration drops or renames. On 2026-09-20 that combination took /plan and
-# /overview down for seven minutes: the smoke test passed because the column
+# /overview down for 1 min 40 s: the smoke test passed because the column
 # still existed at the time it ran.
 #
 # Override: bash deploy.sh --force "why this deploy cannot wait". The reason is
