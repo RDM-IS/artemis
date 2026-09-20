@@ -252,9 +252,9 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Minute-level heart rate** lives in `health.watch_heart_rate` (migration 037): timestamp + three smallints + device, no raw JSON, because it arrives at ~1,100 samples/day and would otherwise dominate `watch_sample`. It is what makes ZONE-1 possible.
 - **Workout match:** a watch workout attaches to the logged session by time overlap with that day's `session_log`. It fills `session_log.hr_avg` / `hr_peak`; calories come from the watch table. With no overlap there's no match, and it's never attached by date alone.
 
-**ZONE-1 — time in zone from minute-level heart rate (small; data only; after WATCH-1 has HR).** The Z2 sessions carry a target zone, and a workout's single average HR cannot show whether the session was actually spent in it or drifted. With `health.watch_heart_rate` (037) the answer is arithmetic: intersect the minute samples with the session window and report minutes per zone.
+**ZONE-1 — time in zone from minute-level heart rate (small; data only; BLOCKED until there is an observed max HR).** The Z2 sessions carry a target zone, and a workout's single average HR cannot show whether the session was actually spent in it or drifted. With `health.watch_heart_rate` (037) the answer is arithmetic: intersect the minute samples with the session window and report minutes per zone.
 - **Data only.** Minutes in each zone, and the share of the session. **No verdict, no "too easy / too hard", no plan change** — the same rule EVAL-1 follows.
-- **Zones** come from the plan's `target_hr_zone` and a max-HR basis that Ryan sets once; until he does, report raw minutes by HR band rather than inventing a threshold.
+- **Zone thresholds are NEVER computed from a formula** (Ryan, 2026-09-20). No 220-minus-age, no estimate. The basis is **Ryan's own observed max HR across logged sessions**, taken once there are a few weeks of workout HR in `health.watch_heart_rate`. **Until that exists, ZONE-1 stays unbuilt** — reporting bands off a guessed maximum would be a fabricated number wearing a data label.
 - **Session window** is the logged session's span, or a matched `watch_workout` when one exists. No overlap → no zone line, never a guess.
 - **Consumers:** the daily and weekly reports (EXPORT-1), and EVAL-1's recovery area.
 
