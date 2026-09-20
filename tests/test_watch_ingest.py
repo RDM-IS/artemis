@@ -199,6 +199,38 @@ class TestEndpointGuards(unittest.TestCase):
         self.assertIn("'watch_ingest'", ingest)
 
 
+class TestDeviceDecode(unittest.TestCase):
+    """RAW = the watch, RIP = the iPhone, RAW|RIP = both (Ryan, 2026-09-20)."""
+
+    def test_decode(self):
+        self.assertEqual(wp.decode_device("RAW"), "watch")
+        self.assertEqual(wp.decode_device("RIP"), "iphone")
+        self.assertEqual(wp.decode_device("RAW|RIP"), "watch+iphone")
+        self.assertEqual(wp.decode_device("rip"), "iphone")
+        # an unknown marker is NOT guessed at; the raw string is still kept
+        self.assertIsNone(wp.decode_device("PHONE9"))
+        self.assertIsNone(wp.decode_device(None))
+
+    def test_watch_is_preferred_where_it_matters(self):
+        for m in ("resting_heart_rate", "hrv", "heart_rate", "sleep_asleep", "sleep_deep"):
+            self.assertTrue(wp.prefers_watch(m), m)
+        for m in ("weight", "active_energy", "basal_energy"):
+            self.assertFalse(wp.prefers_watch(m), m)
+
+    def test_the_endpoint_stores_both_forms_in_the_right_columns(self):
+        """038 renamed 037's `device` to `device_raw` and added a decoded
+        `device`; writing the raw string into the decoded column would be
+        silent corruption."""
+        src = (Path(__file__).resolve().parent.parent / "api" / "app" / "routers"
+               / "health.py").read_text()
+        ingest = src[src.index('@router.post("/ingest"'):src.index('@router.get("/overview"')]
+        self.assertIn('"device_raw": row.get("device")', ingest)
+        self.assertIn('"device": decode_device(row.get("device"))', ingest)
+        for table in ("watch_heart_rate", "watch_sample"):
+            stmt = ingest[ingest.index(f"INSERT INTO health.{table}"):]
+            self.assertIn("device_raw", stmt[:400], table)
+
+
 class TestKeySeparation(unittest.TestCase):
     """The watch key is accepted on /ingest ONLY, and the display key is not
     accepted there — different dependencies, different secrets (HARDEN-1)."""
