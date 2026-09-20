@@ -1216,9 +1216,10 @@ def get_sessions(
 # (adjustment included) and a status derived from session_log + plan.status:
 #
 #   done      a finished session: a real session_summary (flow: "complete"),
-#             all planned sets logged, plan.status='completed', or a rest day
+#             all planned sets logged, or a rest day
 #             that has passed
 #   partial   some real logs but not finished (flow: a "partial" summary)
+#   skipped   a past training day Ryan marked `skip <reason>` (MAKEUP-1)
 #   missed    a past training day with no real logs (inferred rows don't count)
 #   today     today, nothing logged yet
 #   upcoming  a future day
@@ -1226,7 +1227,7 @@ def get_sessions(
 # Past and current days also return `logged` — per-exercise sets actually done.
 
 PLAN_RANGE_MAX_DAYS = 14
-PLAN_STATUSES = ("done", "partial", "missed", "upcoming", "today")
+PLAN_STATUSES = ("done", "partial", "missed", "skipped", "upcoming", "today")
 HOME_TIMEZONE = "America/Chicago"   # mirrors artemis.config.HOME_TIMEZONE
 
 
@@ -1302,8 +1303,10 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
 
     if any(n.startswith("recovery_flow: complete") for n in notes):
         return "done"
-    if plan.get("status") == "completed":
-        return "done"
+    # PLAN-STATUS-DEBRIS (2026-09-20): `plan.status` used to be a second source
+    # for "done". Nothing had written it since the ramp engine was retired, and
+    # migration 039 drops the column — session_log is the only source now, as
+    # it already was for every other consumer.
     if summaries and not all(n.startswith("recovery_flow: partial") for n in notes):
         return "done"
     planned = _planned_set_count(blocks)
@@ -1317,6 +1320,9 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
         return "today"
     if _is_rest_day(plan.get("session_type"), blocks) and not plan.get("is_skipped"):
         return "done"
+    if plan.get("is_skipped"):
+        # MAKEUP-1: Ryan said so out loud; a skip is not a missed session.
+        return "skipped"
     return "missed"
 
 

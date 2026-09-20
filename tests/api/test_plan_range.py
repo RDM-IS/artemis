@@ -221,17 +221,21 @@ class TestStatus(Base):
         self.assertEqual(d["2026-09-19"]["status"], "missed")
         self.assertEqual(d["2026-09-17"]["summary_notes"], "recovery_flow: partial 14 of 30 min")
 
-    def test_debrief_summary_and_plan_status_complete_a_day(self):
+    def test_a_debrief_summary_completes_a_day(self):
+        """PLAN-STATUS-DEBRIS: session_log is the ONLY source for `done` now.
+        `plan.status='completed'` used to be a second one; migration 039 drops
+        the column, so a day with no logs is missed however status reads."""
         W = date(2026, 9, 16)
         d = self.days([plan(1, W), plan(3, W + timedelta(2), status="completed")],
                       [log(1, "session_summary", None, rpe_actual=7, notes="felt good")])
-        self.assertEqual(d["2026-09-16"]["status"], "done")
-        self.assertEqual(d["2026-09-18"]["status"], "done")
+        self.assertEqual(d["2026-09-16"]["status"], "done")     # from its summary
+        self.assertEqual(d["2026-09-18"]["status"], "missed")   # no logs, status ignored
 
-    def test_skipped_past_day_is_missed(self):
+    def test_a_skipped_past_day_is_skipped_not_missed(self):
+        """MAKEUP-1: a deliberate skip is a different fact from a missed day."""
         W = date(2026, 9, 16)
         d = self.days([plan(4, W + timedelta(3), "rest_mobility", {"type": "mobility"}, is_skipped=True)], [])
-        self.assertEqual(d["2026-09-19"]["status"], "missed")
+        self.assertEqual(d["2026-09-19"]["status"], "skipped")
         self.assertTrue(d["2026-09-19"]["is_skipped"])
 
     def test_adjusted_day_returns_the_stored_blocks(self):
