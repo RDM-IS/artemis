@@ -1936,7 +1936,9 @@ def post_ingest(
                 "bpm": int(row["value"]),
                 "bpm_min": int(row["value_min"]) if row.get("value_min") is not None else None,
                 "bpm_max": int(row["value_max"]) if row.get("value_max") is not None else None,
-                "device": row.get("device")})
+                # 038: device_raw is what arrived, device is what it means
+                "device_raw": row.get("device"),
+                "device": decode_device(row.get("device"))})
             continue
         if not is_wanted(row["metric"]):
             continue                      # counted in `ignored`, never stored
@@ -1949,6 +1951,8 @@ def post_ingest(
         sample_rows.append({
             "metric": row["metric"], "measured_at": row["measured_at"],
             "local_date": local_day, "value": row["value"], "unit": row["unit"],
+            "device_raw": row.get("device"),
+            "device": decode_device(row.get("device")),
             "raw": json.dumps(row["raw"], default=str)})
 
     seen_w, workout_rows = set(), []
@@ -1965,13 +1969,16 @@ def post_ingest(
             "local_date": local_day, "raw": json.dumps(w["raw"], default=str)})
 
     ins_s = _bulk_insert(
-        db, "INSERT INTO health.watch_sample (metric, measured_at, local_date, value, unit, raw)",
-        ["metric", "measured_at", "local_date", "value", "unit", "raw"], sample_rows) \
+        db, "INSERT INTO health.watch_sample (metric, measured_at, local_date, value, unit, "
+            "device_raw, device, raw)",
+        ["metric", "measured_at", "local_date", "value", "unit", "device_raw", "device", "raw"],
+        sample_rows) \
         if sample_rows else 0
     ins_hr = _bulk_insert(
         db, "INSERT INTO health.watch_heart_rate (measured_at, local_date, bpm, bpm_min, "
-            "bpm_max, device)",
-        ["measured_at", "local_date", "bpm", "bpm_min", "bpm_max", "device"], hr_rows) \
+            "bpm_max, device_raw, device)",
+        ["measured_at", "local_date", "bpm", "bpm_min", "bpm_max", "device_raw", "device"],
+        hr_rows) \
         if hr_rows else 0
     ins_w = _bulk_insert(
         db, "INSERT INTO health.watch_workout (kind, started_at, ended_at, local_date, "
