@@ -37,7 +37,30 @@ METRIC_NAMES = {
     "body_mass": "weight",
     "active_energy": "active_energy",
     "basal_energy_burned": "basal_energy",
+    "heart_rate": "heart_rate",
 }
+
+# WATCH-2 (Ryan, 2026-09-20): the endpoint is DEFENSIVE. One wrong toggle in
+# the app must not be able to write 300k rows, so only these metrics are
+# stored. Everything else is counted and NAMED in the response — nothing is
+# silently dropped — but no row is written for it.
+#
+# Real data (2026-09-18..20) showed ~3,250 samples/day, of which ~2,600 were
+# metrics on nobody's list: step_count, walking gait, stair speeds,
+# physical_effort, apple_stand_*, respiratory_rate, cardio_recovery.
+WANTED = {
+    "resting_heart_rate", "hrv", "walking_heart_rate", "weight",
+    "active_energy", "basal_energy",
+}
+SLEEP_PREFIX = "sleep"
+# Minute-level HR: high volume (~1,100/day) and only useful inside a session.
+# Held out of watch_sample; see migration 037 for the compact store.
+HEART_RATE = "heart_rate"
+
+
+def is_wanted(metric: str) -> bool:
+    """True when a metric is stored in watch_sample."""
+    return metric in WANTED or metric.startswith(SLEEP_PREFIX)
 
 # Sleep arrives as one sample with a field per stage.
 SLEEP_STAGES = ("asleep", "deep", "rem", "core", "awake", "in_bed", "inBed",
@@ -130,16 +153,25 @@ def parse_samples(payload: dict) -> list[dict]:
             if when is None:
                 # keep it: a sample with no readable date is still evidence
                 out.append({"metric": name, "measured_at": None, "value": None,
-                            "unit": unit, "raw": sample})
+                            "unit": unit, "raw": sample, "value_min": None,
+                            "value_max": None, "device": None})
                 continue
             if name == "sleep":
                 rows = _sleep_rows(sample, when, unit)
                 out.extend(rows or [{"metric": "sleep", "measured_at": when,
                                      "value": _number(sample), "unit": unit,
-                                     "raw": sample}])
+                                     "raw": sample, "value_min": None,
+                                     "value_max": None,
+                                     "device": sample.get("source")}])
                 continue
+            lo = hi = None
+            if isinstance(sample, dict) and ("Min" in sample or "Max" in sample):
+                lo = _number(sample.get("Min"))
+                hi = _number(sample.get("Max"))
             out.append({"metric": name, "measured_at": when,
-                        "value": _number(sample), "unit": unit, "raw": sample})
+                        "value": _number(sample), "unit": unit, "raw": sample,
+                        "value_min": lo, "value_max": hi,
+                        "device": (sample.get("source") if isinstance(sample, dict) else None)})
     return out
 
 
@@ -154,11 +186,13 @@ def _sleep_rows(sample: dict, when: datetime, unit) -> list[dict]:
             continue
         key = re.sub(r"(?<!^)(?=[A-Z])", "_", stage).lower()
         rows.append({"metric": f"sleep_{key}", "measured_at": when,
-                     "value": value, "unit": unit, "raw": sample})
+                     "value": value, "unit": unit, "raw": sample,
+                     "value_min": None, "value_max": None,
+                     "device": sample.get("source")})
     return rows
 
 
-def parse_workouts(payload: dict) -> list[dict]:
+def parse_workouts(payload: dict, skipped: list | None = None) -> list[dict]:
     """Every workout, as {kind, started_at, ended_at, duration_sec, hr_avg,
     hr_max, kcal, raw}. A workout with no readable start is skipped — it has
     no natural key — but it is reported by parse_counts as unreadable."""
@@ -169,6 +203,10 @@ def parse_workouts(payload: dict) -> list[dict]:
             continue
         start = parse_date(w.get("start") or w.get("startDate"))
         if start is None:
+            # WATCH-2: a workout with no readable start has no natural key, so
+            # it can't be stored — but it is REPORTED, never dropped in silence.
+            if skipped is not None:
+                skipped.append(w)
             continue
         end = parse_date(w.get("end") or w.get("endDate"))
         hr_avg, hr_max = _hr_bounds(w.get("heartRateAvg") or w.get("heart_rate_avg")
@@ -192,16 +230,29 @@ def parse_workouts(payload: dict) -> list[dict]:
 
 
 def parse_counts(payload: dict) -> dict:
-    """What the payload contained — for the response body and the log."""
+    """What the payload contained — for the response body, the audit row and
+    the log. Nothing here writes; it only describes."""
     data = (payload or {}).get("data") or {}
     samples = parse_samples(payload)
-    known = {m for m in METRIC_NAMES.values()}
+    skipped_workouts: list = []
+    workouts = parse_workouts(payload, skipped_workouts)
+    ignored: dict[str, int] = {}
+    wanted = hr = 0
+    for s in samples:
+        if is_wanted(s["metric"]):
+            wanted += 1
+        elif s["metric"] == HEART_RATE:
+            hr += 1
+        else:
+            ignored[s["metric"]] = ignored.get(s["metric"], 0) + 1
     return {
         "metrics_in": len(data.get("metrics") or []),
         "workouts_in": len(data.get("workouts") or []),
         "samples": len(samples),
+        "stored_samples": wanted,
         "undated_samples": sum(1 for s in samples if s["measured_at"] is None),
-        "unparsed_metrics": sorted({s["metric"] for s in samples
-                                    if s["metric"].split("_")[0] not in
-                                    {k.split("_")[0] for k in known} | {"sleep"}}),
+        "heart_rate_samples": hr,
+        "ignored_metrics": dict(sorted(ignored.items(), key=lambda kv: -kv[1])),
+        "ignored_samples": sum(ignored.values()),
+        "workouts_without_a_readable_start": len(skipped_workouts),
     }
