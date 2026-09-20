@@ -995,11 +995,44 @@ class SessionsResponse(BaseModel):
     days: list[SessionDayRow]
 
 
+def _exercise_sets(ex: Any, rounds: int) -> int:
+    """One exercise's planned sets — src/lib/adjustment.ts exerciseSets().
+
+    A check-in adjustment can give ONE exercise fewer sets than the circuit has
+    rounds: health_checkin writes `ex["sets"]` (soreness 2–3 lightening, global
+    recovery capping at 2) and persists the whole blocks JSONB back to
+    health.plan. The iPad counts that exercise's sets from `ex.sets`; anything
+    here that assumes `rounds` disagrees with what Ryan is actually asked to do.
+
+    The clamp to `rounds` is gym-display's. artemis/health_checkin.exercise_sets
+    does NOT clamp — harmless today because every adjustment only ever lowers
+    the count, but the two are not the same function.
+    """
+    if not isinstance(ex, dict):
+        return max(1, rounds)
+    try:
+        n = int(ex.get("sets"))
+    except (TypeError, ValueError):
+        return max(1, rounds)
+    return min(n, max(1, rounds)) if n > 0 else max(1, rounds)
+
+
 def _planned_set_count(blocks: Any) -> int:
     """Walk a plan.blocks JSONB and return the total expected set count.
 
-    Mirrors src/lib/log-state.ts totalSetsFor: circuit rounds × occurrences
-    summed across main + finisher; intervals/steady/walk/mobility = 1.
+    Mirrors src/lib/log-state.ts totalSetsFor, summed over every exercise:
+
+      main circuit   Σ exerciseSets(ex, rounds) — per-exercise, because an
+                     adjustment can cap one exercise below `rounds`.
+      finisher       rounds × occurrences. gym-display's finisher branch does
+                     NOT consult `ex.sets`, so neither does this; the asymmetry
+                     is theirs and being wrong in the same direction is the
+                     point of the word "mirrors".
+      intervals / steady / walk / mobility = 1.
+
+    Until 2026-09-20 this multiplied rounds × len(exercises) flat while the
+    docstring claimed it mirrored totalSetsFor. An adjusted session then read
+    11 of 12 and classified `partial` — correct arithmetic, wrong plan.
     """
     if not isinstance(blocks, dict):
         return 0
@@ -1008,8 +1041,8 @@ def _planned_set_count(blocks: Any) -> int:
     if t == "circuit":
         rounds = max(1, int(blocks.get("rounds") or 1))
         exs = blocks.get("exercises")
-        n = len(exs) if isinstance(exs, list) else 0
-        total += rounds * n
+        if isinstance(exs, list):
+            total += sum(_exercise_sets(ex, rounds) for ex in exs)
     elif t in ("intervals", "steady", "walk", "mobility"):
         total += 1
     # recovery_flow: 0 — a flow logs one session_summary, never sets, so a
@@ -1297,6 +1330,10 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
     summaries = [r for r in real if r["log_type"] == "session_summary"]
     notes = [(r.get("notes") or "") for r in summaries]
     work = [r for r in real if r["log_type"] in ("strength_set", "cardio_block")]
+    # A skipped set does NOT complete a slot: a `walk` whose single cardio
+    # block was skipped is not a walk that happened. Whether one skipped
+    # exercise inside an otherwise finished circuit should still read `done`
+    # is an open question for Ryan, not something to change quietly here.
     done_sets = [r for r in work if not r.get("is_skipped")]
     blocks = plan.get("blocks") if isinstance(plan.get("blocks"), dict) else {}
     d = plan["plan_date"]
