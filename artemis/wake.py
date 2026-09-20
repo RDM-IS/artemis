@@ -42,28 +42,39 @@ def _mmss(sec: int) -> str:
     return f"{m} min" if not s else f"{m}:{s:02d}"
 
 
+def _join(names: list[str]) -> str:
+    """'easy pose' / 'easy pose and bridge' / 'a, b and c'."""
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+
 def flow_lines(blocks: dict, name: str = "Recovery Flow") -> list[str]:
-    """YOGA-1 — plan-exact Recovery Flow: every step with side and hold, the
-    round-2 doubling, and the total. Read only from the plan row."""
-    from artemis.health_office import flow_step_holds, flow_total_sec, flow_transition_total_sec
+    """YOGA-1 — plan-exact Recovery Flow: every step with side and hold, and
+    the total. Read only from the plan row. Since YOGA-4 nothing doubles, and
+    round 2 differs only by the poses it drops (easy pose)."""
+    from artemis.health_office import (flow_steps_for_round, flow_total_sec,
+                                       flow_transition_total_sec)
 
     total = flow_total_sec(blocks)
     where = f" ({blocks['location']})" if blocks.get("location") else ""
     out = [f"\U0001f9d8 Today: **{name}**{where} — {_mmss(total)} total, hands-free."]
     for p in blocks.get("pre") or []:
         out.append(f"· {p['name']} — {_mmss(p['duration_sec'])}: {p.get('cue') or ''}".rstrip(": "))
-    r1 = flow_step_holds(blocks, 1)
+    r1 = flow_steps_for_round(blocks, 1)
     steps = []
-    for st, hold in zip(blocks.get("flow") or [], r1):
+    for st in r1:
         side = f" {st['side']}" if st.get("side") else ""
-        steps.append(f"{st['name']}{side} {hold}s")
+        steps.append(f"{st['name']}{side} {st['duration_sec']}s")
     rounds = int(blocks.get("rounds") or 1)
-    out.append(f"· Round 1 ({_mmss(sum(r1))}): " + " · ".join(steps))
+    out.append(f"· Round 1 ({_mmss(sum(s['duration_sec'] for s in r1))}): " + " · ".join(steps))
     for r in range(2, rounds + 1):
-        hr = flow_step_holds(blocks, r)
-        doubled = [st["name"] for st, a, b in zip(blocks["flow"], r1, hr) if b != a]
-        extra = (f"; {doubled[0].lower()} → {doubled[-1].lower()} held 2×" if doubled else "")
-        out.append(f"· Round {r} ({_mmss(sum(hr))}): same order{extra}")
+        later = flow_steps_for_round(blocks, r)
+        kept = {s["step"] for s in later}
+        dropped = [s["name"].lower() for s in r1 if s["step"] not in kept]
+        extra = f", without {_join(dropped)}" if dropped else ""
+        out.append(f"· Round {r} ({_mmss(sum(s['duration_sec'] for s in later))}): "
+                   f"same order{extra}")
     close = blocks.get("close")
     if close:
         out.append(f"· Close: {close['name'].lower()} — {_mmss(close['duration_sec'])}")
