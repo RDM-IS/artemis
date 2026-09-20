@@ -1330,11 +1330,12 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
     summaries = [r for r in real if r["log_type"] == "session_summary"]
     notes = [(r.get("notes") or "") for r in summaries]
     work = [r for r in real if r["log_type"] in ("strength_set", "cardio_block")]
-    # A skipped set does NOT complete a slot: a `walk` whose single cardio
-    # block was skipped is not a walk that happened. Whether one skipped
-    # exercise inside an otherwise finished circuit should still read `done`
-    # is an open question for Ryan, not something to change quietly here.
-    done_sets = [r for r in work if not r.get("is_skipped")]
+    # Ryan's rule (2026-09-20): a skipped set COMPLETES its slot, but only in
+    # a session he actually trained — at least one real logged set. Skipping
+    # one exercise out of twelve is a decision about that exercise; skipping
+    # everything is a session that did not happen, and a `walk` is a single
+    # cardio block, so a skipped walk must not read `done` off its own skip.
+    logged = [r for r in work if not r.get("is_skipped")]
     blocks = plan.get("blocks") if isinstance(plan.get("blocks"), dict) else {}
     d = plan["plan_date"]
 
@@ -1347,8 +1348,11 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
     if summaries and not all(n.startswith("recovery_flow: partial") for n in notes):
         return "done"
     planned = _planned_set_count(blocks)
-    if work:
-        return "done" if planned and len(done_sets) >= planned else "partial"
+    if logged:
+        # Every slot accounted for — logged or explicitly skipped. Sessions of
+        # nothing but skips fall past this to missed / skipped / today, as if
+        # the session had never been opened.
+        return "done" if planned and len(work) >= planned else "partial"
     if summaries:            # only flow "partial" summaries
         return "partial"
     if d > today:
@@ -1704,7 +1708,10 @@ def progress_for(day: "PlanDay", logs: list[dict[str, Any]]) -> ProgressOut:
                         and (r.get("notes") or "").startswith("recovery_flow")] or [0])
         return ProgressOut(unit="minutes", done=round(done_sec / 60), planned=round(planned_sec / 60))
     if t == "circuit":
-        done = sum(1 for r in real if r["log_type"] == "strength_set" and not r.get("is_skipped"))
+        rows = [r for r in real if r["log_type"] == "strength_set"]
+        # Skipped slots count once the session is real, matching
+        # derive_day_status; a session of nothing but skips counts nothing.
+        done = len(rows) if any(not r.get("is_skipped") for r in rows) else 0
         return ProgressOut(unit="sets", done=done, planned=_planned_set_count(b))
     done_sec = sum(int(r.get("duration_sec") or 0) for r in real
                    if r["log_type"] == "cardio_block" and not r.get("is_skipped"))

@@ -275,9 +275,16 @@ class TestToday(Base):
             return PlanDay(plan_id=1, plan_date=TODAY, session_type=st, phase=1, week_num=1,
                            est_duration_min=est, status="today", blocks=blocks)
         strength = day("strength_b", circuit("B", B))
+        # One real set plus one skipped slot = 2 of 4: Ryan trained, so the
+        # skip counts as a decision about that slot (2026-09-20 rule). The
+        # inferred row is never progress.
         self.assertEqual(progress_for(strength, [log(1, "DB goblet squat"), log(1, "X", is_skipped=True),
                                                  log(1, "Y", logged_via="inferred")]).model_dump(),
-                         {"unit": "sets", "done": 1, "planned": 4})
+                         {"unit": "sets", "done": 2, "planned": 4})
+        # Nothing but skips counts nothing, however many there are.
+        self.assertEqual(progress_for(strength, [log(1, "X", is_skipped=True),
+                                                 log(1, "Y", is_skipped=True)]).model_dump(),
+                         {"unit": "sets", "done": 0, "planned": 4})
         flow = day("recovery_flow", FLOW, 38)
         self.assertEqual(progress_for(flow, [log(1, None, log_type="session_summary", duration_sec=2250,
                                                  notes="recovery_flow: complete 37 min")]).model_dump(),

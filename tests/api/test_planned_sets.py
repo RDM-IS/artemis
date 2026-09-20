@@ -10,8 +10,9 @@ three consequences all look the same on the Status page:
      they are loggable — they are, and were, on 2026-06-08;
   3. an exercise skipped on the Done screen — 11 logged, 1 skipped, of 12.
 
-(1) is fixed here. (2) is now arithmetically right and its remaining question
-is for Ryan. (3) is deliberately NOT changed — see TestTheSkippedExerciseCase.
+All three are fixed. (3) follows Ryan's rule of 2026-09-20: a skipped set
+completes its slot in a session with at least one real logged set, and a
+session of nothing but skips stays missed.
 
 Every one of them was masked by the session_summary rule, which returns `done`
 before the arithmetic runs. Weeks 5–6 (from 2026-10-11) put a 6-round finisher
@@ -119,11 +120,11 @@ class TestTheFinisherCase(unittest.TestCase):
         self.assertEqual(status(circuit(rounds=3, n=6, finisher=self.FIN), sets(24)),
                          "done")
 
-    def test_a_skipped_finisher_does_not_close_the_day(self):
-        """Same open question as TestTheSkippedExerciseCase, and it will bite
-        on 10/16: six skipped carry rounds leave the day at 18 of 24."""
+    def test_a_skipped_finisher_closes_the_day_once_the_main_work_is_logged(self):
+        """10/16: 18 real sets then six skipped carry rounds. He trained, and
+        he decided about the carries — that is `done`, not a standing 18 of 24."""
         self.assertEqual(status(circuit(rounds=3, n=6, finisher=self.FIN),
-                                sets(24, skipped=6)), "partial")
+                                sets(24, skipped=6)), "done")
 
     def test_the_finisher_ignores_per_exercise_sets_as_gym_display_does(self):
         """gym-display's finisher branch is `occurrences × rounds` and never
@@ -141,47 +142,95 @@ class TestTheSkippedExerciseCase(unittest.TestCase):
     """Skip on the Done screen writes a session_log row with is_skipped=true
     and no fake metrics.
 
-    A skipped set does NOT complete its slot. That rule is deliberate and
-    predates this change, and the reason it must stay is the degenerate case:
-    a `walk` is one cardio_block, so counting a skip as complete would make a
-    skipped walk read `done`. Whether ONE skipped exercise inside an otherwise
-    finished twelve-slot circuit should read `done` is a separate question —
-    open, and Ryan's, not mine. These tests pin today's answer so a change to
-    it has to be deliberate.
+    Ryan's rule (2026-09-20): a skipped set COMPLETES its slot — but only in a
+    session he actually trained, meaning at least one real logged set. A
+    session of nothing but skips stays missed.
+
+    The second half is not hypothetical. My first attempt made every skip
+    complete its slot, and tests/api/test_plan_range.py caught the cost: a
+    `walk` is a single cardio_block, so a skipped walk read `done`. That case
+    is pinned below and is the reason the rule has two halves.
     """
 
-    def test_eleven_logged_plus_one_skipped_is_partial_today(self):
-        self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=1)), "partial")
+    def test_eleven_logged_plus_one_skipped_is_done(self):
+        self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=1)), "done")
 
-    def test_eleven_logged_with_nothing_for_the_twelfth_is_also_partial(self):
-        """Today the two are indistinguishable in the status, which is the
-        substance of the open question."""
+    def test_eleven_logged_with_nothing_for_the_twelfth_is_partial(self):
+        """Saying nothing about a slot is not the same as skipping it."""
         self.assertEqual(status(circuit(rounds=2, n=6), sets(11)), "partial")
 
+    def test_one_real_set_is_enough_to_make_the_skips_count(self):
+        """The threshold is 'he trained', not 'he trained a lot'. 1 logged +
+        11 skipped closes the day; whether that is a good session is EVAL-1's
+        business, and the skipped rows are all still there for it to read."""
+        self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=11)), "done")
+
+    def test_a_session_of_nothing_but_skips_is_missed(self):
+        """Every slot skipped, nothing logged: the session did not happen."""
+        self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=12),
+                                day=date(2026, 10, 15), today=TODAY), "missed")
+
     def test_a_skipped_walk_is_not_a_walk_that_happened(self):
-        """The case that settles the rule for single-block sessions."""
+        """The case that caught the first attempt: one cardio_block, skipped.
+        Without the 'at least one real set' half it would read `done` — a walk
+        marked complete by the act of skipping it."""
         self.assertEqual(status({"type": "steady"},
-                                sets(1, skipped=1, log_type="cardio_block")), "partial")
+                                sets(1, skipped=1, log_type="cardio_block"),
+                                day=date(2026, 10, 15), today=TODAY), "missed")
+
+    def test_a_walk_actually_logged_is_done(self):
+        self.assertEqual(status({"type": "steady"},
+                                sets(1, log_type="cardio_block"),
+                                day=date(2026, 10, 15), today=TODAY), "done")
+
+    def test_an_all_skipped_day_that_was_declared_skipped_reads_skipped(self):
+        """MAKEUP-1 still wins over `missed` when Ryan said so out loud."""
+        self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=12),
+                                day=date(2026, 10, 15), today=TODAY,
+                                is_skipped=True), "skipped")
+
+    def test_an_all_skipped_session_today_still_reads_today(self):
+        """Mid-session, having skipped the first two: the day is not over."""
+        self.assertEqual(status(circuit(rounds=2, n=6), sets(2, skipped=2)), "today")
 
     def test_a_session_summary_still_masks_all_of_it(self):
         """Ryan's debrief returns `done` before any arithmetic runs — which is
-        why none of these three failure modes were ever visible."""
+        why none of these failure modes were ever visible."""
         logs = sets(11) + [{"log_type": "session_summary", "logged_via": "ipad",
                             "is_skipped": False, "notes": "felt good"}]
         self.assertEqual(status(circuit(rounds=2, n=6), logs), "done")
-
-    def test_a_wholly_skipped_session_is_not_silently_done_by_arithmetic(self):
-        """Every slot skipped still reaches the planned count — but a day
-        skipped out loud with nothing logged reads `skipped` (MAKEUP-1), not
-        `done`. Checked the day after, so it isn't answered by "today"."""
-        self.assertEqual(status(circuit(rounds=2, n=6), [], is_skipped=True,
-                                today=date(2026, 10, 17)), "skipped")
 
     def test_the_skipped_rows_survive_for_the_weekly_report(self):
         """Nothing here deletes or rewrites them; EVAL-1 reads session_log."""
         rows = sets(12, skipped=3)
         status(circuit(rounds=2, n=6), rows)
         self.assertEqual(sum(1 for r in rows if r["is_skipped"]), 3)
+
+
+class TestProgressAgreesWithTheStatus(unittest.TestCase):
+    """The ring and the day status must not contradict each other."""
+
+    def day(self, blocks):
+        from api.app.routers.health import PlanDay
+        return PlanDay(plan_date=TODAY, plan_id=1, session_type="strength_c",
+                       phase=2, week_num=5, blocks=blocks, status="today")
+
+    def progress(self, blocks, logs):
+        from api.app.routers.health import progress_for
+        return progress_for(self.day(blocks), logs)
+
+    def test_a_skipped_slot_counts_once_the_session_is_real(self):
+        p = self.progress(circuit(rounds=2, n=6), sets(12, skipped=1))
+        self.assertEqual((p.done, p.planned), (12, 12))
+
+    def test_nothing_but_skips_counts_nothing(self):
+        p = self.progress(circuit(rounds=2, n=6), sets(12, skipped=12))
+        self.assertEqual((p.done, p.planned), (0, 12))
+
+    def test_an_adjusted_session_targets_the_adjusted_count(self):
+        blocks = circuit(rounds=3, exercises=[ex("Row"), ex("Press"),
+                                              ex("Squat", sets=2), ex("Curl")])
+        self.assertEqual(self.progress(blocks, sets(11)).planned, 11)
 
 
 class TestExerciseSetsMirrorsGymDisplay(unittest.TestCase):
