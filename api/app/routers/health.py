@@ -83,6 +83,35 @@ def _load_health_key() -> str:
     return _HEALTH_API_KEY
 
 
+_WATCH_INGEST_KEY: Optional[str] = None
+
+
+def _load_watch_key() -> str:
+    """Lazy-load the WATCH-1 ingest key, cached per-process."""
+    global _WATCH_INGEST_KEY
+    if _WATCH_INGEST_KEY is None:
+        from knowledge.secrets import get_watch_ingest_key
+        _WATCH_INGEST_KEY = get_watch_ingest_key()
+    return _WATCH_INGEST_KEY
+
+
+def verify_watch_ingest_key(api_key: Optional[str] = Security(_API_KEY_HEADER)):
+    """WATCH-1: POST /ingest accepts ONLY the watch key.
+
+    The display key (gym-display, the Shortcut) is rejected here, and this key
+    is rejected on every other route — they are checked by different
+    dependencies against different secrets. A leaked watch key can write
+    samples; it cannot read the plan or log a session.
+    """
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail={"error": "unauthorized"})
+    if api_key != _load_watch_key():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail={"error": "unauthorized"})
+    return api_key
+
+
 def verify_health_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)):
     """Validate X-API-Key header. Returns 401 on missing/invalid (per spec).
 
@@ -1802,6 +1831,100 @@ def _patterns(db: Session) -> list[PatternOut]:
             text=f"{r['region']} pain ≥2 after {r['exercise']} — {r['hits']} of {r['exposures']} sessions{also}",
         ))
     return out
+
+
+# ── WATCH-1: Health Auto Export ingest ─────────────────────────────────────
+
+class IngestResponse(BaseModel):
+    received: dict
+    inserted: dict
+    duplicates: dict
+    note: Optional[str] = None
+
+
+@router.post("/ingest", response_model=IngestResponse)
+def post_ingest(
+    payload: dict,
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_watch_ingest_key),
+):
+    """Accept a Health Auto Export payload (WATCH-1).
+
+    Idempotent: samples are keyed (metric, measured_at) and workouts
+    (kind, started_at), so a re-sent or overlapping export inserts nothing and
+    reports the duplicate counts instead.
+
+    Forgiving by design: a sample this parser can't read is stored raw with a
+    NULL value rather than rejecting the payload, and an unknown metric is
+    stored under its own name. Only a payload that isn't an object is refused.
+    The shape is an ASSUMPTION until a real export lands — keeping `raw` means
+    a parser fix can be replayed without re-exporting from the phone.
+    """
+    from knowledge.watch_payload import parse_counts, parse_samples, parse_workouts
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail={"error": "payload must be a JSON object"})
+
+    counts = parse_counts(payload)
+    samples = parse_samples(payload)
+    workouts = parse_workouts(payload)
+    ins_s = dup_s = ins_w = dup_w = skipped = 0
+
+    for row in samples:
+        if row["measured_at"] is None:
+            skipped += 1
+            continue
+        local_day = row["measured_at"].astimezone(CT).date() \
+            if row["measured_at"].tzinfo else row["measured_at"].date()
+        res = db.execute(text("""
+            INSERT INTO health.watch_sample
+                (metric, measured_at, local_date, value, unit, raw)
+            VALUES (:metric, :measured_at, :local_date, :value, :unit, CAST(:raw AS jsonb))
+            ON CONFLICT (metric, measured_at) DO NOTHING
+            RETURNING sample_id"""), {
+                "metric": row["metric"], "measured_at": row["measured_at"],
+                "local_date": local_day, "value": row["value"], "unit": row["unit"],
+                "raw": json.dumps(row["raw"], default=str)})
+        if res.first():
+            ins_s += 1
+        else:
+            dup_s += 1
+
+    for w in workouts:
+        local_day = w["started_at"].astimezone(CT).date() \
+            if w["started_at"].tzinfo else w["started_at"].date()
+        res = db.execute(text("""
+            INSERT INTO health.watch_workout
+                (kind, started_at, ended_at, local_date, duration_sec,
+                 hr_avg, hr_max, kcal, raw)
+            VALUES (:kind, :started_at, :ended_at, :local_date, :duration_sec,
+                    :hr_avg, :hr_max, :kcal, CAST(:raw AS jsonb))
+            ON CONFLICT (kind, started_at) DO NOTHING
+            RETURNING workout_id"""), {
+                **{k: w[k] for k in ("kind", "started_at", "ended_at", "duration_sec",
+                                     "hr_avg", "hr_max", "kcal")},
+                "local_date": local_day, "raw": json.dumps(w["raw"], default=str)})
+        if res.first():
+            ins_w += 1
+        else:
+            dup_w += 1
+
+    db.commit()
+    note = None
+    if skipped or counts["unparsed_metrics"]:
+        bits = []
+        if skipped:
+            bits.append(f"{skipped} sample(s) had no readable date and were not stored")
+        if counts["unparsed_metrics"]:
+            bits.append("stored unparsed: " + ", ".join(counts["unparsed_metrics"][:10]))
+        note = "; ".join(bits)
+    return IngestResponse(
+        received=counts,
+        inserted={"samples": ins_s, "workouts": ins_w},
+        duplicates={"samples": dup_s, "workouts": dup_w},
+        note=note,
+    )
 
 
 @router.get("/overview", response_model=OverviewResponse)

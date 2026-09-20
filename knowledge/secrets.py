@@ -137,6 +137,18 @@ def get_health_api_key() -> str:
     return secret["api_key"]
 
 
+def get_watch_ingest_key() -> str:
+    """Returns the WATCH-1 ingest key used by POST /api/health/ingest ONLY.
+
+    Separate from get_health_api_key on purpose (HARDEN-1): this key lives in
+    the Health Auto Export app on Ryan's phone and is rejected on every other
+    health route, so a leak can write samples but cannot read the plan or log
+    sessions.
+    Secret name: rdmis/dev/watch-ingest-key"""
+    secret = get_secret("rdmis/dev/watch-ingest-key")
+    return secret["api_key"]
+
+
 def get_vault_repo() -> dict:
     """Returns {clone_url, token} for the private Obsidian vault repo (PB-011).
     Token is a fine-grained, READ-ONLY PAT (Contents: read) scoped to RDM-IS/vault.

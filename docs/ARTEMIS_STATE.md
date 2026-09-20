@@ -252,12 +252,13 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **EVAL-1 — read-only weekly evaluator — BUILT 2026-09-19** (`artemis/health_eval.py`; `python3.11 -m artemis.health_eval --week <day>`). Feeds the weekly report (EXPORT-1's "Weekly evaluation" section) and the Sunday 08:35 post (`job_weekly_eval`, week to date, labelled partial). Spec as written:
 - **Scope:** read-only. It makes **no plan changes and no recommendations**, and holds no confirm routes or pending state. It's the small report-only evaluator RAMP-RETIRE calls for, and it doesn't reuse `health_ramp.py`.
-- **Week and timezone:** weeks are the office Wed–Tue windows counted from `health_office.WEEK1_START`. Dates come from the active timezone.
+- **Week and timezone:** weeks are **Sun–Sat** from `health_office.WEEK2_START` (SCHEDULE-2 moved them off Wed–Tue; week 1 is the 9/16–9/19 stub). Dates come from the active timezone.
 - **Inputs:** the week's `health.plan` rows and `health.session_log` rows (`logged_via <> 'inferred'`).
 - **Output**, as one structured result:
   - sessions done vs planned (training days only; rest days are neither done nor missed)
   - per-exercise load change vs the prior week (top logged weight per exercise; an exercise with no load either week is reported as such, not as 0)
   - average RPE (`session_log.rpe_actual`) vs the cap (`plan.target_rpe`)
+  - **Recovery (WATCH-1, 2026-09-19):** average sleep hours and average resting HR for the week, from `health.daily_state`. Data only — no interpretation, no target, and "no sleep or resting HR recorded" when there is none.
   - missed sessions
   - adjustments applied (`blocks.adjustment`: date, rules fired, reason)
 - **Consumers:**
