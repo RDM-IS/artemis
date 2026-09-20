@@ -1365,7 +1365,7 @@ def _plan_days(db: Session, start: date, end: date,
     plan_rows = db.execute(
         text("""
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
-                   target_rpe, est_duration_min, is_skipped, status
+                   target_rpe, est_duration_min, is_skipped
             FROM health.plan
             WHERE plan_date BETWEEN :s AND :e
             ORDER BY plan_date
