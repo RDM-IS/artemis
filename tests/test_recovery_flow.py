@@ -325,16 +325,16 @@ class TestTransitions(unittest.TestCase):
             office.validate_flow(b)
         self.assertIn("no cue_mid key", str(cm.exception))
 
-    def test_meditation_and_savasana_speak_at_the_start_instead(self):
-        """There is no middle of a 3 min hold worth interrupting."""
+    def test_meditation_and_savasana_are_silent_for_their_whole_hold(self):
+        """Ryan, 2026-09-20: nothing at all while those two timers run. The
+        lead-in and the move cue still happen BEFORE the hold starts."""
         for day in (THU, SAT):
             b = ROWS[day]["blocks"]
-            self.assertTrue(b["pre"][0]["cue_mid_at_start"])
-            self.assertTrue(b["close"]["cue_mid_at_start"])
-            self.assertEqual(b["close"]["cue_mid"], "Let everything go heavy")
-            # …and no POSE is marked that way.
-            for st in b["flow"]:
-                self.assertNotIn("cue_mid_at_start", st, st["name"])
+            self.assertIsNone(b["pre"][0]["cue_mid"])
+            self.assertIsNone(b["close"]["cue_mid"])
+            for item in (*b["pre"], b["close"], *b["flow"]):
+                self.assertNotIn("cue_mid_at_start", item, item["name"])
+        self.assertNotIn("Savasana", office.FLOW_CUE_MID)
 
     def test_the_mid_cue_never_collides_with_the_lead_in(self):
         """12 s in vs 7 s before the end: the shortest hold is 40 s, so the
@@ -346,7 +346,7 @@ class TestTransitions(unittest.TestCase):
                 self.assertLess(at, st["duration_sec"] - b["leadin_sec"], st["name"])
 
     def test_every_cue_mid_entry_is_used(self):
-        used = {s["name"] for s in office.FLOW_STEPS} | {office.FLOW_CLOSE["name"]}
+        used = {s["name"] for s in office.FLOW_STEPS}
         self.assertEqual(set(office.FLOW_CUE_MID) - used, set())
 
     def test_a_pose_without_a_posture_fails_validation(self):

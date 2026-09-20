@@ -399,13 +399,11 @@ FLOW_ROUNDS = 2
 FLOW_MEDITATION = {"name": "Seated meditation", "side": None, "duration_sec": 60,
                    "transition_sec": 5,
                    "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated",
-                   "cue_mid": "Sit tall and comfortable, eyes soft, slow breaths.",
-                   "cue_mid_at_start": True}
+                   "cue_mid": None}
 FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180, "transition_sec": 5,
               "cue": "Lie on your back, arms by your sides, let everything go.",
               "posture": "supine", "sanskrit": "Shavasana",
-              "sanskrit_spoken": "shah-VAH-sah-nah",
-              "cue_mid": "Let everything go heavy", "cue_mid_at_start": True}
+              "sanskrit_spoken": "shah-VAH-sah-nah", "cue_mid": None}
 FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
                         "transition_sec": 5,
                         "cue": "Follow the 8 placard stretches", "posture": "standing"}
@@ -425,10 +423,9 @@ FLOW_POSTURE = {
 # Ryan's framing: what helps in week one is noise by week six — hence the
 # toggle on the setup screen, default on.
 #
-# The meditation and savasana blocks are the exception: their line is spoken at
-# the START of the hold and then silence, because there is no "middle" of a
-# three-minute hold worth interrupting. Meditation's line is its existing
-# written cue; savasana's is Ryan's.
+# Meditation and savasana get NOTHING (Ryan, 2026-09-20): those two are silent
+# for the whole of their timer. The lead-in and the move cue still happen
+# before the hold starts; once it is running, nothing speaks.
 FLOW_CUE_MID = {
     "Child's pose":          "Let your forehead rest, widen your knees",
     "Cobra":                 "Draw your shoulders down and back",
@@ -444,7 +441,7 @@ FLOW_CUE_MID = {
     "Seated twist":          "For a deeper stretch, look over your shoulder",
     "Seated mountain":       "Relax your shoulders, sit tall",
     "Easy pose":             "Settle in, soften your jaw",
-    "Savasana":              "Let everything go heavy",
+    # Savasana is deliberately absent — silence, not a line at the start.
 }
 # How long into a hold the mid cue is spoken. Never collides with the 7 s
 # lead-in: the shortest hold is 40 s, so the gap is 21 s.
