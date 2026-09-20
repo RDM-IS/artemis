@@ -292,6 +292,28 @@ and pain. Sleep stays in hours.
   rather than soreness — only the region they're attached to. Stored as
   `soreness.pain = {region: score}`.
 
+**RPE is a different scale — 1–10, reps in reserve (RPE-SCALE, 2026-09-20).**
+Check-in ratings are 0–5; the RPE logged against a set or a session is **1–10**
+and means *how many reps you had left*:
+
+| RPE | Reps left |
+|---|---|
+| 10 | none — could not have done another |
+| 9 | one |
+| 8 | two |
+| 7 | three |
+| 6 | four |
+
+The program's `target_rpe` caps are on this scale, so a cap of 6 means "stop
+with about four reps in the tank". Higher is harder.
+
+Ryan had been rating with 8 = four reps left, which made every logged value read
+2 too high and turned three under-cap sessions into over-cap ones in EVAL-1.
+The 26 values on 2026-09-16 and 2026-09-18 were corrected on 2026-09-20; the
+originals are in `acos.audit_log` under `action = 'rpe_scale_correction'`.
+State the scale whenever the prompt asks for an RPE — an unstated scale is what
+caused this.
+
 **Rules — the pain ladder (PAIN-1).** Highest priority first. A **day-level**
 rule (1–4) ends the ladder; the region rules (5–8) apply to whatever exercises
 are left, then recovery (9). Nothing adds volume, load or RPE; high energy or
