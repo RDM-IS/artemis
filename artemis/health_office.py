@@ -321,64 +321,93 @@ def _rest(week_num: int):
 # (step, name, side, hold s, mirror_group, side label, cue, easier option)
 # Holds are round 1. Round 2 repeats every step and doubles steps 10-16.
 # Cues are our own wording.
+# YOGA-4 (Ryan, 2026-09-20) — the flow, in play order.
+#
+# Every hold is 40 s in BOTH rounds; the old round-2 doubling is gone. The
+# `transition_sec` on each step is the time to move INTO it from the step
+# before, and this table is now the ONLY source of transition lengths — the
+# posture-derived 3 s / 5 s rule is deleted. `posture` is kept because it
+# describes the pose, not because anything computes from it.
+#
+# Order notes:
+#   * the four lunge poses run R, R, L, L, so the side switch lands at the top
+#     of the crescent rather than between two different poses;
+#   * extended puppy follows all four lunges and leads into bridge;
+#   * easy pose closes round 1 only — round 2 ends at seated mountain and goes
+#     straight to savasana.
+#
+# child's pose takes 5 s in both rounds: after the meditation (or the Stretch
+# Trainer at the office) in round 1, and after easy pose in round 2.
+FLOW_HOLD_SEC = 40
+
 FLOW_STEPS = [
-    ("1", "Child's pose", None, 30, None, None,
-     "Knees wide, hips back toward your heels, arms long.", None),
-    ("2", "Cobra", None, 30, None, None,
-     "Hips stay down; press through the palms and lift the chest gently.", None),
-    ("3", "Downward dog", None, 60, None, None,
-     "Hips high, heels reaching down, long spine.", "Dolphin — forearms down"),
-    ("4", "Standing forward bend", None, 30, None, None,
-     "Soft knees, let your head hang heavy.", None),
-    ("5", "High lunge", "R", 30, "lunge-unit", "Right leg forward",
-     "Front knee over ankle, back heel lifted, arms up.", "Knee down"),
-    ("6", "Crescent lunge", "R", 30, "lunge-unit", "Right leg forward",
-     "Square the hips, sink a little deeper, reach up.", "Knee down"),
-    ("7", "Extended puppy", None, 30, None, None,
-     "From hands and knees, walk the hands forward, chest toward the mat.", None),
-    ("8", "High lunge", "L", 30, "lunge-unit", "Left leg forward",
-     "Front knee over ankle, back heel lifted, arms up.", "Knee down"),
-    ("9", "Crescent lunge", "L", 30, "lunge-unit", "Left leg forward",
-     "Square the hips, sink a little deeper, reach up.", "Knee down"),
-    ("10", "Bridge", None, 30, None, None,
-     "Feet hip-width, press through the heels, lift the hips.", None),
-    ("11a", "Supine twist", "R", 30, "twist-supine", "Right side",
-     "Knees drop to one side, both shoulders stay down.", None),
-    ("11b", "Supine twist", "L", 30, "twist-supine", "Left side",
-     "Knees drop to one side, both shoulders stay down.", None),
-    ("12a", "Wind release", "R", 30, "wind", "Right knee",
-     "Hug one knee to the chest, the other leg long.", None),
-    ("12b", "Wind release", "L", 30, "wind", "Left knee",
-     "Hug one knee to the chest, the other leg long.", None),
-    ("13a", "Seated side bend", "L", 30, "side-bend", "Lean left",
-     "Sit tall, reach the opposite arm overhead and lean.", None),
-    ("13b", "Seated side bend", "R", 30, "side-bend", "Lean right",
-     "Sit tall, reach the opposite arm overhead and lean.", None),
-    ("14a", "Seated twist", "L", 30, "twist-seated", "Twist left",
-     "Lengthen up first, then turn from the ribs.", None),
-    ("14b", "Seated twist", "R", 30, "twist-seated", "Twist right",
-     "Lengthen up first, then turn from the ribs.", None),
-    ("15", "Seated mountain", None, 30, None, None,
-     "Sit tall, arms overhead, slow breaths.", None),
-    ("16", "Easy pose", None, 30, None, None,
-     "Cross-legged, hands on knees, breathe slowly.", None),
+    {"step": "1", "name": "Child's pose", "transition_sec": 5,
+     "cue": "Knees wide, hips back toward your heels, arms long."},
+    {"step": "2", "name": "Cobra", "transition_sec": 3,
+     "cue": "Hips stay down; press through the palms and lift the chest gently."},
+    {"step": "3", "name": "Downward dog", "transition_sec": 3,
+     "cue": "Hips high, heels reaching down, long spine.", "easier": "Dolphin — forearms down"},
+    {"step": "4", "name": "Standing forward bend", "transition_sec": 3,
+     "cue": "Soft knees, let your head hang heavy."},
+    {"step": "5", "name": "High lunge", "side": "R", "mirror_group": "lunge-unit",
+     "side_label": "Right leg forward", "transition_sec": 5,
+     "cue": "Front knee over ankle, back heel lifted, arms up.", "easier": "Knee down"},
+    {"step": "6", "name": "Crescent lunge", "side": "R", "mirror_group": "lunge-unit",
+     "side_label": "Right leg forward", "transition_sec": 3,
+     "cue": "Square the hips, sink a little deeper, reach up.", "easier": "Knee down"},
+    {"step": "7", "name": "Crescent lunge", "side": "L", "mirror_group": "lunge-unit",
+     "side_label": "Left leg forward", "transition_sec": 3,
+     "cue": "Square the hips, sink a little deeper, reach up.", "easier": "Knee down"},
+    {"step": "8", "name": "High lunge", "side": "L", "mirror_group": "lunge-unit",
+     "side_label": "Left leg forward", "transition_sec": 3,
+     "cue": "Front knee over ankle, back heel lifted, arms up.", "easier": "Knee down"},
+    {"step": "9", "name": "Extended puppy", "transition_sec": 5,
+     "cue": "From hands and knees, walk the hands forward, chest toward the mat."},
+    {"step": "10", "name": "Bridge", "transition_sec": 4,
+     "cue": "Feet hip-width, press through the heels, lift the hips."},
+    {"step": "11", "name": "Supine twist", "side": "R", "mirror_group": "twist-supine",
+     "side_label": "Right side", "transition_sec": 3,
+     "cue": "Knees drop to one side, both shoulders stay down."},
+    {"step": "12", "name": "Supine twist", "side": "L", "mirror_group": "twist-supine",
+     "side_label": "Left side", "transition_sec": 3,
+     "cue": "Knees drop to one side, both shoulders stay down."},
+    {"step": "13", "name": "Wind release", "side": "R", "mirror_group": "wind",
+     "side_label": "Right knee", "transition_sec": 4,
+     "cue": "Hug one knee to the chest, the other leg long."},
+    {"step": "14", "name": "Wind release", "side": "L", "mirror_group": "wind",
+     "side_label": "Left knee", "transition_sec": 3,
+     "cue": "Hug one knee to the chest, the other leg long."},
+    {"step": "15", "name": "Seated side bend", "side": "L", "mirror_group": "side-bend",
+     "side_label": "Lean left", "transition_sec": 5,
+     "cue": "Sit tall, reach the opposite arm overhead and lean."},
+    {"step": "16", "name": "Seated twist", "side": "L", "mirror_group": "twist-seated",
+     "side_label": "Twist left", "transition_sec": 3,
+     "cue": "Lengthen up first, then turn from the ribs."},
+    {"step": "17", "name": "Seated twist", "side": "R", "mirror_group": "twist-seated",
+     "side_label": "Twist right", "transition_sec": 3,
+     "cue": "Lengthen up first, then turn from the ribs."},
+    {"step": "18", "name": "Seated side bend", "side": "R", "mirror_group": "side-bend",
+     "side_label": "Lean right", "transition_sec": 3,
+     "cue": "Sit tall, reach the opposite arm overhead and lean."},
+    {"step": "19", "name": "Seated mountain", "transition_sec": 3,
+     "cue": "Sit tall, arms overhead, slow breaths."},
+    {"step": "20", "name": "Easy pose", "transition_sec": 3, "rounds": [1],
+     "cue": "Cross-legged, hands on knees, breathe slowly."},
 ]
 FLOW_ROUNDS = 2
-FLOW_DOUBLE_ROUND = 2            # round whose holds double …
-FLOW_DOUBLE_STEPS = (10, 16)     # … on steps 10-16 (by step number)
-# YOGA-3 (Ryan, 9/19): open with 1 min seated meditation; close with 3 min
-# savasana (seated breathing stays inside the rounds as step 16).
+# YOGA-3 (Ryan, 9/19): open with seated meditation; close with savasana.
 FLOW_MEDITATION = {"name": "Seated meditation", "side": None, "duration_sec": 60,
+                   "transition_sec": 5,
                    "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated"}
-FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180,
+FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180, "transition_sec": 5,
               "cue": "Lie on your back, arms by your sides, let everything go.", "posture": "supine"}
 FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
+                        "transition_sec": 5,
                         "cue": "Follow the 8 placard stretches", "posture": "standing"}
 FLOW_TARGET_RPE = 2.0
 
-# Body position of every pose. The transition before a pose depends on the
-# change: 3 s when it's the same position or floor-to-floor, 5 s when you have
-# to get up or down (into/out of standing, or supine <-> seated).
+# Body position of every pose. Descriptive only since YOGA-4 — transitions come
+# from the table above, not from this.
 FLOW_POSTURE = {
     "Child's pose": "kneeling", "Cobra": "prone", "Downward dog": "quadruped",
     "Standing forward bend": "standing", "High lunge": "standing", "Crescent lunge": "standing",
@@ -389,9 +418,9 @@ FLOW_POSTURE = {
 FLOW_POSTURES = ("standing", "kneeling", "quadruped", "prone", "supine", "seated")
 # How the voice says a pose, where it differs from the written name.
 FLOW_SPOKEN = {"Downward dog": "Downward facing dog"}
-FLOW_TRANSITION_SHORT_SEC = 3
-FLOW_TRANSITION_LONG_SEC = 5
-FLOW_LEADIN_SEC = 3            # the "Next we'll move into …" lead-in, before the hold ends
+# YOGA-4: the lead-in moves to 7 s before the hold ends, and there is no chime
+# in front of it any more — the words start at 7 s exactly.
+FLOW_LEADIN_SEC = 7
 FLOW_START_POSTURE = "standing"   # at the iPad when Start is tapped
 
 
@@ -399,46 +428,28 @@ def _step_no(step: str) -> int:
     return int("".join(ch for ch in step if ch.isdigit()))
 
 
+def flow_steps_for_round(blocks: dict, round_num: int) -> list[dict]:
+    """The steps played in `round_num`. A step may name the rounds it belongs
+    to (`"rounds": [1]`); most belong to all of them."""
+    return [s for s in blocks.get("flow") or []
+            if round_num in (s.get("rounds") or range(1, int(blocks.get("rounds") or 1) + 1))]
+
+
 def flow_step_holds(blocks: dict, round_num: int) -> list[int]:
-    """Hold seconds for every flow step in `round_num` (1-based)."""
-    lo, hi = blocks.get("double_steps") or FLOW_DOUBLE_STEPS
-    dbl = blocks.get("double_round", FLOW_DOUBLE_ROUND)
-    return [s["duration_sec"] * (2 if round_num == dbl and lo <= _step_no(s["step"]) <= hi else 1)
-            for s in blocks["flow"]]
-
-
-def transition_sec(prev: str | None, nxt: str | None, short: int = FLOW_TRANSITION_SHORT_SEC,
-                   long: int = FLOW_TRANSITION_LONG_SEC) -> int:
-    """Seconds to move from one body position to the next (YOGA-3).
-
-    Short when nothing changes or it's floor to floor; long only when you have
-    to get up or down — into or out of standing, or supine <-> seated. An
-    unknown posture gets the long transition."""
-    if prev not in FLOW_POSTURES or nxt not in FLOW_POSTURES:
-        return long
-    if prev == nxt:
-        return short
-    if "standing" in (prev, nxt) or {prev, nxt} == {"supine", "seated"}:
-        return long
-    return short
+    """Hold seconds for every step played in `round_num` (1-based). Since
+    YOGA-4 every hold is the same in every round — nothing doubles."""
+    return [s["duration_sec"] for s in flow_steps_for_round(blocks, round_num)]
 
 
 def flow_sequence(blocks: dict) -> list[dict]:
-    """Every timed item in play order — pre, each round, close — with its hold,
-    posture and the transition before it (the first one is from standing at
-    the iPad)."""
+    """Every timed item in play order — pre, each round, close — with its hold
+    and the transition before it, both read straight from the data."""
     items = [dict(p) for p in blocks.get("pre") or []]
     for r in range(1, int(blocks.get("rounds") or 1) + 1):
-        for st, hold in zip(blocks.get("flow") or [], flow_step_holds(blocks, r)):
-            items.append({**st, "duration_sec": hold, "round": r})
+        for st in flow_steps_for_round(blocks, r):
+            items.append({**st, "round": r})
     if blocks.get("close"):
         items.append(dict(blocks["close"]))
-    short = blocks.get("transition_short_sec", FLOW_TRANSITION_SHORT_SEC)
-    long = blocks.get("transition_long_sec", FLOW_TRANSITION_LONG_SEC)
-    prev = blocks.get("start_posture", FLOW_START_POSTURE)
-    for it in items:
-        it["transition_sec"] = transition_sec(prev, it.get("posture"), short, long)
-        prev = it.get("posture")
     return items
 
 
@@ -465,39 +476,44 @@ def validate_flow(blocks: dict) -> None:
     flow = blocks.get("flow") or []
     if not flow:
         raise FlowError("flow has no steps")
-    groups: dict[str, list[int]] = {}
-    for i, st in enumerate(flow):
-        g = st.get("mirror_group")
-        if g is None:
-            if st.get("side") is not None:
-                raise FlowError(f"step {st.get('step')} has a side but no mirror_group")
-            continue
-        if st.get("side") not in ("R", "L"):
-            raise FlowError(f"step {st.get('step')} in {g} needs side R or L")
-        groups.setdefault(g, []).append(i)
     for r in range(1, int(blocks.get("rounds") or 1) + 1):
-        holds = flow_step_holds(blocks, r)
-        for g, idx in groups.items():
-            sides = {"R": 0, "L": 0}
-            seen = set()
-            for i in idx:
-                sides[flow[i]["side"]] += holds[i]
-                seen.add(flow[i]["side"])
-            if seen != {"R", "L"}:
-                raise FlowError(f"{g}: missing side {sorted({'R', 'L'} - seen)[0]}")
+        steps = flow_steps_for_round(blocks, r)
+        groups: dict[str, dict[str, int]] = {}
+        for st in steps:
+            g = st.get("mirror_group")
+            if g is None:
+                if st.get("side") is not None:
+                    raise FlowError(f"step {st.get('step')} has a side but no mirror_group")
+                continue
+            if st.get("side") not in ("R", "L"):
+                raise FlowError(f"step {st.get('step')} in {g} needs side R or L")
+            sides = groups.setdefault(g, {"R": 0, "L": 0})
+            sides[st["side"]] += st["duration_sec"]
+        for g, sides in groups.items():
+            missing = [k for k, v in sides.items() if v == 0]
+            if missing:
+                raise FlowError(f"{g}: missing side {missing[0]} (round {r})")
             if sides["R"] != sides["L"]:
                 raise FlowError(f"{g}: R {sides['R']}s ≠ L {sides['L']}s (round {r})")
-    for it in [*(blocks.get("pre") or []), *flow, *([blocks["close"]] if blocks.get("close") else [])]:
+    for it in flow_sequence(blocks):
         if it.get("posture") not in FLOW_POSTURES:
             raise FlowError(f"{it.get('step') or it.get('name')}: posture {it.get('posture')!r} "
                             f"is not one of {', '.join(FLOW_POSTURES)}")
+        if not isinstance(it.get("transition_sec"), int) or it["transition_sec"] <= 0:
+            raise FlowError(f"{it.get('step') or it.get('name')}: transition_sec "
+                            f"{it.get('transition_sec')!r} is not a positive whole number")
 
 
-def _flow_step(spec) -> dict:
-    step, name, side, hold, group, label, cue, easier = spec
-    out = {"step": step, "name": name, "side": side, "side_label": label,
-           "duration_sec": hold, "mirror_group": group, "cue": cue, "easier": easier,
+def _flow_step(spec: dict) -> dict:
+    """One FLOW_STEPS entry as the JSONB row gym-display reads."""
+    name = spec["name"]
+    out = {"step": spec["step"], "name": name, "side": spec.get("side"),
+           "side_label": spec.get("side_label"), "duration_sec": FLOW_HOLD_SEC,
+           "transition_sec": spec["transition_sec"], "mirror_group": spec.get("mirror_group"),
+           "cue": spec.get("cue"), "easier": spec.get("easier"),
            "posture": FLOW_POSTURE.get(name)}
+    if spec.get("rounds"):
+        out["rounds"] = list(spec["rounds"])
     if name in FLOW_SPOKEN:
         out["spoken"] = FLOW_SPOKEN[name]
     return out
@@ -510,10 +526,7 @@ def _recovery_flow(location: str = LOCATION):
         "display_name": _DISPLAY["recovery_flow"],
         "location": location,
         "rounds": FLOW_ROUNDS,
-        "double_round": FLOW_DOUBLE_ROUND,
-        "double_steps": list(FLOW_DOUBLE_STEPS),
-        "transition_short_sec": FLOW_TRANSITION_SHORT_SEC,
-        "transition_long_sec": FLOW_TRANSITION_LONG_SEC,
+        "hold_sec": FLOW_HOLD_SEC,
         "leadin_sec": FLOW_LEADIN_SEC,
         "start_posture": FLOW_START_POSTURE,
         "pre": [dict(FLOW_MEDITATION)] + ([dict(FLOW_STRETCH_TRAINER)] if office else []),
@@ -523,10 +536,13 @@ def _recovery_flow(location: str = LOCATION):
     }
     total = flow_total_sec(blocks)
     blocks["total_sec"] = total
-    blocks["notes"] = ("1 min seated meditation, "
+    r1 = len(flow_steps_for_round(blocks, 1))
+    r2 = len(flow_steps_for_round(blocks, 2))
+    med = -(-FLOW_MEDITATION["duration_sec"] // 60)
+    blocks["notes"] = (f"{med} min seated meditation, "
                        + ("8 min Stretch Trainer, " if office else "")
-                       + f"2 rounds of {len({_step_no(s[0]) for s in FLOW_STEPS})} poses (round 2 holds 2× from bridge on), "
-                       + "3 min savasana; 3–5 s to move between poses")
+                       + f"round 1 of {r1} poses, round 2 of {r2}, every hold "
+                       + f"{FLOW_HOLD_SEC} s, 3 min savasana; 3–5 s to move between poses")
     validate_flow(blocks)
     return blocks, FLOW_TARGET_RPE, None, -(-total // 60)
 
