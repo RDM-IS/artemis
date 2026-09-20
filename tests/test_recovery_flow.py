@@ -271,6 +271,40 @@ class TestTransitions(unittest.TestCase):
         self.assertEqual(next(s for s in ROWS[SAT]["blocks"]["flow"] if s["step"] == "3")["spoken"],
                          "Downward facing dog")
 
+    def test_every_pose_resolves_to_a_sanskrit_entry(self):
+        """YOGA-5: a pose with no Sanskrit is a seeding bug, not a fallback."""
+        for day in (THU, SAT):
+            for st in ROWS[day]["blocks"]["flow"]:
+                self.assertTrue(st.get("sanskrit"), f"{st['name']} has no sanskrit")
+                self.assertTrue(st.get("sanskrit_spoken"), f"{st['name']} has no sanskrit_spoken")
+                # The spoken form is a phonetic respelling, never the display one.
+                self.assertNotEqual(st["sanskrit_spoken"], st["sanskrit"], st["name"])
+        by = {s["name"]: s for s in ROWS[SAT]["blocks"]["flow"]}
+        self.assertEqual((by["Crescent lunge"]["sanskrit"], by["Crescent lunge"]["sanskrit_spoken"]),
+                         ("Ashta Chandrasana", "AHSH-tah chahn-DRAH-sah-nah"))
+        self.assertEqual(by["Downward dog"]["sanskrit"], "Adho Mukha Svanasana")
+        close = ROWS[SAT]["blocks"]["close"]
+        self.assertEqual((close["sanskrit"], close["sanskrit_spoken"]),
+                         ("Shavasana", "shah-VAH-sah-nah"))
+
+    def test_the_pre_blocks_have_no_sanskrit_and_fall_back(self):
+        """Meditation and the Stretch Trainer have no meaningful Sanskrit."""
+        for pre in OFFICE_FLOW["pre"]:
+            self.assertNotIn("sanskrit", pre, pre["name"])
+        office.validate_flow(OFFICE_FLOW)      # and that is not an error
+
+    def test_a_pose_missing_its_sanskrit_fails_validation(self):
+        b = copy.deepcopy(ROWS[SAT]["blocks"])
+        b["flow"][5].pop("sanskrit_spoken")
+        with self.assertRaises(office.FlowError) as cm:
+            office.validate_flow(b)
+        self.assertIn("no Sanskrit entry", str(cm.exception))
+
+    def test_every_pose_name_in_the_table_is_used(self):
+        """A stale FLOW_SANSKRIT entry is dead weight; catch it here."""
+        used = {s["name"] for s in office.FLOW_STEPS} | {office.FLOW_CLOSE["name"]}
+        self.assertEqual(set(office.FLOW_SANSKRIT) - used, set())
+
     def test_a_pose_without_a_posture_fails_validation(self):
         b = copy.deepcopy(ROWS[SAT]["blocks"])
         b["flow"][0]["posture"] = None
