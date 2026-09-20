@@ -205,6 +205,16 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Anchor (confirmed 2026-09-19): Sunday 2026-09-20 is week 1, day 1.** Verified against the FCA start: 2026-09-20 − 2026-08-09 = 42 days = 3 × 14, and both are Sundays.
   - **Profile discrepancy — flagged, not resolved:** the profile records the FCA start as **8/8/2026, a Saturday**; Ryan states **Sunday 8/9**. Both can't be right. The anchor above doesn't depend on which it is (42 days either way only works from the Sunday), but the profile should be corrected once Ryan says which is true.
 
+**CYCLE-2 — the chat command for day-type overrides (small; not urgent).** CYCLE-1 shipped the resolution, the storage (`acos.cycle_day_overrides`, migration 035) and the timing rule, but **nothing writes a row yet** — an override can only be inserted by hand. Thanksgiving week 2026 is the first real use, and the current program ends 10/31, so there is time.
+- **`@artemis set <date|range> to <day_type> [at <location>]`** — inserts one row. `day_type` and `location` are independent, so `@artemis set 11/23-11/27 to wi` and `@artemis set tuesday to msp_work at richfield` are both valid, and either field may be omitted (the CHECK requires at least one).
+- **`@artemis overrides`** — lists the live ones (`revoked_at IS NULL`) with their id, span, what they set and the reason.
+- **`@artemis revoke <id>`** — **soft delete**: sets `revoked_at`, never DELETEs, so a cleared override stays readable as history.
+- **The reply echoes the resolved wake / open / quiet for the affected dates**, so the effect is visible before the morning it lands. Use `cycle.describe()`.
+- **Same next-day timing rule as CYCLE-1**, via `cycle.apply_override_effect` / `describe_override_effect`: an override takes effect from the next day; a boundary still ahead today applies; one already passed is skipped for today and **the confirmation says so explicitly**. Never a silent skip.
+- **Routing:** deterministic, like the other health commands — it must not go through the LLM classifier (HEALTH-1). `set` and `revoke` are destructive-ish, so they follow the existing confirm pattern and are added to the bare-control-word inventory in CONFIRM-ARB.
+- **After a write, re-point the schedule immediately** (`job_tz_sync` already detects location drift within 60 s; the command can call it directly, the way the `set timezone` command does, so there is no lag).
+- **Dates:** parse through `quiet_hours.parse_date_token` so `tuesday`, `11/23` and `2026-11-23` all work and anchor to the ACTIVE timezone.
+
 **LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
 - **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, a **wake time** (CYCLE-1: wake follows the location, not the day type), an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
 - **`richfield` is the farm** — one place, not two. There is no fifth WI location.
