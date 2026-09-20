@@ -40,6 +40,28 @@ def canon(name: str | None) -> str | None:
     return EXERCISE_ALIASES.get(name, name) if name else name
 
 
+def _recovery(checkins, start: date, through: date) -> dict | None:
+    """WATCH-1: average sleep hours and resting HR for the week. Data only —
+    no interpretation, no target, no advice. None when nothing was recorded."""
+    sleeps, hrs = [], []
+    for c in checkins:
+        d = c.get("state_date")
+        if d is None or not (start <= d <= through):
+            continue
+        if c.get("sleep_hrs") is not None:
+            sleeps.append(float(c["sleep_hrs"]))
+        if c.get("resting_hr") is not None:
+            hrs.append(float(c["resting_hr"]))
+    if not sleeps and not hrs:
+        return None
+    return {
+        "avg_sleep_hrs": round(sum(sleeps) / len(sleeps), 1) if sleeps else None,
+        "sleep_nights": len(sleeps),
+        "avg_resting_hr": round(sum(hrs) / len(hrs)) if hrs else None,
+        "resting_hr_days": len(hrs),
+    }
+
+
 def week_of(day: date, anchor: date = office.WEEK2_START) -> tuple[date, date]:
     """The program week containing `day` (SCHEDULE-2).
 
@@ -81,10 +103,11 @@ def _top_weights(logs) -> dict[str, float | None]:
 
 
 def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
-             anchor: date = office.WEEK1_START) -> dict:
+             anchor: date = office.WEEK1_START, checkins=None) -> dict:
     """Pure. `plans`: health.plan rows for start..end; `logs`: real session_log
     rows for start..end (with plan_date, plan_id); `prior_logs`: the same for
-    the 7 days before `start`."""
+    the 7 days before `start`; `checkins`: health.daily_state rows for
+    start..end (WATCH-1 — sleep and resting HR, data only)."""
     by_plan: dict[int, list] = {}
     for l in logs:
         by_plan.setdefault(l["plan_id"], []).append(l)
@@ -161,12 +184,14 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
     # SCHEDULE-2: week 1 is the 9/16..9/19 stub, weeks 2+ are Sun..Sat from
     # WEEK2_START. office.week_num_for is the one definition of that.
     program_week = office.week_num_for(start) if start >= office.WEEK1_START else None
+    recovery = _recovery(checkins or [], start, min(today, end))
     return {
         "week": {"start": start.isoformat(), "end": end.isoformat(), "program_week": program_week,
                  "through": min(today, end).isoformat(), "partial": end > today},
         "counts": {"planned": sum(1 for s in sessions if s["status"] != "rest"),
                    "done": done, "due": due, "missed": len(missed), "upcoming": upcoming},
         "sessions": sessions,
+        "recovery": recovery,
         "missed": missed,
         "rpe": rpe,
         "loads": loads,
@@ -192,8 +217,12 @@ def load(start: date, end: date, today: date | None = None) -> dict:
            "ORDER BY p.plan_date, sl.log_id")
     logs = execute_query(sql, (start, end))
     prior = execute_query(sql, (start - timedelta(days=7), start - timedelta(days=1)))
+    checkins = execute_query(
+        "SELECT state_date, sleep_hrs, resting_hr FROM health.daily_state "
+        "WHERE state_date BETWEEN %s AND %s ORDER BY state_date", (start, end))
     return evaluate([dict(r) for r in plans], [dict(r) for r in logs], [dict(r) for r in prior],
-                    start=start, end=end, today=today)
+                    start=start, end=end, today=today,
+                    checkins=[dict(r) for r in checkins])
 
 
 # ── Rendering (data only — no advice) ───────────────────────────────────────
@@ -221,6 +250,17 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
              f"{c['done']} of {c['due']} sessions due done"
              + (f" · {c['upcoming']} still to come" if c["upcoming"] else "")
              + f" · {c['planned']} planned"]
+    rec = ev.get("recovery")
+    if rec:
+        bits = []
+        if rec["avg_sleep_hrs"] is not None:
+            bits.append(f"sleep {rec['avg_sleep_hrs']}h avg over {rec['sleep_nights']} night(s)")
+        if rec["avg_resting_hr"] is not None:
+            bits.append(f"resting HR {rec['avg_resting_hr']} avg over "
+                        f"{rec['resting_hr_days']} day(s)")
+        lines.append("Recovery: " + " · ".join(bits))
+    else:
+        lines.append("Recovery: no sleep or resting HR recorded")
     lines.append("Missed: " + (", ".join(f"{_d(m['date'])} {m['label']}" for m in ev["missed"])
                                if ev["missed"] else "none"))
     r = ev["rpe"]

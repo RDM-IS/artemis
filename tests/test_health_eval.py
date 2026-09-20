@@ -145,6 +145,37 @@ class TestSundaySpan(unittest.TestCase):
         self.assertNotIn("partial", ev.render_lines(r)[0])
 
 
+class TestRecoveryLine(unittest.TestCase):
+    """WATCH-1: sleep and resting HR averages, data only — no interpretation."""
+
+    def checkins(self):
+        d = lambda i: WED + timedelta(days=i)  # noqa: E731
+        return [{"state_date": d(0), "sleep_hrs": 7.5, "resting_hr": 54},
+                {"state_date": d(1), "sleep_hrs": 6.5, "resting_hr": 56},
+                {"state_date": d(2), "sleep_hrs": None, "resting_hr": 55},
+                {"state_date": d(30), "sleep_hrs": 9.0, "resting_hr": 40}]   # outside the week
+
+    def test_averages_only_the_week_and_only_what_exists(self):
+        r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE,
+                        today=TUE + timedelta(days=1), checkins=self.checkins())
+        self.assertEqual(r["recovery"], {"avg_sleep_hrs": 7.0, "sleep_nights": 2,
+                                         "avg_resting_hr": 55, "resting_hr_days": 3})
+        line = next(l for l in ev.render_lines(r) if l.startswith("Recovery:"))
+        self.assertEqual(line, "Recovery: sleep 7.0h avg over 2 night(s) · "
+                               "resting HR 55 avg over 3 day(s)")
+
+    def test_no_data_says_so_rather_than_zero(self):
+        r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE, today=TUE)
+        self.assertIsNone(r["recovery"])
+        self.assertIn("Recovery: no sleep or resting HR recorded", ev.render_lines(r))
+
+    def test_the_line_carries_no_interpretation(self):
+        r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE,
+                        today=TUE, checkins=self.checkins())
+        line = next(l for l in ev.render_lines(r) if l.startswith("Recovery:"))
+        self.assertNotRegex(line.lower(), r"\b(low|high|poor|good|short|below|above|target)\b")
+
+
 class TestLoads(unittest.TestCase):
     def test_no_load_is_reported_as_such_not_zero(self):
         d = WED + timedelta(days=2)
