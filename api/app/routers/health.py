@@ -1833,13 +1833,40 @@ def _patterns(db: Session) -> list[PatternOut]:
     return out
 
 
-# ── WATCH-1: Health Auto Export ingest ─────────────────────────────────────
+# ── WATCH-1 / WATCH-2: Health Auto Export ingest ───────────────────────────
+
+# One INSERT per this many rows. The first build did one round-trip PER ROW:
+# 8,986 samples took 20.3 s and anything larger hit the 30 s Lambda/gateway
+# ceiling (two timeouts, 2026-09-19 21:50). Batched, the same payload is a
+# handful of round-trips.
+INSERT_CHUNK = 500
+# Refuse early, with a useful message, rather than hanging to the 30 s ceiling.
+MAX_SAMPLES_PER_REQUEST = 60_000
+MAX_WORKOUTS_PER_REQUEST = 2_000
+
 
 class IngestResponse(BaseModel):
     received: dict
     inserted: dict
     duplicates: dict
+    ignored: dict
     note: Optional[str] = None
+
+
+def _bulk_insert(db: Session, sql_head: str, cols: list[str], rows: list[dict]) -> int:
+    """Multi-row INSERT ... ON CONFLICT DO NOTHING RETURNING, in chunks.
+    Returns the number actually inserted (the rest were duplicates)."""
+    inserted = 0
+    for i in range(0, len(rows), INSERT_CHUNK):
+        chunk = rows[i:i + INSERT_CHUNK]
+        values, params = [], {}
+        for n, row in enumerate(chunk):
+            values.append("(" + ", ".join(f":{c}{n}" for c in cols) + ")")
+            for c in cols:
+                params[f"{c}{n}"] = row[c]
+        stmt = f"{sql_head} VALUES {', '.join(values)} ON CONFLICT DO NOTHING RETURNING 1"
+        inserted += len(db.execute(text(stmt), params).fetchall())
+    return inserted
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -1848,82 +1875,124 @@ def post_ingest(
     db: Session = Depends(get_db),
     _api_key: str = Depends(verify_watch_ingest_key),
 ):
-    """Accept a Health Auto Export payload (WATCH-1).
+    """Accept a Health Auto Export payload.
 
-    Idempotent: samples are keyed (metric, measured_at) and workouts
-    (kind, started_at), so a re-sent or overlapping export inserts nothing and
-    reports the duplicate counts instead.
+    Idempotent: samples key on (metric, measured_at), workouts on
+    (kind, started_at), so a re-sent or overlapping export writes nothing and
+    reports the duplicates instead.
 
-    Forgiving by design: a sample this parser can't read is stored raw with a
-    NULL value rather than rejecting the payload, and an unknown metric is
-    stored under its own name. Only a payload that isn't an object is refused.
-    The shape is an ASSUMPTION until a real export lands — keeping `raw` means
-    a parser fix can be replayed without re-exporting from the phone.
+    DEFENSIVE (WATCH-2): only the metrics on the allow-list are stored. Every
+    other metric is counted and NAMED in the response — so a wrong toggle in
+    the app can't write hundreds of thousands of rows, and nothing vanishes in
+    silence. Unreadable samples and workouts are reported the same way.
     """
-    from knowledge.watch_payload import parse_counts, parse_samples, parse_workouts
+    from knowledge.watch_payload import (
+        HEART_RATE, is_wanted, parse_counts, parse_samples, parse_workouts,
+    )
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail={"error": "payload must be a JSON object"})
 
     counts = parse_counts(payload)
-    samples = parse_samples(payload)
-    workouts = parse_workouts(payload)
-    ins_s = dup_s = ins_w = dup_w = skipped = 0
+    if counts["stored_samples"] > MAX_SAMPLES_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"error": "too many samples in one request",
+                    "storable_samples": counts["stored_samples"],
+                    "limit": MAX_SAMPLES_PER_REQUEST,
+                    "fix": "send a shorter date range — about a week per request"})
+    if counts["workouts_in"] > MAX_WORKOUTS_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"error": "too many workouts in one request",
+                    "workouts": counts["workouts_in"],
+                    "limit": MAX_WORKOUTS_PER_REQUEST,
+                    "fix": "send a shorter date range"})
 
+    skipped_workouts: list = []
+    samples = parse_samples(payload)
+    workouts = parse_workouts(payload, skipped_workouts)
+
+    # de-duplicate within the request itself, so the natural key is unique
+    # before Postgres ever sees it
+    seen, sample_rows = set(), []
+    undated = 0
     for row in samples:
         if row["measured_at"] is None:
-            skipped += 1
+            undated += 1
             continue
-        local_day = row["measured_at"].astimezone(CT).date() \
-            if row["measured_at"].tzinfo else row["measured_at"].date()
-        res = db.execute(text("""
-            INSERT INTO health.watch_sample
-                (metric, measured_at, local_date, value, unit, raw)
-            VALUES (:metric, :measured_at, :local_date, :value, :unit, CAST(:raw AS jsonb))
-            ON CONFLICT (metric, measured_at) DO NOTHING
-            RETURNING sample_id"""), {
-                "metric": row["metric"], "measured_at": row["measured_at"],
-                "local_date": local_day, "value": row["value"], "unit": row["unit"],
-                "raw": json.dumps(row["raw"], default=str)})
-        if res.first():
-            ins_s += 1
-        else:
-            dup_s += 1
+        if not is_wanted(row["metric"]):
+            continue                      # counted in `ignored`, never stored
+        key = (row["metric"], row["measured_at"])
+        if key in seen:
+            continue
+        seen.add(key)
+        local_day = (row["measured_at"].astimezone(CT).date()
+                     if row["measured_at"].tzinfo else row["measured_at"].date())
+        sample_rows.append({
+            "metric": row["metric"], "measured_at": row["measured_at"],
+            "local_date": local_day, "value": row["value"], "unit": row["unit"],
+            "raw": json.dumps(row["raw"], default=str)})
 
+    seen_w, workout_rows = set(), []
     for w in workouts:
-        local_day = w["started_at"].astimezone(CT).date() \
-            if w["started_at"].tzinfo else w["started_at"].date()
-        res = db.execute(text("""
-            INSERT INTO health.watch_workout
-                (kind, started_at, ended_at, local_date, duration_sec,
-                 hr_avg, hr_max, kcal, raw)
-            VALUES (:kind, :started_at, :ended_at, :local_date, :duration_sec,
-                    :hr_avg, :hr_max, :kcal, CAST(:raw AS jsonb))
-            ON CONFLICT (kind, started_at) DO NOTHING
-            RETURNING workout_id"""), {
-                **{k: w[k] for k in ("kind", "started_at", "ended_at", "duration_sec",
-                                     "hr_avg", "hr_max", "kcal")},
-                "local_date": local_day, "raw": json.dumps(w["raw"], default=str)})
-        if res.first():
-            ins_w += 1
-        else:
-            dup_w += 1
+        key = (w["kind"], w["started_at"])
+        if key in seen_w:
+            continue
+        seen_w.add(key)
+        local_day = (w["started_at"].astimezone(CT).date()
+                     if w["started_at"].tzinfo else w["started_at"].date())
+        workout_rows.append({
+            **{k: w[k] for k in ("kind", "started_at", "ended_at", "duration_sec",
+                                 "hr_avg", "hr_max", "kcal")},
+            "local_date": local_day, "raw": json.dumps(w["raw"], default=str)})
 
+    ins_s = _bulk_insert(
+        db, "INSERT INTO health.watch_sample (metric, measured_at, local_date, value, unit, raw)",
+        ["metric", "measured_at", "local_date", "value", "unit", "raw"], sample_rows) \
+        if sample_rows else 0
+    ins_w = _bulk_insert(
+        db, "INSERT INTO health.watch_workout (kind, started_at, ended_at, local_date, "
+            "duration_sec, hr_avg, hr_max, kcal, raw)",
+        ["kind", "started_at", "ended_at", "local_date", "duration_sec",
+         "hr_avg", "hr_max", "kcal", "raw"], workout_rows) \
+        if workout_rows else 0
+
+    # WATCH-2: every ingest leaves a trace. The only record used to be the HTTP
+    # response, which is why a failed import could not be investigated later.
+    db.execute(text(
+        "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
+        "outcome, token_count, api_cost_usd, metadata) "
+        "VALUES ('watch_ingest', NULL, 'watch_ingest', 'health', NULL, :outcome, 0, 0, "
+        "CAST(:meta AS jsonb))"),
+        {"outcome": "executed",
+         "meta": json.dumps({"received": counts,
+                             "inserted": {"samples": ins_s, "workouts": ins_w},
+                             "duplicates": {"samples": len(sample_rows) - ins_s,
+                                            "workouts": len(workout_rows) - ins_w}},
+                            default=str)})
     db.commit()
-    note = None
-    if skipped or counts["unparsed_metrics"]:
-        bits = []
-        if skipped:
-            bits.append(f"{skipped} sample(s) had no readable date and were not stored")
-        if counts["unparsed_metrics"]:
-            bits.append("stored unparsed: " + ", ".join(counts["unparsed_metrics"][:10]))
-        note = "; ".join(bits)
+
+    bits = []
+    if undated:
+        bits.append(f"{undated} sample(s) had no readable date and were not stored")
+    if counts["workouts_without_a_readable_start"]:
+        bits.append(f"{counts['workouts_without_a_readable_start']} workout(s) had no readable "
+                    f"start and were not stored")
+    if counts["heart_rate_samples"]:
+        bits.append(f"{counts['heart_rate_samples']} minute-level heart-rate sample(s) not "
+                    f"stored (high volume; see WATCH-2)")
+    if counts["ignored_samples"]:
+        bits.append(f"{counts['ignored_samples']} sample(s) of metrics not on the list: "
+                    + ", ".join(list(counts["ignored_metrics"])[:8]))
     return IngestResponse(
         received=counts,
         inserted={"samples": ins_s, "workouts": ins_w},
-        duplicates={"samples": dup_s, "workouts": dup_w},
-        note=note,
+        duplicates={"samples": len(sample_rows) - ins_s, "workouts": len(workout_rows) - ins_w},
+        ignored={"heart_rate": counts["heart_rate_samples"],
+                 "other": counts["ignored_metrics"]},
+        note="; ".join(bits) or None,
     )
 
 

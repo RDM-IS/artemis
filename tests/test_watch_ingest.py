@@ -128,6 +128,77 @@ class TestForgiving(unittest.TestCase):
         self.assertEqual(c["undated_samples"], 0)
 
 
+class TestDefensiveFilter(unittest.TestCase):
+    """WATCH-2: only allow-listed metrics are stored, but nothing vanishes in
+    silence — everything else is counted and named."""
+
+    REAL_SHAPE = {"data": {"metrics": [
+        {"name": "resting_heart_rate", "units": "bpm",
+         "data": [{"date": "2026-09-19 06:12:00 -0500", "qty": 54, "source": "RAW"}]},
+        {"name": "heart_rate", "units": "count/min",
+         "data": [{"date": "2026-09-19 06:13:00 -0500", "Avg": 84, "Min": 80, "Max": 92,
+                   "source": "RAW"}]},
+        {"name": "step_count", "units": "count",
+         "data": [{"date": "2026-09-19 06:14:00 -0500", "qty": 30, "source": "RAW|RIP"}]},
+        {"name": "physical_effort", "units": "kcal/hr·kg",
+         "data": [{"date": "2026-09-19 06:15:00 -0500", "qty": 3.2}]}]}}
+
+    def test_only_wanted_metrics_are_storable(self):
+        self.assertTrue(wp.is_wanted("resting_heart_rate"))
+        self.assertTrue(wp.is_wanted("hrv"))
+        self.assertTrue(wp.is_wanted("weight"))
+        self.assertTrue(wp.is_wanted("active_energy"))
+        self.assertTrue(wp.is_wanted("basal_energy"))
+        self.assertTrue(wp.is_wanted("sleep_asleep"))
+        for junk in ("heart_rate", "step_count", "physical_effort", "stair_speed_up",
+                     "apple_stand_time", "walking_speed", "respiratory_rate"):
+            self.assertFalse(wp.is_wanted(junk), junk)
+
+    def test_counts_name_what_was_ignored(self):
+        c = wp.parse_counts(self.REAL_SHAPE)
+        self.assertEqual(c["stored_samples"], 1)          # resting_heart_rate only
+        self.assertEqual(c["heart_rate_samples"], 1)      # held out separately
+        self.assertEqual(c["ignored_samples"], 2)
+        self.assertEqual(set(c["ignored_metrics"]), {"step_count", "physical_effort"})
+
+    def test_hr_min_max_and_device_are_captured(self):
+        hr = next(r for r in wp.parse_samples(self.REAL_SHAPE) if r["metric"] == "heart_rate")
+        self.assertEqual((hr["value"], hr["value_min"], hr["value_max"]), (84.0, 80.0, 92.0))
+        self.assertEqual(hr["device"], "RAW")
+
+    def test_a_workout_with_no_start_is_reported_not_dropped(self):
+        payload = {"data": {"workouts": [
+            {"name": "no start here"},
+            {"name": "fine", "start": "2026-09-19 06:35:00 -0500"}]}}
+        skipped = []
+        got = wp.parse_workouts(payload, skipped)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(wp.parse_counts(payload)["workouts_without_a_readable_start"], 1)
+
+
+class TestEndpointGuards(unittest.TestCase):
+    """The handler refuses early with a useful message instead of hanging to
+    the 30 s ceiling (two timeouts, 2026-09-19)."""
+
+    def test_the_limits_are_set_and_the_insert_is_batched(self):
+        src = (Path(__file__).resolve().parent.parent / "api" / "app" / "routers"
+               / "health.py").read_text()
+        self.assertIn("MAX_SAMPLES_PER_REQUEST", src)
+        self.assertIn("HTTP_413_REQUEST_ENTITY_TOO_LARGE", src)
+        # one INSERT per chunk, not per row
+        ingest = src[src.index("def _bulk_insert"):src.index('@router.get("/overview"')]
+        self.assertIn("VALUES {', '.join(values)}", ingest)
+        self.assertNotIn("for row in samples:\n        res = db.execute", ingest)
+
+    def test_every_ingest_writes_an_audit_row(self):
+        src = (Path(__file__).resolve().parent.parent / "api" / "app" / "routers"
+               / "health.py").read_text()
+        ingest = src[src.index('@router.post("/ingest"'):src.index('@router.get("/overview"')]
+        self.assertIn("acos.audit_log", ingest)
+        self.assertIn("'watch_ingest'", ingest)
+
+
 class TestKeySeparation(unittest.TestCase):
     """The watch key is accepted on /ingest ONLY, and the display key is not
     accepted there — different dependencies, different secrets (HARDEN-1)."""
