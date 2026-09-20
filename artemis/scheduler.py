@@ -418,7 +418,19 @@ class ArtemisScheduler:
         set_system_value(checkin_key(_local_today()), "open")
 
     def job_wake(self):
-        """04:30 local (Sat/Sun 07:30) — wake. Health only; business waits for open."""
+        """Wake (time from CYCLE-1's location table) — health only; business
+        waits for open.
+
+        WATCH-1: last night's watch values are written FIRST, so the post and
+        the check-in reply can name them. The pre-fill never overwrites
+        anything Ryan typed, and a failure here leaves the check-in fully
+        usable typed.
+        """
+        try:
+            from artemis import watch_prefill
+            watch_prefill.run()
+        except Exception:
+            logger.exception("Watch pre-fill failed — continuing with the wake post")
         try:
             from artemis.quiet_hours import get_quiet_state
             state = get_quiet_state()
