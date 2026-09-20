@@ -398,11 +398,14 @@ FLOW_ROUNDS = 2
 # YOGA-3 (Ryan, 9/19): open with seated meditation; close with savasana.
 FLOW_MEDITATION = {"name": "Seated meditation", "side": None, "duration_sec": 60,
                    "transition_sec": 5,
-                   "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated"}
+                   "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated",
+                   "cue_mid": "Sit tall and comfortable, eyes soft, slow breaths.",
+                   "cue_mid_at_start": True}
 FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180, "transition_sec": 5,
               "cue": "Lie on your back, arms by your sides, let everything go.",
               "posture": "supine", "sanskrit": "Shavasana",
-              "sanskrit_spoken": "shah-VAH-sah-nah"}
+              "sanskrit_spoken": "shah-VAH-sah-nah",
+              "cue_mid": "Let everything go heavy", "cue_mid_at_start": True}
 FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
                         "transition_sec": 5,
                         "cue": "Follow the 8 placard stretches", "posture": "standing"}
@@ -417,6 +420,36 @@ FLOW_POSTURE = {
     "Wind release": "supine", "Seated side bend": "seated", "Seated twist": "seated",
     "Seated mountain": "seated", "Easy pose": "seated",
 }
+# YOGA-5 mid-hold cues (Ryan, 2026-09-20). ONE short line per pose, spoken
+# 12 s into the hold and then nothing, so the rest of the hold is silent.
+# Ryan's framing: what helps in week one is noise by week six — hence the
+# toggle on the setup screen, default on.
+#
+# The meditation and savasana blocks are the exception: their line is spoken at
+# the START of the hold and then silence, because there is no "middle" of a
+# three-minute hold worth interrupting. Meditation's line is its existing
+# written cue; savasana's is Ryan's.
+FLOW_CUE_MID = {
+    "Child's pose":          "Let your forehead rest, widen your knees",
+    "Cobra":                 "Draw your shoulders down and back",
+    "Downward dog":          "Press the floor away, let your heels sink",
+    "Standing forward bend": "Soften your knees, let your head hang",
+    "High lunge":            "Front knee over the ankle, back leg long",
+    "Crescent lunge":        "Lift through your ribs, reach up",
+    "Extended puppy":        "Melt your chest toward the floor",
+    "Bridge":                "Press through your heels, open your chest",
+    "Supine twist":          "Let the top shoulder drop toward the mat",
+    "Wind release":          "Draw the knee closer, relax your neck",
+    "Seated side bend":      "Lengthen first, then lean",
+    "Seated twist":          "For a deeper stretch, look over your shoulder",
+    "Seated mountain":       "Relax your shoulders, sit tall",
+    "Easy pose":             "Settle in, soften your jaw",
+    "Savasana":              "Let everything go heavy",
+}
+# How long into a hold the mid cue is spoken. Never collides with the 7 s
+# lead-in: the shortest hold is 40 s, so the gap is 21 s.
+FLOW_CUE_MID_SEC = 12
+
 FLOW_POSTURES = ("standing", "kneeling", "quadruped", "prone", "supine", "seated")
 # How the voice says a pose, where it differs from the written name.
 FLOW_SPOKEN = {"Downward dog": "Downward facing dog"}
@@ -538,6 +571,12 @@ def validate_flow(blocks: dict) -> None:
         if not st.get("sanskrit") or not st.get("sanskrit_spoken"):
             raise FlowError(f"step {st.get('step')} ({st.get('name')}): no Sanskrit entry — "
                             f"add it to FLOW_SANSKRIT")
+        # YOGA-5: every pose resolves to a mid-hold cue or explicitly to none.
+        # The key must be PRESENT either way, so "nobody wrote one" and "this
+        # one deliberately has none" stay different facts.
+        if "cue_mid" not in st:
+            raise FlowError(f"step {st.get('step')} ({st.get('name')}): no cue_mid key — "
+                            f"add it to FLOW_CUE_MID, or set it to None on purpose")
 
 
 def _flow_step(spec: dict) -> dict:
@@ -555,6 +594,7 @@ def _flow_step(spec: dict) -> dict:
     sans = FLOW_SANSKRIT.get(name)
     if sans:
         out["sanskrit"], out["sanskrit_spoken"] = sans
+    out["cue_mid"] = FLOW_CUE_MID.get(name)
     return out
 
 
@@ -567,6 +607,7 @@ def _recovery_flow(location: str = LOCATION):
         "rounds": FLOW_ROUNDS,
         "hold_sec": FLOW_HOLD_SEC,
         "leadin_sec": FLOW_LEADIN_SEC,
+        "cue_mid_sec": FLOW_CUE_MID_SEC,
         "start_posture": FLOW_START_POSTURE,
         "pre": [dict(FLOW_MEDITATION)] + ([dict(FLOW_STRETCH_TRAINER)] if office else []),
         "flow": [_flow_step(s) for s in FLOW_STEPS],
