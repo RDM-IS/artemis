@@ -1177,13 +1177,26 @@ class ArtemisScheduler:
             logger.debug("ws watchdog job failed", exc_info=True)
 
     def job_update_check(self):
-        """Mon 08:00 — two independent checks, each silent when all is well:
-        a newer commit on GitHub, and SCHEMA-DRIFT (migrations on disk vs
-        acos.schema_migrations)."""
+        """Mon 08:00 — three independent checks, each silent when all is well:
+        a newer commit on GitHub, SCHEMA-DRIFT (migrations on disk vs
+        acos.schema_migrations), and LAMBDA-DRIFT (the live Lambda package vs
+        the repo, file by file)."""
         if not self._is_open():
             return
         self._check_github_update()
         self._check_schema_drift()
+        self._check_lambda_drift()
+
+    def _check_lambda_drift(self):
+        """The Lambda deploys by hand from a Mac and has no CI — nothing else
+        would notice a merge that never reached AWS."""
+        try:
+            from artemis.lambda_drift import check
+            msg = check()
+            if msg:
+                self._post(config.CHANNEL_OPS, msg)
+        except Exception:
+            logger.exception("Lambda drift check failed")
 
     def _check_schema_drift(self):
         try:
