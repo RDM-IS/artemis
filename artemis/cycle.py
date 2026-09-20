@@ -227,6 +227,44 @@ def describe(d: date) -> str:
             f"open {b['open']:%H:%M} · quiet {b['quiet']:%H:%M}")
 
 
+def apply_override_effect(start: date, end: date, now: datetime) -> dict:
+    """What an override spanning [start, end] actually changes, as of `now`.
+
+    Ryan, 2026-09-19: overrides take effect from the NEXT day by default. One
+    that covers today still applies to a boundary that hasn't passed yet; one
+    whose new time is already behind us is skipped FOR TODAY ONLY, and the
+    confirmation has to say so. Never a silent skip.
+
+    Returns {"effective_from": date, "today_applies": [...], "today_skipped":
+    [(kind, time), ...]} — the caller turns that into the reply.
+    """
+    today = now.date()
+    if start > today:
+        return {"effective_from": start, "today_applies": [], "today_skipped": []}
+    applies, skipped = [], []
+    for kind, get in (("wake", wake_on), ("open", open_on), ("quiet", quiet_on)):
+        t = get(today)
+        (applies if now.time() < t else skipped).append((kind, t))
+    return {
+        "effective_from": today,
+        "today_applies": [k for k, _ in applies],
+        "today_skipped": skipped,
+    }
+
+
+def describe_override_effect(effect: dict) -> str:
+    """The confirmation line. States a same-day skip explicitly."""
+    if not effect["today_applies"] and not effect["today_skipped"]:
+        return f"In effect from {effect['effective_from']:%a %-m/%d}."
+    parts = []
+    if effect["today_applies"]:
+        parts.append("today's " + ", ".join(effect["today_applies"]) + " move")
+    if effect["today_skipped"]:
+        past = ", ".join(f"{k} ({t:%H:%M})" for k, t in effect["today_skipped"])
+        parts.append(f"{past} already passed today — unchanged until tomorrow")
+    return "In effect now: " + "; ".join(parts) + "."
+
+
 def next_boundary(kind: str, now: datetime) -> datetime:
     """The next `wake` / `open` / `quiet` instant at or after `now` (local)."""
     get = {"wake": wake_on, "open": open_on, "quiet": quiet_on}[kind]

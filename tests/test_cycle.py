@@ -126,6 +126,37 @@ class TestOverrides(unittest.TestCase):
             self.assertEqual(cycle.day_type(OFFICE_TUE), "msp_work")
 
 
+class TestOverrideTiming(unittest.TestCase):
+    """Overrides take effect from the next day; a same-day boundary applies
+    only if it hasn't passed, and a skip is always stated."""
+
+    def test_a_future_override_is_next_day_only(self):
+        now = datetime(2026, 9, 22, 9, 0, tzinfo=CT)
+        with no_overrides():
+            eff = cycle.apply_override_effect(date(2026, 9, 25), date(2026, 9, 25), now)
+        self.assertEqual(eff["effective_from"], date(2026, 9, 25))
+        self.assertEqual((eff["today_applies"], eff["today_skipped"]), ([], []))
+        self.assertIn("In effect from Fri 9/25", cycle.describe_override_effect(eff))
+
+    def test_todays_override_applies_to_boundaries_still_ahead(self):
+        now = datetime(2026, 9, 22, 3, 0, tzinfo=CT)      # before the 04:30 wake
+        with no_overrides():
+            eff = cycle.apply_override_effect(now.date(), now.date(), now)
+        self.assertEqual(eff["today_applies"], ["wake", "open", "quiet"])
+        self.assertEqual(eff["today_skipped"], [])
+
+    def test_a_boundary_already_passed_is_skipped_and_said_out_loud(self):
+        now = datetime(2026, 9, 22, 7, 0, tzinfo=CT)      # after wake, before open
+        with no_overrides():
+            eff = cycle.apply_override_effect(now.date(), now.date(), now)
+        self.assertEqual(eff["today_applies"], ["quiet"])
+        self.assertEqual([k for k, _ in eff["today_skipped"]], ["wake", "open"])
+        line = cycle.describe_override_effect(eff)
+        self.assertIn("already passed today", line)
+        self.assertIn("unchanged until tomorrow", line)
+        self.assertIn("wake (04:30)", line)
+
+
 class TestOneSourceOfTruth(unittest.TestCase):
     """The registry and the quiet_hours helpers must agree — a split source is
     how a 04:30 wake survives a 06:00 Richfield morning."""
@@ -149,6 +180,25 @@ class TestOneSourceOfTruth(unittest.TestCase):
                 self.assertEqual(got.timetz().replace(tzinfo=None), expected, d)
                 self.assertEqual(got.date(), d, d)
                 self.assertEqual(got, cycle.next_boundary("wake", midnight), d)
+
+    def test_no_second_copy_of_the_cycle_tables(self):
+        """health_office and the scheduler must READ artemis.cycle, not keep
+        their own day-type or location tables."""
+        root = Path(__file__).resolve().parent.parent / "artemis"
+        for name in ("health_office.py", "scheduler.py", "quiet_hours.py"):
+            src = (root / name).read_text()
+            for marker in ("CYCLE_DAY_TYPES", "DAY_LOCATIONS = ", "DAY_TYPES = ",
+                           "DAY_TYPE_HOURS = ", "CYCLE_LOCATION = "):
+                self.assertNotIn(marker, src, f"{name} re-declares {marker}")
+        # …and health_office's view of a date matches the cycle's
+        from artemis import health_office as office
+        for i in range(cycle.CYCLE_LEN):
+            d = ANCHOR + timedelta(days=i)
+            with no_overrides():
+                want = cycle.location_at(d, time(0, 0), use_overrides=False)
+                display = (cycle.DEFAULT_LOCATIONS[want] or {})["display"]
+                self.assertEqual(office.day_location(d), display, d)
+                self.assertEqual(office.day_type(d, use_overrides=False), cycle.day_type(d), d)
 
     def test_no_weekend_branching_left_in_the_schedule_path(self):
         src = (Path(__file__).resolve().parent.parent / "artemis" / "quiet_hours.py").read_text()

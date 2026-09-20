@@ -154,6 +154,7 @@ class ArtemisScheduler:
         self.scheduler = BackgroundScheduler(timezone=ZoneInfo(config.HOME_TIMEZONE))
         self._cron_specs: list[CronSpec] = []
         self._applied_tz: str | None = None
+        self._applied_cron_times: dict[str, tuple[int, int]] = {}
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
         self._pending_availability: dict[str, dict] = {}
@@ -161,92 +162,86 @@ class ArtemisScheduler:
         self._gmail_fail_count: int = 0
         self._calendar_fail_count: int = 0
 
-    @staticmethod
-    def _sample_date(day_type: str) -> date:
-        """A date in the current cycle with this day type — the interim bridge
-        while the registry still has one fixed time per job. The nightly
-        recompute replaces this with tomorrow's real date."""
-        from artemis import cycle
-        base = cycle.anchor()
-        for i in range(cycle.CYCLE_LEN):
-            d = base + timedelta(days=i)
-            if cycle.day_type(d, use_overrides=False) == day_type:
-                return d
-        return base
-
     # ── Cron registry (WAKE-1 §C) ─────────────────────────────────────────
     #  Local wall-clock times. apply_timezone() is the ONLY registration path;
     #  no add_job(..., "cron", ...) call may live outside it.
 
-    def cron_specs(self) -> list[CronSpec]:
-        # CYCLE-1: the times come from artemis.cycle — the same resolution the
-        # quiet_hours boundary helpers use, so the registry and those helpers
-        # can never disagree. The weekday specs carry the OFFICE (msp_work)
-        # times and the weekend twins the MSP-home ones; the nightly location
-        # recompute replaces that split next.
-        from artemis import cycle
-        wake_h, wake_m = _time_parts(cycle.wake_on(self._sample_date("msp_work")))
-        open_h, open_m = _time_parts(cycle.open_on(self._sample_date("msp_work")))
-        quiet_h, quiet_m = _time_parts(cycle.quiet_on(self._sample_date("msp_work")))
-        brief_h, brief_m = _hhmm(config.MORNING_BRIEF_TIME)
-        pre_h, pre_m = _minus_minutes(brief_h, brief_m, 5)
-        home = self._sample_date("msp_home")
-        we_wake_h, we_wake_m = _time_parts(cycle.wake_on(home))
-        we_open_h, we_open_m = _time_parts(cycle.open_on(home))
-        we_quiet_h, we_quiet_m = _time_parts(cycle.quiet_on(home))
-        we_pre_h, we_pre_m = _minus_minutes(we_open_h, we_open_m, 5)
-        WD, WE = "mon-fri", "sat,sun"
+    # CYCLE-1: the six location-dependent jobs. Each is registered ONCE (no
+    # weekday/weekend twins) at the time its next firing date calls for, which
+    # comes from artemis.cycle — the same resolution quiet_hours uses.
+    #   job id -> which boundary it hangs off
+    LOCATION_JOBS = {
+        "wake": "wake", "checkin_nudge": "wake",
+        "inbox_zero_morning": "open", "open": "open", "morning_brief": "open",
+        "quiet_hours_start": "quiet",
+    }
 
+    @staticmethod
+    def _next_date_for(kind: str, now=None):
+        """The date whose boundaries a job should carry: today while today's
+        boundary is still ahead, otherwise tomorrow. Cron repeats daily, and
+        the nightly recompute re-points it, so this is always the next firing."""
+        from artemis import cycle
+        from artemis.quiet_hours import local_now
+        now = now or local_now()
+        get = {"wake": cycle.wake_on, "open": cycle.open_on, "quiet": cycle.quiet_on}[kind]
+        today = now.date()
+        return today if now.time() < get(today) else today + timedelta(days=1)
+
+    def cron_times(self, now=None) -> dict[str, tuple[int, int]]:
+        """(hour, minute) for every location-dependent job, from the cycle."""
+        from artemis import cycle
+        get = {"wake": cycle.wake_on, "open": cycle.open_on, "quiet": cycle.quiet_on}
+        out = {}
+        for job_id, kind in self.LOCATION_JOBS.items():
+            d = self._next_date_for(kind, now)
+            t = get[kind](d)
+            if job_id == "checkin_nudge":
+                out[job_id] = _plus_minutes(t.hour, t.minute, config.CHECKIN_NUDGE_OFFSET_MIN)
+            elif job_id == "inbox_zero_morning":
+                out[job_id] = _minus_minutes(t.hour, t.minute, 5)
+            else:
+                out[job_id] = (t.hour, t.minute)
+        return out
+
+    def cron_specs(self, now=None) -> list[CronSpec]:
+        t = self.cron_times(now)
         specs = [
             # 03:30 — silent vault ingest, before the wake window.
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
-            # 04:30 (Sat/Sun 07:30) — wake: health holds flush + the wake post.
-            CronSpec("wake", "job_wake", wake_h, wake_m, WD, tier="health"),
-            CronSpec("wake_weekend", "job_wake", we_wake_h, we_wake_m, WE,
-                     tier="health", guard="wake"),
+            # wake: health holds flush + the wake post. Time follows the day's
+            # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer / home 07:30).
+            CronSpec("wake", "job_wake", *t["wake"], tier="health"),
             # wake + 45 min — one nudge if no check-in arrived (FRIDAY-1).
-            # Event-driven adjustment replaced the fixed 04:45 calibration post.
-            CronSpec("checkin_nudge", "job_checkin_nudge",
-                     *_plus_minutes(wake_h, wake_m, config.CHECKIN_NUDGE_OFFSET_MIN), WD,
-                     tier="health"),
-            CronSpec("checkin_nudge_weekend", "job_checkin_nudge",
-                     *_plus_minutes(we_wake_h, we_wake_m, config.CHECKIN_NUDGE_OFFSET_MIN), WE,
-                     tier="health", guard="checkin_nudge"),
-            # 06:25 / 06:30 (Sat/Sun 08:25 / 08:30) — open: business holds
-            # flush, then the brief.
-            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", pre_h, pre_m, WD),
-            CronSpec("inbox_zero_morning_weekend", "job_inbox_zero_morning",
-                     we_pre_h, we_pre_m, WE, guard="inbox_zero_morning"),
-            CronSpec("open", "job_open", open_h, open_m, WD),
-            CronSpec("open_weekend", "job_open", we_open_h, we_open_m, WE, guard="open"),
-            CronSpec("morning_brief", "job_morning_brief", brief_h, brief_m, WD),
-            CronSpec("morning_brief_weekend", "job_morning_brief", we_open_h, we_open_m, WE,
-                     guard="morning_brief"),
+            CronSpec("checkin_nudge", "job_checkin_nudge", *t["checkin_nudge"], tier="health"),
+            # open: business holds flush, then the brief. Follows the DAY TYPE
+            # (work 06:30 · non-work 08:30).
+            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", *t["inbox_zero_morning"]),
+            CronSpec("open", "job_open", *t["open"]),
+            CronSpec("morning_brief", "job_morning_brief", *t["open"]),
             # 08:00 / 08:05 — weekdays only (open-only checks).
-            CronSpec("ssl_check", "job_ssl_check", 8, 0, WD),
-            CronSpec("domain_check", "job_domain_check", 8, 5, WD),
+            CronSpec("ssl_check", "job_ssl_check", 8, 0, "mon-fri"),
+            CronSpec("domain_check", "job_domain_check", 8, 5, "mon-fri"),
             CronSpec("follow_up_radar", "job_follow_up_radar", 8, 0, "mon-fri"),
             CronSpec("update_check", "job_update_check", 8, 0, "mon"),
             CronSpec("commitment_reminders", "job_commitment_reminders", 8, 15, "mon-fri"),
-            # 16:30 — workouts are AM now, so the debrief nag moved off 21:00
-            # (which would sit inside the 17:00 quiet window and never fire).
+            # 16:30 — workouts are AM now, so the debrief nag moved off 21:00.
             CronSpec("health_nag", "job_health_nag", 16, 30, tier="health"),
             CronSpec("vault_coverage", "job_vault_coverage", 16, 30, "mon-fri"),
-            # 17:00 (Sat/Sun 22:30) — quiet.
-            CronSpec("quiet_hours_start", "job_quiet_hours_start", quiet_h, quiet_m, WD),
-            CronSpec("quiet_hours_start_weekend", "job_quiet_hours_start",
-                     we_quiet_h, we_quiet_m, WE, guard="quiet_hours_start"),
+            # quiet: follows the DAY TYPE (work 17:00 · non-work 22:30).
+            CronSpec("quiet_hours_start", "job_quiet_hours_start", *t["quiet_hours_start"]),
             # 21:50 — silent DB backstop; writes only, posts nothing.
             CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
             # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
             CronSpec("pain_pattern_recompute", "job_pain_pattern_recompute", 21, 55),
-            # Sunday at the weekend open (08:30) — weekly health review: new or
-            # changed pain patterns only. It posts in the OPEN phase only.
-            CronSpec("health_review", "job_health_review", we_open_h, we_open_m, "sun",
-                     tier="health"),
-            # Sunday 08:35 — EVAL-1: the week so far, data only, labelled partial.
-            CronSpec("weekly_eval", "job_weekly_eval", *_plus_minutes(we_open_h, we_open_m, 5),
-                     "sun", tier="health"),
+            # 22:00 — CYCLE-1: re-point the location jobs at tomorrow. Quiet
+            # hours, posts nothing.
+            CronSpec("location_recompute", "job_location_recompute", 22, 0),
+            # Sunday 08:30 / 08:35 — FIXED hours, independent of open time and
+            # location (Ryan, 2026-09-19): the weekly health review, then the
+            # EVAL-1 post for the week that just ended.
+            CronSpec("health_review", "job_health_review", 8, 30, "sun", tier="health"),
+            CronSpec("weekly_eval", "job_weekly_eval", 8, 35, "sun", tier="health"),
         ]
         if config.FOCUS_CLIENT:
             specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
@@ -305,6 +300,7 @@ class ArtemisScheduler:
                     self._wrap_cron(spec), trigger=trigger, id=spec.id, replace_existing=True,
                 )
         self._applied_tz = tz_name
+        self._applied_cron_times = {sp.id: (sp.hour, sp.minute) for sp in self._cron_specs}
         set_system_value("scheduler_tz", tz_name)
         logger.info("Scheduler timezone applied: %s", tz_name)
         for line in self.job_dump():
@@ -474,7 +470,8 @@ class ArtemisScheduler:
             logger.exception("Open job failed")
 
     def job_tz_sync(self):
-        """Every 60s: keep the cron schedule on the ACTIVE timezone.
+        """Every 60s: keep the cron schedule on the ACTIVE timezone and on the
+        day's LOCATION (CYCLE-1).
 
         Also sweeps an expired override (atomic delete) and announces the
         change. The set/clear command calls this directly so there is no lag.
@@ -488,10 +485,44 @@ class ArtemisScheduler:
                 logger.info("Timezone change: %s → %s — rescheduling crons",
                             self._applied_tz, active)
                 self.apply_timezone(active)
+            elif self._location_drift():
+                logger.info("Location drift: %s — rescheduling crons", self._location_drift())
+                self.apply_timezone(active)
             if announcement:
                 self._post(config.CHANNEL_OPS, announcement, tier="business")
         except Exception:
             logger.exception("Timezone sync failed")
+
+    def _location_drift(self) -> dict[str, tuple]:
+        """Location jobs whose registered time is not what the cycle now says.
+
+        Catches a manual override taking effect, a day rolling over, and a
+        missed recompute — the same shape as the timezone check above.
+        """
+        if not self._applied_cron_times:
+            return {}
+        want = self.cron_times()
+        return {job_id: (self._applied_cron_times.get(job_id), t)
+                for job_id, t in want.items()
+                if self._applied_cron_times.get(job_id) != t}
+
+    def job_location_recompute(self):
+        """22:00 local — re-point the location jobs at TOMORROW (CYCLE-1).
+
+        Runs inside quiet hours and posts nothing. Each job is registered for
+        the date its next firing falls on, so this is just apply_timezone with
+        a fresh read of the cycle.
+        """
+        try:
+            from artemis import cycle
+            from artemis.quiet_hours import get_active_timezone, local_today
+            tomorrow = local_today() + timedelta(days=1)
+            drift = self._location_drift()
+            self.apply_timezone(get_active_timezone())
+            logger.info("CYCLE-1 recompute for %s: %s%s", tomorrow, cycle.describe(tomorrow),
+                        f" — moved {sorted(drift)}" if drift else " — no change")
+        except Exception:
+            logger.exception("Location recompute failed")
 
     def _poll_gmail(self, max_results: int = 20) -> list[dict]:
         """Poll Gmail inline using the already-authenticated GmailClient."""
