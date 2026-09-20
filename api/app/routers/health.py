@@ -1887,7 +1887,7 @@ def post_ingest(
     silence. Unreadable samples and workouts are reported the same way.
     """
     from knowledge.watch_payload import (
-        HEART_RATE, is_wanted, parse_counts, parse_samples, parse_workouts,
+        HEART_RATE, decode_device, is_wanted, parse_counts, parse_samples, parse_workouts,
     )
 
     if not isinstance(payload, dict):
@@ -1917,10 +1917,26 @@ def post_ingest(
     # de-duplicate within the request itself, so the natural key is unique
     # before Postgres ever sees it
     seen, sample_rows = set(), []
+    seen_hr, hr_rows = set(), []
     undated = 0
     for row in samples:
         if row["measured_at"] is None:
             undated += 1
+            continue
+        if row["metric"] == HEART_RATE:
+            # WATCH-2: minute-level HR lives in its own compact table
+            # (migration 037) — timestamp + three smallints, no raw JSON.
+            if row["measured_at"] in seen_hr or row["value"] is None:
+                continue
+            seen_hr.add(row["measured_at"])
+            hr_local = (row["measured_at"].astimezone(CT).date()
+                        if row["measured_at"].tzinfo else row["measured_at"].date())
+            hr_rows.append({
+                "measured_at": row["measured_at"], "local_date": hr_local,
+                "bpm": int(row["value"]),
+                "bpm_min": int(row["value_min"]) if row.get("value_min") is not None else None,
+                "bpm_max": int(row["value_max"]) if row.get("value_max") is not None else None,
+                "device": row.get("device")})
             continue
         if not is_wanted(row["metric"]):
             continue                      # counted in `ignored`, never stored
@@ -1952,6 +1968,11 @@ def post_ingest(
         db, "INSERT INTO health.watch_sample (metric, measured_at, local_date, value, unit, raw)",
         ["metric", "measured_at", "local_date", "value", "unit", "raw"], sample_rows) \
         if sample_rows else 0
+    ins_hr = _bulk_insert(
+        db, "INSERT INTO health.watch_heart_rate (measured_at, local_date, bpm, bpm_min, "
+            "bpm_max, device)",
+        ["measured_at", "local_date", "bpm", "bpm_min", "bpm_max", "device"], hr_rows) \
+        if hr_rows else 0
     ins_w = _bulk_insert(
         db, "INSERT INTO health.watch_workout (kind, started_at, ended_at, local_date, "
             "duration_sec, hr_avg, hr_max, kcal, raw)",
@@ -1968,7 +1989,8 @@ def post_ingest(
         "CAST(:meta AS jsonb))"),
         {"outcome": "executed",
          "meta": json.dumps({"received": counts,
-                             "inserted": {"samples": ins_s, "workouts": ins_w},
+                             "inserted": {"samples": ins_s, "workouts": ins_w,
+                                          "heart_rate": ins_hr},
                              "duplicates": {"samples": len(sample_rows) - ins_s,
                                             "workouts": len(workout_rows) - ins_w}},
                             default=str)})
@@ -1981,17 +2003,16 @@ def post_ingest(
         bits.append(f"{counts['workouts_without_a_readable_start']} workout(s) had no readable "
                     f"start and were not stored")
     if counts["heart_rate_samples"]:
-        bits.append(f"{counts['heart_rate_samples']} minute-level heart-rate sample(s) not "
-                    f"stored (high volume; see WATCH-2)")
+        bits.append(f"{ins_hr} of {counts['heart_rate_samples']} heart-rate sample(s) stored "
+                    f"in watch_heart_rate")
     if counts["ignored_samples"]:
         bits.append(f"{counts['ignored_samples']} sample(s) of metrics not on the list: "
                     + ", ".join(list(counts["ignored_metrics"])[:8]))
     return IngestResponse(
         received=counts,
-        inserted={"samples": ins_s, "workouts": ins_w},
+        inserted={"samples": ins_s, "workouts": ins_w, "heart_rate": ins_hr},
         duplicates={"samples": len(sample_rows) - ins_s, "workouts": len(workout_rows) - ins_w},
-        ignored={"heart_rate": counts["heart_rate_samples"],
-                 "other": counts["ignored_metrics"]},
+        ignored={"other": counts["ignored_metrics"]},
         note="; ".join(bits) or None,
     )
 

@@ -58,6 +58,35 @@ SLEEP_PREFIX = "sleep"
 HEART_RATE = "heart_rate"
 
 
+# The payload's own "source" field, decoded (Ryan, 2026-09-20).
+DEVICE_DECODE = {
+    "RAW": "watch",          # Ryan's Apple Watch
+    "RIP": "iphone",         # Ryan's iPhone
+    "RAW|RIP": "watch+iphone",
+    "RIP|RAW": "watch+iphone",
+}
+# Where a metric can come from either device, the WATCH is the better source.
+# Weight comes from the scale via either and needs no preference.
+PREFER_WATCH = {"resting_heart_rate", "hrv", "heart_rate"}
+PREFER_WATCH_PREFIXES = ("sleep",)
+
+
+def decode_device(raw: str | None) -> str | None:
+    """'RAW' -> 'watch', 'RIP' -> 'iphone', 'RAW|RIP' -> 'watch+iphone'.
+
+    An unrecognised string returns None and the raw value is still stored, so
+    a new device name shows up as data rather than being guessed at."""
+    if not raw:
+        return None
+    return DEVICE_DECODE.get(raw.strip().upper())
+
+
+def prefers_watch(metric: str) -> bool:
+    """True when a watch reading should win over an iPhone one for this metric
+    (resting HR, HRV, sleep). Used when both devices report the same moment."""
+    return metric in PREFER_WATCH or metric.startswith(PREFER_WATCH_PREFIXES)
+
+
 def is_wanted(metric: str) -> bool:
     """True when a metric is stored in watch_sample."""
     return metric in WANTED or metric.startswith(SLEEP_PREFIX)
