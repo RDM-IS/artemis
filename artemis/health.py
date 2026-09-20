@@ -2264,7 +2264,89 @@ def handle_workout_session(message: str) -> str | None:
 # is_skipped plans). Phrases mirror the legacy life_ops handler verbatim.
 # ----------------------------------------------------------------------------
 
-_REST_DAY_PHRASES = ("skip today", "rest day", "taking today off", "day off")
+_REST_DAY_PHRASES = ("rest day", "taking today off", "day off")
+
+# MAKEUP-1 (Ryan, 2026-09-20): `skip <reason>` records INTENT. It marks the
+# plan row is_skipped with the reason, so EVAL-1 and the reports stop showing
+# a deliberate skip as a missed session. It moves nothing — a makeup that
+# slides a session is deferred until a missed day is a recurring problem
+# rather than a one-off.
+_SKIP_RE = re.compile(r"^\s*skip\b(?P<rest>.*)$", re.I | re.S)
+
+
+def parse_skip(message: str, today: date) -> tuple[date, str] | None:
+    """("which day", "reason") from `skip [<date>] <reason>`, or None when the
+    message isn't a skip command. The reason is required — a skip with no
+    reason is what `missed` already means."""
+    m = _SKIP_RE.match(message or "")
+    if not m:
+        return None
+    rest = (m.group("rest") or "").strip(_TRIM)
+    if not rest:
+        return None
+    day = today
+    # a leading day token ("skip friday travelling", "skip 9/25 travelling")
+    head = rest.split(None, 1)
+    if len(head) > 1:
+        got = _skip_day_token(head[0], today)
+        if got is not None:
+            day, rest = got, head[1].strip(_TRIM)
+    return (day, rest) if rest else None
+
+
+_TRIM = " :,-—–"
+
+
+def _skip_day_token(token: str, today: date) -> date | None:
+    """A weekday name, `tomorrow`/`yesterday`, or a numeric date. None when the
+    token isn't a day — then it is part of the reason, not the date."""
+    t = (token or "").strip(_TRIM).lower()
+    if not t:
+        return None
+    if t in ("today",):
+        return today
+    if t in ("tomorrow",):
+        return today + timedelta(days=1)
+    if t in ("yesterday",):
+        return today - timedelta(days=1)
+    for name, idx in _WEEKDAYS.items():
+        if t == name or t == name[:3]:
+            # the nearest such weekday, this week or the next
+            delta = (idx - today.weekday()) % 7
+            return today + timedelta(days=delta)
+    from artemis.quiet_hours import parse_date_token
+    return parse_date_token(token, today)
+
+
+def handle_skip(message: str, today: date | None = None) -> str | None:
+    """`skip <reason>` / `skip <date> <reason>` — record a deliberate skip.
+
+    Returns the ack, or None when the message isn't a skip (so the caller
+    falls through). Deterministic: never routed through the classifier.
+    """
+    today = today or datetime.now(_local_tz()).date()
+    parsed = parse_skip(message, today)
+    if not parsed:
+        return None
+    day, reason = parsed
+    from knowledge.db import execute_one, execute_write
+    plan = execute_one(
+        "SELECT plan_id, session_type, is_skipped, blocks FROM health.plan "
+        "WHERE plan_date = %s", (day,))
+    if not plan:
+        return f"No session planned for {day:%a %-m/%-d} — nothing to skip."
+    try:
+        execute_write(
+            "UPDATE health.plan SET is_skipped = TRUE, skip_reason = %s WHERE plan_date = %s",
+            (reason, day))
+    except Exception:
+        logger.exception("Failed to record skip for %s", day)
+        return "⚠️ Couldn't record the skip — check DB."
+    blocks = plan["blocks"] if isinstance(plan["blocks"], dict) else json.loads(plan["blocks"] or "{}")
+    what = blocks.get("display_name") or plan["session_type"]
+    when = "today" if day == today else f"{day:%a %-m/%-d}"
+    return (f"Skipped {when} — {what}: {reason}. It won't count as missed; "
+            f"the session isn't moved.")
 
 
 def handle_rest_day(message: str) -> str | None:

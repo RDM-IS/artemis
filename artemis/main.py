@@ -3140,6 +3140,13 @@ def _try_life_ops(question: str) -> str | None:
     precedence the legacy workout handler had.
     """
     q = question.lower()
+    # MAKEUP-1: `skip <reason>` records a deliberate skip on the plan row.
+    # Deterministic and ahead of the rest-day phrases, so "skip today, travelling"
+    # keeps its reason instead of being swallowed as a bare rest day.
+    from artemis.health import handle_skip
+    skipped = handle_skip(question)
+    if skipped:
+        return skipped
     # Ad-hoc rest day → RDS (replaces life_ops.log_rest_day; marks health.plan).
     from artemis.health import handle_rest_day
     rest = handle_rest_day(question)

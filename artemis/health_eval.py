@@ -112,7 +112,7 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
     for l in logs:
         by_plan.setdefault(l["plan_id"], []).append(l)
 
-    sessions, missed, adjustments = [], [], []
+    sessions, missed, skipped, adjustments = [], [], [], []
     done = due = upcoming = 0
     rpe_pairs = []
     for p in sorted(plans, key=lambda r: r["plan_date"]):
@@ -127,6 +127,12 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
         st = p["session_type"]
         if st in REST_TYPES:
             status = "rest"
+        elif p.get("is_skipped"):
+            # MAKEUP-1: Ryan said so out loud. A deliberate skip is NOT a
+            # missed session and never counts against the week.
+            status = "skipped"
+            skipped.append({"date": d.isoformat(), "label": b.get("display_name") or st,
+                            "reason": (p.get("skip_reason") or "").strip() or None})
         else:
             real = [l for l in by_plan.get(p["plan_id"], []) if not l.get("is_skipped")]
             if real:
@@ -193,6 +199,7 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
         "sessions": sessions,
         "recovery": recovery,
         "missed": missed,
+        "skipped": skipped,
         "rpe": rpe,
         "loads": loads,
         "adjustments": adjustments,
@@ -208,7 +215,8 @@ def load(start: date, end: date, today: date | None = None) -> dict:
 
     today = today or local_today()
     plans = execute_query(
-        "SELECT plan_id, plan_date, session_type, week_num, target_rpe, blocks "
+        "SELECT plan_id, plan_date, session_type, week_num, target_rpe, blocks, "
+        "is_skipped, skip_reason "
         "FROM health.plan WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date", (start, end))
     sql = ("SELECT p.plan_date, sl.plan_id, sl.log_type, sl.exercise, sl.weight_lbs, "
            "sl.reps_done, sl.rpe_actual, sl.is_skipped "
@@ -261,6 +269,10 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
         lines.append("Recovery: " + " · ".join(bits))
     else:
         lines.append("Recovery: no sleep or resting HR recorded")
+    if ev.get("skipped"):
+        lines.append("Skipped: " + ", ".join(
+            f"{_d(s['date'])} {s['label']}" + (f" — {s['reason']}" if s["reason"] else "")
+            for s in ev["skipped"]))
     lines.append("Missed: " + (", ".join(f"{_d(m['date'])} {m['label']}" for m in ev["missed"])
                                if ev["missed"] else "none"))
     r = ev["rpe"]
