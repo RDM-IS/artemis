@@ -400,7 +400,9 @@ FLOW_MEDITATION = {"name": "Seated meditation", "side": None, "duration_sec": 60
                    "transition_sec": 5,
                    "cue": "Sit tall and comfortable, eyes soft, slow breaths.", "posture": "seated"}
 FLOW_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180, "transition_sec": 5,
-              "cue": "Lie on your back, arms by your sides, let everything go.", "posture": "supine"}
+              "cue": "Lie on your back, arms by your sides, let everything go.",
+              "posture": "supine", "sanskrit": "Shavasana",
+              "sanskrit_spoken": "shah-VAH-sah-nah"}
 FLOW_STRETCH_TRAINER = {"name": "Stretch Trainer", "side": None, "duration_sec": 480,
                         "transition_sec": 5,
                         "cue": "Follow the 8 placard stretches", "posture": "standing"}
@@ -418,6 +420,34 @@ FLOW_POSTURE = {
 FLOW_POSTURES = ("standing", "kneeling", "quadruped", "prone", "supine", "seated")
 # How the voice says a pose, where it differs from the written name.
 FLOW_SPOKEN = {"Downward dog": "Downward facing dog"}
+
+# YOGA-5 (Ryan, 2026-09-20) — the Sanskrit name of every pose, twice:
+#   sanskrit         the display spelling, shown small beneath the English name
+#   sanskrit_spoken  a phonetic respelling, for speechSynthesis ONLY, because
+#                    the engine mangles the proper spelling
+# The transition cue speaks the Sanskrit with no side ("Move to Ashta
+# Chandrasana") — the 7 s lead-in just gave the side in English and the screen
+# shows it. Meditation and the Stretch Trainer have no meaningful Sanskrit and
+# fall back to English; every POSE must resolve, and validate_flow fails if one
+# does not.
+FLOW_SANSKRIT = {
+    "Child's pose":          ("Balasana", "bah-LAH-sah-nah"),
+    "Cobra":                 ("Bhujangasana", "boo-jang-GAH-sah-nah"),
+    "Downward dog":          ("Adho Mukha Svanasana", "AH-doh MOO-kah shvah-NAH-sah-nah"),
+    "Standing forward bend": ("Uttanasana", "oo-tah-NAH-sah-nah"),
+    "High lunge":            ("Utthita Ashwa Sanchalanasana",
+                              "oo-TEE-tah ASH-wah sahn-chah-lah-NAH-sah-nah"),
+    "Crescent lunge":        ("Ashta Chandrasana", "AHSH-tah chahn-DRAH-sah-nah"),
+    "Extended puppy":        ("Uttana Shishosana", "oo-TAH-nah shih-SHOH-sah-nah"),
+    "Bridge":                ("Setu Bandha Sarvangasana", "SEH-too BAHN-dah sar-vahn-GAH-sah-nah"),
+    "Supine twist":          ("Supta Matsyendrasana", "SOOP-tah mahts-yen-DRAH-sah-nah"),
+    "Wind release":          ("Pawanmuktasana", "pah-wahn-mook-TAH-sah-nah"),
+    "Seated side bend":      ("Parsva Sukhasana", "PARSH-vah soo-KAH-sah-nah"),
+    "Seated twist":          ("Parivrtta Sukhasana", "pah-ree-VRIT-tah soo-KAH-sah-nah"),
+    "Seated mountain":       ("Parvatasana", "par-vah-TAH-sah-nah"),
+    "Easy pose":             ("Sukhasana", "soo-KAH-sah-nah"),
+    "Savasana":              ("Shavasana", "shah-VAH-sah-nah"),
+}
 # YOGA-4: the lead-in moves to 7 s before the hold ends, and there is no chime
 # in front of it any more — the words start at 7 s exactly.
 FLOW_LEADIN_SEC = 7
@@ -502,6 +532,12 @@ def validate_flow(blocks: dict) -> None:
         if not isinstance(it.get("transition_sec"), int) or it["transition_sec"] <= 0:
             raise FlowError(f"{it.get('step') or it.get('name')}: transition_sec "
                             f"{it.get('transition_sec')!r} is not a positive whole number")
+    # YOGA-5: every pose resolves to a Sanskrit entry. The pre blocks
+    # (meditation, Stretch Trainer) have none and fall back to English.
+    for st in flow:
+        if not st.get("sanskrit") or not st.get("sanskrit_spoken"):
+            raise FlowError(f"step {st.get('step')} ({st.get('name')}): no Sanskrit entry — "
+                            f"add it to FLOW_SANSKRIT")
 
 
 def _flow_step(spec: dict) -> dict:
@@ -516,6 +552,9 @@ def _flow_step(spec: dict) -> dict:
         out["rounds"] = list(spec["rounds"])
     if name in FLOW_SPOKEN:
         out["spoken"] = FLOW_SPOKEN[name]
+    sans = FLOW_SANSKRIT.get(name)
+    if sans:
+        out["sanskrit"], out["sanskrit_spoken"] = sans
     return out
 
 
