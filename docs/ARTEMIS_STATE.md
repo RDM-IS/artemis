@@ -500,9 +500,14 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **WAKE-2** — the next day-phase slice (not started).
 - **TV retirement decision** — the gym-display TV layout is gone; decide whether the TV is retired for good or gets a read-only glance view.
 
+**COLUMN-GREP — the migrate-first rule for drops and renames (2026-09-20, from an outage).** Before any migration that drops or renames a column, grep **every** `SELECT`, `INSERT` and `UPDATE` naming it across `artemis/`, `scripts/` and `api/`, and report the hits. Code that merely *reads the value* is the obvious half; code that merely *names the column* is the half that bites.
+- **What happened:** 039 dropped `health.plan.status`. The paired Lambda change removed the `plan.status == 'completed'` branch but left `status` in `_plan_days`' SELECT column list. `/plan` and `/overview` returned 500 (`psycopg2.errors.UndefinedColumn`) from 17:57Z until the fix deployed at 18:04Z. `/today`, `/status` and `/log` were unaffected.
+- **Why the pre-drop smoke test was worthless:** it ran while the column still existed, so it passed for the wrong reason. A check that cannot fail before the change is not a check.
+- **The check that works** is textual, not behavioural: `grep -rn "<column>" artemis scripts api` and read every hit, plus a scan of every statement against that table.
+
 ## 7. Operating disciplines (non-negotiable)
 
-Propose-then-confirm · the Brad Spaits rule (no autonomous external comms; activation gates) · trust-the-data-not-the-report · verify-on-the-live-box · statistics-vs-semantics wall · generated-vs-authored split · CT-anchored "today" · one system of record (RDS) · no-tokens-on-disk (Secrets Manager) · solo-scale (no enterprise patterns) · `feat/*`→PR→`main`, migrate-first deploy. Full detail in `CLAUDE.md`.
+Propose-then-confirm · **column-grep before a drop or rename (COLUMN-GREP)** · the Brad Spaits rule (no autonomous external comms; activation gates) · trust-the-data-not-the-report · verify-on-the-live-box · statistics-vs-semantics wall · generated-vs-authored split · CT-anchored "today" · one system of record (RDS) · no-tokens-on-disk (Secrets Manager) · solo-scale (no enterprise patterns) · `feat/*`→PR→`main`, migrate-first deploy. Full detail in `CLAUDE.md`.
 
 ---
 

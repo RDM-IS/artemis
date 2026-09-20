@@ -35,6 +35,7 @@ Never delete a branch on ahead/behind counts — squash/rebase merges leave bran
 - **The box runs `acos.service`** (`python3.11 -m artemis.main`) via systemd. Restart: `sudo systemctl restart acos`. Logs: `journalctl -u acos -n N --no-pager | cat`.
 - **DB queries on the box** need env sourced first: `set -a; [ -f .env ] && . ./.env; set +a`, then `PYTHONPATH="$PWD" /usr/bin/python3.11 ...`. `knowledge.db.execute_query` takes optional params — **use `%s` + params**, never string-interpolate (`execute_query("... where k = %s", (v,))`).
 - **Migrate-first deploy:** if a branch adds a migration, apply it to RDS (`run_migrations.py`) and confirm the table exists **before** restarting onto the new code, or the code hits a missing table.
+- **Before a migration that DROPS or RENAMES a column: grep every SELECT, INSERT and UPDATE for that column name — across `artemis/`, `scripts/` AND `api/` (the Lambda) — and report the hits.** A smoke test before the drop proves nothing: it passes *because the column still exists*. **2026-09-20:** migration 039 dropped `health.plan.status`; the Lambda change removed the branch that READ it but left it in `_plan_days`' SELECT list, so `/plan` and `/overview` 500ed (`UndefinedColumn`) for 7 minutes. `/plan` had returned 200 minutes earlier — that check could not have failed.
 - **The deploy path must run `run_migrations.py`** — merging a migration does NOT apply it (016/017 were merged-but-unapplied for weeks; the migrate-first discipline caught it).
 
 ## Disciplines (non-negotiable)
