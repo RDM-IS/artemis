@@ -93,7 +93,8 @@ def load(start: date, end: date) -> Data:
     d = Data(start, end, local_today())
     d.plans = [dict(r, blocks=_blocks(r["blocks"])) for r in execute_query(
         "SELECT plan_id, plan_date, phase, week_num, session_type, blocks, target_rpe, "
-        "est_duration_min FROM health.plan WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date",
+        "est_duration_min, is_skipped, skip_reason "
+        "FROM health.plan WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date",
         (start, end))]
     log_sql = (
         "SELECT sl.log_id, p.plan_date, sl.plan_id, sl.log_type, sl.exercise, sl.set_num, "
@@ -158,6 +159,9 @@ def day_status(data: Data, plan: dict) -> str:
         return "rest"
     if is_done(data, plan):
         return "done"
+    # MAKEUP-1: a deliberate skip is not a missed session.
+    if plan.get("is_skipped"):
+        return "skipped"
     if plan["plan_date"] > data.today:
         return "upcoming"
     if plan["plan_date"] == data.today:
@@ -178,7 +182,7 @@ def adherence(data: Data) -> tuple[int, int, int]:
     done = due = upcoming = 0
     for p in data.plans:
         st = day_status(data, p)
-        if st in ("rest", "pre-program"):
+        if st in ("rest", "pre-program", "skipped"):
             continue
         if st == "done":
             done += 1
@@ -473,7 +477,10 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
         logs = logs_for(data, p["plan_id"])
         sets = [l for l in logs if l["log_type"] == "strength_set"]
         span = logged_span_min(logs)
-        rows.append([f"{p['plan_date']:%a %-m/%-d}", label(p), day_status(data, p),
+        st = day_status(data, p)
+        if st == "skipped" and p.get("skip_reason"):
+            st = f"skipped — {p['skip_reason']}"
+        rows.append([f"{p['plan_date']:%a %-m/%-d}", label(p), st,
                      str(len(sets)) if sets else "—", fmt(session_rpe(logs)), fmt(p["target_rpe"]),
                      format_estimate(p.get("est_duration_min")) or "—",
                      f"{span} min" if span is not None else "—"])
