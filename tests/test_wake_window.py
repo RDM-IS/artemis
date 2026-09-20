@@ -92,7 +92,9 @@ class TestPhaseBoundaries(PhaseCase):
 
 
 class TestWeekendSchedule(PhaseCase):
-    """Sat/Sun: wake 07:30 · open 08:30 · quiet 22:30. Weekdays unchanged."""
+    """CYCLE-1: the day boundaries follow LOCATION (wake) and DAY TYPE (open /
+    quiet), not Sat/Sun. In this cycle Sat 9/26 and Sun 9/27 are `wi` days, so
+    they still read 07:30 / 08:30 / 22:30 — but now because of the cycle."""
 
     def test_saturday_and_sunday_boundaries(self):
         cases = [
@@ -110,15 +112,28 @@ class TestWeekendSchedule(PhaseCase):
                 with self.subTest(day=day, time=f"{hh:02d}:{mm:02d}"):
                     self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, day, hh, mm)), expected)
 
-    def test_friday_night_still_goes_quiet_at_17(self):
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 16, 59)), quiet_hours.PHASE_OPEN)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 17, 0)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 23, 0)), quiet_hours.PHASE_QUIET)
+    def test_the_wi_friday_stays_open_past_17(self):
+        """Fri 9/25 is the Richfield day off work: quiet starts 22:30, not 17:00.
+        Before CYCLE-1 this Friday went quiet at 17:00 because it was a weekday."""
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 17, 0)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 22, 29)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 25, 22, 30)), quiet_hours.PHASE_QUIET)
 
-    def test_sunday_night_quiet_to_monday_weekday_wake(self):
+    def test_an_office_friday_still_goes_quiet_at_17(self):
+        """Fri 10/2 is an msp_work day in week 2 of the cycle."""
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 10, 2, 16, 59)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 10, 2, 17, 0)), quiet_hours.PHASE_QUIET)
+
+    def test_sunday_night_quiet_to_the_travel_monday_richfield_wake(self):
+        """Mon 9/28 is the travel day and a RICHFIELD morning: wake 06:00, not
+        the office 04:30. This is the gap SCHEDULE-2 left open."""
         self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 27, 23, 0)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 29)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 30)), quiet_hours.PHASE_WAKE)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 30)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 5, 59)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 6, 0)), quiet_hours.PHASE_WAKE)
+        # …and it is still a work day: open 06:30, quiet 17:00
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 6, 30)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 17, 0)), quiet_hours.PHASE_QUIET)
 
     def test_next_wake_and_next_open(self):
         tz = ZoneInfo(CHICAGO)
@@ -126,7 +141,8 @@ class TestWeekendSchedule(PhaseCase):
         self.assertEqual(quiet_hours.next_wake(fri_eve), at(CHICAGO, 2026, 9, 26, 7, 30))
         self.assertEqual(quiet_hours.next_open(fri_eve), at(CHICAGO, 2026, 9, 26, 8, 30))
         sun_eve = at(CHICAGO, 2026, 9, 27, 23, 0).astimezone(tz)
-        self.assertEqual(quiet_hours.next_wake(sun_eve), at(CHICAGO, 2026, 9, 28, 4, 30))
+        # the travel Monday wakes at Richfield's 06:00, and works from 06:30
+        self.assertEqual(quiet_hours.next_wake(sun_eve), at(CHICAGO, 2026, 9, 28, 6, 0))
         self.assertEqual(quiet_hours.next_open(sun_eve), at(CHICAGO, 2026, 9, 28, 6, 30))
 
     def test_friday_goodnight_holds_until_saturday_wake(self):

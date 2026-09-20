@@ -445,23 +445,29 @@ def _upsert_quiet_state(**kwargs) -> None:
 
 
 def is_weekend(d: date) -> bool:
+    """Calendar weekend. NOT a schedule input any more — CYCLE-1 made the day
+    boundaries depend on location and day type, not on Sat/Sun. Kept only for
+    callers that genuinely mean "is it the weekend" (availability heuristics).
+    """
     return d.weekday() in config.WEEKEND_DAYS
 
 
 def wake_time_on(d: date) -> time:
-    """Wake boundary on local date `d` (weekend-aware)."""
-    return _parse_time(config.WEEKEND_WAKE_TIME if is_weekend(d) else config.WAKE_TIME)
+    """Wake boundary on local date `d`. CYCLE-1: follows the day's LOCATION."""
+    from artemis import cycle
+    return cycle.wake_on(d)
 
 
 def open_time_on(d: date) -> time:
-    """Business-open boundary on local date `d` (weekend-aware)."""
-    return _parse_time(config.WEEKEND_OPEN_TIME if is_weekend(d) else config.OPEN_TIME)
+    """Business-open boundary on local date `d`. CYCLE-1: follows the DAY TYPE."""
+    from artemis import cycle
+    return cycle.open_on(d)
 
 
 def quiet_start_on(d: date) -> time:
-    """Quiet-hours start on local date `d` (weekend-aware)."""
-    return _parse_time(config.WEEKEND_QUIET_HOURS_START if is_weekend(d)
-                       else config.QUIET_HOURS_START)
+    """Quiet-hours start on local date `d`. CYCLE-1: follows the DAY TYPE."""
+    from artemis import cycle
+    return cycle.quiet_on(d)
 
 
 def next_wake(now: datetime | None = None) -> datetime:

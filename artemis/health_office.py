@@ -24,7 +24,7 @@ date mid-run is never orphaned. generated_by='manual' (CHECK-legal); week_num is
 import copy
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -138,64 +138,52 @@ _DISPLAY = {
     "recovery_flow": "Recovery Flow",
 }
 
-# ── CYCLE-1: the 14-day pay period, Sun..Sat x2 from the anchor ─────────────
-CYCLE_ANCHOR = date(2026, 9, 20)   # Sun — week 1, day 1 of the cycle
-# Position 0..13 from the anchor. 8 msp_work, 2 msp_home, 3 wi, 1 travel.
-CYCLE_DAY_TYPES = (
-    "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "wi", "wi",     # wk 1
-    "wi", "travel", "msp_work", "msp_work", "msp_work", "msp_work", "msp_home",  # wk 2
+# ── CYCLE-1 ────────────────────────────────────────────────────────────────
+# The cycle lives in artemis.cycle — ONE definition, shared with the scheduler
+# and the quiet_hours boundary helpers. Nothing here re-declares day types or
+# locations (tests/test_cycle.py asserts there is no second copy).
+from artemis.cycle import (  # noqa: E402
+    CYCLE_LEN,
+    cycle_pos,
+    day_type,
 )
-# Where each day is. Richfield = the farm (LOCATION-1).
-CYCLE_LOCATION = {
-    0: "home", 1: LOCATION, 2: LOCATION, 3: LOCATION, 4: LOCATION,
-    5: "Richfield", 6: "Brown Deer",
-    7: "Richfield", 8: "Richfield", 9: LOCATION, 10: LOCATION, 11: LOCATION,
-    12: LOCATION, 13: "home",
-}
+from artemis import cycle as _cycle  # noqa: E402
+
+CYCLE_ANCHOR = _cycle.DEFAULT_ANCHOR
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
+
+
+def day_location(d: date) -> str:
+    """The seeded row's location: where he is in the MORNING, when the session
+    happens. Returns the display name the plan rows carry ("office gym")."""
+    key = _cycle.location_at(d, time(0, 0), use_overrides=False)
+    return (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
+
+
+def is_office_day(d: date) -> bool:
+    return day_type(d, use_overrides=False) == "msp_work"
+
 
 # SCHEDULE-2: lift on the 1st, 3rd and 4th OFFICE day of each cycle week —
 # wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C in order. That puts B and C
 # back to back once a week; Ryan accepted that deliberately (test asserts
-# exactly 6 such pairs, one per program week). Every other day is
-# a flow, Z2 or a walk, chosen so wi and travel days only ever get sessions
-# that need no gym.
+# exactly 6 such pairs, one per program week).
 LIFT_SLOTS = (1, 3, 4)             # 1-based office-day positions within a cycle week
 LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
-# Non-lifting days, by cycle position. Z2 stays at the office (Richfield's
-# rower and trainer could take it — see LOCATION-1 — but nothing depends on
-# that here). Flows need only a mat; walks go outside anywhere.
 # Ryan, 2026-09-19: Z2 sits on the office non-lift days, where the equipment is
 # reliable; the flows sit on the wi days because a mat travels. Richfield's
-# rower and trainer stay available for extra cardio if he wants it — the
-# SEEDED session there is a flow.
+# rower and trainer stay available for extra cardio — the SEEDED session there
+# is a flow.
 NON_LIFT = {
     0: "recovery_flow",   # Sun, msp_home — mat
     2: "cardio_z2",       # Tue, office — treadmill / elliptical
     5: "recovery_flow",   # Fri, Richfield — mat
     6: "walk",            # Sat, Brown Deer
-    7: "recovery_flow",   # Sun, Richfield — mat
+    7: "recovery_flow",   # Sun, Brown Deer (morning) — mat
     8: "walk",            # Mon, travel — leaves 11:00
     10: "cardio_z2",      # Wed, office — treadmill / elliptical
     13: "recovery_flow",  # Sat, msp_home — mat
 }
-
-
-def cycle_pos(d: date) -> int:
-    """0..13 position in the pay period. Derived from the anchor, never stored."""
-    return (d - CYCLE_ANCHOR).days % 14
-
-
-def day_type(d: date) -> str:
-    return CYCLE_DAY_TYPES[cycle_pos(d)]
-
-
-def day_location(d: date) -> str:
-    return CYCLE_LOCATION[cycle_pos(d)]
-
-
-def is_office_day(d: date) -> bool:
-    return day_type(d) == "msp_work"
 
 
 def session_for(d: date) -> str:
@@ -203,7 +191,7 @@ def session_for(d: date) -> str:
     pos = cycle_pos(d)
     week_start = pos - (pos % 7)                       # 0 or 7
     office = [p for p in range(week_start, week_start + 7)
-              if CYCLE_DAY_TYPES[p] == "msp_work"]
+              if _cycle.DAY_TYPES[p] == "msp_work"]
     if pos in office:
         slot = office.index(pos) + 1                   # 1-based office day
         if slot in LIFT_SLOTS:

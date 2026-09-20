@@ -676,9 +676,16 @@ class TestPlanExactRender(unittest.TestCase):
 
 class TestSchedulerRegistry(unittest.TestCase):
     def test_nudge_registered_calibration_gone(self):
+        """CYCLE-1: the nudge rides 45 min behind the wake, which now depends on
+        the day's location — so pin an office day (wake 04:30 -> nudge 05:15)."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from artemis import config, cycle
         from artemis.scheduler import ArtemisScheduler
         s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
-        by_id = {c.id: c for c in s.cron_specs()}
+        office_day = datetime(2026, 9, 22, 0, 1, tzinfo=ZoneInfo(config.HOME_TIMEZONE))
+        with patch.object(cycle, "override_for", return_value=None):
+            by_id = {c.id: c for c in s.cron_specs(office_day)}
         self.assertEqual((by_id["checkin_nudge"].hour, by_id["checkin_nudge"].minute), (5, 15))
         self.assertEqual(by_id["checkin_nudge"].tier, "health")
         self.assertFalse(hasattr(s, "job_health_calibration_followup"))

@@ -14,7 +14,7 @@ import os
 import re
 import sys
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -62,7 +62,12 @@ class TestRegistryShape(unittest.TestCase):
                 self.assertIn(spec.tier, ("health", "business"))
 
     def test_phase_jobs_track_the_configured_times(self):
-        by_id = {s.id: s for s in self.s.cron_specs()}
+        """CYCLE-1: the phase times now depend on the day, so pin an office
+        Tuesday (wake 04:30 · open 06:30 · quiet 17:00)."""
+        from artemis import cycle
+        office_day = datetime(2026, 9, 22, 0, 1, tzinfo=ZoneInfo(config.HOME_TIMEZONE))
+        with patch.object(cycle, "override_for", return_value=None):
+            by_id = {s.id: s for s in self.s.cron_specs(office_day)}
         self.assertEqual((by_id["wake"].hour, by_id["wake"].minute), (4, 30))
         self.assertEqual((by_id["open"].hour, by_id["open"].minute), (6, 30))
         self.assertEqual((by_id["quiet_hours_start"].hour,
@@ -77,25 +82,57 @@ class TestRegistryShape(unittest.TestCase):
         # The debrief nag must sit OUTSIDE the quiet window.
         self.assertLess(by_id["health_nag"].hour, 17)
 
-    def test_weekend_twins_move_wake_open_brief_and_quiet(self):
-        by_id = {s.id: s for s in self.s.cron_specs()}
-        expect = {
-            "wake_weekend": ((7, 30), "wake", "health"),
-            "checkin_nudge_weekend": ((8, 15), "checkin_nudge", "health"),
-            "inbox_zero_morning_weekend": ((8, 25), "inbox_zero_morning", "business"),
-            "open_weekend": ((8, 30), "open", "business"),
-            "morning_brief_weekend": ((8, 30), "morning_brief", "business"),
-            "quiet_hours_start_weekend": ((22, 30), "quiet_hours_start", "business"),
+    def test_no_weekend_twins_remain(self):
+        """CYCLE-1 collapsed them: one job per function, timed by location."""
+        ids = [s.id for s in self.s.cron_specs()]
+        self.assertEqual([i for i in ids if i.endswith("_weekend")], [])
+        for job in ("wake", "checkin_nudge", "inbox_zero_morning", "open",
+                    "morning_brief", "quiet_hours_start"):
+            with self.subTest(job=job):
+                self.assertEqual(ids.count(job), 1)
+                spec = next(s for s in self.s.cron_specs() if s.id == job)
+                self.assertIsNone(spec.day_of_week, "location jobs run every day")
+
+    def test_location_jobs_take_their_time_from_the_cycle(self):
+        """Richfield Friday 06:00 · office Tuesday 04:30 · MSP-home Saturday 07:30."""
+        from datetime import datetime
+        from artemis import cycle
+        cases = {
+            date(2026, 9, 25): (6, 0),      # wi, Richfield
+            date(2026, 9, 22): (4, 30),     # msp_work, office
+            date(2026, 10, 3): (7, 30),     # msp_home
+            date(2026, 9, 28): (6, 0),      # travel, a Richfield morning
         }
-        for sid, (hm, twin, tier) in expect.items():
-            with self.subTest(job=sid):
-                spec = by_id[sid]
-                self.assertEqual((spec.hour, spec.minute), hm)
-                self.assertEqual(spec.day_of_week, "sat,sun")
-                self.assertEqual(spec.guard, twin)
-                self.assertEqual(spec.func_name, by_id[twin].func_name)
-                self.assertEqual(spec.tier, tier)
-                self.assertEqual(by_id[twin].day_of_week, "mon-fri")
+        with patch.object(cycle, "override_for", return_value=None):
+            for d, hm in cases.items():
+                with self.subTest(day=d):
+                    # just before midnight the day before → the job is for `d`
+                    now = datetime.combine(d, time(0, 1), tzinfo=ZoneInfo(config.HOME_TIMEZONE))
+                    times = self.s.cron_times(now)
+                    self.assertEqual(times["wake"], hm)
+                    # the nudge rides 45 min behind the wake
+                    self.assertEqual(times["checkin_nudge"],
+                                     ((hm[0] * 60 + hm[1] + config.CHECKIN_NUDGE_OFFSET_MIN) // 60 % 24,
+                                      (hm[1] + config.CHECKIN_NUDGE_OFFSET_MIN) % 60))
+
+    def test_business_hours_follow_the_day_type(self):
+        from datetime import datetime
+        from artemis import cycle
+        tz = ZoneInfo(config.HOME_TIMEZONE)
+        with patch.object(cycle, "override_for", return_value=None):
+            work = self.s.cron_times(datetime(2026, 9, 22, 0, 1, tzinfo=tz))
+            off = self.s.cron_times(datetime(2026, 9, 25, 0, 1, tzinfo=tz))
+        self.assertEqual((work["open"], work["quiet_hours_start"]), ((6, 30), (17, 0)))
+        self.assertEqual((off["open"], off["quiet_hours_start"]), ((8, 30), (22, 30)))
+
+    def test_sunday_review_and_eval_are_pinned_to_fixed_hours(self):
+        """Ryan, 2026-09-19: 08:30 / 08:35 whatever the location says."""
+        by_id = {s.id: s for s in self.s.cron_specs()}
+        self.assertEqual((by_id["health_review"].hour, by_id["health_review"].minute), (8, 30))
+        self.assertEqual((by_id["weekly_eval"].hour, by_id["weekly_eval"].minute), (8, 35))
+        for job in ("health_review", "weekly_eval"):
+            self.assertEqual(by_id[job].day_of_week, "sun")
+            self.assertNotIn(job, self.s.LOCATION_JOBS)
 
     def test_weekly_eval_posts_sunday_after_the_review(self):
         spec = {s.id: s for s in self.s.cron_specs()}["weekly_eval"]
@@ -158,8 +195,15 @@ class TestApplyTimezone(unittest.TestCase):
                 self.assertEqual(self._tz_of(job_id), SAO_PAULO)
         self.assertEqual(self.kv.get("scheduler_tz"), SAO_PAULO)
 
-    def test_wake_fires_at_0430_local_away(self):
-        self.s.apply_timezone(SAO_PAULO)
+    def test_wake_fires_at_the_local_wall_clock_away(self):
+        """A timezone move keeps the wall-clock time; CYCLE-1 decides what that
+        time IS (here: an office day, 04:30)."""
+        from artemis import cycle
+        office_day = datetime(2026, 9, 22, 0, 1, tzinfo=ZoneInfo(config.HOME_TIMEZONE))
+        with patch.object(cycle, "override_for", return_value=None), \
+             patch.object(self.s, "cron_specs",
+                          side_effect=lambda now=None: ArtemisScheduler.cron_specs(self.s, office_day)):
+            self.s.apply_timezone(SAO_PAULO)
         trigger = self.s.scheduler.get_job("wake").trigger
         nxt = trigger.get_next_fire_time(None, datetime.now(ZoneInfo(SAO_PAULO)))
         self.assertEqual((nxt.hour, nxt.minute), (4, 30))
@@ -238,12 +282,14 @@ class TestDuplicateGuard(unittest.TestCase):
         self.today = date(2026, 9, 24)
         self.assertTrue(self.s._once_per_local_day("wake"))
 
-    def test_weekend_twin_and_weekday_job_share_one_run_per_day(self):
+    def test_a_rescheduled_job_does_not_fire_twice_on_one_local_day(self):
+        """CYCLE-1: moving wake 04:30 -> 06:00 mid-day must not re-fire it.
+        The twins used to share a guard key; now there is one job, one key."""
         calls = []
         with patch.object(self.s, "job_wake", side_effect=lambda: calls.append(1)):
-            specs = {s.id: s for s in self.s.cron_specs()}
-            self.s._wrap_cron(specs["wake"])()
-            self.s._wrap_cron(specs["wake_weekend"])()
+            spec = next(s for s in self.s.cron_specs() if s.id == "wake")
+            self.s._wrap_cron(spec)()          # 04:30 firing
+            self.s._wrap_cron(spec)()          # after a recompute moved it
         self.assertEqual(len(calls), 1, "wake fired twice on one local day")
 
     def test_jobs_are_guarded_independently(self):
@@ -321,7 +367,7 @@ class TestWeeklyEvalJob(unittest.TestCase):
         from artemis import scheduler as sched
         s = make_scheduler()
         sun = date(2026, 9, 20)
-        result = health_eval.evaluate([], [], [], start=date(2026, 9, 16), end=date(2026, 9, 22),
+        result = health_eval.evaluate([], [], [], start=date(2026, 9, 16), end=date(2026, 9, 19),
                                       today=sun)
         with patch.object(sched, "_local_today", return_value=sun), \
              patch.object(s, "_is_open", return_value=is_open), \
@@ -329,11 +375,16 @@ class TestWeeklyEvalJob(unittest.TestCase):
             s.job_weekly_eval()
         return s, load
 
-    def test_posts_the_week_to_date_wed_to_sat(self):
+    def test_posts_the_week_that_just_ended(self):
+        """SCHEDULE-2 moved program weeks to Sun..Sat, so the Sunday 08:35 post
+        covers the COMPLETE week that ended yesterday, not a partial."""
         s, load = self._run()
         load.assert_called_once()
+        start, end = load.call_args[0][0], load.call_args[0][1]
+        self.assertEqual((start, end), (date(2026, 9, 16), date(2026, 9, 19)))
         text = s.mm.post_message.call_args[0][1]
-        self.assertIn("Week 1 (Wed 9/16 – Sat 9/19, partial)", text)
+        self.assertIn("Week 1 (Wed 9/16 – Sat 9/19)", text)
+        self.assertNotIn("partial", text)
 
     def test_nothing_outside_the_open_phase(self):
         s, load = self._run(is_open=False)
