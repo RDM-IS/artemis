@@ -104,14 +104,27 @@ class FakeCursor:
                     and l["logged_via"] != "inferred"
                     and l["log_type"] in ("strength_set", "cardio_block"))
             self._rows = [(n,)]
+        elif s.startswith("SELECT sleep_hrs, sleep_source"):
+            row = self.db.daily.get(params[0])
+            self._rows = [] if row is None else [{
+                "sleep_hrs": row.get("sleep_hrs"), "sleep_source": row.get("sleep_source"),
+                "resting_hr": row.get("resting_hr"),
+                "resting_hr_source": row.get("resting_hr_source"),
+                "weight_lbs": row.get("weight_lbs"), "weight_source": row.get("weight_source")}]
         elif s.startswith("SELECT 1 FROM health.daily_state"):
             self._rows = [(1,)] if params[0] in self.db.daily else []
         elif s.startswith("INSERT INTO health.daily_state"):
-            d, w, sl, en, sore, rhr, ft = params
+            # WATCH-1: the three source markers ride along after free_text
+            d, w, sl, en, sore, rhr, ft = params[:7]
             old = self.db.daily.get(d, {})
             new = {"weight_lbs": w, "sleep_hrs": sl, "energy": en,
                    "soreness": json.loads(sore) if sore else None, "resting_hr": rhr, "free_text": ft}
-            self.db.daily[d] = {k: (v if v is not None else old.get(k)) for k, v in new.items()}
+            merged = {k: (v if v is not None else old.get(k)) for k, v in new.items()}
+            # a typed value marks its field `manual` and is final for the date
+            for value, marker in ((sl, "sleep_source"), (rhr, "resting_hr_source"),
+                                  (w, "weight_source")):
+                merged[marker] = "manual" if value is not None else old.get(marker)
+            self.db.daily[d] = merged
         elif s.startswith("UPDATE health.plan SET blocks"):
             blocks, st, rpe, est, pid = params
             row = next(r for r in self.db.plan.values() if r["plan_id"] == pid)

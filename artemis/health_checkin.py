@@ -926,12 +926,58 @@ def has_checkin(cur, day: date) -> bool:
     return cur.fetchone() is not None
 
 
+def _watch_source_note(cur, day: date, ci: CheckIn) -> str | None:
+    """"From the watch: sleep 7.2h. Not synced: weight." — read AFTER the
+    check-in is stored, so it reflects what actually stands for the day.
+
+    Fields Ryan typed are `manual` and are named as his, not the watch's.
+    """
+    try:
+        cur.execute(
+            "SELECT sleep_hrs, sleep_source, resting_hr, resting_hr_source, "
+            "weight_lbs, weight_source FROM health.daily_state WHERE state_date = %s",
+            (day,))
+        row = cur.fetchone()
+    except Exception:
+        logger.debug("watch source note unavailable", exc_info=True)
+        return None
+    if not row:
+        return None
+    r = dict(row) if not isinstance(row, dict) else row
+    from_watch, missing = [], []
+    for value_key, source_key, label, fmt in (
+            ("sleep_hrs", "sleep_source", "sleep", lambda v: f"{float(v):g}h"),
+            ("resting_hr", "resting_hr_source", "resting HR", lambda v: f"{int(v)}"),
+            ("weight_lbs", "weight_source", "weight", lambda v: f"{float(v):g}")):
+        value, source = r.get(value_key), r.get(source_key)
+        if value is not None and source == "watch":
+            from_watch.append(f"{label} {fmt(value)}")
+        elif value is None:
+            missing.append(label)
+    # Silent when the watch supplied nothing at all: a daily "not synced"
+    # line on a check-in Ryan typed himself would be noise, and the wake post
+    # is where an empty watch belongs. When it DID supply something, name it
+    # and name what is still absent.
+    if not from_watch:
+        return None
+    line = "From the watch: " + ", ".join(from_watch) + "."
+    if missing:
+        line += " Not synced: " + ", ".join(missing) + "."
+    return line
+
+
 def store_checkin(cur, day: date, ci: CheckIn) -> None:
     sore = ci.soreness_json()
+    # WATCH-1: a value Ryan types is `manual` and is FINAL for that date — a
+    # watch sample arriving later never overwrites it (artemis.watch_prefill).
     cur.execute(
         """INSERT INTO health.daily_state
-           (state_date, weight_lbs, sleep_hrs, energy, soreness, resting_hr, free_text)
-           VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
+           (state_date, weight_lbs, sleep_hrs, energy, soreness, resting_hr, free_text,
+            sleep_source, resting_hr_source, weight_source)
+           VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s,
+                   CASE WHEN %s IS NULL THEN NULL ELSE 'manual' END,
+                   CASE WHEN %s IS NULL THEN NULL ELSE 'manual' END,
+                   CASE WHEN %s IS NULL THEN NULL ELSE 'manual' END)
            ON CONFLICT (state_date) DO UPDATE SET
                weight_lbs = COALESCE(EXCLUDED.weight_lbs, health.daily_state.weight_lbs),
                sleep_hrs  = COALESCE(EXCLUDED.sleep_hrs,  health.daily_state.sleep_hrs),
@@ -939,9 +985,16 @@ def store_checkin(cur, day: date, ci: CheckIn) -> None:
                soreness   = COALESCE(EXCLUDED.soreness,   health.daily_state.soreness),
                resting_hr = COALESCE(EXCLUDED.resting_hr, health.daily_state.resting_hr),
                free_text  = COALESCE(EXCLUDED.free_text,  health.daily_state.free_text),
+               sleep_source = CASE WHEN EXCLUDED.sleep_hrs IS NOT NULL THEN 'manual'
+                                   ELSE health.daily_state.sleep_source END,
+               resting_hr_source = CASE WHEN EXCLUDED.resting_hr IS NOT NULL THEN 'manual'
+                                        ELSE health.daily_state.resting_hr_source END,
+               weight_source = CASE WHEN EXCLUDED.weight_lbs IS NOT NULL THEN 'manual'
+                                    ELSE health.daily_state.weight_source END,
                logged_at  = NOW()""",
         (day, ci.weight_lbs, ci.sleep_hrs, ci.energy,
-         json.dumps(sore) if sore is not None else None, ci.resting_hr, ci.free_text))
+         json.dumps(sore) if sore is not None else None, ci.resting_hr, ci.free_text,
+         ci.sleep_hrs, ci.resting_hr, ci.weight_lbs))
 
 
 def write_plan(cur, plan_id: int, blocks: dict, session_type: str,
@@ -1064,6 +1117,11 @@ def process_checkin_full(cur, text: str, day: date, *, checkin_id: str,
     if ci.unknown_regions:
         notes.append("Didn't recognize region " + ", ".join(sorted(ci.unknown_regions))
                      + " — logged, no change for it.")
+    # WATCH-1: name what the watch supplied and what hasn't synced, so a
+    # pre-filled number is never mistaken for one Ryan gave.
+    watch_note = _watch_source_note(cur, day, ci)
+    if watch_note:
+        notes.append(watch_note)
     reply = _checkin_reply(cur, ci, day, checkin_id, now, adjust, notes)
 
     # PAIN-1 §4: one line when this check-in completes a pain pattern.
