@@ -258,7 +258,7 @@ The morning is **event-driven**; the fixed 04:45 calibration post and its
 
 | When | What |
 |---|---|
-| 04:30 (Sat/Sun 07:30) | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>`. |
+| 04:30 (Sat/Sun 07:30) | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, **the watch line** (below), the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>`. |
 | on the check-in reply | Parsed **deterministically** (`artemis/health_checkin.py`, no LLM) and stored in `health.daily_state`. **No sets logged today** → the rules run and today's plan row is rewritten; the reply is the plan-exact diff. **Sets already logged** → stored only, reply `Logged.` |
 | 05:15 (Sat/Sun 08:15) | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): **training days only**, if no check-in and no sets — one post, "No check-in yet — run Session X as written." Nothing on rest/walk days; never repeats. |
 
@@ -276,6 +276,23 @@ gets **no** Gmail, calendar, inbox or notes context.
 
 **Scale — every rating is 0–5** (0 = none, 5 = can't use it): energy, soreness
 and pain. Sleep stays in hours.
+
+**Sleep is recorded, never acted on (2026-09-21).** Energy drives recovery
+(rule 9); sleep — typed or from the watch — never adjusts the plan on its own.
+`slept 4 energy 5` → no change; `slept 8 energy 2` → recovery. Whether sleep
+should matter is an open question for SLEEP-PERF (data-only, ≥ 4 weeks of
+data) — no rule changes until Ryan has looked at its results.
+
+**Watch values (WATCH-1).** Sleep hours, resting HR and weight are pre-filled
+into `health.daily_state` by the wake job and again on every watch ingest for
+today. **Watch data never triggers any adjustment** — only a typed check-in
+does. A value is today's only if it was measured today (sleep: the night whose
+`sleepEnd` falls between noon yesterday and noon today); nothing is carried
+forward, and an unsynced value is named as missing. A typed value is `manual`
+and final for the date; a watch-only row is not a check-in (the 05:15 nudge
+still fires). The wake post carries one line — values only, never a judgement:
+
+> From the watch: sleep 5.7h (20:57–03:19), weight 282. Not synced: resting HR.
 
 - `x/10` is halved and rounded up (8/10 → 4, 5/10 → 3); `x/5` is taken as is.
 - A bare number above 5 (or an `x/5` above 5) → reply **"Ratings are 0–5."** —
@@ -329,7 +346,7 @@ long sleep never adds work — progression belongs to the program.
 | 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, seated back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed or added. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
 | 7 | **pain 2** | Exercises with that **primary** region get a lighter target: `target_load_lbs` = 80% of the **last logged load** (top set of the exercise's most recent earlier session; skipped and inferred rows ignored), rounded **down** to a load the office can make (DBs 5–45 by 5; machines/cables by 10; Smith/bar = bar + 2 × a subset of 45/35/25/10/5 per side), never above the last load; `load_from` records it. No history → target stays null and the exercise notes say "go lighter than last time". Bodyweight work is left alone. |
 | 8 | **soreness 2–3** | Exercises with that **primary** region: −1 set (min 1), RPE cap −1. |
-| 9 | sleep < 6 or energy ≤ 2 | RPE cap −1 on everything (stacks with rule 8, floor 1), sets capped at 2, Z2 duration −25%. |
+| 9 | **energy ≤ 2** (typed in the check-in) | RPE cap −1 on everything (stacks with rule 8, floor 1), sets capped at 2, Z2 duration −25%. **Sleep is not a trigger** (below). |
 | — | **pain 0–1**, soreness 0–1, or nothing qualifying | No change. Pain is stored and noted: "Pain shoulder 1/5 — noted." then "Check-in logged — run Session X as written." Pain 2 with no primary exercise to lighten is noted the same way. |
 
 Overall priority: pain day off > rising day off > pain whole-day mobility >
