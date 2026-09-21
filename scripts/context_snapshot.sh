@@ -20,7 +20,8 @@ mkdir -p context
   PY=$(systemctl cat acos 2>/dev/null | sed -nE 's/^ExecStart=([^ ]+).*/\1/p' | head -1)
   PY=${PY:-/usr/bin/python3.11}
   echo "- Python: $("$PY" --version 2>&1) (${PY})"
-  if systemctl list-units --type=service 2>/dev/null | grep -q acos; then
+  # Not `list-units | grep -q`: under pipefail, grep -q exiting early SIGPIPEs systemctl and the test fails at random.
+  if systemctl cat acos >/dev/null 2>&1; then
     echo "- acos.service: $(systemctl is-active acos 2>/dev/null) | ExecStart: $(systemctl cat acos 2>/dev/null | grep -E '^ExecStart=' | head -1)"
   fi
   echo
