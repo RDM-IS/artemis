@@ -195,7 +195,8 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
                   kcal, protein_g, carb_g, fat_g, fiber_g,
                   source, source_id, confidence, status)
                VALUES (%s, %s,
-                       (SELECT id FROM nutrition.food WHERE source_id = %s),
+                       (SELECT id FROM nutrition.food
+                         WHERE kind = 'recipe' AND source_id = %s),
                        %s, 1, %s, %s, %s, %s, %s,
                        'notion', %s, 'exact', 'assumed')""",
             (d, slot, food.page_id, food.name, food.kcal, food.protein_g,
@@ -216,20 +217,24 @@ def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
 
 
-def upsert_food(cur, food) -> None:
-    """Mirror a Notion recipe into nutrition.food as a saved food.
+def upsert_food(cur, food, kind: str = "recipe") -> None:
+    """Mirror a Notion recipe or ingredient into nutrition.food.
 
     This is a CACHE of the first lookup tier, not a second source of truth:
-    every row keeps source='notion' and the Notion page id, and the pre-fill
-    refreshes it on every run.
+    every row keeps source='notion' and the Notion page id, and the 00:15 job
+    refreshes it. `kind` keeps "Protein bar — peanut" (recipe) and
+    "protein bar (peanut)" (ingredient) apart even though they share a slug.
     """
     cur.execute(
         """INSERT INTO nutrition.food
-             (name, slug, kcal, protein_g, carb_g, fat_g, fiber_g,
-              source, source_id, source_detail, is_placeholder, updated_at)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, 'notion', %s, %s, %s, now())
-           ON CONFLICT (slug) DO UPDATE SET
+             (kind, name, slug, kcal, protein_g, carb_g, fat_g, fiber_g, portion,
+              source, source_id, source_detail, is_placeholder, active, updated_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   'notion', %s, %s, %s, TRUE, now())
+           ON CONFLICT (kind, slug) DO UPDATE SET
              name           = EXCLUDED.name,
+             portion        = EXCLUDED.portion,
+             active         = TRUE,
              kcal           = EXCLUDED.kcal,
              protein_g      = EXCLUDED.protein_g,
              carb_g         = EXCLUDED.carb_g,
@@ -240,33 +245,77 @@ def upsert_food(cur, food) -> None:
              source_detail  = EXCLUDED.source_detail,
              is_placeholder = EXCLUDED.is_placeholder,
              updated_at     = now()""",
-        (food.name, slugify(food.name), food.kcal, food.protein_g,
-         food.carb_g, food.fat_g, food.fiber_g, food.page_id,
-         food.source_detail, food.is_placeholder))
+        (kind, food.name, slugify(food.name), food.kcal, food.protein_g,
+         food.carb_g, food.fat_g, food.fiber_g, getattr(food, "portion", None),
+         food.page_id, food.source_detail, food.is_placeholder))
+
+
+def sync_ingredients(cur) -> dict:
+    """Mirror every `ingredients` row that has macros into nutrition.food as
+    kind='ingredient' — the SECOND saved-food source, looked up after recipes.
+
+    Macros are per the row's `serving`, stored as the portion. A row that has
+    vanished from Notion (or lost its macros) is marked inactive rather than
+    left matching. Raises NotionUnavailable; the caller decides what that
+    means (the 00:15 job logs it and carries on with the pre-fill).
+    """
+    from artemis import notion_meal_plan as nmp
+
+    foods, skipped = nmp.fetch_ingredients()
+    seen: set[str] = set()
+    for food in foods:
+        slug = slugify(food.name)
+        if not slug or slug in seen:
+            # two ingredient rows with the same name: keep the first, name it
+            skipped.append(f"{food.name} (duplicate name)")
+            continue
+        seen.add(slug)
+        upsert_food(cur, food, kind="ingredient")
+
+    cur.execute(
+        "UPDATE nutrition.food SET active = FALSE, updated_at = now() "
+        "WHERE kind = 'ingredient' AND active AND NOT (slug = ANY(%s))",
+        (list(seen),))
+    deactivated = cur.rowcount if isinstance(cur.rowcount, int) else 0
+
+    _audit(cur, "nutrition_ingredient_sync", "ok",
+           {"synced": len(seen), "deactivated": deactivated, "skipped": skipped})
+    return {"synced": len(seen), "deactivated": deactivated, "skipped": skipped}
+
+
+SAVED_FOOD_KINDS = ("recipe", "ingredient")   # lookup order
+
+_FOOD_COLS = ("id, kind, name, kcal, protein_g, carb_g, fat_g, fiber_g, portion, "
+              "source, source_id, is_placeholder")
+
+
+def _as_dict(row):
+    return dict(row) if not isinstance(row, dict) else row
 
 
 def find_saved_food(cur, text: str) -> dict | None:
-    """Tier 1 of the source order. Exact slug first, then a unique prefix —
-    an ambiguous prefix returns None so the caller asks rather than picks."""
+    """Tier 1 of the source order: recipes, then ingredients.
+
+    Within each kind: exact slug first, then a unique prefix. An ambiguous
+    prefix in a kind stops the search for that kind rather than picking one.
+    """
     slug = slugify(text)
     if not slug:
         return None
-    cur.execute(
-        "SELECT id, name, kcal, protein_g, carb_g, fat_g, fiber_g, "
-        "source, source_id, is_placeholder "
-        "FROM nutrition.food WHERE slug = %s AND active", (slug,))
-    row = cur.fetchone()
-    if row:
-        return dict(row) if not isinstance(row, dict) else row
-    cur.execute(
-        "SELECT id, name, kcal, protein_g, carb_g, fat_g, fiber_g, "
-        "source, source_id, is_placeholder "
-        "FROM nutrition.food WHERE slug LIKE %s AND active LIMIT 2",
-        (slug + "%",))
-    rows = cur.fetchall()
-    if len(rows) == 1:
-        r = rows[0]
-        return dict(r) if not isinstance(r, dict) else r
+    for kind in SAVED_FOOD_KINDS:
+        cur.execute(
+            f"SELECT {_FOOD_COLS} FROM nutrition.food "
+            "WHERE kind = %s AND slug = %s AND active", (kind, slug))
+        row = cur.fetchone()
+        if row:
+            return _as_dict(row)
+        cur.execute(
+            f"SELECT {_FOOD_COLS} FROM nutrition.food "
+            "WHERE kind = %s AND slug LIKE %s AND active LIMIT 2",
+            (kind, slug + "%"))
+        rows = cur.fetchall()
+        if len(rows) == 1:
+            return _as_dict(rows[0])
     return None
 
 
@@ -419,8 +468,14 @@ def apply_deviation(cur, d: date, dev: Deviation) -> str:
     _mark_corrected(cur, d)
     tier = resolved["confidence"]
     mark = " *(estimated)*" if tier == "estimated" else ""
-    return (f"{slot}: {resolved['name']} — {resolved['kcal']} kcal, "
-            f"{float(resolved['protein_g']):g} g protein{mark}.")
+    per = ""
+    if resolved.get("kind") == "ingredient" and resolved.get("portion"):
+        per = (f" ({dev.quantity:g} × {resolved['portion']})" if dev.quantity != 1
+               else f" ({resolved['portion']})")
+    kcal = int(round(float(resolved["kcal"]) * dev.quantity))
+    protein = float(resolved["protein_g"]) * dev.quantity
+    return (f"{slot}: {resolved['name']}{per} — {kcal} kcal, "
+            f"{protein:g} g protein{mark}.")
 
 
 def _ask_about(text: str) -> str:

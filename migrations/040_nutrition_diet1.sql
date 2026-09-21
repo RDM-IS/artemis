@@ -31,6 +31,14 @@ CREATE SCHEMA IF NOT EXISTS nutrition;
 -- FOOD — saved foods. The first tier of the deviation source order
 -- (saved foods -> USDA -> Open Food Facts).
 --
+-- Two kinds, both mirrored from Notion (a cache with provenance, refreshed by
+-- the 00:15 job — Notion stays the source of truth):
+--   recipe      a `recipes` row: one portion as eaten
+--   ingredient  an `ingredients` row: macros per its `serving` (kept in portion)
+-- Lookup order is recipe first, then ingredient. The two kinds share a
+-- namespace in practice ("Protein bar — peanut" vs "protein bar (peanut)"
+-- slugify identically), so uniqueness is per (kind, slug), not per slug.
+--
 -- `source` says where the macros came from; `source_id` identifies the record
 -- there (Notion page id, USDA fdcId, Open Food Facts barcode). A row whose
 -- macros are a stand-in carries is_placeholder = TRUE and is rendered as such
@@ -39,16 +47,18 @@ CREATE SCHEMA IF NOT EXISTS nutrition;
 
 CREATE TABLE IF NOT EXISTS nutrition.food (
     id             SERIAL PRIMARY KEY,
+    kind           TEXT NOT NULL DEFAULT 'recipe',
     name           TEXT NOT NULL,
-    -- lowercase, punctuation-stripped match key; one saved food per slug
-    slug           TEXT NOT NULL UNIQUE,
+    -- lowercase, punctuation-stripped match key; unique within a kind
+    slug           TEXT NOT NULL,
     kcal           INT NOT NULL,
     protein_g      NUMERIC(6,2) NOT NULL,
     carb_g         NUMERIC(6,2),
     fat_g          NUMERIC(6,2),
     fiber_g        NUMERIC(6,2),
     sodium_mg      INT,
-    -- one portion as eaten; free text because "1 bar (68 g)" is not a number
+    -- recipe: one portion as eaten; ingredient: the Notion `serving` the
+    -- macros are per. Free text because "1 bar (68 g)" is not a number.
     portion        TEXT,
     source         TEXT NOT NULL,
     source_id      TEXT,
@@ -57,6 +67,10 @@ CREATE TABLE IF NOT EXISTS nutrition.food (
     active         BOOLEAN NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT food_kind_known
+        CHECK (kind IN ('recipe', 'ingredient')),
+    CONSTRAINT food_kind_slug_unique
+        UNIQUE (kind, slug),
     CONSTRAINT food_source_known
         CHECK (source IN ('notion', 'usda', 'off', 'manual')),
     -- A saved food always knows where it came from. `manual` is the one

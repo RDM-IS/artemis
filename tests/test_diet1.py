@@ -155,6 +155,125 @@ class TestNeverInventsMacros(unittest.TestCase):
         self.assertIsNone(nutrition.find_saved_food(cur, "protein bar"))
 
 
+class TestIngredientsSavedFoods(unittest.TestCase):
+    """Ingredients are the SECOND saved-food source: recipes first."""
+
+    class _KindCursor:
+        """Answers find_saved_food's queries from a {(kind, slug): row} map."""
+        def __init__(self, rows):
+            self.rows, self._one, self._all = rows, None, []
+        def execute(self, sql, params=()):
+            kind, key = params
+            if "slug = %s" in sql:
+                self._one = self.rows.get((kind, key))
+            else:
+                prefix = key[:-1]
+                self._all = [r for (k, sl), r in self.rows.items()
+                             if k == kind and sl.startswith(prefix)]
+        def fetchone(self):
+            return self._one
+        def fetchall(self):
+            return self._all
+
+    def test_recipe_wins_over_an_ingredient_with_the_same_slug(self):
+        cur = self._KindCursor({
+            ("recipe", "protein bar peanut"): {"kind": "recipe", "name": "Protein bar — peanut"},
+            ("ingredient", "protein bar peanut"): {"kind": "ingredient", "name": "protein bar (peanut)"},
+        })
+        self.assertEqual(nutrition.find_saved_food(cur, "Protein bar — peanut")["kind"], "recipe")
+
+    def test_falls_through_to_ingredients(self):
+        cur = self._KindCursor({
+            ("ingredient", "chicken patties"): {"kind": "ingredient", "name": "chicken patties"},
+        })
+        got = nutrition.find_saved_food(cur, "chicken patties")
+        self.assertEqual(got["kind"], "ingredient")
+
+    def test_ingredient_prefix_match(self):
+        cur = self._KindCursor({
+            ("ingredient", "salmon atlantic fresh portion"): {"kind": "ingredient", "name": "salmon"},
+        })
+        self.assertEqual(nutrition.find_saved_food(cur, "salmon")["name"], "salmon")
+
+    def test_ingredient_deviation_scales_by_serving_and_names_it(self):
+        cur = mock.Mock()
+        food = {"id": 7, "kind": "ingredient", "name": "banana", "kcal": 105,
+                "protein_g": 1.3, "carb_g": 27, "fat_g": 0.4, "fiber_g": 3.1,
+                "portion": "1 medium (118g)", "source": "notion", "source_id": "pg"}
+        with mock.patch.object(nutrition, "find_saved_food", return_value=food), \
+             mock.patch.object(nutrition, "_mark_corrected"):
+            reply = nutrition.apply_deviation(
+                cur, date(2026, 9, 21), nutrition.parse_deviation("+2 banana"))
+        self.assertIn("2 × 1 medium (118g)", reply)
+        self.assertIn("210 kcal", reply)
+        insert = [c for c in cur.execute.call_args_list
+                  if "INSERT INTO nutrition.entry" in str(c)][0]
+        params = insert.args[1]
+        self.assertEqual(params[5], 210)            # kcal scaled by quantity
+        self.assertEqual(params[10], "saved")       # source
+        self.assertEqual(params[11], "pg")          # Notion page id kept
+        self.assertEqual(params[12], "exact")       # saved food => exact
+
+    def test_fetch_ingredients_skips_rows_without_macros_and_paginates(self):
+        from artemis import notion_meal_plan as nmp
+
+        def page(name, cal=None, prot=None, serving="1 cup"):
+            return {"id": name, "properties": {
+                "ingredient": {"title": [{"plain_text": name}]},
+                "serving": {"rich_text": [{"plain_text": serving}]},
+                "calories": {"number": cal}, "protein": {"number": prot},
+                "carbs": {"number": None}, "fats": {"number": None},
+                "fiber": {"number": None}, "source": {"rich_text": []}}}
+
+        pages = [
+            {"results": [page("oats", 200, 10), page("dish soap")],
+             "has_more": True, "next_cursor": "c2"},
+            {"results": [page("half-filled", 50, None), page("tomato", 22, 1.1)],
+             "has_more": False},
+        ]
+        calls = []
+        def fake_post(path, token, payload):
+            calls.append(payload.get("start_cursor"))
+            return pages[len(calls) - 1]
+        with mock.patch.object(nmp, "_token", return_value="t"), \
+             mock.patch.object(nmp, "_post", side_effect=fake_post):
+            foods, skipped = nmp.fetch_ingredients()
+        self.assertEqual([f.name for f in foods], ["oats", "tomato"])
+        self.assertEqual(foods[0].portion, "1 cup")
+        self.assertEqual(skipped, ["half-filled"])      # empty rows aren't noise
+        self.assertEqual(calls, [None, "c2"])
+
+    def test_sync_deactivates_ingredients_gone_from_notion(self):
+        from artemis import notion_meal_plan as nmp
+        from artemis.notion_meal_plan import PlannedFood
+        cur = mock.Mock()
+        cur.rowcount = 1
+        foods = [PlannedFood("oats", "p1", kcal=200, protein_g=10, portion="1/3 cup")]
+        with mock.patch.object(nmp, "fetch_ingredients", return_value=(foods, [])):
+            out = nutrition.sync_ingredients(cur)
+        self.assertEqual(out["synced"], 1)
+        upsert = [c for c in cur.execute.call_args_list
+                  if "INSERT INTO nutrition.food" in str(c)][0]
+        self.assertEqual(upsert.args[1][0], "ingredient")
+        deact = [c for c in cur.execute.call_args_list
+                 if "SET active = FALSE" in str(c)][0]
+        self.assertIn("kind = 'ingredient'", deact.args[0])
+        self.assertEqual(deact.args[1], (["oats"],))
+
+    def test_ddl_uniqueness_is_per_kind(self):
+        sql = (_REPO_ROOT / "migrations" / "040_nutrition_diet1.sql").read_text()
+        self.assertIn("UNIQUE (kind, slug)", sql)
+        self.assertNotIn("slug           TEXT NOT NULL UNIQUE", sql)
+
+    def test_prefill_job_isolates_the_sync_in_a_savepoint(self):
+        src = (_REPO_ROOT / "artemis" / "scheduler.py").read_text()
+        body = src[src.index("def job_nutrition_prefill"):
+                   src.index("def job_pain_pattern_recompute")]
+        self.assertLess(body.index("SAVEPOINT ingredient_sync"),
+                        body.index("prefill_day("))
+        self.assertIn("ROLLBACK TO SAVEPOINT ingredient_sync", body)
+
+
 class TestMorningLine(unittest.TestCase):
     """Appears only on a planned, still-assumed, still-open previous day."""
 

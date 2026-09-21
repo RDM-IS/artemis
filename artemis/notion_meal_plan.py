@@ -14,6 +14,8 @@ Property names are the live ones, read from the databases on 2026-09-21:
                   (relations -> recipes)
   recipes       : recipe (title), course, status, calories, protein, carbs,
                   fats, fiber, servings, source
+  ingredients   : ingredient (title), serving, calories, protein, carbs, fats,
+                  fiber, source — macros are per `serving`
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ _TIMEOUT = 15
 # The two databases, by id. These are stable Notion ids, not secrets.
 MEAL_PLANNING_DB = "634b4123-5502-41d4-8ae8-b627d5f8b175"
 RECIPES_DB = "89624308-605a-4eb2-af4c-58fb78ea3657"
+INGREDIENTS_DB = "4bdd6a3a-c4e7-4cb6-9e5c-2d101e93ed11"
 
 # The undated row the 00:15 pre-fill reads on msp_work days.
 DEFAULT_DAY_NAME = "default day — work day"
@@ -57,6 +60,9 @@ class PlannedFood:
     fat_g: float | None = None
     fiber_g: float | None = None
     source_detail: str | None = None
+    # what the macros are per: None for a recipe (one portion as eaten),
+    # the Notion `serving` text for an ingredient
+    portion: str | None = None
 
     @property
     def has_macros(self) -> bool:
@@ -179,6 +185,21 @@ def _recipe_from_page(page: dict) -> PlannedFood:
     )
 
 
+def _ingredient_from_page(page: dict) -> PlannedFood:
+    props = page.get("properties") or {}
+    return PlannedFood(
+        name=_plain_title(props.get("ingredient")) or "(unnamed ingredient)",
+        page_id=page.get("id", ""),
+        kcal=_as_int(_number(props.get("calories"))),
+        protein_g=_number(props.get("protein")),
+        carb_g=_number(props.get("carbs")),
+        fat_g=_number(props.get("fats")),
+        fiber_g=_number(props.get("fiber")),
+        source_detail=_plain_text(props.get("source")),
+        portion=_plain_text(props.get("serving")),
+    )
+
+
 # ── public API ──────────────────────────────────────────────────────────────
 
 def is_configured() -> bool:
@@ -231,3 +252,36 @@ def fetch_default_day(name: str = DEFAULT_DAY_NAME) -> DefaultDay:
                     food.name)
         day.slots[slot] = foods
     return day
+
+
+def fetch_ingredients() -> tuple[list[PlannedFood], list[str]]:
+    """Every `ingredients` row that carries calories AND protein, plus the
+    names of rows that were skipped for lacking them.
+
+    The database also holds non-food rows (cleaning, hygiene) and foods with
+    no macros yet; those are skipped, never zero-filled. Paginated — the
+    database is a shopping list as much as a food table and will grow.
+
+    Raises NotionUnavailable when Notion is not configured or not reachable.
+    """
+    token = _token()
+    foods: list[PlannedFood] = []
+    skipped: list[str] = []
+    cursor = None
+    while True:
+        payload: dict = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        result = _post(f"/databases/{INGREDIENTS_DB}/query", token, payload)
+        for page in result.get("results") or []:
+            food = _ingredient_from_page(page)
+            if food.has_macros:
+                foods.append(food)
+            elif food.kcal is not None or food.protein_g is not None:
+                # half-filled macros are worth naming; empty rows are just
+                # shopping-list items and are not noise-logged
+                skipped.append(food.name)
+        if not result.get("has_more"):
+            break
+        cursor = result.get("next_cursor")
+    return foods, skipped

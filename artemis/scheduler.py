@@ -1710,11 +1710,24 @@ class ArtemisScheduler:
             today = _local_today()
             with get_connection() as conn:
                 cur = conn.cursor()
+                # Refresh the ingredients saved-food mirror first. It runs in a
+                # savepoint: a Notion outage or a bad row must cost the sync,
+                # never the pre-fill that follows in the same transaction.
+                cur.execute("SAVEPOINT ingredient_sync")
+                try:
+                    synced = nutrition.sync_ingredients(cur)
+                    cur.execute("RELEASE SAVEPOINT ingredient_sync")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT ingredient_sync")
+                    synced = None
+                    logger.warning("Ingredient sync skipped: %s", exc)
                 result = nutrition.prefill_day(cur, today)
                 locked = nutrition.lock_expired_days(cur)
             logger.info(
-                "Nutrition pre-fill %s: outcome=%s entries=%d; locked %d day(s)",
-                today, result.outcome, result.entries_written, len(locked))
+                "Nutrition pre-fill %s: outcome=%s entries=%d; ingredients=%s; "
+                "locked %d day(s)",
+                today, result.outcome, result.entries_written,
+                synced["synced"] if synced else "skipped", len(locked))
         except Exception:
             logger.exception("Nutrition pre-fill failed")
 
