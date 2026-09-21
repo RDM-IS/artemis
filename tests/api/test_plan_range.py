@@ -216,7 +216,8 @@ class TestStatus(Base):
             [log(2, "session_summary", None, notes="recovery_flow: partial 14 of 30 min"),
              *[log(3, exercise=f"Ex{i}", set_num=s, is_skipped=(i == 0)) for i in range(3) for s in (1, 2)]])
         self.assertEqual(d["2026-09-17"]["status"], "partial")
-        self.assertEqual(d["2026-09-18"]["status"], "partial", "skipped sets don't complete a session")
+        self.assertEqual(d["2026-09-18"]["status"], "done",
+                         "Ryan trained (Ex1, Ex2) and decided about Ex0 — skipped slots count")
         # 9/17-style flow on a rest_mobility row: a missed flow is missed, not a rest day.
         self.assertEqual(d["2026-09-19"]["status"], "missed")
         self.assertEqual(d["2026-09-17"]["summary_notes"], "recovery_flow: partial 14 of 30 min")
@@ -258,7 +259,9 @@ class TestStatus(Base):
         p = plan(1, TODAY - timedelta(1), "walk", {"type": "steady"})
         self.assertEqual(derive_day_status(p, [], TODAY), "missed")
         self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk")], TODAY), "done")   # 1 of 1
-        self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk", is_skipped=True)], TODAY), "partial")
+        # A walk is one cardio_block. Skipping it is not doing it, and there
+        # is no other real set in the session to make the skip count.
+        self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk", is_skipped=True)], TODAY), "missed")
         self.assertEqual(derive_day_status(p, [log(1, "session_summary", None)], TODAY), "done")
         self.assertEqual(derive_day_status(plan(2, TODAY, "rest_mobility", {"type": "mobility"}), [], TODAY), "today")
 
