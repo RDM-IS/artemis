@@ -23,6 +23,12 @@ if [ "$1" = "--force" ]; then
   echo "[deploy] override recorded in $OVERRIDE_LOG"
 fi
 
+# ROLLBACK FIRST — the live package goes to ~/backups on the box, verified
+# against its CodeSha256, before anything is built or uploaded. No override:
+# --force skips the column-grep refusal, never this. (2026-09-21: the rollback
+# for #148 had been saved only to a session scratch dir.)
+bash "$REPO/scripts/lambda_backup.sh"
+
 echo "Building Lambda package for Python 3.12 (linux/amd64)..."
 rm -rf package function.zip
 
