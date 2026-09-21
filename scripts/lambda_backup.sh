@@ -12,6 +12,11 @@
 # exits non-zero, and deploy.sh stops before uploading. There is no override:
 # a deploy without a rollback is the thing this exists to prevent.
 #
+# Retention: the newest KEEP (5) packages on the box are kept, newest by the
+# time they were saved. Older ones are deleted only AFTER the new package is
+# verified on the box, and never if the new one isn't among the kept set.
+# The Mac's ~/backups copy is trimmed the same way.
+#
 # Rollback (from a Mac with SSO; the box role has no Lambda write permission):
 #   scp rdmis:backups/<file> /tmp/
 #   aws lambda update-function-code --function-name rdmis-crm-api \
@@ -22,8 +27,29 @@ FUNCTION="rdmis-crm-api"
 REGION="us-east-1"
 BOX="${ARTEMIS_BOX:-rdmis}"
 LOCAL_DIR="$HOME/backups"
+KEEP=5
 
 fail() { echo "[backup] FAILED: $*" >&2; exit 1; }
+
+# Delete all but the newest $KEEP lambda_*.zip on the box — called only once
+# $name is verified there. Refuses if $name wouldn't survive.
+prune() {
+  local kept old
+  kept=$(ssh "$BOX" "cd ~/backups && ls -1t lambda_*.zip | head -n $KEEP") \
+    || fail "could not list ~/backups on the box for retention"
+  grep -qx "$name" <<<"$kept" \
+    || fail "retention: $name is not among the newest $KEEP on the box — deleting nothing"
+  old=$(ssh "$BOX" "cd ~/backups && ls -1t lambda_*.zip | tail -n +$((KEEP + 1))")
+  if [ -n "$old" ]; then
+    # shellcheck disable=SC2086
+    ssh "$BOX" "cd ~/backups && rm -f -- $(tr '\n' ' ' <<<"$old")" \
+      || fail "retention: delete on the box failed"
+    echo "[backup] retention: removed from the box: $(tr '\n' ' ' <<<"$old")"
+  fi
+  if [ -d "$LOCAL_DIR" ]; then
+    (cd "$LOCAL_DIR" && ls -1t lambda_*.zip 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --)
+  fi
+}
 
 info=$(aws lambda get-function --function-name "$FUNCTION" --region "$REGION" \
         --query '[Configuration.CodeSha256, Configuration.LastModified, Code.Location]' \
@@ -39,6 +65,7 @@ name="lambda_${modified:0:10}_${hex:0:12}.zip"
 remote_hex=$(ssh -o ConnectTimeout=20 "$BOX" "sha256sum ~/backups/$name 2>/dev/null | cut -d' ' -f1" || true)
 if [ "$remote_hex" = "$hex" ]; then
   echo "[backup] rollback already on the box: ~/backups/$name (sha256 $hex)"
+  prune
   exit 0
 fi
 
@@ -52,5 +79,6 @@ scp -q "$LOCAL_DIR/$name" "$BOX:backups/$name" || fail "copy to the box failed"
 remote_hex=$(ssh "$BOX" "chmod 600 ~/backups/$name && sha256sum ~/backups/$name | cut -d' ' -f1") \
   || fail "could not verify the copy on the box"
 [ "$remote_hex" = "$hex" ] || fail "box copy sha256 $remote_hex != $hex"
+prune
 
 echo "[backup] rollback saved: $BOX:~/backups/$name (sha256 $hex, live since $modified; local copy $LOCAL_DIR/$name)"
