@@ -158,8 +158,9 @@ class TestDefensiveFilter(unittest.TestCase):
         c = wp.parse_counts(self.REAL_SHAPE)
         self.assertEqual(c["stored_samples"], 1)          # resting_heart_rate only
         self.assertEqual(c["heart_rate_samples"], 1)      # held out separately
-        self.assertEqual(c["ignored_samples"], 2)
-        self.assertEqual(set(c["ignored_metrics"]), {"step_count", "physical_effort"})
+        self.assertEqual(c["hourly_samples"], 1)          # STEPS-HOURLY: steps are stored now
+        self.assertEqual(c["ignored_samples"], 1)
+        self.assertEqual(set(c["ignored_metrics"]), {"physical_effort"})
 
     def test_hr_min_max_and_device_are_captured(self):
         hr = next(r for r in wp.parse_samples(self.REAL_SHAPE) if r["metric"] == "heart_rate")
@@ -175,6 +176,103 @@ class TestDefensiveFilter(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(len(skipped), 1)
         self.assertEqual(wp.parse_counts(payload)["workouts_without_a_readable_start"], 1)
+
+
+class TestStepsHourly(unittest.TestCase):
+    """STEPS-HOURLY (2026-09-21): step_count and apple_exercise_time become
+    hourly totals. A push never ADDS to an hour: minutes merge by key, so an
+    overlapping resend can't double-count and a partial push can't shrink it."""
+
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("America/Chicago")   # a fixture zone, not app config
+
+    @staticmethod
+    def _payload(metric, points, source="RAW|RIP"):
+        return {"data": {"metrics": [{"name": metric, "units": "count", "data": [
+            {"date": d, "qty": q, "source": source} for d, q in points]}]}}
+
+    def _buckets(self, payload):
+        return wp.bucket_hourly(wp.parse_samples(payload), self.TZ)
+
+    def test_both_metrics_are_hourly_and_nothing_else(self):
+        self.assertTrue(wp.is_hourly("step_count"))
+        self.assertTrue(wp.is_hourly("apple_exercise_time"))
+        for other in ("active_energy", "physical_effort", "walking_running_distance"):
+            self.assertFalse(wp.is_hourly(other), other)
+        self.assertFalse(wp.is_wanted("step_count"))     # never into watch_sample
+
+    def test_samples_bucket_by_local_hour(self):
+        b = self._buckets(self._payload("step_count", [
+            ("2026-09-22 06:05:00 -0500", 100), ("2026-09-22 06:59:00 -0500", 50),
+            ("2026-09-22 07:00:00 -0500", 20)]))
+        self.assertEqual(len(b), 2)
+        six = next(v for (m, h), v in b.items() if h.hour == 6)
+        self.assertEqual(sum(six["minutes"].values()), 150)
+        self.assertEqual(six["local_date"].isoformat(), "2026-09-22")
+
+    def test_hour_and_date_follow_the_active_timezone(self):
+        # 23:30 local on the 21st is 04:30Z on the 22nd: it belongs to the 21st
+        b = self._buckets(self._payload("step_count", [("2026-09-22T04:30:00+00:00", 10)]))
+        (_, hour), v = next(iter(b.items()))
+        self.assertEqual(v["local_date"].isoformat(), "2026-09-21")
+        self.assertEqual((hour.hour, hour.minute), (23, 0))
+
+    def test_an_overlapping_resend_does_not_double_count(self):
+        first = self._buckets(self._payload("step_count", [
+            ("2026-09-22 06:05:00 -0500", 100), ("2026-09-22 06:06:00 -0500", 40)]))
+        again = self._buckets(self._payload("step_count", [
+            ("2026-09-22 06:05:00 -0500", 100), ("2026-09-22 06:06:00 -0500", 40),
+            ("2026-09-22 06:07:00 -0500", 10)]))
+        key = next(iter(first))
+        merged = wp.merge_minutes(first[key]["minutes"], again[key]["minutes"])
+        self.assertEqual(wp.summarise_minutes(merged)["value"], 150)   # not 290
+
+    def test_a_partial_push_cannot_shrink_the_hour(self):
+        full = self._buckets(self._payload("step_count", [
+            ("2026-09-22 06:05:00 -0500", 100), ("2026-09-22 06:40:00 -0500", 60)]))
+        tail = self._buckets(self._payload("step_count", [("2026-09-22 06:40:00 -0500", 60)]))
+        key = next(iter(full))
+        merged = wp.merge_minutes(full[key]["minutes"], tail[key]["minutes"])
+        self.assertEqual(wp.summarise_minutes(merged)["value"], 160)
+
+    def test_a_revised_minute_replaces_itself(self):
+        a = self._buckets(self._payload("step_count", [("2026-09-22 06:05:00 -0500", 30)]))
+        b = self._buckets(self._payload("step_count", [("2026-09-22 06:05:00 -0500", 45)]))
+        key = next(iter(a))
+        merged = wp.merge_minutes(a[key]["minutes"], b[key]["minutes"])
+        self.assertEqual(wp.summarise_minutes(merged)["value"], 45)
+
+    def test_two_devices_in_one_minute_are_kept_and_flagged_not_guessed(self):
+        watch = self._payload("step_count", [("2026-09-22 06:05:00 -0500", 30)], "RAW")
+        phone = self._payload("step_count", [("2026-09-22 06:05:00 -0500", 28)], "RIP")
+        watch["data"]["metrics"] += phone["data"]["metrics"]
+        b = self._buckets(watch)
+        s = wp.summarise_minutes(next(iter(b.values()))["minutes"])
+        self.assertEqual(s["overlap_minutes"], 1)
+        self.assertEqual(s["value"], 58)                 # both counted, and flagged
+        self.assertEqual(s["devices"], ["RAW", "RIP"])
+
+    def test_summary_bounds_and_counts(self):
+        b = self._buckets(self._payload("apple_exercise_time", [
+            ("2026-09-22 06:05:00 -0500", 1), ("2026-09-22 06:30:00 -0500", 1)]))
+        s = wp.summarise_minutes(next(iter(b.values()))["minutes"])
+        self.assertEqual((s["value"], s["sample_count"], s["overlap_minutes"]), (2, 2, 0))
+        self.assertEqual(s["first_at"].isoformat(), "2026-09-22T11:05:00+00:00")
+        self.assertEqual(s["last_at"].isoformat(), "2026-09-22T11:31:00+00:00")
+
+    def test_undated_or_valueless_samples_are_not_bucketed(self):
+        b = self._buckets({"data": {"metrics": [{"name": "step_count", "data": [
+            {"qty": 5}, {"date": "2026-09-22 06:05:00 -0500"}]}]}})
+        self.assertEqual(b, {})
+
+    def test_the_endpoint_upsert_is_a_merge_not_an_add(self):
+        src = (Path(__file__).resolve().parent.parent / "api" / "app" / "routers"
+               / "health.py").read_text()
+        fn = src[src.index("def _upsert_hourly"):src.index('@router.post("/ingest"')]
+        self.assertIn("FOR UPDATE", fn)
+        self.assertIn("merge_minutes(previous", fn)
+        self.assertNotIn("value + EXCLUDED.value", fn)
+        self.assertNotIn("watch_hourly.value +", fn)
 
 
 class TestEndpointGuards(unittest.TestCase):

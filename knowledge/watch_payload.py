@@ -24,7 +24,9 @@ so the rules are deliberately forgiving:
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+_UTC = timezone.utc
 
 # Health Auto Export metric name -> our metric key. Everything Ryan asked for
 # (2026-09-19): sleep (all stages), resting HR, HRV, weight, active + basal
@@ -57,6 +59,11 @@ SLEEP_PREFIX = "sleep"
 # Minute-level HR: high volume (~1,100/day) and only useful inside a session.
 # Held out of watch_sample; see migration 037 for the compact store.
 HEART_RATE = "heart_rate"
+
+# STEPS-HOURLY (Ryan, 2026-09-21): stored as HOURLY totals in
+# health.watch_hourly (migration 041), never in watch_sample. They leave the
+# ignore list; everything else on it stays ignored and named.
+HOURLY = {"step_count", "apple_exercise_time"}
 
 
 # The payload's own "source" field, decoded (Ryan, 2026-09-20).
@@ -91,6 +98,77 @@ def prefers_watch(metric: str) -> bool:
 def is_wanted(metric: str) -> bool:
     """True when a metric is stored in watch_sample."""
     return metric in WANTED or metric.startswith(SLEEP_PREFIX)
+
+
+def is_hourly(metric: str) -> bool:
+    """True when a metric is stored as hourly totals in watch_hourly."""
+    return metric in HOURLY
+
+
+def minute_key(when: datetime, device: str | None) -> str:
+    """The key a minute's value is stored under inside an hourly row:
+    "<UTC minute ISO>|<device string as it arrived>". The device is part of
+    the key so two separate samples for one minute (watch and iPhone) are
+    both KEPT and counted as an overlap, never silently merged or dropped.
+    `when` must be timezone-aware (bucket_hourly makes it so)."""
+    minute = when.astimezone(_UTC).replace(second=0, microsecond=0)
+    return f"{minute.strftime('%Y-%m-%dT%H:%MZ')}|{device or ''}"
+
+
+def bucket_hourly(samples: list[dict], tz) -> dict:
+    """Group hourly-metric samples into {(metric, hour_start): bucket}.
+
+    hour_start is the start of the LOCAL hour in `tz` (the active timezone),
+    as an aware datetime. Each bucket holds `minutes` {minute_key: value},
+    plus the unit and local_date. Within one payload a repeated minute key
+    keeps the last value seen: a resend, not a second reading. Samples with
+    no date or no value are skipped (parse_counts reports undated ones)."""
+    out: dict = {}
+    for s in samples:
+        if not is_hourly(s["metric"]) or s["measured_at"] is None or s["value"] is None:
+            continue
+        when = s["measured_at"]
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=tz)
+        local = when.astimezone(tz)
+        hour_start = local.replace(minute=0, second=0, microsecond=0)
+        b = out.setdefault((s["metric"], hour_start), {
+            "metric": s["metric"], "hour_start": hour_start,
+            "local_date": hour_start.date(), "unit": s["unit"], "minutes": {}})
+        b["minutes"][minute_key(when, s.get("device"))] = float(s["value"])
+    return out
+
+
+def merge_minutes(stored: dict | None, incoming: dict) -> dict:
+    """The hour's minute map after a push: stored keys, overwritten or extended
+    by the incoming ones. NEVER additive: a minute the push resends replaces
+    itself, and a push covering part of the hour can't shrink it."""
+    merged = dict(stored or {})
+    merged.update(incoming)
+    return merged
+
+
+def summarise_minutes(minutes: dict) -> dict:
+    """value / sample_count / overlap_minutes / first_at / last_at / devices
+    for one hour's minute map. overlap_minutes counts minutes that have more
+    than one key, i.e. separate samples from different devices."""
+    per_minute: dict = {}
+    devices = set()
+    for key in minutes:
+        minute, _, device = key.partition("|")
+        per_minute[minute] = per_minute.get(minute, 0) + 1
+        if device:
+            devices.add(device)
+    stamps = sorted(per_minute)
+    parse = lambda m: datetime.strptime(m, "%Y-%m-%dT%H:%MZ").replace(tzinfo=_UTC)  # noqa: E731
+    return {
+        "value": round(sum(minutes.values()), 4),
+        "sample_count": len(minutes),
+        "overlap_minutes": sum(1 for n in per_minute.values() if n > 1),
+        "first_at": parse(stamps[0]) if stamps else None,
+        "last_at": parse(stamps[-1]) + timedelta(minutes=1) if stamps else None,
+        "devices": sorted(devices),
+    }
 
 # Sleep arrives as ONE aggregated record per night, a field per stage.
 # Observed 2026-09-21 (the first real night):
@@ -306,12 +384,14 @@ def parse_counts(payload: dict) -> dict:
     skipped_workouts: list = []
     workouts = parse_workouts(payload, skipped_workouts)
     ignored: dict[str, int] = {}
-    wanted = hr = 0
+    wanted = hr = hourly = 0
     for s in samples:
         if is_wanted(s["metric"]):
             wanted += 1
         elif s["metric"] == HEART_RATE:
             hr += 1
+        elif is_hourly(s["metric"]):
+            hourly += 1
         else:
             ignored[s["metric"]] = ignored.get(s["metric"], 0) + 1
     return {
@@ -321,6 +401,7 @@ def parse_counts(payload: dict) -> dict:
         "stored_samples": wanted,
         "undated_samples": sum(1 for s in samples if s["measured_at"] is None),
         "heart_rate_samples": hr,
+        "hourly_samples": hourly,
         "ignored_metrics": dict(sorted(ignored.items(), key=lambda kv: -kv[1])),
         "ignored_samples": sum(ignored.values()),
         "workouts_without_a_readable_start": len(skipped_workouts),
