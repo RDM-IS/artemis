@@ -1721,13 +1721,24 @@ class ArtemisScheduler:
                     cur.execute("ROLLBACK TO SAVEPOINT ingredient_sync")
                     synced = None
                     logger.warning("Ingredient sync skipped: %s", exc)
+                # Recipes too, so a backup meal the default day doesn't link
+                # ("dinner: patty bowl") is a saved food. Same savepoint rule.
+                cur.execute("SAVEPOINT recipe_sync")
+                try:
+                    recipes = nutrition.sync_recipes(cur)
+                    cur.execute("RELEASE SAVEPOINT recipe_sync")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT recipe_sync")
+                    recipes = None
+                    logger.warning("Recipe sync skipped: %s", exc)
                 result = nutrition.prefill_day(cur, today)
                 locked = nutrition.lock_expired_days(cur)
             logger.info(
                 "Nutrition pre-fill %s: outcome=%s entries=%d; ingredients=%s; "
-                "locked %d day(s)",
+                "recipes=%s; locked %d day(s)",
                 today, result.outcome, result.entries_written,
-                synced["synced"] if synced else "skipped", len(locked))
+                synced["synced"] if synced else "skipped",
+                recipes["synced"] if recipes else "skipped", len(locked))
         except Exception:
             logger.exception("Nutrition pre-fill failed")
 

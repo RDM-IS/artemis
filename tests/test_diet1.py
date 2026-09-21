@@ -260,6 +260,71 @@ class TestIngredientsSavedFoods(unittest.TestCase):
         self.assertIn("kind = 'ingredient'", deact.args[0])
         self.assertEqual(deact.args[1], (["oats"],))
 
+    def test_fetch_recipes_only_active_unarchived_with_macros(self):
+        """2026-09-21: a backup meal the default day doesn't link must still be
+        a saved food, so every active recipe is synced — not just linked ones."""
+        from artemis import notion_meal_plan as nmp
+
+        def page(name, cal=None, prot=None, source=""):
+            return {"id": name, "properties": {
+                "recipe": {"title": [{"plain_text": name}]},
+                "course": {"select": {"name": "dinner"}},
+                "calories": {"number": cal}, "protein": {"number": prot},
+                "carbs": {"number": None}, "fats": {"number": None},
+                "fiber": {"number": None},
+                "source": {"rich_text": [{"plain_text": source}] if source else []}}}
+
+        payloads = []
+        def fake_post(path, token, payload):
+            payloads.append((path, payload))
+            return {"results": [page("Patty bowl (patty + veg)", 310, 32),
+                                page("Chicken thigh bowl", 366, 41, "ESTIMATE — computed"),
+                                page("Untested idea")], "has_more": False}
+        with mock.patch.object(nmp, "_token", return_value="t"), \
+             mock.patch.object(nmp, "_post", side_effect=fake_post):
+            foods, skipped = nmp.fetch_recipes()
+        self.assertEqual([f.name for f in foods], ["Patty bowl (patty + veg)", "Chicken thigh bowl"])
+        self.assertEqual(skipped, ["Untested idea"])
+        path, payload = payloads[0]
+        self.assertIn(nmp.RECIPES_DB, path)
+        self.assertIn({"property": "status", "status": {"equals": "active"}},
+                      payload["filter"]["and"])
+        self.assertIn({"property": "archive", "checkbox": {"equals": False}},
+                      payload["filter"]["and"])
+        self.assertFalse(foods[0].is_placeholder)
+        self.assertTrue(foods[1].is_placeholder)        # "estimate" marks it
+
+    def test_sync_recipes_upserts_as_recipe_and_deactivates_the_rest(self):
+        from artemis import notion_meal_plan as nmp
+        from artemis.notion_meal_plan import PlannedFood
+        cur = mock.Mock()
+        cur.rowcount = 0
+        foods = [PlannedFood("Patty bowl (patty + veg)", "p9", kcal=310, protein_g=32)]
+        with mock.patch.object(nmp, "fetch_recipes", return_value=(foods, [])):
+            out = nutrition.sync_recipes(cur)
+        self.assertEqual(out["synced"], 1)
+        upsert = [c for c in cur.execute.call_args_list
+                  if "INSERT INTO nutrition.food" in str(c)][0]
+        self.assertEqual(upsert.args[1][0], "recipe")
+        deact = [c for c in cur.execute.call_args_list
+                 if "SET active = FALSE" in str(c)][0]
+        self.assertIn("kind = 'recipe'", deact.args[0])
+        self.assertEqual(deact.args[1], (["patty bowl patty veg"],))
+
+    def test_patty_bowl_resolves_by_prefix(self):
+        """'dinner: patty bowl' → the recipe titled 'Patty bowl (patty + veg)'."""
+        self.assertTrue(nutrition.slugify("Patty bowl (patty + veg)")
+                        .startswith(nutrition.slugify("patty bowl")))
+        dev = nutrition.parse_deviation("dinner: patty bowl")
+        self.assertIsNotNone(dev)
+
+    def test_prefill_job_syncs_recipes_in_its_own_savepoint(self):
+        src = (_REPO_ROOT / "artemis" / "scheduler.py").read_text()
+        body = src[src.index("def job_nutrition_prefill"):
+                   src.index("def job_pain_pattern_recompute")]
+        self.assertLess(body.index("SAVEPOINT recipe_sync"), body.index("prefill_day("))
+        self.assertIn("ROLLBACK TO SAVEPOINT recipe_sync", body)
+
     def test_ddl_uniqueness_is_per_kind(self):
         sql = (_REPO_ROOT / "migrations" / "040_nutrition_diet1.sql").read_text()
         self.assertIn("UNIQUE (kind, slug)", sql)

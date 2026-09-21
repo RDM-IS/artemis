@@ -292,6 +292,38 @@ def sync_ingredients(cur) -> dict:
     return {"synced": len(seen), "deactivated": deactivated, "skipped": skipped}
 
 
+def sync_recipes(cur) -> dict:
+    """Mirror every active `recipes` row with macros into nutrition.food as
+    kind='recipe' — the FIRST saved-food source. Before this, a recipe only
+    reached the mirror when the default day linked it, so a backup meal the
+    plan doesn't name ("dinner: patty bowl") was never found.
+
+    A recipe that is no longer active in Notion is marked inactive, not
+    deleted. Raises NotionUnavailable; the caller decides what that means.
+    """
+    from artemis import notion_meal_plan as nmp
+
+    foods, skipped = nmp.fetch_recipes()
+    seen: set[str] = set()
+    for food in foods:
+        slug = slugify(food.name)
+        if not slug or slug in seen:
+            skipped.append(f"{food.name} (duplicate name)")
+            continue
+        seen.add(slug)
+        upsert_food(cur, food, kind="recipe")
+
+    cur.execute(
+        "UPDATE nutrition.food SET active = FALSE, updated_at = now() "
+        "WHERE kind = 'recipe' AND active AND NOT (slug = ANY(%s))",
+        (list(seen),))
+    deactivated = cur.rowcount if isinstance(cur.rowcount, int) else 0
+
+    _audit(cur, "nutrition_recipe_sync", "ok",
+           {"synced": len(seen), "deactivated": deactivated, "skipped": skipped})
+    return {"synced": len(seen), "deactivated": deactivated, "skipped": skipped}
+
+
 SAVED_FOOD_KINDS = ("recipe", "ingredient")   # lookup order
 
 _FOOD_COLS = ("id, kind, name, kcal, protein_g, carb_g, fat_g, fiber_g, portion, "

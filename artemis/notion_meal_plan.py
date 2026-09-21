@@ -72,7 +72,11 @@ class PlannedFood:
 
     @property
     def is_placeholder(self) -> bool:
-        return "placeholder" in (self.source_detail or "").lower()
+        """True when the row's own `source` says its macros are not from a
+        label: "placeholder" or "estimate" (Ryan, 2026-09-21 — the chicken
+        thigh bowl is computed partly from USDA generics)."""
+        src = (self.source_detail or "").lower()
+        return "placeholder" in src or "estimate" in src
 
 
 @dataclass
@@ -252,6 +256,38 @@ def fetch_default_day(name: str = DEFAULT_DAY_NAME) -> DefaultDay:
                     food.name)
         day.slots[slot] = foods
     return day
+
+
+def fetch_recipes() -> tuple[list[PlannedFood], list[str]]:
+    """Every ACTIVE, un-archived `recipes` row that carries calories AND
+    protein, plus the names of active rows skipped for lacking them.
+
+    Why: the saved-food lookup only knew recipes the default day links, so a
+    backup meal ("dinner: patty bowl") fell through to USDA. Paginated.
+    Raises NotionUnavailable when Notion is not configured or not reachable.
+    """
+    token = _token()
+    foods: list[PlannedFood] = []
+    skipped: list[str] = []
+    cursor = None
+    while True:
+        payload: dict = {"page_size": 100, "filter": {"and": [
+            {"property": "status", "status": {"equals": "active"}},
+            {"property": "archive", "checkbox": {"equals": False}},
+        ]}}
+        if cursor:
+            payload["start_cursor"] = cursor
+        result = _post(f"/databases/{RECIPES_DB}/query", token, payload)
+        for page in result.get("results") or []:
+            food = _recipe_from_page(page)
+            if food.has_macros:
+                foods.append(food)
+            else:
+                skipped.append(food.name)
+        if not result.get("has_more"):
+            break
+        cursor = result.get("next_cursor")
+    return foods, skipped
 
 
 def fetch_ingredients() -> tuple[list[PlannedFood], list[str]]:
