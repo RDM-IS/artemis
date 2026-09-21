@@ -3,8 +3,8 @@
 The case that matters is the first one: the 2026-09-20 sequence. Migration 039
 dropped `health.plan.status` while the code being deployed still listed
 `status` in `_plan_days`' SELECT. The smoke test passed because the column
-still existed when it ran; `/plan` and `/overview` then 500ed for seven
-minutes. The preflight must REFUSE that exact arrangement.
+still existed when it ran; `/plan` and `/overview` then 500ed until the fix
+deployed 1 min 40 s later. The preflight must REFUSE that exact arrangement.
 
 Each case builds a throwaway repo — migrations/ plus api/app — so the tests
 pin behaviour rather than the current contents of this checkout.
