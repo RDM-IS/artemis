@@ -305,6 +305,50 @@ class TestTransitions(unittest.TestCase):
         used = {s["name"] for s in office.FLOW_STEPS} | {office.FLOW_CLOSE["name"]}
         self.assertEqual(set(office.FLOW_SANSKRIT) - used, set())
 
+    def test_every_pose_resolves_to_a_mid_hold_cue_or_explicitly_none(self):
+        """YOGA-5: the key must be PRESENT either way, so "nobody wrote one"
+        and "this one deliberately has none" stay different facts."""
+        for day in (THU, SAT):
+            for st in ROWS[day]["blocks"]["flow"]:
+                self.assertIn("cue_mid", st, st["name"])
+                self.assertTrue(st["cue_mid"], f"{st['name']} has an empty cue_mid")
+        by = {s["name"]: s for s in ROWS[SAT]["blocks"]["flow"]}
+        self.assertEqual(by["Child's pose"]["cue_mid"],
+                         "Let your forehead rest, widen your knees")
+        self.assertEqual(by["Seated twist"]["cue_mid"],
+                         "For a deeper stretch, look over your shoulder")
+
+    def test_a_pose_with_no_cue_mid_key_fails_validation(self):
+        b = copy.deepcopy(ROWS[SAT]["blocks"])
+        b["flow"][3].pop("cue_mid")
+        with self.assertRaises(office.FlowError) as cm:
+            office.validate_flow(b)
+        self.assertIn("no cue_mid key", str(cm.exception))
+
+    def test_meditation_and_savasana_are_silent_for_their_whole_hold(self):
+        """Ryan, 2026-09-20: nothing at all while those two timers run. The
+        lead-in and the move cue still happen BEFORE the hold starts."""
+        for day in (THU, SAT):
+            b = ROWS[day]["blocks"]
+            self.assertIsNone(b["pre"][0]["cue_mid"])
+            self.assertIsNone(b["close"]["cue_mid"])
+            for item in (*b["pre"], b["close"], *b["flow"]):
+                self.assertNotIn("cue_mid_at_start", item, item["name"])
+        self.assertNotIn("Savasana", office.FLOW_CUE_MID)
+
+    def test_the_mid_cue_never_collides_with_the_lead_in(self):
+        """12 s in vs 7 s before the end: the shortest hold is 40 s, so the
+        gap is 21 s. If a hold ever gets short enough, this fails first."""
+        for day in (THU, SAT):
+            b = ROWS[day]["blocks"]
+            at = b["cue_mid_sec"]
+            for st in b["flow"]:
+                self.assertLess(at, st["duration_sec"] - b["leadin_sec"], st["name"])
+
+    def test_every_cue_mid_entry_is_used(self):
+        used = {s["name"] for s in office.FLOW_STEPS}
+        self.assertEqual(set(office.FLOW_CUE_MID) - used, set())
+
     def test_a_pose_without_a_posture_fails_validation(self):
         b = copy.deepcopy(ROWS[SAT]["blocks"])
         b["flow"][0]["posture"] = None
