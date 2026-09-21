@@ -385,7 +385,7 @@ def open_correction(cur, channel_id: str, today: date,
     hours_left = int((correction_deadline(target) - now).total_seconds() // 3600)
     return (
         f"Correcting {target:%a %b %-d} — logged as planned: "
-        f"{totals['kcal']} kcal, {totals['protein_g']:g} g protein.\n"
+        f"{totals['kcal']} kcal, {float(totals['protein_g']):g} g protein.\n"
         f"Send the deviations, one per line — e.g. `lunch: chipotle chicken bowl`, "
         f"`skipped breakfast`, `+2 beers`. Reply `done` when finished.\n"
         f"About {hours_left}h left on this day.")
