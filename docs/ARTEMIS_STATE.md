@@ -283,6 +283,12 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Session window** is the logged session's span, or a matched `watch_workout` when one exists. No overlap → no zone line, never a guess.
 - **Consumers:** the daily and weekly reports (EXPORT-1), and EVAL-1's recovery area.
 
+**ENERGY-HOURLY — aggregate active/basal energy to hourly on ingest (small; backlog, not urgent; option recorded 2026-09-21, NOT approved to build).** Minute-level energy is nearly all of `health.watch_sample` and nothing uses it at that grain: no code reads `active_energy` or `basal_energy` today, and DIET-1 only needs daily energy-out. Heart rate stays at full resolution in `watch_heart_rate` — ZONE-1 needs it.
+- **Measured 2026-09-21:** `watch_sample` = 229,778 rows / 71 MB. `basal_energy` 149,607 rows (~1,360/day, one a minute) + `active_energy` 77,691 (~713/day) = **227,298 rows, 98.9% of the table**, ~2,020 rows/day over the last 30 days. Everything else (resting HR, HRV, walking HR, weight, sleep) is ~2,500 rows in total.
+- **Size:** at current rates, ~740k energy rows / **~230 MB a year**. Hourly would be ≤ 48 rows/day (observed ~38, as there are hours with no samples): ~17k rows / **~5.5 MB a year**, a ~42× reduction.
+- **Design notes, for whenever it's built:** bucket by metric and hour, value = sum of `qty`, plus `sample_count` and first/last minute. Pushes overlap and resend minutes, so an ingest must NOT add to a stored bucket (that double-counts). Replace the bucket when the incoming payload has at least as many minutes for that hour. Keep one representative `raw` per bucket, not all 60. Existing rows could be rolled up by a one-off migration, with an export to the box first. Decide then.
+- **What is lost:** minute-level active energy inside a session. On 9/21 it was the only calorie evidence for the unrecorded workout (~217 kcal over 05:21–05:51). A `watch_workout` record carries its own kcal, so that stops mattering once workouts arrive. Hourly still covers daily energy-out for DIET-1.
+
 **SLEEP-PERF — does sleep show up in performance? (small; data only; NOT before ~4 weeks of watch sleep, so no earlier than ~2026-10-19).** Ryan, 2026-09-21: sleep < 6 was removed as a recovery trigger; energy drives recovery. This checks whether that was right.
 - **Data only:** per training day, performance — load, reps, RPE vs cap — beside watch sleep, typed sleep and typed energy for that morning. Tables and simple pairings; no model, no verdict.
 - **No rule changes from it** until Ryan has looked at the results.
