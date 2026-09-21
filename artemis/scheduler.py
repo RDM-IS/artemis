@@ -208,6 +208,10 @@ class ArtemisScheduler:
         t = self.cron_times(now)
         specs = [
             # 03:30 — silent vault ingest, before the wake window.
+            # 00:15 — DIET-1 pre-fill + the 48h correction lock. SILENT: this
+            # is inside quiet hours and posts nothing. tier stays "business"
+            # only because it never posts; see job_nutrition_prefill.
+            CronSpec("nutrition_prefill", "job_nutrition_prefill", 0, 15),
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
             # wake: health holds flush + the wake post. Time follows the day's
             # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer / home 07:30).
@@ -1682,6 +1686,37 @@ class ArtemisScheduler:
                 logger.info("Posted check-in nudge for %s", today)
         except Exception:
             logger.exception("Check-in nudge failed")
+
+    def job_nutrition_prefill(self):
+        """00:15 local — pre-fill today from the Notion default day (DIET-1).
+
+        SILENT BY DESIGN. It posts nothing, ever: 00:15 is inside quiet hours,
+        and the spec is explicit that there is no prompt, no nudge and no
+        scheduled nutrition post of any kind. Everything this job has to say
+        lands on the morning check-in reply instead.
+
+        It also sweeps the 48h correction lock, so a day that went unconfirmed
+        is recorded as `locked_unconfirmed` rather than silently staying
+        `assumed`.
+
+        Work-day scope: only `msp_work` days are pre-filled. If Notion is
+        unreachable or unconfigured, nothing is pre-filled and the day records
+        why — no plan is invented.
+        """
+        try:
+            from artemis import nutrition
+            from knowledge.db import get_connection
+
+            today = _local_today()
+            with get_connection() as conn:
+                cur = conn.cursor()
+                result = nutrition.prefill_day(cur, today)
+                locked = nutrition.lock_expired_days(cur)
+            logger.info(
+                "Nutrition pre-fill %s: outcome=%s entries=%d; locked %d day(s)",
+                today, result.outcome, result.entries_written, len(locked))
+        except Exception:
+            logger.exception("Nutrition pre-fill failed")
 
     def job_pain_pattern_recompute(self):
         """21:55 local — refresh health.pain_pattern. Silent: posts nothing."""

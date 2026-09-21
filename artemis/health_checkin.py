@@ -1131,6 +1131,21 @@ def process_checkin_full(cur, text: str, day: date, *, checkin_id: str,
         mentioned, lines = hp.mention_on_checkin(cur, day, now)
         if lines:
             reply = "\n".join([reply] + lines)
+
+    # DIET-1: one line about YESTERDAY, appended to the reply — never a
+    # separate post. It is added AFTER routing has already resolved to the
+    # morning flow, so it cannot influence check-in intent (HEALTH-1).
+    # morning_line() returns None when yesterday had corrections, had no
+    # plan, or is already locked.
+    try:
+        from artemis import nutrition
+        line = nutrition.morning_line(cur, day)
+        if line:
+            reply = "\n".join([reply, line])
+    except Exception:
+        # A nutrition problem must never cost Ryan his check-in reply.
+        logger.debug("nutrition morning line unavailable", exc_info=True)
+
     return reply, mentioned
 
 

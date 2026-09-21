@@ -3707,6 +3707,103 @@ def _handle_morning_flow(post: dict, question: str) -> bool:
     return True
 
 
+_NUTRITION_FIX_RE = re.compile(r"^\s*fix\s*[.!]*\s*$", re.I)
+_NUTRITION_DONE_RE = re.compile(r"^\s*(?:done|finished|that'?s\s+it)\s*[.!]*\s*$", re.I)
+
+
+def _handle_nutrition_fix(post: dict, question: str) -> bool:
+    """DIET-1 — `fix` opens a correction for the PREVIOUS day, and the lines
+    that follow it are deviations.
+
+    Deliberately narrow. Only a BARE `fix` is claimed here: `fix <exercise>
+    rpe <n>` is the existing workout-set correction (artemis/health.py) and
+    must keep reaching it, so this handler sits AFTER morning_flow and matches
+    nothing with arguments.
+
+    Once a correction is open for this channel, subsequent deviation-shaped
+    lines are consumed here until `done`. A line that parses as neither is
+    NOT claimed — it falls through to the rest of the chain.
+
+    CONFIRM-ARB: `fix` and the closing `done` are bare control words. `fix`
+    targets one store (nutrition_fix_pending) and is only claimed when that
+    store is empty-or-not; `done` is only claimed while a correction is open,
+    so it cannot steal the morning flow's `done`.
+    """
+    from artemis import nutrition
+
+    text = question or ""
+
+    # Cheap text gate FIRST. Every handler in deterministic_chain runs on every
+    # message, and an exception here aborts the whole chain (the dispatcher
+    # returns on any handler error), so this must not touch the database for
+    # traffic that plainly isn't ours.
+    is_fix = bool(_NUTRITION_FIX_RE.match(text))
+    is_done = bool(_NUTRITION_DONE_RE.match(text))
+    maybe_deviation = any(
+        nutrition.parse_deviation(ln) for ln in text.splitlines() if ln.strip())
+    if not (is_fix or is_done or maybe_deviation):
+        return False
+
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    try:
+        today = local_today()
+        conn_ctx = get_connection()
+    except Exception:
+        # Fail OPEN: a nutrition problem must never swallow the rest of the
+        # chain. Let the next handler have the message.
+        logger.exception("nutrition_fix unavailable — not claiming post %s",
+                         post.get("id"))
+        return False
+
+    with conn_ctx as conn:
+        cur = conn.cursor()
+        pending = nutrition.pending_correction(cur, channel_id)
+
+        if is_fix:
+            reply = nutrition.open_correction(cur, channel_id, today)
+        elif pending is None:
+            return False
+        elif not nutrition.is_open(pending):
+            # The window closed while this correction sat open — a `fix` on
+            # Monday whose deviations arrive on Thursday. Refuse and lock,
+            # rather than back-dating an edit into a closed day.
+            nutrition.lock_day(cur, pending)
+            nutrition.clear_correction(cur, channel_id)
+            reply = (f"{pending:%a %b %-d} locked while that correction was open "
+                     f"— it's now past the {nutrition.CORRECTION_WINDOW_HOURS}h "
+                     f"window, so nothing was changed. The day stays "
+                     f"`locked_unconfirmed`.")
+        elif _NUTRITION_DONE_RE.match(text):
+            totals = nutrition.day_totals(cur, pending)
+            nutrition.clear_correction(cur, channel_id)
+            reply = (f"{pending:%a %b %-d} corrected — {totals['kcal']} kcal, "
+                     f"{float(totals['protein_g']):g} g protein, "
+                     f"{totals['n_entries']} entries.")
+        else:
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            devs = [(ln, nutrition.parse_deviation(ln)) for ln in lines]
+            if not any(d for _, d in devs):
+                return False          # not a deviation — let the chain continue
+            out = []
+            for raw, dev in devs:
+                if dev is None:
+                    out.append(f"· skipped “{raw.strip()}” — I couldn't read that "
+                               f"as a deviation.")
+                else:
+                    out.append("· " + nutrition.apply_deviation(cur, pending, dev))
+            out.append("Reply `done` when finished.")
+            reply = "\n".join(out)
+
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_pattern_thread(post: dict, question: str) -> bool:
     """PAIN-1 — replies in a pain-pattern thread.
 
@@ -4133,6 +4230,11 @@ def _handle_mention(post: dict, thread: list[dict]):
         # FRIDAY-1: check-ins and short morning replies, AHEAD of nutrition (whose
         # "i had"/"log" patterns used to swallow check-ins) and of the LLM.
         ("morning_flow", _handle_morning_flow),
+        # DIET-1: a BARE `fix` opens yesterday's nutrition correction, and the
+        # deviation lines that follow it are consumed while it is open. After
+        # morning_flow so a check-in still wins, and it never claims
+        # `fix <exercise> rpe <n>` (the workout-set correction in health.py).
+        ("nutrition_fix", _handle_nutrition_fix),
         # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
         # resolved). After morning_flow so a check-in in the thread is a check-in.
         ("pattern_thread", _handle_pattern_thread),
