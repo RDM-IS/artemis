@@ -336,8 +336,22 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 **REPORT-1 — PDF training reports (medium; after STATUS-1, WATCH-1 and EVAL-1).**
 - **Prerequisites.** These are numbered steps, each verified on the box or in AWS before any report work starts:
   1. **WeasyPrint + pango on the box.** Install pango (and its cairo/harfbuzz dependencies) with `dnf`, and `weasyprint` for `/usr/bin/python3.11`. Add both to the deploy path. **Verify:** a test HTML page renders to a PDF on the box with fonts and CSS applied.
+     - **Checked 2026-09-21.** `pango`, `dejavu-sans-fonts` and `dejavu-sans-mono-fonts` are installed (dnf transaction 6, 22 MB). WeasyPrint is NOT yet installed for the system Python; add it at build time (≈75–90 MB). Proof of concept in a throwaway venv: weasyprint 70.0, a one-page A4 test rendered in 0.09–0.14 s (import 0.4–0.6 s), peak RSS 58 MB, 10.5 KB, DejaVu fonts embedded. gym-display's SF fonts can't be installed on Linux; DejaVu is the stand-in.
+     - **Render in a separate process**, not inside `acos.service`, so a memory spike can't take the bot down (decided 2026-09-21).
   2. **S3 bucket and permissions.** Create a private bucket (no public access, encrypted). Give the EC2 role put/get on the reports prefix and the Lambda role get plus signing. **Verify:** the box writes an object, the Lambda signs a link to it, the link downloads, and the same object is not reachable without a signature.
+     - **DONE 2026-09-21.**
+       - **Bucket:** `rdmis-artemis-reports` (us-east-1): all public-access blocks on, bucket-owner-enforced, SSE-S3, TLS-only bucket policy, versioning off. Lifecycle: `reports/daily/` expires at 180 d, `reports/weekly/` at 730 d, monthly and dietitian are kept, incomplete multipart uploads are aborted at 1 d.
+       - **Box role (`acos-ec2-role`), inline `acos-reports-s3`:** Put/Get on `reports/*`, and ListBucket limited to the `reports/` prefix.
+       - **Lambda role, inline `crm-api-reports-s3-read`:** **GetObject on `reports/*` only** (ListBucket dropped 2026-09-21, see below).
+       - **Verified:** the box writes, reads and lists its own objects, gets 404 for a missing key, and is refused writes outside `reports/`, delete, and whole-bucket list. A link signed with the Lambda role's credentials downloads (200). Unsigned, plain-HTTP and tampered requests are refused (403).
+     - **No S3 VPC endpoint — listing moved to the database (decided 2026-09-21).**
+       - **The problem:** `rdmis-crm-api` runs in the default VPC with no NAT and no S3 endpoint, so it can sign links (a local operation) but any S3 API call hangs.
+       - **Why not an endpoint:** an S3 gateway endpoint would attach to the VPC's single main route table, which every subnet shares, the box's included. A policy scoped to the reports bucket would then also govern the box's S3 traffic, and the box's `dnf` package updates come from the AWS-owned bucket `al2023-repos-us-east-1-de612dc2`.
+       - **Instead:** the box records every report it writes in `acos.report_index` (migration below). The Status page lists from that table, and the Lambda signs links only for keys in it, with no network access to S3.
+       - Keep this in mind for any future S3 use from the Lambda.
   3. **Mattermost upload call.** Add file upload to `artemis/mattermost.py` (`POST /files`, then a post carrying `file_ids`). **Verify:** a test PDF posts to `#artemis-ryan` as an attachment. **If upload proves awkward, post a signed S3 link instead. Don't block REPORT-1 on it.**
+     - **Checked 2026-09-21: upload works with the current bot token** (roles `system_user` + `system_post_all`, Mattermost 11.5.1, 100 MB limit). A test file was uploaded and posted to `artemis-ryan` (a private channel), then deleted. **Build note:** the upload request must not use the client's JSON `Content-Type` header.
+     - **A signed S3 link is NOT a good Mattermost fallback.** A presigned URL dies when the credentials that signed it expire. The box's instance-role credentials last about an hour, whatever `ExpiresIn` says, so a link in chat goes dead within hours. Signed links suit the Status page, which signs per request.
 - **Rendering:** PDFs generated on the box with WeasyPrint from HTML/CSS templates, styled to match gym-display. No new services (prerequisite 1).
 - **Daily** (after a session, 1 page):
   - the session and every set: weight × reps and effort
@@ -357,10 +371,35 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - body weight trend, phase and week progress
   - a highlights list
 - **Storage:** S3 (prerequisite 2), keyed by type and date (e.g. `reports/{daily|weekly|monthly}/{period}.pdf`), served by signed link.
+- **Report index — proposed migration (build with REPORT-1 after 2026-10-01; take the next free migration number then).** The box and the Lambda both connect as the same RDS user, so no grants are needed.
+  ```sql
+  CREATE TABLE IF NOT EXISTS acos.report_index (
+      id           SERIAL PRIMARY KEY,
+      report_type  TEXT NOT NULL,
+      period       TEXT NOT NULL,          -- '2026-10-01' | '2026-09-30..2026-10-06' | '2026-10'
+      period_start DATE NOT NULL,          -- sort key; the local date the period opens
+      s3_key       TEXT NOT NULL UNIQUE,
+      size_bytes   BIGINT NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      posted_at    TIMESTAMPTZ,            -- set when posted to Mattermost; NULL = not yet posted
+      CONSTRAINT report_type_known
+          CHECK (report_type IN ('daily', 'weekly', 'monthly', 'dietitian')),
+      CONSTRAINT report_type_period_unique UNIQUE (report_type, period),
+      CONSTRAINT report_key_under_prefix CHECK (s3_key LIKE 'reports/%')
+  );
+  CREATE INDEX IF NOT EXISTS idx_report_index_created
+      ON acos.report_index (created_at DESC);
+  ```
+  - **Columns beyond the five asked for:**
+    - `period_start`, so the table sorts by period and not by text.
+    - `posted_at`: "posts once per period unless forced" becomes a column check, so the box no longer needs `s3:ListBucket`/`HeadObject` for it. Drop ListBucket from `acos-reports-s3` when REPORT-1 ships.
+  - **Write order:** put the object first, then `INSERT … ON CONFLICT (report_type, period) DO UPDATE SET s3_key, size_bytes, created_at = now()`. A row never points at an object that hasn't been written. A failed insert leaves an orphan object, which the next run's upsert fixes.
+  - **Lifecycle drift:** S3 deletes daily objects at 180 d and weekly at 730 d; the table doesn't know that. The nightly job deletes index rows past their type's retention, using the same retention constants as the bucket's lifecycle rules, so the index only lists objects S3 still holds.
+  - **Signing rule:** the Lambda signs a link only for a key it has just read from `acos.report_index` (looked up by id), never for a key supplied by the client.
 - **Idempotent per period:** re-running replaces the object and never duplicates it. It posts once per period unless forced.
 - **Delivery:**
   - Posted to Mattermost as an attachment when generated (prerequisite 3; a signed S3 link is the fallback).
-  - Downloadable from the Status page: a "Reports" section showing the last 12, backed by a Lambda endpoint that lists and signs links on request. Signed links are generated per request, never stored.
+  - Downloadable from the Status page: a "Reports" section showing the last 12, backed by a Lambda endpoint that **lists from `acos.report_index`** (not S3) and signs links on request. Signed links are generated per request, never stored.
 - **Timezone:** all period boundaries use the active timezone (`local_today()`; SQL with `get_active_timezone()` passed as a parameter).
 - **Tests:**
   - a golden-file layout for each type
