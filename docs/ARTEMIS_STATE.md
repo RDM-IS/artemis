@@ -457,13 +457,27 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Reports (extend REPORT-1):**
   - **Daily:** meals, totals, comparison to target.
   - **Weekly:** daily averages, protein per day, net per day, weight trend, workout summary.
-  - **Monthly for the dietitian:** one page, clinical tone, data only, with no advice or judgment language. It covers:
-    - daily average intake and macros, protein per day
-    - weight start/end/trend
-    - sessions completed, activity minutes
-    - logging completeness (days logged out of days, split into `assumed` / `corrected` / `locked_unconfirmed` days)
-    - the percentage of intake from each confidence tier (`exact` / `matched` / `estimated`)
-  - **Email:** the monthly PDF can be emailed as an attachment, but by the Brad Spaits rule Artemis only prepares a Gmail **draft**. Ryan sends it.
+  - **Dietitian report (VA MOVE!) — decided 2026-09-21. BUILD AFTER ~2026-10-01, once a week of real logged days exists** (the first pre-fill is 00:15 Tue 9/22, and only work days are pre-filled). PDF, US Letter, 2 pages. Clinical tone, data only.
+    - **Language rule:** numbers and neutral labels only; no advice or judgment. A test fails the build if the PDF text contains *under, over, short, good, poor, on track, deficit, surplus, should*, or any similar judgment word.
+    - **Header:** "Nutrition and Activity Record", name, the period, the generation date, and the target line: "Reference target: 2,100 kcal / 175 g protein, provisional, set by patient 2026-09-21, pending dietitian review" (read from `nutrition.target`, never hard-coded).
+    - **Page 1 — summary:**
+      1. **Period and completeness:** dates, days in the period, and "days with intake recorded: X of N". Unrecorded days are counted by reason from `nutrition.day.prefill_outcome`: non-work day (not pre-filled), plan unavailable, no plan.
+      2. **Daily average intake, over recorded days only** (the count is stated): energy, protein, carbohydrate, fat and fiber, each with its min–max range. Energy and protein also show the reference target and a signed numeric difference; carbohydrate, fat and fiber show "—" (no target).
+      3. **How days were recorded:** counts of *planned, no correction received* (`assumed` and `locked_unconfirmed`, labelled that way), *confirmed* (see below), and *corrected*.
+      4. **Share of intake by macro basis:** per cent of kcal and of protein from *label*, *USDA*, *Open Food Facts*, *estimate* and *placeholder*, from `macro_basis`.
+      5. **Weight:** first weigh-in (date, lb), last weigh-in (date, lb), the change, the 7-day average and the number of weigh-ins. With fewer than 3 weigh-ins in a 7-day window, the values are listed instead of averaged.
+      6. **Activity:** sessions completed of sessions planned; exercise minutes; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
+    - **Page 2 — detail:**
+      - **Per-day table:** date, day type, recording status, kcal, protein, carbohydrate, fat, fiber, and the share from `estimate`/`placeholder`.
+      - **Recurring meals:** the default work day, each item with portion, kcal, protein and `macro_basis`, so she can see what "planned" contains. Below it, foods logged 2 or more times as deviations.
+      - **Footer:** definitions of each recording status and basis. "Figures are recorded data only."
+    - **Decisions (Ryan, 2026-09-21):**
+      - **Default-day status is reported as "planned, no correction received".** Silence is never presented as confirmation.
+      - **Optional confirm:** the morning line gains an optional confirm reply that sets the day to `confirmed`. It is **never required**, never nudged, and a day without it is not treated as incomplete. This needs `confirmed` added to `day_status_known` (migration, migrate-first) and the reply added to the CONFIRM-ARB bare-control-word inventory. A later `fix` inside the 48 h window moves a confirmed day to `corrected`.
+      - **`macro_basis`** (`label` | `usda` | `open_food_facts` | `estimate` | `placeholder`) is added to `nutrition.food` (both recipes and ingredients) and carried onto `nutrition.entry`. It is backfilled from the current free-text `source_detail`, and any row that can't be classified unambiguously is reported to Ryan, not guessed. `is_placeholder = TRUE` maps to `placeholder`. It is kept alongside `confidence` (exact/matched/estimated), which answers a different question.
+      - **Weight source:** Apple Health samples (`health.watch_sample`, metric `weight`), falling back to the check-in value (`health.daily_state.weight_lbs`) on days with no sample. Each weigh-in is marked with its source in the per-day detail.
+      - **Delivery:** Artemis renders the PDF (REPORT-1 pipeline, S3 `reports/`) and prepares a **Gmail draft** with it attached. Ryan reviews and sends it; **it is never sent automatically** (Brad Spaits rule). Upload to My HealtheVet stays manual.
+    - **Tests:** a golden file; the banned-word scan; an empty period; a period with non-work days that weren't pre-filled; all four day statuses; the basis shares summing to 100 %; the weight fallback; fewer than 3 weigh-ins; no watch data.
 - **Provisional seed:** 2,100 calories and 175 g protein, marked "provisional — pending dietitian", with an effective date. Ryan chose these values; it's a human-run seed, not an Artemis decision. The dietitian's target later closes it cleanly by effective date.
 - **Targets:** `@artemis set nutrition target calories 2200 protein 180 …` writes `nutrition.target` with an effective date. It keeps the existing propose-then-confirm flow. Artemis never sets or changes a target itself and never recommends a deficit. The existing target parser is a Claude call; replace it with a deterministic parse (targets are numbers Ryan typed).
 - **Tests:**
