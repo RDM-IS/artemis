@@ -1,12 +1,14 @@
 """The 04:30 wake post (WAKE-1 §F).
 
-Exactly five things, and nothing else:
+Exactly six things, and nothing else:
 
   1. today's workout (session, duration, location, equipment, first lift, warmup)
-  2. the morning check-in prompt (PB-009 survey)
-  3. held health notices (health-tier posts held overnight)
-  4. pre-departure (checklist, first event time, weather, `depart:` commitments)
-  5. a one-line header when a timezone override is active
+  2. what the watch supplied (WATCH-1): one line — values only, and what hasn't
+     synced. Stated, never acted on: watch data doesn't adjust the plan.
+  3. the morning check-in prompt (PB-009 survey)
+  4. held health notices (health-tier posts held overnight)
+  5. pre-departure (checklist, first event time, weather, `depart:` commitments)
+  6. a one-line header when a timezone override is active
 
 Explicitly NOT here: email, inbox, triage, other meetings, general commitments,
 action items, vault digest, ops alerts. Those wait for 06:30 (job_open).
@@ -155,6 +157,22 @@ def prompt_type_for(plan: dict | None) -> str:
     return "workout_am"
 
 
+def _watch_section() -> list[str]:
+    """"From the watch: sleep 5.7h (20:57–03:19), weight 282. Not synced:
+    resting HR." — read after the wake job's pre-fill. A DB failure costs the
+    line, never the post."""
+    try:
+        from artemis.watch_prefill import today_line
+        from knowledge.db import get_connection
+
+        with get_connection() as conn:
+            line = today_line(conn.cursor())
+    except Exception:
+        logger.exception("wake: watch line unavailable")
+        return []
+    return ["", line] if line else []
+
+
 def _checkin_section(plan: dict | None) -> list[str]:
     from artemis.health import build_morning_survey_prompt
 
@@ -284,6 +302,7 @@ def build_wake_message(calendar=None, held_health: list[str] | None = None) -> s
         lines.append(header)
     lines.append("")
     lines.extend(_workout_section(plan))
+    lines.extend(_watch_section())
     lines.extend(_checkin_section(plan))
     for notice in held_health or []:
         lines.extend(["", notice])

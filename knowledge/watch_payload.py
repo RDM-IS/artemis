@@ -3,8 +3,9 @@
 Lives in knowledge/ because the Lambda bundles that directory but not artemis/
 (the same reason knowledge/machine_setup.py does).
 
-THE SHAPE HERE IS AN ASSUMPTION until a real payload lands. Health Auto Export
-posts roughly:
+Metrics and sleep are now OBSERVED (real exports 2026-09-18..21; sleep shape
+below at SLEEP_STAGES). WORKOUTS ARE STILL AN ASSUMPTION — none has arrived.
+Health Auto Export posts roughly:
 
     {"data": {"metrics":  [{"name": ..., "units": ..., "data": [{...}, ...]}],
               "workouts": [{"name": ..., "start": ..., "end": ..., ...}]}}
@@ -91,11 +92,22 @@ def is_wanted(metric: str) -> bool:
     """True when a metric is stored in watch_sample."""
     return metric in WANTED or metric.startswith(SLEEP_PREFIX)
 
-# Sleep arrives as one sample with a field per stage.
+# Sleep arrives as ONE aggregated record per night, a field per stage.
+# Observed 2026-09-21 (the first real night):
+#   {"date": "2026-09-21 00:00:00 -0500",           <- local MIDNIGHT of the wake day
+#    "totalSleep": 5.73, "core": 4.07, "deep": 0.77, "rem": 0.88,
+#    "awake": 0.64, "asleep": 0, "inBed": 0, "source": "RAW",
+#    "sleepStart": "2026-09-20 20:57:29 -0500", "sleepEnd": "2026-09-21 03:19:20 -0500",
+#    "inBedStart": ..., "inBedEnd": ...}
+# totalSleep = core + deep + rem (+ asleep); awake is excluded. Units: hours.
 SLEEP_STAGES = ("asleep", "deep", "rem", "core", "awake", "in_bed", "inBed",
-                "total_sleep", "totalSleep", "sleep_start", "sleep_end")
-SLEEP_NUMERIC = {"asleep", "deep", "rem", "core", "awake", "in_bed", "inBed",
-                 "total_sleep", "totalSleep"}
+                "total_sleep", "totalSleep")
+SLEEP_NUMERIC = set(SLEEP_STAGES)
+# FALSE ZEROS. `asleep` is the "unspecified" stage and reads 0 whenever the
+# watch recorded real stages; `inBed` reads 0 because the watch doesn't write
+# in-bed time (the in-bed start/end strings still span the night). A 0 in
+# either is "no data", not "no sleep" — stored, it read as 0 h asleep / in bed.
+SLEEP_ZERO_IS_ABSENT = {"asleep", "in_bed", "inBed"}
 
 _DATE_FORMATS = (
     "%Y-%m-%d %H:%M:%S %z",     # 2026-09-25 06:30:00 -0500  (documented form)
@@ -211,7 +223,7 @@ def _sleep_rows(sample: dict, when: datetime, unit) -> list[dict]:
         if stage not in sample or stage not in SLEEP_NUMERIC:
             continue
         value = _number(sample.get(stage))
-        if value is None:
+        if value is None or (value == 0 and stage in SLEEP_ZERO_IS_ABSENT):
             continue
         key = re.sub(r"(?<!^)(?=[A-Z])", "_", stage).lower()
         rows.append({"metric": f"sleep_{key}", "measured_at": when,
@@ -219,6 +231,34 @@ def _sleep_rows(sample: dict, when: datetime, unit) -> list[dict]:
                      "value_min": None, "value_max": None,
                      "device": sample.get("source")})
     return rows
+
+
+def sleep_bounds(raw) -> tuple[datetime | None, datetime | None]:
+    """(sleepStart, sleepEnd) of one night's record, offsets kept. The record's
+    own `date` is only a label (local midnight of the wake day) — these two are
+    when the night actually happened."""
+    if not isinstance(raw, dict):
+        return None, None
+    return (parse_date(raw.get("sleepStart") or raw.get("sleep_start")),
+            parse_date(raw.get("sleepEnd") or raw.get("sleep_end")))
+
+
+def is_later_night(new_raw, old_raw) -> bool:
+    """True when `new_raw` should REPLACE the stored record for the same night.
+
+    A push in the middle of the night stores a partial aggregate; the complete
+    one arrives later under the same key with a later sleepEnd. Only a strictly
+    later end replaces — a re-send of the same night is a duplicate."""
+    _, new_end = sleep_bounds(new_raw)
+    _, old_end = sleep_bounds(old_raw)
+    if new_end is None:
+        return False
+    if old_end is None:
+        return True
+    try:
+        return new_end > old_end
+    except TypeError:          # one naive, one aware — can't order them safely
+        return False
 
 
 def parse_workouts(payload: dict, skipped: list | None = None) -> list[dict]:

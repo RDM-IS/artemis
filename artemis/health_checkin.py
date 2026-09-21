@@ -45,10 +45,14 @@ load or RPE:
                          time").
   8. Soreness lighten    soreness 2-3 -> PRIMARY exercises: -1 set (min 1),
                          RPE cap -1.
-  9. Recovery            sleep < 6 or energy <= 2 -> RPE cap -1 everywhere
-                         (floor 1), sets capped at 2, Z2 duration -25%.
+  9. Recovery            energy <= 2 -> RPE cap -1 everywhere (floor 1),
+                         sets capped at 2, Z2 duration -25%.
      Otherwise           no change. Pain 0-1 is stored and noted. High energy
                          or long sleep never adds work.
+
+SLEEP NEVER ADJUSTS THE PLAN (Ryan, 2026-09-21). It is recorded — typed or
+from the watch — but energy is what drives recovery. Watch data never triggers
+any adjustment at all: only a typed check-in does, and only through these rules.
 
 Recovery Flow days (YOGA-1) only take rules 1-2 (day off); everything else
 leaves the flow as planned. Walk days likewise.
@@ -554,8 +558,8 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
 
     # Every region with something going on — substitutes must avoid them all.
     affected = set(sore_heavy) | set(sore_mid) | set(pain_3) | set(pain_2)
-    recovery = (ci.sleep_hrs is not None and ci.sleep_hrs < 6) or \
-               (ci.energy is not None and ci.energy <= 2)
+    # Energy only — sleep is recorded but never a trigger (2026-09-21).
+    recovery = ci.energy is not None and ci.energy <= 2
 
     # ── 4. Soreness day swap ────────────────────────────────────────────────
     if len(sore_heavy) >= 2:
@@ -725,11 +729,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # ── 9. Global recovery ──────────────────────────────────────────────────
     if recovery:
         adj.rules_fired.append("recovery")
-        why = []
-        if ci.sleep_hrs is not None and ci.sleep_hrs < 6:
-            why.append(f"sleep {_n(ci.sleep_hrs)}h")
-        if ci.energy is not None and ci.energy <= 2:
-            why.append(f"energy {ci.energy}/5")
+        why = [f"energy {ci.energy}/5"]
         what = []
         if blocks.get("exercises"):
             for ex in blocks["exercises"]:
@@ -922,7 +922,18 @@ def logged_set_count(cur, plan_id: int) -> int:
 
 
 def has_checkin(cur, day: date) -> bool:
-    cur.execute("SELECT 1 FROM health.daily_state WHERE state_date = %s", (day,))
+    """True when Ryan checked in for `day`.
+
+    A daily_state row alone is not a check-in: the WATCH-1 pre-fill writes one
+    at 04:30 with only `watch` fields, and counting it suppressed the 05:15
+    nudge. A check-in is a row with anything typed — a manual field, energy,
+    soreness or free text — or a pre-WATCH-1 row (no source markers at all)."""
+    cur.execute(
+        "SELECT 1 FROM health.daily_state WHERE state_date = %s AND ("
+        " energy IS NOT NULL OR soreness IS NOT NULL OR free_text IS NOT NULL"
+        " OR 'manual' IN (sleep_source, resting_hr_source, weight_source)"
+        " OR (sleep_source IS NULL AND resting_hr_source IS NULL"
+        "     AND weight_source IS NULL))", (day,))
     return cur.fetchone() is not None
 
 
@@ -937,13 +948,15 @@ def _watch_source_note(cur, day: date, ci: CheckIn) -> str | None:
             "SELECT sleep_hrs, sleep_source, resting_hr, resting_hr_source, "
             "weight_lbs, weight_source FROM health.daily_state WHERE state_date = %s",
             (day,))
-        row = cur.fetchone()
+        rows = _rows(cur)
     except Exception:
         logger.debug("watch source note unavailable", exc_info=True)
         return None
-    if not row:
+    if not rows:
         return None
-    r = dict(row) if not isinstance(row, dict) else row
+    # _rows, not dict(row): the box cursor returns TUPLES, and dict(tuple)
+    # raised TypeError on every check-in once a daily_state row existed.
+    r = rows[0]
     from_watch, missing = [], []
     for value_key, source_key, label, fmt in (
             ("sleep_hrs", "sleep_source", "sleep", lambda v: f"{float(v):g}h"),

@@ -105,14 +105,24 @@ class FakeCursor:
                     and l["log_type"] in ("strength_set", "cardio_block"))
             self._rows = [(n,)]
         elif s.startswith("SELECT sleep_hrs, sleep_source"):
+            # TUPLES + description, like the box's psycopg2 cursor. This fake
+            # used to return a dict, which hid a TypeError that broke every
+            # real check-in once a daily_state row existed (2026-09-21).
+            cols = ("sleep_hrs", "sleep_source", "resting_hr", "resting_hr_source",
+                    "weight_lbs", "weight_source")
             row = self.db.daily.get(params[0])
-            self._rows = [] if row is None else [{
-                "sleep_hrs": row.get("sleep_hrs"), "sleep_source": row.get("sleep_source"),
-                "resting_hr": row.get("resting_hr"),
-                "resting_hr_source": row.get("resting_hr_source"),
-                "weight_lbs": row.get("weight_lbs"), "weight_source": row.get("weight_source")}]
+            self.description = [(c,) for c in cols]
+            self._rows = [] if row is None else [tuple(row.get(c) for c in cols)]
         elif s.startswith("SELECT 1 FROM health.daily_state"):
-            self._rows = [(1,)] if params[0] in self.db.daily else []
+            # a check-in = anything typed, or a pre-WATCH-1 row with no markers;
+            # a watch-only pre-fill row is NOT a check-in
+            row = self.db.daily.get(params[0])
+            marks = [row.get(m) for m in ("sleep_source", "resting_hr_source",
+                                          "weight_source")] if row else []
+            typed = row is not None and (
+                any(row.get(k) is not None for k in ("energy", "soreness", "free_text"))
+                or "manual" in marks or all(m is None for m in marks))
+            self._rows = [(1,)] if typed else []
         elif s.startswith("INSERT INTO health.daily_state"):
             # WATCH-1: the three source markers ride along after free_text
             d, w, sl, en, sore, rhr, ft = params[:7]
@@ -328,8 +338,9 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(self.db.daily, {})
         self.assertEqual(self.db.audit, [])
 
-    def test_09_poor_sleep_global_recovery_only(self):
-        reply = self.checkin("slept 5 energy 2 sore 0")
+    def test_09_low_energy_global_recovery_only(self):
+        """Energy drives recovery; the sleep in the same message plays no part."""
+        reply = self.checkin("slept 8 energy 2 sore 0")
         b = self.db.plan[FRI]["blocks"]
         self.assertEqual(names(self.db), B_NAMES)
         for ex in b["exercises"]:
@@ -338,7 +349,25 @@ class TestSessionBScenarios(unittest.TestCase):
             self.assertNotIn("load_pct", ex)
         self.assertEqual(self.db.plan[FRI]["target_rpe"], 5.0)
         self.assertEqual(b["adjustment"]["rules_fired"], ["recovery"])
-        self.assertTrue(reply.startswith("Sleep 5h / energy 2/5 → RPE ≤5 on every exercise."), reply)
+        self.assertTrue(reply.startswith("Energy 2/5 → RPE ≤5 on every exercise."), reply)
+
+    def test_09c_short_sleep_alone_changes_nothing(self):
+        """2026-09-21: sleep < 6 is no longer a trigger. It is recorded, never acted on."""
+        before = copy.deepcopy(self.db.plan[FRI])
+        reply = self.checkin("slept 4 energy 5")
+        self.assertEqual(self.db.plan[FRI], before)
+        self.assertEqual(self.db.daily[FRI]["sleep_hrs"], 4.0)
+        self.assertNotIn("RPE", reply)
+        for text in ("slept 3", "slept 5.5 energy 3", "slept 0 energy 4 sore 0"):
+            with self.subTest(text=text):
+                adj = hc.compute_adjustment(office_row(FRI), hc.parse_checkin(text))
+                self.assertNotIn("recovery", adj.rules_fired)
+                self.assertFalse(adj.changed, text)
+
+    def test_09d_the_rule_has_no_sleep_threshold_left(self):
+        src = (Path(hc.__file__)).read_text()
+        body = src[src.index("def compute_adjustment"):]
+        self.assertNotRegex(body, r"sleep_hrs\s*<")
 
     def test_09b_recovery_stacks_with_lighten_floor_1(self):
         self.checkin("slept 5 energy 2 legs sore 3")
@@ -468,7 +497,7 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(self.db.plan[FRI], before)
 
     def test_rules_never_add_volume_load_or_rpe(self):
-        for text in ("sore shoulder 4", "legs sore 3", "slept 5 energy 2", "shoulder pain 2",
+        for text in ("sore shoulder 4", "legs sore 3", "slept 8 energy 2", "shoulder pain 2",
                      "sore shoulder 4 and legs 5", "shoulder pain 5 plus legs pain 5",
                      "shoulder pain 3", "legs pain 3", "knee pain 1",
                      "slept 9 energy 5 sore 0"):
@@ -496,7 +525,7 @@ class TestSessionBScenarios(unittest.TestCase):
     def test_z2_day_recovery_cuts_duration(self):
         tue = date(2026, 9, 22)   # SCHEDULE-2: Z2 is the office Tuesday
         db = FakeDB(office_row(tue, plan_id=109))
-        hc.process_checkin(db.cursor(), "slept 4 energy 3", tue, checkin_id="x", adjust=True)
+        hc.process_checkin(db.cursor(), "slept 8 energy 2", tue, checkin_id="x", adjust=True)
         self.assertEqual(db.plan[tue]["blocks"]["duration_min"], 15)   # 20 → 15
 
     def test_monday_c_week5_legs_heavy_drops_finisher(self):
@@ -506,6 +535,45 @@ class TestSessionBScenarios(unittest.TestCase):
         db = FakeDB(row)
         hc.process_checkin(db.cursor(), "legs sore 4", mon, checkin_id="x", adjust=True)
         self.assertNotIn("finisher", db.plan[mon]["blocks"])
+
+
+class TestWatchPrefilledDay(unittest.TestCase):
+    """A day the WATCH-1 pre-fill already wrote (every morning since 9/20).
+
+    Regression: the check-in crashed on the real tuple cursor
+    (`dict(tuple)` in _watch_source_note), and the watch-only row counted as a
+    check-in, suppressing the 05:15 nudge (2026-09-21)."""
+
+    def setUp(self):
+        self.db = FakeDB(office_row(FRI))
+        self.db.daily[FRI] = {"sleep_hrs": 5.7, "sleep_source": "watch",
+                              "resting_hr": None, "resting_hr_source": None,
+                              "weight_lbs": 282.0, "weight_source": "watch",
+                              "energy": None, "soreness": None, "free_text": None}
+        self.cur = self.db.cursor()
+        self.now = datetime(2026, 9, 18, 10, 10, tzinfo=timezone.utc)
+
+    def test_a_watch_only_row_is_not_a_checkin(self):
+        self.assertFalse(hc.has_checkin(self.cur, FRI))
+
+    def test_the_checkin_goes_through_and_names_the_watch_values(self):
+        reply = hc.process_checkin(self.cur, "energy 4 sore 0", FRI, checkin_id="p",
+                                   now=self.now, adjust=True)
+        self.assertIn("From the watch: sleep 5.7h, weight 282. Not synced: resting HR.", reply)
+        self.assertTrue(hc.has_checkin(self.cur, FRI))
+
+    def test_watch_sleep_never_triggers_recovery(self):
+        """5.7 h from the watch and no energy typed: the plan is untouched."""
+        before = copy.deepcopy(self.db.plan[FRI])
+        hc.process_checkin(self.cur, "sore 0", FRI, checkin_id="p", now=self.now, adjust=True)
+        self.assertEqual(self.db.plan[FRI], before)
+
+    def test_a_typed_value_replaces_the_watch_one_and_is_named_as_his(self):
+        reply = hc.process_checkin(self.cur, "slept 7 energy 4", FRI, checkin_id="p",
+                                   now=self.now, adjust=True)
+        self.assertEqual(self.db.daily[FRI]["sleep_source"], "manual")
+        self.assertIn("From the watch: weight 282.", reply)
+        self.assertNotIn("sleep 5.7h", reply)
 
 
 class TestFlows(unittest.TestCase):

@@ -1937,7 +1937,8 @@ def post_ingest(
     silence. Unreadable samples and workouts are reported the same way.
     """
     from knowledge.watch_payload import (
-        HEART_RATE, decode_device, is_wanted, parse_counts, parse_samples, parse_workouts,
+        HEART_RATE, decode_device, is_later_night, is_wanted, parse_counts, parse_samples,
+        parse_workouts,
     )
 
     if not isinstance(payload, dict):
@@ -1960,6 +1961,10 @@ def post_ingest(
                     "limit": MAX_WORKOUTS_PER_REQUEST,
                     "fix": "send a shorter date range"})
 
+    # local_date is fixed at ingest in the ACTIVE timezone (a `set timezone`
+    # override included) — never a hard-coded zone.
+    tz = ZoneInfo(_active_timezone(db))
+
     skipped_workouts: list = []
     samples = parse_samples(payload)
     workouts = parse_workouts(payload, skipped_workouts)
@@ -1979,7 +1984,7 @@ def post_ingest(
             if row["measured_at"] in seen_hr or row["value"] is None:
                 continue
             seen_hr.add(row["measured_at"])
-            hr_local = (row["measured_at"].astimezone(CT).date()
+            hr_local = (row["measured_at"].astimezone(tz).date()
                         if row["measured_at"].tzinfo else row["measured_at"].date())
             hr_rows.append({
                 "measured_at": row["measured_at"], "local_date": hr_local,
@@ -1996,14 +2001,40 @@ def post_ingest(
         if key in seen:
             continue
         seen.add(key)
-        local_day = (row["measured_at"].astimezone(CT).date()
+        local_day = (row["measured_at"].astimezone(tz).date()
                      if row["measured_at"].tzinfo else row["measured_at"].date())
         sample_rows.append({
             "metric": row["metric"], "measured_at": row["measured_at"],
             "local_date": local_day, "value": row["value"], "unit": row["unit"],
             "device_raw": row.get("device"),
             "device": decode_device(row.get("device")),
-            "raw": json.dumps(row["raw"], default=str)})
+            "raw": json.dumps(row["raw"], default=str), "_raw": row["raw"]})
+
+    # Sleep: one record per night, all its stage rows sharing a measured_at. A
+    # push in the middle of the night stores a PARTIAL night; the complete one
+    # arrives later under the same key. It REPLACES the stored night when its
+    # sleepEnd is later (all of that night's stage rows, so a stage the new
+    # record no longer has doesn't linger). Everything else stays insert-only.
+    sleep_rows = [r for r in sample_rows if r["metric"].startswith("sleep")]
+    sample_rows = [r for r in sample_rows if not r["metric"].startswith("sleep")]
+    replaced_nights = 0
+    if sleep_rows:
+        nights: dict = {}
+        for r in sleep_rows:
+            nights.setdefault(r["measured_at"], []).append(r)
+        stored = db.execute(text(
+            "SELECT DISTINCT ON (measured_at) measured_at, raw FROM health.watch_sample "
+            "WHERE metric LIKE 'sleep%' AND measured_at = ANY(:ts) ORDER BY measured_at"),
+            {"ts": list(nights)}).mappings().all()
+        stored_raw = {r["measured_at"]: r["raw"] for r in stored}
+        for ts, group in nights.items():
+            if ts in stored_raw and is_later_night(group[0]["_raw"], stored_raw[ts]):
+                db.execute(text("DELETE FROM health.watch_sample "
+                                "WHERE metric LIKE 'sleep%' AND measured_at = :ts"),
+                           {"ts": ts})
+                replaced_nights += 1
+            # new night: inserted; same night again: counted as duplicates
+            sample_rows.extend(group)
 
     seen_w, workout_rows = set(), []
     for w in workouts:
@@ -2011,7 +2042,7 @@ def post_ingest(
         if key in seen_w:
             continue
         seen_w.add(key)
-        local_day = (w["started_at"].astimezone(CT).date()
+        local_day = (w["started_at"].astimezone(tz).date()
                      if w["started_at"].tzinfo else w["started_at"].date())
         workout_rows.append({
             **{k: w[k] for k in ("kind", "started_at", "ended_at", "duration_sec",
@@ -2037,6 +2068,24 @@ def post_ingest(
          "hr_avg", "hr_max", "kcal", "raw"], workout_rows) \
         if workout_rows else 0
 
+    # WATCH-1: re-run the pre-fill for TODAY on every ingest, so a value that
+    # syncs after the 04:30 wake (resting HR usually does) still lands. Only
+    # empty or `watch` fields are filled; a manual value is never touched. A
+    # savepoint keeps a pre-fill failure from costing the ingest.
+    prefill: dict = {}
+    try:
+        from knowledge.watch_prefill import audit_view, prefill_day
+        raw_cur = db.connection().connection.cursor()
+        raw_cur.execute("SAVEPOINT watch_prefill")
+        try:
+            prefill = audit_view(prefill_day(raw_cur, datetime.now(tz).date(), tz))
+            raw_cur.execute("RELEASE SAVEPOINT watch_prefill")
+        except Exception as exc:                       # noqa: BLE001
+            raw_cur.execute("ROLLBACK TO SAVEPOINT watch_prefill")
+            prefill = {"error": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:                           # noqa: BLE001
+        prefill = {"error": f"{type(exc).__name__}: {exc}"}
+
     # WATCH-2: every ingest leaves a trace. The only record used to be the HTTP
     # response, which is why a failed import could not be investigated later.
     db.execute(text(
@@ -2049,7 +2098,9 @@ def post_ingest(
                              "inserted": {"samples": ins_s, "workouts": ins_w,
                                           "heart_rate": ins_hr},
                              "duplicates": {"samples": len(sample_rows) - ins_s,
-                                            "workouts": len(workout_rows) - ins_w}},
+                                            "workouts": len(workout_rows) - ins_w},
+                             "replaced_sleep_nights": replaced_nights,
+                             "prefill": prefill},
                             default=str)})
     db.commit()
 
