@@ -512,6 +512,18 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **CORRECTION-DEADCODE — remove `_handle_correction` (low).** Unrouted since HEALTH-1 A2 but still in `artemis/main.py`, including an INSERT into `acos.data_vault_satellites` and the "I've learned that…" reply. Delete it with the tests that reference it.
 
+**OPS — Engagement Ops (`ops.rdm.is`) — PARKED 2026-09-21, a separate product.** No further work in Artemis sessions; it stays as it is. State when parked (read-only check, 2026-09-21):
+- **Production works.** Signed in, `ops.rdm.is` renders the portfolio; its bundle matches main built with `VITE_OPS_API_BASE=https://ops-api.rdm.is`.
+- **All four OPS-2 deploy blockers are done:**
+  - **Tunnel:** `ops-api.rdm.is → localhost:5001`.
+  - **Access:** separate apps for `ops.rdm.is` and `ops-api.rdm.is`; OPTIONS bypass works.
+  - **Env:** `CF_ACCESS_*` and `OPS_ALLOWED_ORIGIN` are set in `/etc/systemd/system/acos.service.d/override.conf`, not `.env`.
+  - **Old bundled key:** it was the CRM API key; rotated 2026-07-19, and the live API rejects it.
+- **Known and left as-is:**
+  - "portfolio — non-JSON response" on a non-production deployment. It is the signature of a build with `VITE_OPS_API_BASE` empty: same-origin `/api/portfolio` falls through to the Pages SPA `index.html` (200 `text/html`). Probably a Pages Preview deployment without the variable; not confirmed.
+  - The first load after the `ops-api` Access cookie lapses shows "portfolio — network error"; Retry recovers.
+  - cloudflared is 2026.7.2 (2026.9.1 available).
+
 **VAULT-UNAPPROVE — gated `unapprove <n>` reversal (low).** A gated reversal of an approved vault proposal using its `target_ref` (`commitment:N` / `dossier_entry:N` / `org_note:N`): flip the proposal back to pending and undo/retire the written row. Human-gated (propose-then-confirm); do not build the auto-path. Deferred from OPS-1.
 
 **OPS-RUNBOOK — runbook registry expansion (low).** `artemis/opsdiag.py` seeds vault-pat-auth / vault-secret-missing / vault-clone-network / google-oauth-refresh / rds-unreachable. Add a TLS/cert-expiry class (feed the existing SSL monitor's findings through `classify`), and more classes as new failure shapes surface in the audit log (`action='failure'`, `metadata.failure_class`).
