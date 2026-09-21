@@ -182,3 +182,42 @@ def get_elevenlabs_api_key() -> str:
     """Returns ElevenLabs API key string.
     Secret name: rdmis/dev/elevenlabs-api-key"""
     return get_secret("rdmis/dev/elevenlabs-api-key")["api_key"]
+
+
+def get_notion_token() -> str | None:
+    """Notion internal-integration token for the DIET-1 meal-plan read.
+
+    Returns None when the secret does not exist. That is a SUPPORTED state, not
+    an error: the 00:15 pre-fill treats an absent token exactly like an
+    unreachable Notion — nothing is pre-filled and the day records
+    `prefill_outcome = 'unavailable'`. No plan is ever invented.
+
+    The integration needs read access to two databases under "— ryan's brain":
+    `meal planning` and `recipes`. Both must be shared with the integration in
+    Notion; a token alone is not enough.
+
+    Secret name: rdmis/dev/notion-token
+    """
+    try:
+        secret = get_secret("rdmis/dev/notion-token")
+    except Exception:
+        return None
+    token = (secret.get("token") or secret.get("api_key") or "").strip()
+    return token or None
+
+
+def get_usda_api_key() -> str | None:
+    """USDA FoodData Central API key for the second deviation lookup tier.
+
+    Returns None when the secret does not exist. The parser then skips the USDA
+    tier and falls through to Open Food Facts (which needs no key) rather than
+    guessing macros.
+
+    Secret name: rdmis/dev/usda-api-key
+    """
+    try:
+        secret = get_secret("rdmis/dev/usda-api-key")
+    except Exception:
+        return None
+    key = (secret.get("api_key") or "").strip()
+    return key or None
