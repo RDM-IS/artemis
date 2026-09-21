@@ -42,6 +42,15 @@ DAY_CORRECTED = "corrected"
 DAY_LOCKED = "locked_unconfirmed"
 
 
+def _as_dict(cur, row) -> dict:
+    """A row as a dict, whatever the cursor. knowledge.db.get_connection()
+    hands out a PLAIN cursor (tuple rows, as health_checkin._rows assumes);
+    execute_query uses a dict cursor. Handle both."""
+    if isinstance(row, dict):
+        return row
+    return dict(zip([c[0] for c in cur.description], row))
+
+
 # ============================================================================
 # Time — the 48h window, anchored to local midnight in the ACTIVE timezone
 # ============================================================================
@@ -81,7 +90,7 @@ def get_day(cur, d: date) -> dict | None:
     row = cur.fetchone()
     if row is None:
         return None
-    return dict(row) if not isinstance(row, dict) else row
+    return _as_dict(cur, row)
 
 
 def _upsert_day(cur, d: date, *, status: str, day_type: str | None,
@@ -111,7 +120,7 @@ def day_totals(cur, d: date) -> dict:
     if row is None:
         return {"kcal": 0, "protein_g": 0, "carb_g": 0,
                 "fat_g": 0, "fiber_g": 0, "n_entries": 0}
-    return dict(row) if not isinstance(row, dict) else row
+    return _as_dict(cur, row)
 
 
 # ============================================================================
@@ -289,10 +298,6 @@ _FOOD_COLS = ("id, kind, name, kcal, protein_g, carb_g, fat_g, fiber_g, portion,
               "source, source_id, is_placeholder")
 
 
-def _as_dict(row):
-    return dict(row) if not isinstance(row, dict) else row
-
-
 def find_saved_food(cur, text: str) -> dict | None:
     """Tier 1 of the source order: recipes, then ingredients.
 
@@ -308,14 +313,14 @@ def find_saved_food(cur, text: str) -> dict | None:
             "WHERE kind = %s AND slug = %s AND active", (kind, slug))
         row = cur.fetchone()
         if row:
-            return _as_dict(row)
+            return _as_dict(cur, row)
         cur.execute(
             f"SELECT {_FOOD_COLS} FROM nutrition.food "
             "WHERE kind = %s AND slug LIKE %s AND active LIMIT 2",
             (kind, slug + "%"))
         rows = cur.fetchall()
         if len(rows) == 1:
-            return _as_dict(rows[0])
+            return _as_dict(cur, rows[0])
     return None
 
 

@@ -274,6 +274,46 @@ class TestIngredientsSavedFoods(unittest.TestCase):
         self.assertIn("ROLLBACK TO SAVEPOINT ingredient_sync", body)
 
 
+class TestPlainTupleCursor(unittest.TestCase):
+    """knowledge.db.get_connection() hands out a PLAIN cursor with tuple rows.
+    Regression guard: the first deploy assumed dict rows (the mocks returned
+    dicts), and find_saved_food raised TypeError on the box."""
+
+    class _TupleCursor:
+        def __init__(self, cols, rows):
+            self.description = [(c,) for c in cols]
+            self._rows = list(rows)
+        def execute(self, sql, params=()):
+            pass
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+        def fetchall(self):
+            return list(self._rows)
+
+    def test_get_day_with_tuple_rows(self):
+        cur = self._TupleCursor(
+            ["day_date", "status", "day_type", "prefilled", "prefill_outcome",
+             "prefill_note", "plan_source_id", "locked_at"],
+            [(date(2026, 9, 21), "assumed", "msp_work", True, "planned", None, "pg", None)])
+        day = nutrition.get_day(cur, date(2026, 9, 21))
+        self.assertEqual(day["status"], "assumed")
+        self.assertTrue(day["prefilled"])
+
+    def test_day_totals_with_tuple_rows(self):
+        cur = self._TupleCursor(
+            ["kcal", "protein_g", "carb_g", "fat_g", "fiber_g", "n_entries"],
+            [(2015, 188, 206, 55, 45, 7)])
+        self.assertEqual(nutrition.day_totals(cur, date(2026, 9, 21))["kcal"], 2015)
+
+    def test_find_saved_food_with_tuple_rows(self):
+        cols = [c.strip() for c in nutrition._FOOD_COLS.split(",")]
+        row = (1, "ingredient", "chicken patties", 180, 30, 4, 4.5, 1,
+               "1 patty (151g)", "notion", "pg", False)
+        cur = self._TupleCursor(cols, [row])
+        got = nutrition.find_saved_food(cur, "chicken patties")
+        self.assertEqual((got["kind"], got["portion"]), ("ingredient", "1 patty (151g)"))
+
+
 class TestMorningLine(unittest.TestCase):
     """Appears only on a planned, still-assumed, still-open previous day."""
 
