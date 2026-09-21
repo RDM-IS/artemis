@@ -304,6 +304,33 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Design notes, for whenever it's built:** bucket by metric and hour, value = sum of `qty`, plus `sample_count` and first/last minute. Pushes overlap and resend minutes, so an ingest must NOT add to a stored bucket (that double-counts). Replace the bucket when the incoming payload has at least as many minutes for that hour. Keep one representative `raw` per bucket, not all 60. Existing rows could be rolled up by a one-off migration, with an export to the box first. Decide then.
 - **What is lost:** minute-level active energy inside a session. On 9/21 it was the only calorie evidence for the unrecorded workout (~217 kcal over 05:21–05:51). A `watch_workout` record carries its own kcal, so that stops mattering once workouts arrive. Hourly still covers daily energy-out for DIET-1.
 
+**STEPS-HOURLY — re-enable `step_count` ingest as hourly totals (small; PROPOSED 2026-09-21, not approved to build; needed by the dietitian report's steps chart).** `step_count` is on the ingest's ignore list today: it is counted and named in the response, but no row is written. The latest push carried 284 step samples. `apple_exercise_time` (4 samples) is ignored the same way.
+- **Store, per the ENERGY-HOURLY design:** a new table, not `watch_sample`, so the minute-level energy there is untouched until ENERGY-HOURLY itself is decided.
+  ```sql
+  CREATE TABLE IF NOT EXISTS health.watch_hourly (
+      metric        TEXT NOT NULL,          -- 'step_count' (and 'apple_exercise_time' if approved)
+      hour_start    TIMESTAMPTZ NOT NULL,   -- the UTC instant the hour opens
+      local_date    DATE NOT NULL,          -- fixed at ingest from the active timezone, like watch_sample
+      value         NUMERIC NOT NULL,       -- the hour's total
+      unit          TEXT,
+      sample_count  INT NOT NULL,           -- samples that made up this total
+      first_at      TIMESTAMPTZ NOT NULL,
+      last_at       TIMESTAMPTZ NOT NULL,
+      device        TEXT,
+      raw           JSONB,                  -- one representative sample, not all of them
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (metric, hour_start)
+  );
+  ```
+- **A push REPLACES an hour's total; it never adds to it.** Pushes overlap and resend samples, so adding would double-count. The rule is `INSERT … ON CONFLICT (metric, hour_start) DO UPDATE … WHERE EXCLUDED.sample_count >= health.watch_hourly.sample_count`. A later push with as many or more samples for the hour replaces it; a push with fewer (a partial window) leaves it alone.
+- **Changes:**
+  - `knowledge/watch_payload.py`: route `step_count` (and `apple_exercise_time` if approved) to the hourly bucketer instead of the ignore list. Everything else on the ignore list stays ignored and named.
+  - The ingest endpoint in `api/app/routers/health.py` writes the buckets in the same transaction. Its audit row reports `hourly_buckets` written and replaced.
+  - Migration first, then the Lambda deploy (the preflight applies).
+- **Verify before trusting it:** steps come from BOTH the iPhone and the watch. Before any report uses them, compare one full day's stored total against the Health app's step count for that day. If the export double-counts the two devices, the fix is a per-device choice (the pattern `prefers_watch` already uses), not a guess.
+- **History:** none. Steps start on the deploy date; earlier days show "no data".
+- **Tests:** an overlapping re-push doesn't double-count; a partial push doesn't shrink an hour; the hour boundaries come out right in the active timezone; the audit counts.
+
 **SLEEP-PERF — does sleep show up in performance? (small; data only; NOT before ~4 weeks of watch sleep, so no earlier than ~2026-10-19).** Ryan, 2026-09-21: sleep < 6 was removed as a recovery trigger; energy drives recovery. This checks whether that was right.
 - **Data only:** per training day, performance — load, reps, RPE vs cap — beside watch sleep, typed sleep and typed energy for that morning. Tables and simple pairings; no model, no verdict.
 - **No rule changes from it** until Ryan has looked at the results.
@@ -410,7 +437,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 **DIET-1 — nutrition logging, rollup and dietitian reports (medium; after WATCH-1 for energy out, and extends REPORT-1).**
 
 **WORK-DAY SCOPE BUILT 2026-09-21 (`feat/diet1-workday`) — migration 040 applied and deployed pre-merge 2026-09-21.** What exists: `artemis/nutrition.py` (pre-fill, day/entry status, the 48h correction window, the deviation parser and the saved-food → USDA → Open Food Facts source order), `artemis/notion_meal_plan.py` (read-only Notion reader), the silent 00:15 `nutrition_prefill` cron job + the lock sweep, the morning check-in line, a bare-`fix` handler, and `tests/test_diet1.py` (46 tests).
-- **Notion rows written 2026-09-21:** 8 `recipes` rows (the 7 confirmed + `Protein bar — peanut`, all `status = active`, bodies carry ingredients and weights) and one undated `meal planning` row, **"default day — work day"**. Totals 2,015 kcal / 188 P / 206 C / 55 F / 45 fiber. A new `source` text column was added to `recipes`; the cottage cheese bowl carries `USDA generic low-fat cottage cheese — placeholder, pending label`. `meal planning` has **no fiber rollup**, so Notion's UI cannot show the 45 g.
+- **Notion rows written 2026-09-21:** 8 `recipes` rows (the 7 confirmed + `Protein bar — peanut`, all `status = active`, bodies carry ingredients and weights) and one undated `meal planning` row, **"default day — work day"**. Totals 2,015 kcal / 188 P / 206 C / 55 F / 45 fiber. **Superseded later on 2026-09-21:** with the chicken thigh bowl as dinner (its macros an ESTIMATE until labels arrive), the default work day is **7 entries, 2,101 kcal / 199.6 g protein** — the figure the first pre-fill (9/22) is checked against. A new `source` text column was added to `recipes`; the cottage cheese bowl carries `USDA generic low-fat cottage cheese — placeholder, pending label`. `meal planning` has **no fiber rollup**, so Notion's UI cannot show the 45 g.
 - **Notion access — LIVE 2026-09-21.** Token at `rdmis/dev/notion-token` (key `token`), readable by `acos-ec2-role`; the integration ("internal") is shared with `meal planning`, `recipes` and `ingredients`. Verified from the box: the default day reads back 7 recipes, 2,015 kcal / 188 P. Without the token or the shares, the 00:15 job records `prefill_outcome = 'unavailable'` and pre-fills nothing.
 - **Still no USDA key** (`rdmis/dev/usda-api-key`): tier 2 is skipped, not guessed. Open Food Facts needs no key.
 - **Saved foods = recipes, then ingredients.** `nutrition.food.kind` is `recipe` | `ingredient`, unique per `(kind, slug)` — "Protein bar — peanut" and "protein bar (peanut)" slugify identically. Ingredient macros are per the Notion `serving`, stored as `portion`; a deviation quantity multiplies it (`+2 banana` = 2 × 1 medium). The 00:15 job refreshes the ingredient mirror in a savepoint before the pre-fill and deactivates rows that vanished from Notion. Ingredient macros live in `ingredients`, NOT as `course = ingredient` rows in `recipes` (that plan was dropped). `ingredients` has no sodium property.
@@ -477,7 +504,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
     | Patty + veg | 310 | 32 g | dinner |
     | Cottage cheese bowl | ~220 | ~25 g | snack, evening — **macros pending a label** |
 
-  - **Work-day total ≈ 2,015 kcal / 188 g protein** against the provisional 2,100 / 175.
+  - **Work-day total ≈ 2,015 kcal / 188 g protein** against the provisional 2,100 / 175. *(Superseded 2026-09-21: 2,101 kcal / 199.6 g, 7 entries, with the thigh bowl as dinner.)*
   - **Two default days, not one** (amends the single "default day" decision above): the protein coffee is a work-day item, so a non-work day is **1,885 kcal / 158 g protein** — 215 under on calories and **17 g under the protein target**. Whether the non-work day gets a replacement item is open; flagged, not decided.
   - **Which days are work days comes from CYCLE-1**: the 8 `msp_work` days per pay period. The `wi` Friday is a day off work, and the `travel` Monday and both `msp_home` days aren't work days either — so 8 of 14 days use the work-day default and 6 use the non-work one.
 - **Logging:** extend the existing nutrition handler (deterministic intent routing is unchanged).
@@ -505,8 +532,22 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       3. **How days were recorded:** counts of *planned, no correction received* (`assumed` and `locked_unconfirmed`, labelled that way), *confirmed* (see below), and *corrected*.
       4. **Share of intake by macro basis:** per cent of kcal and of protein from *label*, *USDA*, *Open Food Facts*, *estimate* and *placeholder*, from `macro_basis`.
       5. **Weight:** first weigh-in (date, lb), last weigh-in (date, lb), the change, the 7-day average and the number of weigh-ins. With fewer than 3 weigh-ins in a 7-day window, the values are listed instead of averaged.
-      6. **Activity:** sessions completed of sessions planned; exercise minutes; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
     - **Page 2 — detail:**
+      - **Activity (moved to the top of page 2, 2026-09-21, so the report stays at two pages):**
+        - **Summary table:** sessions completed of sessions planned; exercise minutes; daily average steps; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
+        - **Two bar charts under the table, side by side:**
+          1. **Daily steps:** one bar per day, with the value labelled on each bar.
+          2. **Active minutes per day:** stacked by intensity (light, moderate, vigorous), with the total labelled on each bar. **Intensity comes from ZONE-1 heart-rate zones only.** Until ZONE-1 is unblocked, the chart shows total active minutes **unstacked**, with the note "Intensity breakdown not yet available." **The split is never estimated.**
+        - **Chart rules:**
+          - Neutral greys only, no colour coding. The stacked segments use three grey tones plus a legend naming them.
+          - Y axis starts at 0. No goal or target lines.
+          - A day with no data is an empty slot labelled "no data", never a zero-height bar.
+          - Rendered as inline SVG on the box (WeasyPrint draws SVG; no JavaScript).
+          - At 28–31 days, the per-bar labels go vertical in small type. If a month can't fit two pages, stop and raise it at build time; never drop days or labels to make it fit.
+        - **Sources:**
+          - Steps come from `step_count`, stored hourly (STEPS-HOURLY, below).
+          - **Active minutes, total (before ZONE-1): Apple's exercise minutes (`apple_exercise_time`).** It is also ignored at ingest today and would need the same hourly store, and its source is stated in the footer.
+          - Once ZONE-1 exists, the stack and its total both come from heart-rate minutes in zone. The footer states which definition a report uses. **Open, decide before build:** which ZONE-1 zones count as light / moderate / vigorous.
       - **Per-day table:** date, day type, recording status, kcal, protein, carbohydrate, fat, fiber, and the share from `estimate`/`placeholder`.
       - **Recurring meals:** the default work day, each item with portion, kcal, protein and `macro_basis`, so she can see what "planned" contains. Below it, foods logged 2 or more times as deviations.
       - **Footer:** definitions of each recording status and basis. "Figures are recorded data only."
@@ -516,7 +557,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       - **`macro_basis`** (`label` | `usda` | `open_food_facts` | `estimate` | `placeholder`) is added to `nutrition.food` (both recipes and ingredients) and carried onto `nutrition.entry`. It is backfilled from the current free-text `source_detail`, and any row that can't be classified unambiguously is reported to Ryan, not guessed. `is_placeholder = TRUE` maps to `placeholder`. It is kept alongside `confidence` (exact/matched/estimated), which answers a different question.
       - **Weight source:** Apple Health samples (`health.watch_sample`, metric `weight`), falling back to the check-in value (`health.daily_state.weight_lbs`) on days with no sample. Each weigh-in is marked with its source in the per-day detail.
       - **Delivery:** Artemis renders the PDF (REPORT-1 pipeline, S3 `reports/`) and prepares a **Gmail draft** with it attached. Ryan reviews and sends it; **it is never sent automatically** (Brad Spaits rule). Upload to My HealtheVet stays manual.
-    - **Tests:** a golden file; the banned-word scan; an empty period; a period with non-work days that weren't pre-filled; all four day statuses; the basis shares summing to 100 %; the weight fallback; fewer than 3 weigh-ins; no watch data.
+    - **Tests:** a golden file; the banned-word scan; an empty period; a period with non-work days that weren't pre-filled; all four day statuses; the basis shares summing to 100 %; the weight fallback; fewer than 3 weigh-ins; no watch data; a day with no steps (an empty slot, not 0); the active-minutes chart unstacked with its note when ZONE-1 is absent, and stacked with a matching total when present; a 31-day period still two pages.
 - **Provisional seed:** 2,100 calories and 175 g protein, marked "provisional — pending dietitian", with an effective date. Ryan chose these values; it's a human-run seed, not an Artemis decision. The dietitian's target later closes it cleanly by effective date.
 - **Targets:** `@artemis set nutrition target calories 2200 protein 180 …` writes `nutrition.target` with an effective date. It keeps the existing propose-then-confirm flow. Artemis never sets or changes a target itself and never recommends a deficit. The existing target parser is a Claude call; replace it with a deterministic parse (targets are numbers Ryan typed).
 - **Tests:**
