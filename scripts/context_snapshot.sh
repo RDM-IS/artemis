@@ -16,7 +16,10 @@ mkdir -p context
   TOK=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); IP=$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "n/a")
   echo "- Public IP: ${IP}"
   echo "- Host: $(hostname)"
-  echo "- Python: $(python3 --version 2>&1)"
+  # The interpreter acos actually runs (ExecStart), not the host's default python3 (3.9 on AL2023).
+  PY=$(systemctl cat acos 2>/dev/null | sed -nE 's/^ExecStart=([^ ]+).*/\1/p' | head -1)
+  PY=${PY:-/usr/bin/python3.11}
+  echo "- Python: $("$PY" --version 2>&1) (${PY})"
   if systemctl list-units --type=service 2>/dev/null | grep -q acos; then
     echo "- acos.service: $(systemctl is-active acos 2>/dev/null) | ExecStart: $(systemctl cat acos 2>/dev/null | grep -E '^ExecStart=' | head -1)"
   fi
