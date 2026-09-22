@@ -173,10 +173,25 @@ def _watch_section() -> list[str]:
     return ["", line] if line else []
 
 
-def _checkin_section(plan: dict | None) -> list[str]:
+def checked_in_today() -> bool:
+    """True when Ryan already checked in today — he can reply before the wake
+    post (04:04 on 9/22). A DB failure reads as "not yet": the prompt and the
+    check-in key then behave exactly as before."""
+    try:
+        from artemis.health_checkin import has_checkin
+        from knowledge.db import get_connection
+
+        with get_connection() as conn:
+            return has_checkin(conn.cursor(), local_today())
+    except Exception:
+        logger.exception("wake: check-in lookup failed")
+        return False
+
+
+def _checkin_section(plan: dict | None, checked_in: bool = False) -> list[str]:
     from artemis.health import build_morning_survey_prompt
 
-    if not plan:
+    if not plan or checked_in:
         return []
     return ["", build_morning_survey_prompt(plan, prompt_type_for(plan))]
 
@@ -285,8 +300,10 @@ def _departure_section(calendar, plan: dict | None = None) -> list[str]:
     return ["", "**Before you leave**", *lines] if lines else []
 
 
-def build_wake_message(calendar=None, held_health: list[str] | None = None) -> str:
-    """Compose the 04:30 post. `held_health` are notices held overnight."""
+def build_wake_message(calendar=None, held_health: list[str] | None = None,
+                       checked_in: bool = False) -> str:
+    """Compose the 04:30 post. `held_health` are notices held overnight;
+    `checked_in` drops the check-in prompt when today's is already in."""
     from artemis.health import get_today_plan
 
     try:
@@ -303,7 +320,7 @@ def build_wake_message(calendar=None, held_health: list[str] | None = None) -> s
     lines.append("")
     lines.extend(_workout_section(plan))
     lines.extend(_watch_section())
-    lines.extend(_checkin_section(plan))
+    lines.extend(_checkin_section(plan, checked_in))
     for notice in held_health or []:
         lines.extend(["", notice])
     lines.extend(_departure_section(calendar, plan))

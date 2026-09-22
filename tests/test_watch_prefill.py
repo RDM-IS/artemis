@@ -285,7 +285,7 @@ class TestWiring(unittest.TestCase):
         src = (ROOT / "artemis" / "wake.py").read_text()
         body = src[src.index("def build_wake_message"):]
         self.assertLess(body.index("_workout_section(plan)"), body.index("_watch_section()"))
-        self.assertLess(body.index("_watch_section()"), body.index("_checkin_section(plan)"))
+        self.assertLess(body.index("_watch_section()"), body.index("_checkin_section(plan"))
 
 
 class TestWakeSection(unittest.TestCase):

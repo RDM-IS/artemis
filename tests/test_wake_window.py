@@ -292,7 +292,7 @@ class TestWakeMessage(unittest.TestCase):
         },
     }
 
-    def _build(self, plan=None, held=None):
+    def _build(self, plan=None, held=None, checked_in=False):
         from artemis import wake as wake_mod
         cal = MagicMock()
         cal.service = True
@@ -303,7 +303,8 @@ class TestWakeMessage(unittest.TestCase):
              patch.object(wake_mod, "get_timezone_override", return_value=None), \
              patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 21, 4, 30)), \
              patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)):
-            return wake_mod.build_wake_message(calendar=cal, held_health=held or [])
+            return wake_mod.build_wake_message(calendar=cal, held_health=held or [],
+                                              checked_in=checked_in)
 
     def test_contains_workout_checkin_and_departure(self):
         msg = self._build()
@@ -318,6 +319,13 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event: 9:00 AM", msg)
         self.assertIn("Weather:", msg)
         self.assertIn("dry cleaning", msg)
+
+    def test_no_checkin_prompt_once_checked_in(self):
+        msg = self._build(checked_in=True)
+        self.assertNotIn("sleep hrs", msg.lower())
+        self.assertNotIn("Morning check-in", msg)
+        self.assertIn("Office Strength A", msg)
+        self.assertIn("Before you leave", msg)
 
     def test_excludes_business_content(self):
         msg = self._build(held=["↔ Slid Strength A → Wed (makeup slot)."]).lower()

@@ -104,6 +104,11 @@ _WEIGHT_RE = re.compile(
     r"\b(?:weight|weighed|wt|scale)\s*(?:is|was|in\s+at|at|of|:)?\s*(\d{2,3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)?\b"
     r"|\b(\d{3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)\b",
     re.I)
+# A number on its own between commas — "sleep 6, energy 4, 281.5" — is the
+# weight when it is 150–400 lb. Only a whole clause counts: "walked 200 steps"
+# is not a weight.
+_BARE_WEIGHT_RE = re.compile(r"(?:^|[,;\n])\s*(\d{3}(?:\.\d{1,2})?)\s*(?=$|[,;\n])")
+_BARE_WEIGHT_RANGE = (150.0, 400.0)
 _RHR_RE = re.compile(r"\b(?:rhr|resting\s*(?:hr|heart\s*rate))\s*(?:is|was|of|:)?\s*(\d{2,3})\b", re.I)
 _ZERO_SORE_RE = re.compile(
     r"\b(?:sore(?:ness)?\s*(?:is|:)?\s*(?:0|zero|none)(?:\s*/\s*(?:10|5))?|no\s+soreness|not\s+sore|nothing\s+sore)\b",
@@ -268,6 +273,12 @@ def parse_checkin(text: str) -> CheckIn:
         if m:
             ci.weight_lbs = float(m.group(1) or m.group(2))
             work = _blank(work, m.span())
+        else:
+            bare = [b for b in _BARE_WEIGHT_RE.finditer(work)
+                    if _BARE_WEIGHT_RANGE[0] <= float(b.group(1)) <= _BARE_WEIGHT_RANGE[1]]
+            if len(bare) == 1:       # two candidates: guessing would be inventing
+                ci.weight_lbs = float(bare[0].group(1))
+                work = _blank(work, bare[0].span(1))
 
         zero = _ZERO_SORE_RE.search(work)
         if zero:
@@ -321,7 +332,8 @@ def parse_checkin(text: str) -> CheckIn:
         ci.soreness = {"overall": 0}
 
     leftover = " ".join(work.split())
-    ci.free_text = leftover or None
+    # Only separators left (", , ,") is nothing Ryan said.
+    ci.free_text = leftover if re.search(r"\w", leftover) else None
     return ci
 
 
