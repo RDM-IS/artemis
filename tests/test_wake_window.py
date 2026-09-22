@@ -378,11 +378,11 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event", text)
         self.assertIn("Weather:", text)
 
-    def test_outside_walk_and_rest_days_follow_the_home_rule(self):
-        walk = {"session_type": "walk", "blocks": {"location": "outside"}}
+    def test_home_and_rest_days_follow_the_home_rule(self):
+        home_flow = {"session_type": "recovery_flow", "blocks": {"location": "home"}}
         rest_with_office_blocks = {"session_type": "rest_mobility",
                                    "blocks": {"location": "office gym"}}
-        for plan in (walk, rest_with_office_blocks, None):
+        for plan in (home_flow, rest_with_office_blocks, None):
             with self.subTest(plan=plan):
                 self.assertNotIn("gym bag", "\n".join(self._depart(plan)))
 
@@ -423,7 +423,7 @@ class TestWakeMessage(unittest.TestCase):
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "strength_b"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "cardio_z2"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "rest_mobility"}), "logging_only")
-        self.assertEqual(wake_mod.prompt_type_for({"session_type": "walk"}), "logging_only")
+        self.assertEqual(wake_mod.prompt_type_for({"session_type": "recovery_flow"}), "logging_only")
         self.assertEqual(wake_mod.prompt_type_for(None), "logging_only")
 
 

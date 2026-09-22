@@ -18,7 +18,7 @@ import export_report as er  # noqa: E402
 
 WED = date(2026, 9, 16)
 GEN = datetime(2026, 9, 18, 13, 0)
-TYPES = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "walk", "strength_c", "cardio_z2"]
+TYPES = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "recovery_flow", "strength_c", "cardio_z2"]
 
 
 def plans(start=WED):

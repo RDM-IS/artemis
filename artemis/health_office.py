@@ -77,7 +77,6 @@ SESSION_EQUIPMENT: dict[str, list[str]] = {
     "strength_c": [EQ_DBS, EQ_PEC_FLY, EQ_CABLE, EQ_ADJ_BENCH, EQ_CALF_PRESS, EQ_AB],
     "cardio_z2": [EQ_TREADMILL, EQ_ELLIPTICAL, EQ_RECUMBENT, EQ_UPRIGHT],
     "cardio_intervals": [EQ_STEPMILL, EQ_UPRIGHT],
-    "walk": ["walking shoes"],
     "rest_mobility": [EQ_MAT, EQ_STRETCH],
     "recovery_flow": [EQ_MAT, EQ_STRETCH],
 }
@@ -133,7 +132,6 @@ _DISPLAY = {
     "strength_b": "Office Strength B",
     "strength_c": "Office Strength C",
     "cardio_z2": "Zone 2 Cardio",
-    "walk": "Walk",
     "rest_mobility": "Rest / Mobility",
     "recovery_flow": "Recovery Flow",
 }
@@ -178,9 +176,9 @@ NON_LIFT = {
     0: "recovery_flow",   # Sun, msp_home — mat
     2: "cardio_z2",       # Tue, office — treadmill / elliptical
     5: "recovery_flow",   # Fri, Richfield — mat
-    6: "walk",            # Sat, Brown Deer
+    6: "recovery_flow",   # Sat, Brown Deer — mat
     7: "recovery_flow",   # Sun, Brown Deer (morning) — mat
-    8: "walk",            # Mon, travel — leaves 11:00
+    8: "recovery_flow",   # Mon, travel — mat, before the 11:00 drive
     10: "cardio_z2",      # Wed, office — treadmill / elliptical
     13: "recovery_flow",  # Sat, msp_home — mat
 }
@@ -291,19 +289,6 @@ def _z2(week_num: int, location: str = LOCATION):
         blocks["target_range_min"] = [lo, hi]
     est = hi + (COOLDOWN_MIN if office else 0)
     return blocks, 4.0, 2, est
-
-
-def _walk(week_num: int, *, recovery: bool = False):
-    blocks = {
-        "type": "steady",
-        "display_name": "Recovery Walk" if recovery else _DISPLAY["walk"],
-        "location": "outside",
-        "duration_min": 30,
-        "intensity": "easy",
-        "equipment": ["walking shoes"],
-        "setup_notes": ["30 min walk outside"],
-    }
-    return blocks, None, None, 30
 
 
 def _rest(week_num: int):
@@ -624,7 +609,7 @@ def _recovery_flow(location: str = LOCATION):
     return blocks, FLOW_TARGET_RPE, None, -(-total // 60)
 
 
-def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: bool = False,
+def _build(session_type: str, week_num: int, *, wk0: bool = False,
            location: str | None = None):
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
@@ -632,8 +617,6 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False, recovery: boo
         return _strength(session_type, week_num, wk0=wk0)
     if session_type == "cardio_z2":
         return _z2(week_num, location or LOCATION)
-    if session_type == "walk":
-        return _walk(week_num, recovery=recovery)
     return _rest(week_num)
 
 
@@ -672,13 +655,10 @@ def build_row(spec: dict) -> dict:
     week_num = spec["week_num"]
     session_type = spec["session_type"]
     location = spec.get("location") or LOCATION
-    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0,
-                                    recovery=wk0 and session_type == "walk",
-                                    location=location)
+    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location)
     blocks = copy.deepcopy(blocks)
     # CYCLE-1: every row carries where it happens and the day type it came from.
-    if blocks.get("type") != "steady" or session_type != "walk":
-        blocks["location"] = location
+    blocks["location"] = location
     if spec.get("day_type"):
         blocks["day_type"] = spec["day_type"]
     tag = f"{spec.get('day_type', 'office')} wk{week_num}"
@@ -752,7 +732,7 @@ def format_estimate(minutes) -> str:
 
 
 LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_intervals",
-                       "cardio_z2", "walk", "rest_mobility", "recovery_flow"}
+                       "cardio_z2", "rest_mobility", "recovery_flow"}
 
 
 def forbidden_hits(blocks) -> list[str]:
@@ -802,9 +782,10 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert lifts[wk] == 3, f"week {wk} has {lifts[wk]} lifts, expected 3"
     for r in rows:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
-        if r["session_type"] != "walk":
-            want, got = day_location(r["plan_date"]), r["blocks"].get("location")
-            assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
+        assert r["session_type"] != "walk", \
+            f"{r['plan_date']}: walks are activity, never planned sessions"
+        want, got = day_location(r["plan_date"]), r["blocks"].get("location")
+        assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
     rejects, notes = duration_findings(rows)
     assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)
     for n in notes:

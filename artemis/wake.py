@@ -21,7 +21,7 @@ from artemis.quiet_hours import get_timezone_override, local_now, local_today
 
 logger = logging.getLogger(__name__)
 
-_LIGHT_SESSIONS = ("rest_mobility", "walk")
+_LIGHT_SESSIONS = ("rest_mobility",)
 
 
 def _override_header() -> str | None:
@@ -87,7 +87,7 @@ def flow_lines(blocks: dict, name: str = "Recovery Flow") -> list[str]:
 
 
 def _workout_section(plan: dict | None) -> list[str]:
-    """Today's session. Light days (rest/walk) get one line."""
+    """Today's session. Light days (rest) get one line."""
     from artemis.health import (
         _session_pretty_name,
         resolve_equipment_and_location,
@@ -120,13 +120,9 @@ def _workout_section(plan: dict | None) -> list[str]:
         tail = f" · {note}" if note else ""
         return [f"\U0001f3cb️ Today: **{name}**{duration_str}.{tail}"]
 
-    weather = None
-    if session_type == "walk":  # pragma: no cover - walk is a light session
-        from artemis.weather import get_current_conditions
-        weather = get_current_conditions()
-    resolved = resolve_equipment_and_location(
-        session_type, weather=weather, blocks=blocks,
-    )
+    # WALK-RETIRE: no planned session is weather-dependent any more — walks are
+    # activity, not sessions, and every session is indoors.
+    resolved = resolve_equipment_and_location(session_type, blocks=blocks)
 
     from artemis.health_checkin import render_plan_lines
 

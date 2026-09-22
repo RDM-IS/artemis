@@ -1854,8 +1854,6 @@ class ArtemisScheduler:
                 already_prompted_today, build_evening_prompt,
                 get_today_plan, mark_prompted, resolve_equipment_and_location,
             )
-            from artemis.weather import get_current_conditions
-
             today = _local_today()
             slot = "evening"
             if already_prompted_today(slot, today):
@@ -1866,12 +1864,10 @@ class ArtemisScheduler:
                 return
 
             session_type = plan.get("session_type", "")
-            # HEALTH-2: weather only matters for an outdoor walk; cardio is at the
-            # office gym and location comes from the plan row's blocks.
-            weather = get_current_conditions() if session_type == "walk" else None
-
+            # WALK-RETIRE: nothing planned happens outdoors any more, so no
+            # session needs the weather. Location comes from the plan row.
             resolved = resolve_equipment_and_location(
-                session_type, weather=weather, blocks=plan.get("blocks"),
+                session_type, blocks=plan.get("blocks"),
             )
             text = build_evening_prompt(plan, resolved)
             self._post(config.CHANNEL_OPS, text, tier="health")

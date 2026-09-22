@@ -441,10 +441,12 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertIn("removed", reply)
         self.assertIn("adjustment", self.db.plan[FRI]["blocks"])
 
-    def test_nudge_skips_rest_and_walk_days(self):
+    def test_nudge_skips_rest_days(self):
+        """WALK-RETIRE (2026-09-22): the walk day is gone — 9/28 is a mat flow
+        now, and the nudge does fire on a flow day (see test_recovery_flow).
+        Rest days remain the only silent day."""
         from artemis.scheduler import ArtemisScheduler
-        for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),
-                       (date(2026, 9, 28), office_row(date(2026, 9, 28), plan_id=107))):
+        for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),):
             db = FakeDB(row)
 
             @contextmanager

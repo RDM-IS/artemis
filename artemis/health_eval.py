@@ -30,6 +30,11 @@ from artemis import health_office as office
 from artemis import health_regions as hr
 
 REST_TYPES = {"rest_mobility"}
+# WALK-RETIRE (Ryan, 2026-09-22): activity, never a prescribed session. Rows of
+# these types are left out of sessions done vs planned entirely — not counted
+# as done, missed, planned or rest. The activity totals (steps, active minutes,
+# energy, heart rate) are read from the watch tables and still include walks.
+ACTIVITY_ONLY_TYPES = {"walk"}
 
 # Names logged before a correction, grouped under the current name so a rename
 # never reads as a new exercise. session_log 123/129 (9/18) predate the fix.
@@ -125,6 +130,12 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
             adjustments.append({"date": d.isoformat(), "rules": list(adj.get("rules_fired") or []),
                                 "reason": adj.get("reason") or ""})
         st = p["session_type"]
+        if st in ACTIVITY_ONLY_TYPES:
+            # WALK-RETIRE (Ryan, 2026-09-22): a walk is activity, never a
+            # session. It counts in steps / active minutes / energy, never in
+            # sessions done vs planned. No current plan row is a walk; this
+            # guard keeps a legacy or hand-inserted row out of the counts.
+            continue
         if st in REST_TYPES:
             status = "rest"
         elif p.get("is_skipped"):
