@@ -417,9 +417,14 @@ class ArtemisScheduler:
 
         exit_quiet()
         held = take_holds("health")
-        text = wake_mod.build_wake_message(calendar=self.calendar, held_health=held)
+        # Ryan can check in before the wake post. Then the post doesn't ask
+        # again and the check-in key is left as it is.
+        checked_in = wake_mod.checked_in_today()
+        text = wake_mod.build_wake_message(calendar=self.calendar, held_health=held,
+                                           checked_in=checked_in)
         self.mm.post_message(config.CHANNEL_OPS, text)
-        set_system_value(checkin_key(_local_today()), "open")
+        if not checked_in:
+            set_system_value(checkin_key(_local_today()), "open")
 
     def job_wake(self):
         """Wake (time from CYCLE-1's location table) — health only; business
