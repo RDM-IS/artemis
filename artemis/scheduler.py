@@ -371,6 +371,11 @@ class ArtemisScheduler:
         # wake — the 04:30 cron alone returned early and nothing re-checked.
         self.scheduler.add_job(self.job_wake_watch, "interval", minutes=1, id="wake_watch")
 
+        # WATCH-1: re-match recent watch workouts to their sessions. A workout
+        # can land before its sets are logged; the ingest only sees the former.
+        self.scheduler.add_job(self.job_watch_workout_match, "interval", minutes=30,
+                               id="watch_workout_match")
+
         # ── Cron jobs: registry, in the active timezone ──
         self.apply_timezone(get_active_timezone())
 
@@ -1746,6 +1751,35 @@ class ArtemisScheduler:
                 recipes["synced"] if recipes else "skipped", len(locked))
         except Exception:
             logger.exception("Nutrition pre-fill failed")
+
+    def job_watch_workout_match(self):
+        """Every 30 min — re-match the last three local days' watch workouts to
+        their sessions (knowledge.watch_match). Silent: posts nothing. Writes
+        only watch_workout.plan_id, and audits only when something changed."""
+        try:
+            import json
+            from datetime import timedelta
+            from knowledge.db import get_connection
+            from knowledge.watch_match import rematch
+
+            today = _local_today()
+            with get_connection() as conn:
+                cur = conn.cursor()
+                result = rematch(cur, [today - timedelta(days=n) for n in range(3)])
+                if result["changed"]:
+                    cur.execute(
+                        "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
+                        "outcome, token_count, api_cost_usd, metadata) "
+                        "VALUES (%s, NULL, %s, %s, NULL, %s, 0, 0, %s::jsonb)",
+                        ("watch_match", "watch_workout_match", "health", "executed",
+                         json.dumps({"trigger": "box_job", **result}, default=str)))
+            if result["changed"]:
+                logger.info("Watch workout match: %d changed; matched %s; unmatched %s",
+                            result["changed"],
+                            [(m["workout_id"], m["plan_id"]) for m in result["matched"]],
+                            [(u["workout_id"], u["outcome"]) for u in result["unmatched"]])
+        except Exception:
+            logger.exception("Watch workout match failed")
 
     def job_pain_pattern_recompute(self):
         """21:55 local — refresh health.pain_pattern. Silent: posts nothing."""
