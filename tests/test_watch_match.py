@@ -87,7 +87,7 @@ class TestFirstRealExport(unittest.TestCase):
             6: (108, wm.MATCHED),           # 9/21 strength A, 14 rows
             5: (None, wm.KIND_MISMATCH),    # 9/21 evening walk on a strength day
             4: (109, wm.MATCHED),           # 9/22 Z2 on the bike; summary at 10:48:48
-            3: (None, wm.NO_LOGGED_ROWS),   # 9/22 walk started after the summary
+            3: (109, wm.ADJACENT),          # 9/22 walk, 11 s after the bike: cool-down
         })
 
     def test_the_921_evidence(self):
@@ -175,6 +175,87 @@ class TestRules(unittest.TestCase):
                 self.assertIs(wm.kind_fits(kind, st), want)
 
 
+class TestAdjacent(unittest.TestCase):
+    """Ryan, 2026-09-22: one warm-up/cool-down workout may attach on each side
+    of the matched one, within 5 min."""
+    BIKE = W(1, "Indoor Cycling", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:50:00", 1200)
+    LOGS = [{"plan_id": 109, "logged_at": ts("2026-09-22 10:45:00")}]
+
+    def _run(self, *others, plans=None):
+        return by_id(wm.decide([self.BIKE, *others], plans or PLANS, self.LOGS))
+
+    def _walk(self, wid, start, end, kind="Indoor Walk"):
+        return W(wid, kind, "2026-09-22", f"2026-09-22 {start}", f"2026-09-22 {end}", 0)
+
+    def test_the_922_session_attaches_both(self):
+        got = by_id(wm.decide(WORKOUTS, PLANS, LOGS))
+        self.assertEqual((got[4]["plan_id"], got[3]["plan_id"]), (109, 109))
+        self.assertEqual(got[3]["detail"], "after workout 4 (11 s gap)")
+
+    def test_the_evening_walks_stay_unattached(self):
+        got = by_id(wm.decide(WORKOUTS, PLANS, LOGS))
+        for wid in (8, 5):
+            self.assertEqual((got[wid]["plan_id"], got[wid]["outcome"]), (None, wm.KIND_MISMATCH))
+
+    def test_five_minutes_is_the_limit_on_both_sides(self):
+        cases = {
+            ("10:55:00", "11:00:00"): 109,       # starts 5:00 after the end
+            ("10:55:01", "11:00:00"): None,      # 5:01
+            ("10:20:00", "10:25:00"): 109,       # ends 5:00 before the start
+            ("10:20:00", "10:24:59"): None,      # 5:01 before
+        }
+        for (start, end), want in cases.items():
+            with self.subTest(start=start, end=end):
+                self.assertEqual(self._run(self._walk(2, start, end))[2]["plan_id"], want)
+
+    def test_one_before_and_one_after(self):
+        got = self._run(self._walk(2, "10:22:00", "10:28:00"),       # before, 2 min gap
+                        self._walk(3, "10:51:00", "10:55:00"),       # after, 1 min gap
+                        self._walk(4, "10:53:00", "10:58:00"))       # after, 3 min: second on that side
+        self.assertEqual({w: got[w]["plan_id"] for w in (2, 3, 4)}, {2: 109, 3: 109, 4: None})
+
+    def test_equally_close_candidates_attach_neither(self):
+        got = self._run(self._walk(2, "10:52:00", "10:55:00"),
+                        self._walk(3, "10:52:00", "10:56:00", kind="Elliptical"))
+        self.assertEqual((got[2]["plan_id"], got[3]["plan_id"]), (None, None))
+
+    def test_it_never_chains(self):
+        got = self._run(self._walk(2, "10:52:00", "10:55:00"),       # attaches after the bike
+                        self._walk(3, "10:57:00", "11:05:00"))       # 2 min after the WALK
+        self.assertEqual((got[2]["plan_id"], got[3]["plan_id"]), (109, None))
+
+    def test_kind_must_fit_or_be_warmup_cardio(self):
+        strength = [dict(PLANS[6], session_type="strength_b")]
+        lift = W(1, "Traditional Strength Training", "2026-09-22",
+                 "2026-09-22 10:30:00", "2026-09-22 10:50:00", 1200)
+        logs = [{"plan_id": 109, "logged_at": ts("2026-09-22 10:45:00")}]
+        cases = {
+            "Indoor Walk": 109, "Outdoor Walk": 109, "Elliptical": 109, "Indoor Cycling": 109,
+            "Functional Strength Training": 109,       # same family as the plan
+            "Outdoor Cycling": None,                   # not an indoor cycle
+            "Yoga": None, "Swimming": None,
+        }
+        for kind, want in cases.items():
+            with self.subTest(kind=kind):
+                other = self._walk(2, "10:52:00", "10:58:00", kind=kind)
+                got = by_id(wm.decide([lift, other], strength, logs))
+                self.assertEqual(got[2]["plan_id"], want)
+
+    def test_nothing_attaches_without_a_matched_anchor(self):
+        """A tie leaves the session unmatched, so there is nothing to attach to."""
+        a = W(1, "Indoor Cycling", "2026-09-22", "2026-09-22 10:00:00", "2026-09-22 10:20:00", 1200)
+        b = W(2, "Indoor Cycling", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:40:00", 600)
+        c = self._walk(3, "10:41:00", "10:45:00")
+        logs = [{"plan_id": 109, "logged_at": ts(t)}
+                for t in ("2026-09-22 10:05:00", "2026-09-22 10:35:00")]
+        got = by_id(wm.decide([a, b, c], PLANS, logs))
+        self.assertEqual({d["plan_id"] for d in got.values()}, {None})
+
+    def test_an_adjacent_workout_on_another_day_is_ignored(self):
+        other = W(2, "Indoor Walk", "2026-09-23", "2026-09-22 10:51:00", "2026-09-22 10:55:00", 0)
+        self.assertIsNone(self._run(other)[2]["plan_id"])
+
+
 class FakeCursor:
     """Answers rematch's three SELECTs and records every statement."""
 
@@ -204,12 +285,12 @@ class TestRematch(unittest.TestCase):
         stored[0]["plan_id"] = 109                                       # already right
         cur = FakeCursor(stored, PLANS, LOGS)
         result = wm.rematch(cur, [date(2026, 9, 22)])
-        self.assertEqual(result["changed"], 0)
-        self.assertEqual([m["workout_id"] for m in result["matched"]], [4])
-        self.assertEqual([(u["workout_id"], u["outcome"]) for u in result["unmatched"]],
-                         [(3, wm.NO_LOGGED_ROWS)])
-        writes = [s for s, _ in cur.statements if not s.startswith("SELECT")]
-        self.assertEqual(writes, [])
+        self.assertEqual([(m["workout_id"], m["outcome"]) for m in result["matched"]],
+                         [(4, wm.MATCHED), (3, wm.ADJACENT)])
+        self.assertEqual(result["unmatched"], [])
+        self.assertEqual(result["changed"], 1)                            # the walk
+        writes = [p for s, p in cur.statements if not s.startswith("SELECT")]
+        self.assertEqual(writes, [{"plan_id": 109, "id": 3}])
 
     def test_a_match_that_is_no_longer_true_is_cleared(self):
         stored = [dict(WORKOUTS[7], plan_id=109)]                        # walk, wrongly set

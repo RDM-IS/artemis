@@ -18,6 +18,13 @@ The rules (design approved 2026-09-21, docs/ARTEMIS_STATE.md WATCH-1):
     would be a guess.
   * A workout with no logged rows in its window stays unmatched and is
     reported. Nothing is ever attached by date alone.
+  * Adjacent workouts (Ryan, 2026-09-22). Once a session has its matched
+    workout, one more may attach BEFORE it (ending at most 5 min before it
+    starts) and one AFTER it (starting at most 5 min after it ends). It must
+    fit the plan's type, or be a warm-up/cool-down cardio kind: walk,
+    elliptical, indoor cycling. Only the matched workout anchors, so it never
+    chains. If two candidates are equally close on one side, neither attaches.
+    Example: 9/22, 21 min on the bike, then a walk starting 11 s later.
 
 Writes only health.watch_workout.plan_id. Nothing goes into session_log.
 """
@@ -38,6 +45,9 @@ KIND_MISMATCH = "kind_mismatch"
 NO_LOGGED_ROWS = "no_logged_rows"
 OUTRANKED = "outranked"
 TIED = "tied"
+ADJACENT = "adjacent"
+
+ADJACENT_GAP = timedelta(minutes=5)
 
 
 def kind_fits(kind: str | None, session_type: str | None) -> bool:
@@ -52,14 +62,25 @@ def kind_fits(kind: str | None, session_type: str | None) -> bool:
     return False
 
 
+def is_warmup_cardio(kind: str | None) -> bool:
+    """A kind that can warm up or cool down any session."""
+    k = (kind or "").lower()
+    return "walk" in k or "elliptical" in k or "indoor cycling" in k
+
+
+def _end(w: dict) -> datetime:
+    """The workout's own end: `ended_at`, else start + duration, else start."""
+    if w.get("ended_at") is not None:
+        return w["ended_at"]
+    if w.get("duration_sec"):
+        return w["started_at"] + timedelta(seconds=int(w["duration_sec"]))
+    return w["started_at"]
+
+
 def window(w: dict) -> tuple[datetime, datetime]:
     """[start, end + grace]. With no end, start + duration; with neither, the
     start alone (plus grace)."""
-    start = w["started_at"]
-    end = w.get("ended_at")
-    if end is None and w.get("duration_sec"):
-        end = start + timedelta(seconds=int(w["duration_sec"]))
-    return start, (end or start) + LOG_GRACE
+    return w["started_at"], _end(w) + LOG_GRACE
 
 
 def decide(workouts: list[dict], plans: list[dict], logs: list[dict]) -> list[dict]:
@@ -129,9 +150,45 @@ def decide(workouts: list[dict], plans: list[dict], logs: list[dict]) -> list[di
                 out[w["workout_id"]] = (
                     OUTRANKED, f"{n} log row(s); workout {winner['workout_id']} has {best}")
 
+    _attach_adjacent(workouts, plans_by_date, matched, out)
+
     return [{"workout_id": w["workout_id"], "plan_id": matched.get(w["workout_id"]),
              "outcome": out[w["workout_id"]][0], "detail": out[w["workout_id"]][1]}
             for w in workouts]
+
+
+def _attach_adjacent(workouts: list[dict], plans_by_date: dict, matched: dict,
+                     out: dict) -> None:
+    """Attach at most one workout before and one after each matched workout
+    (see the module rules). Updates `matched` and `out` in place."""
+    by_id = {w["workout_id"]: w for w in workouts}
+    plan_by_id = {p["plan_id"]: p for ps in plans_by_date.values() for p in ps}
+    anchors = [(by_id[wid], plan_by_id[pid]) for wid, pid in list(matched.items())]
+    for anchor, plan in anchors:
+        sides: dict = {"before": [], "after": []}
+        for w in workouts:
+            if w["workout_id"] in matched or w["local_date"] != plan["plan_date"]:
+                continue
+            if not (kind_fits(w["kind"], plan["session_type"]) or is_warmup_cardio(w["kind"])):
+                continue
+            after = w["started_at"] - _end(anchor)
+            before = anchor["started_at"] - _end(w)
+            if timedelta(0) <= after <= ADJACENT_GAP:
+                sides["after"].append((after, w))
+            elif timedelta(0) <= before <= ADJACENT_GAP:
+                sides["before"].append((before, w))
+        for side, cands in sides.items():
+            if not cands:
+                continue
+            gap = min(g for g, _ in cands)
+            closest = [w for g, w in cands if g == gap]
+            if len(closest) > 1:
+                continue                      # equally close: guessing would be inventing
+            w = closest[0]
+            matched[w["workout_id"]] = plan["plan_id"]
+            out[w["workout_id"]] = (
+                ADJACENT, f"{side} workout {anchor['workout_id']} "
+                f"({int(gap.total_seconds())} s gap)")
 
 
 def rematch(cur, days) -> dict:
@@ -175,6 +232,6 @@ def rematch(cur, days) -> dict:
                 "started_at": w["started_at"].isoformat()}
 
     return {"days": [d.isoformat() for d in days],
-            "matched": [label(d) for d in decisions if d["outcome"] == MATCHED],
-            "unmatched": [label(d) for d in decisions if d["outcome"] != MATCHED],
+            "matched": [label(d) for d in decisions if d["plan_id"] is not None],
+            "unmatched": [label(d) for d in decisions if d["plan_id"] is None],
             "changed": changed}
