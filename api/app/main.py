@@ -34,6 +34,9 @@ def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
 
 app = FastAPI(title="RDMIS CRM API", version="0.1.0")
 
+# One JSON log line per watch /ingest request, refusals included.
+app.middleware("http")(health_router.log_ingest_request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -37,11 +37,12 @@ existing import.
 
 import json
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security, status
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -95,7 +96,8 @@ def _load_watch_key() -> str:
     return _WATCH_INGEST_KEY
 
 
-def verify_watch_ingest_key(api_key: Optional[str] = Security(_API_KEY_HEADER)):
+def verify_watch_ingest_key(request: Request,
+                            api_key: Optional[str] = Security(_API_KEY_HEADER)):
     """WATCH-1: POST /ingest accepts ONLY the watch key.
 
     The display key (gym-display, the Shortcut) is rejected here, and this key
@@ -104,9 +106,11 @@ def verify_watch_ingest_key(api_key: Optional[str] = Security(_API_KEY_HEADER)):
     samples; it cannot read the plan or log a session.
     """
     if not api_key:
+        request.state.ingest_reason = "no X-API-Key header"
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail={"error": "unauthorized"})
     if api_key != _load_watch_key():
+        request.state.ingest_reason = "X-API-Key is not the watch ingest key"
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail={"error": "unauthorized"})
     return api_key
@@ -1919,9 +1923,61 @@ def _bulk_insert(db: Session, sql_head: str, cols: list[str], rows: list[dict]) 
     return inserted
 
 
+# ── One log line per /ingest request (2026-09-22) ─────────────────────────────
+# A refused upload used to leave no trace: no audit row (that is written only on
+# success), and the function logged nothing but Lambda's START/REPORT. The
+# middleware below prints one JSON line per request, including a 401 or 422
+# raised before the handler runs.
+# It logs ONLY: status, body size (Content-Length), elapsed ms, counts, and a
+# reason written by this code. Never the key, never the payload, never a
+# response body (a 422 body echoes the input back).
+INGEST_PATH = "/api/health/ingest"
+_REASON_BY_STATUS = {
+    401: "unauthorized",
+    413: "payload too large",
+    422: "request validation failed: the body is not JSON or not a JSON object",
+}
+
+
+def _numeric(counts: dict) -> dict:
+    """The integer counts only (drops the per-metric name map)."""
+    return {k: v for k, v in counts.items() if isinstance(v, int) and not isinstance(v, bool)}
+
+
+def ingest_log_line(status_code: int, *, state, content_length, elapsed_ms: int,
+                    error: str | None = None) -> str:
+    rec: dict = {"event": "watch_ingest_request", "status": status_code,
+                 "bytes": content_length, "ms": elapsed_ms}
+    rec.update(getattr(state, "ingest", None) or {})
+    if status_code >= 400:
+        rec["reason"] = (getattr(state, "ingest_reason", None) or error
+                         or _REASON_BY_STATUS.get(status_code) or "refused")
+    return json.dumps(rec, default=str, sort_keys=True)
+
+
+async def log_ingest_request(request: Request, call_next):
+    """HTTP middleware (registered in app.main). Only /ingest is logged."""
+    if not request.url.path.endswith(INGEST_PATH):
+        return await call_next(request)
+    started = time.monotonic()
+    raw_len = request.headers.get("content-length")
+    size = int(raw_len) if raw_len and raw_len.isdigit() else None
+    try:
+        response = await call_next(request)
+    except Exception as exc:                           # noqa: BLE001
+        print(ingest_log_line(500, state=request.state, content_length=size,
+                              elapsed_ms=int((time.monotonic() - started) * 1000),
+                              error=f"unhandled {type(exc).__name__}"), flush=True)
+        raise
+    print(ingest_log_line(response.status_code, state=request.state, content_length=size,
+                          elapsed_ms=int((time.monotonic() - started) * 1000)), flush=True)
+    return response
+
+
 @router.post("/ingest", response_model=IngestResponse)
 def post_ingest(
     payload: dict,
+    request: Request,
     db: Session = Depends(get_db),
     _api_key: str = Depends(verify_watch_ingest_key),
 ):
@@ -1942,11 +1998,15 @@ def post_ingest(
     )
 
     if not isinstance(payload, dict):
+        request.state.ingest_reason = "payload is not a JSON object"
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                             detail={"error": "payload must be a JSON object"})
 
     counts = parse_counts(payload)
+    request.state.ingest = {"received": _numeric(counts)}
     if counts["stored_samples"] > MAX_SAMPLES_PER_REQUEST:
+        request.state.ingest_reason = (f"too many samples: {counts['stored_samples']} storable, "
+                                       f"limit {MAX_SAMPLES_PER_REQUEST}")
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail={"error": "too many samples in one request",
@@ -1954,6 +2014,8 @@ def post_ingest(
                     "limit": MAX_SAMPLES_PER_REQUEST,
                     "fix": "send a shorter date range — about a week per request"})
     if counts["workouts_in"] > MAX_WORKOUTS_PER_REQUEST:
+        request.state.ingest_reason = (f"too many workouts: {counts['workouts_in']}, "
+                                       f"limit {MAX_WORKOUTS_PER_REQUEST}")
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail={"error": "too many workouts in one request",
@@ -2123,6 +2185,16 @@ def post_ingest(
                              "prefill": prefill},
                             default=str)})
     db.commit()
+    request.state.ingest = {
+        "received": _numeric(counts),
+        "inserted": {"samples": ins_s, "workouts": ins_w, "heart_rate": ins_hr},
+        "duplicates": {"samples": len(sample_rows) - ins_s,
+                       "workouts": len(workout_rows) - ins_w},
+        "workout_match": ({"error": workout_match["error"]} if "error" in workout_match else
+                          {"matched": len(workout_match.get("matched", [])),
+                           "unmatched": len(workout_match.get("unmatched", [])),
+                           "changed": workout_match.get("changed", 0)}),
+    }
 
     bits = []
     if undated:
