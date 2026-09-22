@@ -48,11 +48,19 @@ DAY_TYPES: tuple[str, ...] = (
 )
 
 # Where each position is. A tuple means the location changes during the day:
-# (before, after, boundary) — the wi Sunday moves Brown Deer -> Richfield 17:00.
+# (before, after, boundary) — the wi Friday moves Richfield -> Brown Deer 16:00,
+# and the wi Sunday moves Brown Deer -> Richfield 17:00.
+#
+# The evening half of a day is about to matter (Ryan, 2026-09-22): the day
+# structure becomes a morning session plus an evening one, so location_at has
+# to be right for BOTH halves, not just the wake. Moves that are still
+# unmodelled are listed in docs/ARTEMIS_STATE.md under CYCLE-1.
+FRIDAY_MOVE = time(16, 0)
 SUNDAY_MOVE = time(17, 0)
 DAY_LOCATIONS: dict[int, object] = {
     0: "msp_home", 1: "office", 2: "office", 3: "office", 4: "office",
-    5: "richfield", 6: "brown_deer",
+    5: ("richfield", "brown_deer", FRIDAY_MOVE),
+    6: "brown_deer",
     7: ("brown_deer", "richfield", SUNDAY_MOVE),
     8: "richfield",          # travel: the morning is a Richfield morning
     9: "office", 10: "office", 11: "office", 12: "office", 13: "msp_home",

@@ -64,16 +64,29 @@ class TestDerivation(unittest.TestCase):
                          (cycle.DAY_TYPES[cycle.cycle_pos(dst - timedelta(days=1))],
                           cycle.DAY_TYPES[cycle.cycle_pos(dst + timedelta(days=1))]))
 
+    def test_the_wi_friday_moves_at_1600(self):
+        """Ryan, 2026-09-22: the farm day ends at Brown Deer. Wake is unchanged
+        (the morning is still Richfield, 06:00)."""
+        with no_overrides():
+            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(6, 0)), "richfield")
+            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(15, 59)), "richfield")
+            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(16, 0)), "brown_deer")
+            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(21, 0)), "brown_deer")
+            self.assertEqual(cycle.wake_on(RICHFIELD_FRI), time(6, 0))
+            b = cycle.boundaries(RICHFIELD_FRI)
+        self.assertEqual((b["location"], b["evening_location"]), ("richfield", "brown_deer"))
+
     def test_the_wi_sunday_moves_at_1700(self):
         with no_overrides():
             self.assertEqual(cycle.location_at(WI_SUNDAY, time(9, 0)), "brown_deer")
             self.assertEqual(cycle.location_at(WI_SUNDAY, time(16, 59)), "brown_deer")
             self.assertEqual(cycle.location_at(WI_SUNDAY, time(17, 0)), "richfield")
             self.assertEqual(cycle.location_at(WI_SUNDAY, time(21, 0)), "richfield")
-            # the morning location drives the wake; the evening one drives quiet
+            # the morning location drives the wake. Quiet follows the DAY TYPE,
+            # so the move changes neither wake nor quiet — only where he is.
             b = cycle.boundaries(WI_SUNDAY)
         self.assertEqual((b["location"], b["evening_location"]), ("brown_deer", "richfield"))
-        self.assertEqual(b["wake"], time(7, 30))
+        self.assertEqual((b["wake"], b["quiet"]), (time(7, 30), time(22, 30)))
 
     def test_wake_follows_location_not_day_type(self):
         with no_overrides():
