@@ -194,15 +194,21 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
   | | Week 1 | Week 2 |
   |---|---|---|
-  | Sun | MSP home | WI (Richfield) |
+  | Sun | MSP home | WI (**Brown Deer**; → Richfield 17:00) |
   | Mon | MSP work | Travel Richfield → MSP, leave 11:00 |
   | Tue–Thu | MSP work | MSP work |
   | Thu eve | drive to the farm, 5 h | — |
-  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 | MSP work |
+  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 (modelled 2026-09-22) | MSP work |
   | Sat | WI (Brown Deer) | MSP home |
 
 - **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
 - **Each day type carries:** location, whether a departure checklist applies, and whether meals are pre-filled. **Wake time is not one of them — it follows the location** (below).
+- **A day's location is the WAKE location** (Ryan, 2026-09-22). `location_at(d)` with no time answers the morning; `wake_on` reads it at 00:00. A day with a move keeps that morning location as "the day's location".
+- **A move changes neither wake nor quiet.** Wake comes from the morning location; quiet-hours start comes from the DAY TYPE. On the wi Sunday the move at 17:00 leaves wake at 07:30 (Brown Deer) and quiet at 22:30 (`wi`); the wi Friday's 16:00 move leaves wake at 06:00 (Richfield). What a move changes is where he *is* in the evening — `boundaries()['evening_location']`.
+- **The evening half is about to matter** (Ryan, 2026-09-22). The day structure becomes a **morning session plus an evening session**, so `location_at` must be correct for **both halves of every day**, not just the wake. Modelled moves today: the wi **Friday 16:00** Richfield → Brown Deer, and the wi **Sunday 17:00** Brown Deer → Richfield. **Still unmodelled, reported 2026-09-22, no change made:**
+  - **Thursday evening of week 1** — the 5 h drive MSP → Richfield. The whole Thursday resolves to `office`, so an evening session would be placed at the office gym while he is on the road or at the farm.
+  - **The travel Monday, 11:00** — leaves Richfield for MSP, so the afternoon and evening are MSP. The whole day resolves to `richfield`. (This one is midday, not evening.)
+  - **Every `msp_work` day** — the whole day resolves to `office`, but the evening is at home. An evening session would read the office gym's inventory rather than what he has at home. This is the one that touches the most days: 8 of every 14.
 - **Wake time follows the location, not the day type** (corrected 2026-09-19). The travel Monday is a Richfield morning, so keying wake off the day type would need a special case for it; keying off the location doesn't. **The resolver reads the location first, then takes the wake time from it.**
 
   | location | wake |
