@@ -2068,6 +2068,25 @@ def post_ingest(
          "hr_avg", "hr_max", "kcal", "raw"], workout_rows) \
         if workout_rows else 0
 
+    # WATCH-1: match the workouts on every date this push carried (re-sent ones
+    # too: the sets may have been logged since). Same savepoint rule as the
+    # pre-fill: a match failure never costs the ingest. The box job re-matches
+    # recent days for sets logged after the workout arrived.
+    workout_match: dict = {}
+    if workout_rows:
+        try:
+            from knowledge.watch_match import rematch
+            raw_cur = db.connection().connection.cursor()
+            raw_cur.execute("SAVEPOINT watch_match")
+            try:
+                workout_match = rematch(raw_cur, {r["local_date"] for r in workout_rows})
+                raw_cur.execute("RELEASE SAVEPOINT watch_match")
+            except Exception as exc:                   # noqa: BLE001
+                raw_cur.execute("ROLLBACK TO SAVEPOINT watch_match")
+                workout_match = {"error": f"{type(exc).__name__}: {exc}"}
+        except Exception as exc:                       # noqa: BLE001
+            workout_match = {"error": f"{type(exc).__name__}: {exc}"}
+
     # WATCH-1: re-run the pre-fill for TODAY on every ingest, so a value that
     # syncs after the 04:30 wake (resting HR usually does) still lands. Only
     # empty or `watch` fields are filled; a manual value is never touched. A
@@ -2100,6 +2119,7 @@ def post_ingest(
                              "duplicates": {"samples": len(sample_rows) - ins_s,
                                             "workouts": len(workout_rows) - ins_w},
                              "replaced_sleep_nights": replaced_nights,
+                             "workout_match": workout_match,
                              "prefill": prefill},
                             default=str)})
     db.commit()
