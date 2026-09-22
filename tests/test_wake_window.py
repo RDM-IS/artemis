@@ -346,11 +346,14 @@ class TestWakeMessage(unittest.TestCase):
         self.assertNotIn("First lift", msg)
 
     # ── Departure block is location-aware ──
+    # The close is the real FLOW_CLOSE: since YOGA-4 every timed item carries its
+    # own transition_sec, and a hand-written close without one (this fixture's
+    # 9/18 shape) raised KeyError in flow_total_sec.
+    from artemis.health_office import FLOW_CLOSE as _FLOW_CLOSE
     HOME_FLOW = {"plan_id": 3, "session_type": "recovery_flow", "est_duration_min": 30,
                  "blocks": {"type": "recovery_flow", "display_name": "Recovery Flow",
                             "location": "home", "rounds": 2, "total_sec": 1770,
-                            "flow": [], "pre": [], "close": {"name": "Easy pose breathing",
-                                                              "duration_sec": 180}}}
+                            "flow": [], "pre": [], "close": dict(_FLOW_CLOSE)}}
 
     def _depart(self, plan, *, event=True, weather=True, commitments=()):
         from artemis import wake as wake_mod
