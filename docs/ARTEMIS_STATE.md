@@ -729,6 +729,96 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Nothing planned is weather-dependent any more.** The indoor-walk swap (rain or < 40 °F → walking pad) went with the type, and `resolve_equipment_and_location` no longer takes `weather`.
 - **History is kept:** no past `health.plan` row is a walk (checked 2026-09-22 — all 6 are future), and the legacy baseline seeder (`scripts/seed_health_baseline.py`, 5/06–9/19) is untouched.
 
+**EVENING-1 — a morning session and an evening session. DECIDED 2026-09-23; the options that led here are kept below the plan. Nothing built, nothing migrated, nothing seeded — this stops before the first write.** The table sketched a few days ago is stale: walks are retired (WALK-RETIRE), the flows sit on the WI days, and `DAY_SEGMENTS`/`transit` now exist. What follows is what the code and RDS say today, then the choices, framed so they can be decided rather than assumed.
+
+**Decided already (Ryan):** mornings are strength / cardio / rest; evenings are recovery yoga / fitness yoga / rest. **Evening sessions are unprompted** — quiet hours start 17:00 on a work day and that is not changing for them; the 04:30 wake post names tonight's session and he does it when he gets to it.
+
+**What is true today, the 14-day cycle (anchor Sun 2026-09-20):**
+
+  | pos | day | day type | morning (anchor) | evening location | seeded session |
+  |---|---|---|---|---|---|
+  | 0 | Sun | msp_home | home | home | recovery_flow |
+  | 1–3 | Mon–Wed | msp_work | office | **msp_home** | strength_a · cardio_z2 · strength_b |
+  | 4 | Thu | msp_work | office | **transit** (the 5 h drive) | strength_c |
+  | 5 | Fri | wi | Richfield | Brown Deer (16:00) | recovery_flow |
+  | 6 | Sat | wi | Brown Deer | Brown Deer | recovery_flow |
+  | 7 | Sun | wi | Brown Deer | Richfield (17:00) | recovery_flow |
+  | 8 | Mon | travel | Richfield | msp_home (16:00) | recovery_flow |
+  | 9–12 | Tue–Fri | msp_work | office | msp_home | strength_a · cardio_z2 · strength_b · strength_c |
+  | 13 | Sat | msp_home | home | home | recovery_flow |
+
+- **Every one of the 14 days already carries a session** — 6 strength, 2 Z2, 6 flows. There are no rest days in the current program, so "mornings include rest" is itself a change, and an evening session is *additional* load unless a morning is given up.
+- **Evening equipment is not the office gym.** On 10 of 14 days the evening is `msp_home` — mat only, which is exactly what a flow needs and nothing a barbell needs. **Thursday of week 1 has no possible evening session**: he is on the road, and `transit` carries no equipment by rule.
+- **Schema blocks two sessions a day.** `health.plan.plan_date` is **UNIQUE** — one row per date, and 27 call sites read a date expecting one row. `health.session_log.plan_id` is how a set is attributed, so two sessions sharing one row cannot be told apart in the logs, in EVAL-1, or by the workout matcher. (Vestige worth knowing: `plan.generated_by` already permits `autoreg_morning` and `autoreg_evening` — an earlier design assumed this split.)
+- **The matcher is already ready.** `knowledge/watch_match.decide` groups plans **by date as a list** and picks between them on logged rows, so a second session per date needs no change there.
+
+**Option A — how to hold two sessions per date.**
+  1. **A `slot` column** (`morning` / `evening`), `UNIQUE (plan_date, slot)` replacing `UNIQUE (plan_date)`. Each session keeps its own `plan_id`, so `session_log`, EVAL-1 and the matcher attribute themselves with no further change. Cost: a migration plus every one-row-per-date reader (`get_today_plan`, the Lambda `/today` `/plan` `/overview` `/sessions`, gym-display, the check-in, the wake post) has to say which slot it means. **Recommended** — it is the only option where a logged set knows which session it belongs to.
+  2. **Nest the evening inside `blocks`** (e.g. `blocks.evening`). No migration. But both sessions share one `plan_id`, so nothing downstream can separate them; adherence and the matcher would both read one blurred session. Cheap now, wrong later.
+  3. **A separate `health.evening_session` table.** Keeps `plan` untouched, at the cost of a second shape for the same idea and a second set of readers — against the one-system-of-record discipline in spirit.
+
+**Option B — how many evenings a week.** The ceiling is 6 of 7 (Thursday of week 1 is impossible), but the real question is load.
+  1. **2–3 a week**, on the lift days, as a mobility counterweight. Smallest change, easiest to sustain, and it leaves the WI mornings as they are.
+  2. **5 weeknights**, with the weekend free. Predictable, and every weeknight evening is at home on a mat.
+  3. **Every day that allows one** (13 of 14). Maximum volume; most likely to be skipped, and a skipped evening is a missed session in every report unless evenings are counted separately (see Option D).
+
+**Option C — what happens to the six existing flow days.**
+  1. **Flows move to the evening; those mornings become rest.** One session a day still, but at the hour the body wants it. Cleanest read of "mornings strength/cardio/rest".
+  2. **Keep the WI-morning flows and add evenings only on lift days.** Two sessions on lift days, one on WI days.
+  3. **Hybrid:** the two `msp_home` flow days (Sun, Sat) stay in the morning because there is no commute pressure; the four WI/travel flows move to evenings.
+
+**Option D — does YOGA-6 (fitness yoga) block this?**
+  1. **No — start every evening as a Recovery Flow.** The player, voice, Sanskrit cues and logging all exist and have run since 9/19. The evening habit proves itself before a second flow type is built. Saturdays start as recovery flows and become fitness yoga later.
+  2. **Yes — build YOGA-6 first**, so "recovery yoga vs fitness yoga" is a real choice from day one. YOGA-6 is currently *unscheduled* and explicitly "do not spec further until the recovery flow has run a few weeks", which is 4 days of running so far.
+
+**Also to decide, because they follow from the above:** whether "sessions completed vs planned" counts evenings (EVAL-1 and the dietitian report would otherwise double their denominators overnight — the third choice is to report morning adherence and evening adherence separately); whether the check-in's pain and soreness rules adjust the evening row as well as the morning one (today they rewrite the single row); and what the wake post says on a day whose evening is `transit`.
+
+**EVENING-1 PLAN (Ryan's decisions, 2026-09-23).** Slot column, unique on (date, slot); the flows move to evenings; **4 evenings a week** to start; YOGA-6 is **not** a prerequisite; **separate adherence denominators**; a pain day-off clears **both** slots; and the transit evening is stated, not implied.
+
+- **Migration 042 (proposed, not applied).**
+  ```sql
+  ALTER TABLE health.plan
+      ADD COLUMN IF NOT EXISTS slot TEXT NOT NULL DEFAULT 'morning'
+      CHECK (slot IN ('morning', 'evening'));
+  -- every existing row is a morning by construction; the DEFAULT backfills them
+  ALTER TABLE health.plan DROP CONSTRAINT IF EXISTS plan_plan_date_key;
+  ALTER TABLE health.plan ADD CONSTRAINT plan_date_slot_key UNIQUE (plan_date, slot);
+  CREATE INDEX IF NOT EXISTS idx_health_plan_date_slot ON health.plan (plan_date, slot);
+  ```
+  Additive and reversible: the down path drops the new constraint, restores `UNIQUE (plan_date)` and drops the column, and it only succeeds while no date has two rows — the honest failure, since by then the data needs the column. **No column is dropped or renamed, so COLUMN-GREP does not force a code-first ship.** `plan.generated_by` already permits `autoreg_morning` / `autoreg_evening`.
+
+- **The 14-day layout.** Evenings sit on the six days whose morning flow moves, plus one training day per week: **4 a week**. Position 4 — the Thursday of week 1 — **never** gets one: he is in `transit` for the 5 h drive, and no session is ever placed in a transit segment.
+
+  | pos | day | morning | evening | evening is at |
+  |---|---|---|---|---|
+  | 0 | Sun | rest (was flow) | **Recovery Flow** | home |
+  | 1 | Mon | Strength A | — | |
+  | 2 | Tue | Zone 2 | **Recovery Flow** | home |
+  | 3 | Wed | Strength B | — | |
+  | 4 | Thu | Strength C | **none — transit** | the road |
+  | 5 | Fri | rest (was flow) | **Recovery Flow** | Brown Deer |
+  | 6 | Sat | rest (was flow) | **Recovery Flow** | Brown Deer |
+  | 7 | Sun | rest (was flow) | **Recovery Flow** | Richfield |
+  | 8 | Mon (travel) | rest (was flow) | **Recovery Flow** | home |
+  | 9 | Tue | Strength A | — | |
+  | 10 | Wed | Zone 2 | **Recovery Flow** | home |
+  | 11 | Thu | Strength B | — | |
+  | 12 | Fri | Strength C | — | |
+  | 13 | Sat | rest (was flow) | **Recovery Flow** | home |
+
+  Every evening lands where a mat is, which is all a flow needs.
+
+- **The reseed diff (computed read-only against RDS on 2026-09-23; nothing written).** Window 2026-09-24 → 2026-10-31, the seeded program:
+  - **17 mornings rewritten** `recovery_flow` → `rest_mobility`;
+  - **22 evening rows added** (`recovery_flow`, `slot='evening'`, located from the day's **evening** segment, mat only);
+  - **4 evenings in each of weeks 3–7**; week 2 gets 2, because it is half in the past;
+  - **0 logged rows on any affected date**, so nothing rewrites history;
+  - no evening row on the three transit Thursdays — **9/24, 10/8, 10/22**.
+
+- **Code the split needs, in ship order.** (1) The migration. (2) `health_office`: `NON_LIFT` yields a morning and an optional evening, `build_rows` emits both slots, `validate_rows` gains "no evening in a transit segment" and "4 evenings a week". (3) Readers that assume one row per date — `get_today_plan`, the Lambda `/today` `/plan` `/overview` `/sessions`, gym-display, the check-in, the wake post — take a slot, defaulting to `morning`. (4) EVAL-1 counts the slots **separately** (morning adherence and evening adherence, never one blended figure), and the dietitian report follows. (5) The check-in's pain day-off clears **both** slots for the date. (6) The wake post names tonight's session, and says nothing on a transit evening. The workout matcher needs **no change** — it already groups plans by date as a list.
+
+- **Two things to settle before the migration goes in.** (a) A morning rest is written here as a `rest_mobility` row; if a rest morning should have **no row at all**, that changes `get_today_plan`'s "no plan" path and the wake post. (b) The docs say the program is seeded 9/16 → **11/03**, but `OFFICE_END` is **2026-10-31** and RDS has no row after 10/31 — the last three days do not exist. Separate drift; the reseed above stops at 10/31.
+
 ## 7. Operating disciplines (non-negotiable)
 
 Propose-then-confirm · **column-grep before a drop or rename (COLUMN-GREP)** · the Brad Spaits rule (no autonomous external comms; activation gates) · trust-the-data-not-the-report · verify-on-the-live-box · statistics-vs-semantics wall · generated-vs-authored split · CT-anchored "today" · one system of record (RDS) · no-tokens-on-disk (Secrets Manager) · solo-scale (no enterprise patterns) · `feat/*`→PR→`main`, migrate-first deploy. Full detail in `CLAUDE.md`.
