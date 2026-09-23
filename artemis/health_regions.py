@@ -152,7 +152,13 @@ _CLASS_RULES = (
 )
 
 
-def equipment_class(name: str) -> str:
+def equipment_class(name: str, explicit: str | None = None) -> str:
+    """The exercise's class. EXERCISE-CLASS (2026-09-23): the ROW's
+    `equipment_class` wins; the keyword rules below are a fallback for rows
+    seeded before the class travelled, and they only know the office's
+    vocabulary — "TRX row" reads as `machine` to them."""
+    if explicit:
+        return explicit
     n = (name or "").lower().strip()
     if n in _EXACT_CLASS:
         return _EXACT_CLASS[n]
@@ -169,15 +175,16 @@ def _reachable_totals(bar: int) -> list[int]:
     return sorted(bar + 2 * s for s in sums)
 
 
-def lighter_load(name: str, last: float) -> float | None:
+def lighter_load(name: str, last: float, explicit_class: str | None = None) -> float | None:
     """80% of `last`, rounded DOWN to a load the office can actually make.
 
     Never returns `last` or more: if the rounding lands there, the next lower
     reachable load is used; at the bottom of the range the minimum stays.
     None for bodyweight work (no load to lighten).
     """
-    cls = equipment_class(name)
-    if cls == "bodyweight" or last is None or last <= 0:
+    cls = equipment_class(name, explicit=explicit_class)
+    # bands / TRX carry no numeric load, so there is nothing to lighten.
+    if cls in ("bodyweight", "bands", "trx") or last is None or last <= 0:
         return None
     goal = float(last) * 0.8
     if cls == "dumbbell":

@@ -124,9 +124,70 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
     ],
 }
 
-# Explicit blocks.exercises[].equipment_class for names the keyword rules
-# once read differently ("back extension" used to mean bodyweight).
-EQUIPMENT_CLASS = {"Seated back extension": "machine"}
+# ── The equipment class of every exercise, explicitly ───────────────────────
+#
+# EXERCISE-CLASS (Ryan, 2026-09-23): the class travels ON THE ROW for every
+# exercise, not just for the handful the keyword rules once misread. Inference
+# from the NAME stays only as a fallback for rows seeded before this.
+#
+# Why: the rules were written for the office and misread any other gym's
+# vocabulary — "Band pulldown" reads as `machine` (and would offer a 10 lb
+# stack step), "TRX row" as `machine`, "Ball hamstring curl" as `dumbbell`,
+# "Lying leg raise" as `dumbbell` rather than bodyweight. LOCATION-1 makes that
+# vocabulary real, so the guessing has to stop first.
+#
+# Every name this generator can emit, and every name already in RDS, is here.
+# `class_for` raises on anything unknown: a new exercise without a class is a
+# build error, not a silent `dumbbell`.
+EQUIPMENT_CLASS: dict[str, str] = {
+    # office — machines
+    "Leg press": "machine",
+    "Lat pulldown": "machine",
+    "Seated leg curl": "machine",
+    "Leg extension": "machine",
+    "Pec fly": "machine",
+    "Rear delt fly": "machine",
+    "Calf press": "machine",
+    "Ab machine crunch": "machine",
+    "Seated back extension": "machine",
+    # the Pulldown/Seated Row machine, despite "cable" in the name
+    "Seated cable row": "machine",
+    # office — functional trainer
+    "Cable face pull (rope)": "cable",
+    "Cable Pallof press": "cable",
+    "Single-arm cable row": "cable",
+    # office — dumbbells
+    "DB bench press": "dumbbell",
+    "Incline DB press": "dumbbell",
+    "DB goblet squat": "dumbbell",
+    "DB Romanian deadlift": "dumbbell",
+    "Seated DB shoulder press": "dumbbell",
+    # bodyweight
+    "Captain's chair knee raise": "bodyweight",
+    # ── pre-office history (the home-gym baseline, 5/06-9/15). Kept so the
+    # backfill can class every row in RDS, not only the current program.
+    "Band chest press": "bands",
+    "Band pull-apart": "bands",
+    "TRX row": "trx",
+    "TRX single-leg DL": "trx",
+    "DB floor press": "dumbbell",
+    "DB RDL": "dumbbell",
+    "Goblet squat": "dumbbell",
+    "Bicep curl": "dumbbell",
+    "Reverse lunge": "bodyweight",
+}
+
+
+def class_for(name: str) -> str:
+    """The exercise's equipment class. Raises on an unknown name — a new
+    exercise without a class is a build error, never a silent `dumbbell`."""
+    try:
+        return EQUIPMENT_CLASS[name]
+    except KeyError:
+        raise KeyError(
+            f"{name!r} has no equipment_class. Add it to health_office."
+            "EQUIPMENT_CLASS — guessing from the name is what LOCATION-1 removes."
+        ) from None
 
 _DISPLAY = {
     "strength_a": "Office Strength A",
@@ -250,9 +311,7 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
     if name == "DB goblet squat" and week_num in (5, 6):
         notes.append("alt: Smith squat")
     ex = {"name": name, "format": "reps", "target_reps": top, "rest_after_sec": 60,
-          "notes": "; ".join(notes)}
-    if name in EQUIPMENT_CLASS:
-        ex["equipment_class"] = EQUIPMENT_CLASS[name]
+          "notes": "; ".join(notes), "equipment_class": class_for(name)}
     if week_num <= 2:
         ex["target_load_lbs"] = None  # finding weights
     return ex
@@ -815,6 +874,10 @@ def validate_rows(rows: list[dict]) -> list[str]:
             assert b.get("location") == LOCATION
             assert b.get("warmup") == WARMUP and b.get("cooldown") == COOLDOWN
             assert b["exercises"] and all("name" in e and "format" in e for e in b["exercises"])
+            # EXERCISE-CLASS: the class travels on the row, always.
+            for e in b["exercises"]:
+                assert e.get("equipment_class") == class_for(e["name"]), \
+                    f"{r['plan_date']}: {e['name']} carries {e.get('equipment_class')!r}"
         if r["session_type"] == "recovery_flow":
             assert b["type"] == "recovery_flow"
             validate_flow(b)
