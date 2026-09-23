@@ -90,6 +90,44 @@ def _minus_minutes(hour: int, minute: int, delta: int) -> tuple[int, int]:
 
 
 @dataclass(frozen=True)
+class IntervalSpec:
+    """One interval job. THE registry for them, the way CronSpec is for cron.
+
+    start() registers exactly these and nothing else, so the live scheduler can
+    be checked against the code instead of against a job count someone has to
+    remember (tests/test_scheduler_registry).
+    """
+    id: str
+    func_name: str
+    every: dict                      # APScheduler interval kwargs
+    needs_billing_scopes: bool = False
+    note: str = ""
+
+
+# Timezone-independent. The business ones check _is_open() themselves.
+INTERVAL_SPECS: tuple[IntervalSpec, ...] = (
+    IntervalSpec("inbox_triage", "job_inbox_triage", {"minutes": 5}),
+    IntervalSpec("triage_batch", "job_post_triage_batch", {"minutes": 30}),
+    IntervalSpec("pre_meeting", "job_pre_meeting_briefs", {"minutes": 10}),
+    IntervalSpec("inbox_zero_audit", "job_inbox_zero_audit", {"minutes": 60}),
+    IntervalSpec("action_item_reminders", "job_action_item_reminders", {"minutes": 30}),
+    IntervalSpec("demo_intake", "job_demo_intake", {"minutes": 5}, note="PB-001"),
+    IntervalSpec("billing_intake", "job_billing_intake", {"minutes": 15},
+                 needs_billing_scopes=True, note="PB-007"),
+    IntervalSpec("ws_watchdog", "job_ws_watchdog", {"seconds": 60}, note="STAB-1 A2"),
+    IntervalSpec("override_expiry_check", "job_override_expiry_check", {"minutes": 1},
+                 note="working-session inactivity"),
+    # WAKE-1: the ONLY path that switches the active timezone.
+    IntervalSpec("tz_sync", "job_tz_sync", {"seconds": 60}, note="WAKE-1"),
+    # A goodnight with a custom wake time: the 04:30 cron returns early.
+    IntervalSpec("wake_watch", "job_wake_watch", {"minutes": 1}, note="WAKE-1"),
+    # WATCH-1: a workout can land before its sets are logged.
+    IntervalSpec("watch_workout_match", "job_watch_workout_match", {"minutes": 30},
+                 note="WATCH-1"),
+)
+
+
+@dataclass(frozen=True)
 class CronSpec:
     """One cron job, in LOCAL wall-clock time.
 
@@ -338,43 +376,19 @@ class ArtemisScheduler:
         from artemis.quiet_hours import get_active_timezone
 
         # ── Interval jobs (timezone-independent) ──
-        # Business intervals require the OPEN phase; each checks _is_open().
-        self.scheduler.add_job(self.job_inbox_triage, "interval", minutes=5, id="inbox_triage")
-        self.scheduler.add_job(self.job_post_triage_batch, "interval", minutes=30, id="triage_batch")
-        self.scheduler.add_job(self.job_pre_meeting_briefs, "interval", minutes=10, id="pre_meeting")
-        self.scheduler.add_job(self.job_inbox_zero_audit, "interval", minutes=60, id="inbox_zero_audit")
-        self.scheduler.add_job(self.job_action_item_reminders, "interval", minutes=30,
-                               id="action_item_reminders")
-        self.scheduler.add_job(self.job_demo_intake, "interval", minutes=5, id="demo_intake")
-        logger.info("PB-001 demo intake enabled")
-
+        # INTERVAL_SPECS is the registry; no add_job(..., "interval", ...) call
+        # may live outside this loop. Business intervals check _is_open().
         scopes_ok, missing = check_billing_scopes()
-        if scopes_ok:
-            self.scheduler.add_job(self.job_billing_intake, "interval", minutes=15, id="billing_intake")
-            logger.info("PB-007 billing intake enabled")
-        else:
-            logger.warning("PB-007 billing intake disabled — missing scopes: %s", missing)
-
-        # STAB-1 A2: websocket watchdog — every 60s.
-        self.scheduler.add_job(self.job_ws_watchdog, "interval", seconds=60, id="ws_watchdog")
-
-        # Working session inactivity check — every 1 minute.
-        self.scheduler.add_job(self.job_override_expiry_check, "interval", minutes=1,
-                               id="override_expiry_check")
-
-        # WAKE-1: the schedule follows the active timezone. This is the ONLY
-        # path that switches it (replaces the old noon expiry cron), and it also
-        # sweeps an expired override and announces the change.
-        self.scheduler.add_job(self.job_tz_sync, "interval", seconds=60, id="tz_sync")
-
-        # A goodnight with a custom wake time ("wake me at 6") must actually
-        # wake — the 04:30 cron alone returned early and nothing re-checked.
-        self.scheduler.add_job(self.job_wake_watch, "interval", minutes=1, id="wake_watch")
-
-        # WATCH-1: re-match recent watch workouts to their sessions. A workout
-        # can land before its sets are logged; the ingest only sees the former.
-        self.scheduler.add_job(self.job_watch_workout_match, "interval", minutes=30,
-                               id="watch_workout_match")
+        for spec in INTERVAL_SPECS:
+            if spec.needs_billing_scopes and not scopes_ok:
+                logger.warning("%s %s disabled — missing scopes: %s",
+                               spec.note or spec.id, spec.id, missing)
+                continue
+            self.scheduler.add_job(getattr(self, spec.func_name), "interval",
+                                   id=spec.id, **spec.every)
+            if spec.note:
+                logger.info("%s %s enabled (every %s)", spec.note, spec.id,
+                            ", ".join(f"{v} {k}" for k, v in spec.every.items()))
 
         # ── Cron jobs: registry, in the active timezone ──
         self.apply_timezone(get_active_timezone())

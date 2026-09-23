@@ -150,21 +150,34 @@ def merge_minutes(stored: dict | None, incoming: dict) -> dict:
 
 def summarise_minutes(minutes: dict) -> dict:
     """value / sample_count / overlap_minutes / first_at / last_at / devices
-    for one hour's minute map. overlap_minutes counts minutes that have more
-    than one key, i.e. separate samples from different devices."""
+    for one hour's minute map.
+
+    THE VALUE TAKES THE MAXIMUM PER MINUTE, NEVER THE SUM ACROSS DEVICE
+    MARKERS (Ryan, 2026-09-22). Apple exports the same minute more than once
+    when it merges sources: 06:08 on 9/21 arrived as `RAW` = 18.0 and
+    `RAW|RIP` = 18.0 — one set of steps described twice, not 36 steps. Adding
+    them inflated 9/21 by 109 steps and 9/22 by 27. The larger value wins when
+    they differ, because a marker covering two devices can only be a superset
+    of the one covering a single device. Every sample is still STORED under its
+    own key, and overlap_minutes still reports how many minutes arrived twice
+    — nothing is dropped, it just isn't counted twice.
+
+    This applies to every hourly metric keyed `minute|device`, not just steps.
+    """
     per_minute: dict = {}
     devices = set()
-    for key in minutes:
+    for key, value in minutes.items():
         minute, _, device = key.partition("|")
-        per_minute[minute] = per_minute.get(minute, 0) + 1
+        seen = per_minute.setdefault(minute, [])
+        seen.append(value)
         if device:
             devices.add(device)
     stamps = sorted(per_minute)
     parse = lambda m: datetime.strptime(m, "%Y-%m-%dT%H:%MZ").replace(tzinfo=_UTC)  # noqa: E731
     return {
-        "value": round(sum(minutes.values()), 4),
+        "value": round(sum(max(vals) for vals in per_minute.values()), 4),
         "sample_count": len(minutes),
-        "overlap_minutes": sum(1 for n in per_minute.values() if n > 1),
+        "overlap_minutes": sum(1 for vals in per_minute.values() if len(vals) > 1),
         "first_at": parse(stamps[0]) if stamps else None,
         "last_at": parse(stamps[-1]) + timedelta(minutes=1) if stamps else None,
         "devices": sorted(devices),

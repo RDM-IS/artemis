@@ -391,5 +391,62 @@ class TestWeeklyEvalJob(unittest.TestCase):
         load.assert_not_called()
         s.mm.post_message.assert_not_called()
 
+class TestLiveRegistryMatchesTheCode(unittest.TestCase):
+    """The job list is self-verifying: start() must register exactly the specs
+    declared in code (CronSpec + IntervalSpec), so no report has to compare the
+    live scheduler against a count someone wrote down a week ago."""
+
+    def _start(self, *, scopes_ok=True):
+        """Run start() against a fake APScheduler and return the ids it added."""
+        from artemis.scheduler import ArtemisScheduler
+        s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
+        fake = MagicMock()
+        fake.get_job.return_value = None
+        s.scheduler = fake
+        with patch("artemis.scheduler.check_billing_scopes",
+                   return_value=(scopes_ok, [] if scopes_ok else ["gmail.readonly"])), \
+             patch("artemis.scheduler.load_playbooks"), \
+             patch("artemis.quiet_hours.get_active_timezone", return_value="America/Chicago"), \
+             patch("artemis.quiet_hours.set_system_value"):
+            s.start()
+        added = [c.kwargs.get("id") or c.args[2] for c in fake.add_job.call_args_list]
+        return s, added
+
+    def test_start_registers_exactly_the_declared_specs(self):
+        from artemis.scheduler import INTERVAL_SPECS
+        s, added = self._start()
+        expected = {spec.id for spec in INTERVAL_SPECS} | {c.id for c in s.cron_specs()}
+        self.assertEqual(sorted(added), sorted(set(added)), f"duplicate job ids: {added}")
+        self.assertEqual(set(added), expected)
+        # and the count follows from the code, not from anyone's memory
+        self.assertEqual(len(added), len(INTERVAL_SPECS) + len(s.cron_specs()))
+
+    def test_billing_intake_is_the_only_conditional_job(self):
+        from artemis.scheduler import INTERVAL_SPECS
+        _, with_scopes = self._start(scopes_ok=True)
+        _, without = self._start(scopes_ok=False)
+        self.assertEqual(set(with_scopes) - set(without), {"billing_intake"})
+        self.assertEqual([spec.id for spec in INTERVAL_SPECS if spec.needs_billing_scopes],
+                         ["billing_intake"])
+
+    def test_every_spec_names_a_real_job_method(self):
+        from artemis.scheduler import INTERVAL_SPECS, ArtemisScheduler
+        s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
+        for spec in INTERVAL_SPECS:
+            with self.subTest(job=spec.id):
+                self.assertTrue(callable(getattr(s, spec.func_name, None)), spec.func_name)
+                self.assertTrue(spec.every, "an interval job needs a period")
+        for c in s.cron_specs():
+            with self.subTest(job=c.id):
+                self.assertTrue(callable(getattr(s, c.func_name, None)), c.func_name)
+
+    def test_no_interval_job_is_registered_outside_the_registry(self):
+        src = (_REPO_ROOT / "artemis" / "scheduler.py").read_text()
+        body = src[src.index("    def start(self):"):src.index("    def stop(self):")]
+        self.assertEqual(body.count("self.scheduler.add_job("), 1,
+                         "start() must add jobs only from INTERVAL_SPECS")
+        self.assertIn("for spec in INTERVAL_SPECS:", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
