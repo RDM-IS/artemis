@@ -242,15 +242,44 @@ class TestStepsHourly(unittest.TestCase):
         merged = wp.merge_minutes(a[key]["minutes"], b[key]["minutes"])
         self.assertEqual(wp.summarise_minutes(merged)["value"], 45)
 
-    def test_two_devices_in_one_minute_are_kept_and_flagged_not_guessed(self):
+    def test_two_devices_in_one_minute_are_kept_and_counted_once(self):
+        """Both samples are STORED and the minute is flagged, but the hour
+        counts the minute once — the larger value (Ryan, 2026-09-22)."""
         watch = self._payload("step_count", [("2026-09-22 06:05:00 -0500", 30)], "RAW")
         phone = self._payload("step_count", [("2026-09-22 06:05:00 -0500", 28)], "RIP")
         watch["data"]["metrics"] += phone["data"]["metrics"]
         b = self._buckets(watch)
-        s = wp.summarise_minutes(next(iter(b.values()))["minutes"])
-        self.assertEqual(s["overlap_minutes"], 1)
-        self.assertEqual(s["value"], 58)                 # both counted, and flagged
+        minutes = next(iter(b.values()))["minutes"]
+        s = wp.summarise_minutes(minutes)
+        self.assertEqual(len(minutes), 2)                # nothing dropped
+        self.assertEqual(s["overlap_minutes"], 1)        # still reported
+        self.assertEqual(s["value"], 30)                 # counted once, the larger
+        self.assertEqual(s["sample_count"], 2)
         self.assertEqual(s["devices"], ["RAW", "RIP"])
+
+    def test_the_same_minute_under_both_markers_counts_once(self):
+        """The real 9/21 shape: RAW 18.0 and RAW|RIP 18.0 at 06:08 is one set
+        of steps described twice, not 36."""
+        watch = self._payload("step_count", [("2026-09-21 01:08:00 -0500", 18.0)], "RAW")
+        both = self._payload("step_count", [("2026-09-21 01:08:00 -0500", 18.0)], "RAW|RIP")
+        watch["data"]["metrics"] += both["data"]["metrics"]
+        s = wp.summarise_minutes(next(iter(self._buckets(watch).values()))["minutes"])
+        self.assertEqual((s["value"], s["overlap_minutes"], s["sample_count"]), (18.0, 1, 2))
+
+    def test_a_single_marker_minute_is_unchanged(self):
+        one = self._payload("step_count", [("2026-09-22 06:05:00 -0500", 42),
+                                           ("2026-09-22 06:06:00 -0500", 13)], "RAW|RIP")
+        s = wp.summarise_minutes(next(iter(self._buckets(one).values()))["minutes"])
+        self.assertEqual((s["value"], s["overlap_minutes"]), (55, 0))
+
+    def test_exercise_minutes_dedupe_the_same_way(self):
+        """The rule is per hourly metric keyed minute|device, not per metric
+        name. apple_exercise_time has the same shape."""
+        watch = self._payload("apple_exercise_time", [("2026-09-22 06:05:00 -0500", 1)], "RAW")
+        both = self._payload("apple_exercise_time", [("2026-09-22 06:05:00 -0500", 1)], "RAW|RIP")
+        watch["data"]["metrics"] += both["data"]["metrics"]
+        s = wp.summarise_minutes(next(iter(self._buckets(watch).values()))["minutes"])
+        self.assertEqual((s["value"], s["overlap_minutes"]), (1, 1))
 
     def test_summary_bounds_and_counts(self):
         b = self._buckets(self._payload("apple_exercise_time", [
