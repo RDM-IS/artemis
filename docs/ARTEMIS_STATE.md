@@ -622,7 +622,9 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 **EXTRACT-DEDUPE-MONITOR — extraction dedupe monitoring (low).** The OPS-1 prompt tuning added cross-type dedupe + commitment-direction + decision-ownership discipline. Watch the proposal stream for residual duplicates (same fact under two types) and mis-directed commitments; if the prompt guidance proves insufficient, add a deterministic post-extraction dedupe pass over `vault.extraction_proposal` before proposals surface.
 
-**Papercuts.** SIGTERM-ignored shutdown (90s SIGKILL every restart — likely websocket/scheduler not closing on signal); Mattermost websocket flap (~60s reconnect loop); SSO re-auth friction (longer session or self-healing ProxyCommand); Mac-vs-EC2 prompt confusion (distinct prompt / dedicated tab).
+**Papercuts.** ~~SIGTERM-ignored shutdown (90s SIGKILL every restart)~~ **— already fixed, struck 2026-09-23**; Mattermost websocket flap (~60s reconnect loop); SSO re-auth friction (longer session or self-healing ProxyCommand — the `rdmis-admin` SSO token expires overnight, and exporting that profile breaks the SSM ProxyCommand: see CLAUDE.md); Mac-vs-EC2 prompt confusion (distinct prompt / dedicated tab).
+
+- **SIGTERM — CLOSED 2026-09-23, no code change needed.** STAB-1 A3 fixed it on 2026-07-17 (`58f29b9`): `signal_handler` runs a time-boxed `_shutdown_cleanup` (the shutdown notice is a daemon thread joined with a 2 s timeout, the scheduler stops with `wait=False`, the websocket and DB pool close best-effort) and then calls `os._exit(0)`, which is what makes the exit prompt even with Flask's blocking server on the main thread. **Evidence, checked on the box:** the retained journal (2026-09-11 onward, 30+ restarts) contains **zero** `SIGKILL`, `Killing process` or `timed out` lines, and every `Stopping` → `Stopped` pair lands in the same second. A measured restart on 2026-09-23 took **0.19 s** wall time, with "Shutting down (signal 15)" logged in the same second as the stop. The backlog line above described behaviour that had been gone for two months.
 
 ---
 
