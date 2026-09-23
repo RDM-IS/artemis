@@ -293,7 +293,8 @@ class TestNagLogic(unittest.TestCase):
 
     def test_no_numeric_load_classes_have_nothing_to_lighten(self):
         from artemis import health_regions as hr
-        for cls in ("bodyweight", "bands", "trx"):
+        self.assertEqual(hr.NO_LOAD_CLASSES, ("bodyweight", "bands", "trx", "cardio"))
+        for cls in hr.NO_LOAD_CLASSES:
             with self.subTest(cls=cls):
                 self.assertIsNone(hr.lighter_load("Whatever", 100.0, explicit_class=cls))
         # a real load still lightens, rounded down to something reachable

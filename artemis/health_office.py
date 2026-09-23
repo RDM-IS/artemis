@@ -175,6 +175,19 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "Goblet squat": "dumbbell",
     "Bicep curl": "dumbbell",
     "Reverse lunge": "bodyweight",
+    # core / finisher work, office and home: no load of its own
+    "Plank": "bodyweight",
+    "Side plank": "bodyweight",
+    "Hollow hold": "bodyweight",
+    "Dead bug": "bodyweight",
+    "Bird dog": "bodyweight",
+    "Ball plank": "bodyweight",
+    "TRX fallout": "trx",
+    # the home-gym Pallof was a band; the office one is "Cable Pallof press"
+    "Pallof press": "bands",
+    # a legacy interval block, not a lift: duration work with no load. `cardio`
+    # is a no-numeric-load class like bands and trx.
+    "Stepmill or upright bike": "cardio",
 }
 
 

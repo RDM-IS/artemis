@@ -697,7 +697,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             name = ex["name"]
             if ex.get("added_by") == "checkin" or not hr.uses_any(name, pain_2, primary_only=True, sides=sides):
                 continue
-            if hr.equipment_class(name, ex.get("equipment_class")) in ("bodyweight", "bands", "trx"):
+            if hr.equipment_class(name, ex.get("equipment_class")) in hr.NO_LOAD_CLASSES:
                 continue
             last = last_loads.get(name)
             if last is None:

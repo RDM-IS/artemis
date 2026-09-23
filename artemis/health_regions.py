@@ -152,6 +152,10 @@ _CLASS_RULES = (
 )
 
 
+#: Classes that carry no numeric load — there is nothing to step or lighten.
+NO_LOAD_CLASSES = ("bodyweight", "bands", "trx", "cardio")
+
+
 def equipment_class(name: str, explicit: str | None = None) -> str:
     """The exercise's class. EXERCISE-CLASS (2026-09-23): the ROW's
     `equipment_class` wins; the keyword rules below are a fallback for rows
@@ -184,7 +188,7 @@ def lighter_load(name: str, last: float, explicit_class: str | None = None) -> f
     """
     cls = equipment_class(name, explicit=explicit_class)
     # bands / TRX carry no numeric load, so there is nothing to lighten.
-    if cls in ("bodyweight", "bands", "trx") or last is None or last <= 0:
+    if cls in NO_LOAD_CLASSES or last is None or last <= 0:
         return None
     goal = float(last) * 0.8
     if cls == "dumbbell":
