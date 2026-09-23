@@ -311,6 +311,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 **ZONE-1 — time in zone from minute-level heart rate (small; data only; BLOCKED until there is an observed max HR).** The Z2 sessions carry a target zone, and a workout's single average HR cannot show whether the session was actually spent in it or drifted. With `health.watch_heart_rate` (037) the answer is arithmetic: intersect the minute samples with the session window and report minutes per zone.
 - **Data only.** Minutes in each zone, and the share of the session. **No verdict, no "too easy / too hard", no plan change** — the same rule EVAL-1 follows.
 - **Zone thresholds are NEVER computed from a formula** (Ryan, 2026-09-20). No 220-minus-age, no estimate. The basis is **Ryan's own observed max HR across logged sessions**, taken once there are a few weeks of workout HR in `health.watch_heart_rate`. **Until that exists, ZONE-1 stays unbuilt** — reporting bands off a guessed maximum would be a fabricated number wearing a data label.
+- **Intensity bands (Ryan, 2026-09-21), as a percentage of the OBSERVED max HR:** **light < 64 %**, **moderate 64–76 %**, **vigorous ≥ 77 %**. A minute is placed by its bpm against these cut-offs. The observed-max rule above still governs: no formula, and **no bands at all until a few weeks of workout HR exist**. Consumer: the dietitian report's active-minutes chart (the light / moderate / vigorous stack).
 - **Session window** is the logged session's span, or a matched `watch_workout` when one exists. No overlap → no zone line, never a guess.
 - **Consumers:** the daily and weekly reports (EXPORT-1), and EVAL-1's recovery area.
 
@@ -320,32 +321,13 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Design notes, for whenever it's built:** bucket by metric and hour, value = sum of `qty`, plus `sample_count` and first/last minute. Pushes overlap and resend minutes, so an ingest must NOT add to a stored bucket (that double-counts). Replace the bucket when the incoming payload has at least as many minutes for that hour. Keep one representative `raw` per bucket, not all 60. Existing rows could be rolled up by a one-off migration, with an export to the box first. Decide then.
 - **What is lost:** minute-level active energy inside a session. On 9/21 it was the only calorie evidence for the unrecorded workout (~217 kcal over 05:21–05:51). A `watch_workout` record carries its own kcal, so that stops mattering once workouts arrive. Hourly still covers daily energy-out for DIET-1.
 
-**STEPS-HOURLY — re-enable `step_count` ingest as hourly totals (small; PROPOSED 2026-09-21, not approved to build; needed by the dietitian report's steps chart).** `step_count` is on the ingest's ignore list today: it is counted and named in the response, but no row is written. The latest push carried 284 step samples. `apple_exercise_time` (4 samples) is ignored the same way.
-- **Store, per the ENERGY-HOURLY design:** a new table, not `watch_sample`, so the minute-level energy there is untouched until ENERGY-HOURLY itself is decided.
-  ```sql
-  CREATE TABLE IF NOT EXISTS health.watch_hourly (
-      metric        TEXT NOT NULL,          -- 'step_count' (and 'apple_exercise_time' if approved)
-      hour_start    TIMESTAMPTZ NOT NULL,   -- the UTC instant the hour opens
-      local_date    DATE NOT NULL,          -- fixed at ingest from the active timezone, like watch_sample
-      value         NUMERIC NOT NULL,       -- the hour's total
-      unit          TEXT,
-      sample_count  INT NOT NULL,           -- samples that made up this total
-      first_at      TIMESTAMPTZ NOT NULL,
-      last_at       TIMESTAMPTZ NOT NULL,
-      device        TEXT,
-      raw           JSONB,                  -- one representative sample, not all of them
-      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (metric, hour_start)
-  );
-  ```
-- **A push REPLACES an hour's total; it never adds to it.** Pushes overlap and resend samples, so adding would double-count. The rule is `INSERT … ON CONFLICT (metric, hour_start) DO UPDATE … WHERE EXCLUDED.sample_count >= health.watch_hourly.sample_count`. A later push with as many or more samples for the hour replaces it; a push with fewer (a partial window) leaves it alone.
-- **Changes:**
-  - `knowledge/watch_payload.py`: route `step_count` (and `apple_exercise_time` if approved) to the hourly bucketer instead of the ignore list. Everything else on the ignore list stays ignored and named.
-  - The ingest endpoint in `api/app/routers/health.py` writes the buckets in the same transaction. Its audit row reports `hourly_buckets` written and replaced.
-  - Migration first, then the Lambda deploy (the preflight applies).
-- **Verify before trusting it:** steps come from BOTH the iPhone and the watch. Before any report uses them, compare one full day's stored total against the Health app's step count for that day. If the export double-counts the two devices, the fix is a per-device choice (the pattern `prefers_watch` already uses), not a guess.
+**STEPS-HOURLY — `step_count` and `apple_exercise_time` as hourly totals — BUILT 2026-09-21 (approved by Ryan the same day; migration 041; Lambda ingest).** Both were on the ingest's ignore list: counted and named, never stored. The dietitian report's activity charts need them.
+- **Store:** `health.watch_hourly` (migration 041), one row per (metric, local hour). `hour_start` is the local hour in the active timezone; `local_date` is fixed at ingest. `watch_sample` and its minute-level energy are untouched.
+- **Never additive — a push merges by minute (deviation from the proposal, deliberate).** The proposal replaced an hour's total when a push had at least as many samples. That still loses data when a push covers only part of an hour: the second half of an hour can carry as many samples as the first and would replace it. So each row keeps its per-minute values in `minutes` (JSONB, keyed `<UTC minute>|<device>`). An ingest merges the push's minutes by key: a resent minute overwrites itself, a new minute is added. `value` is always recomputed from the map. An overlapping resend can't double-count, and a partial push can't shrink the hour. Rows are locked `FOR UPDATE` during the merge. At most 60 keys per device per hour.
+- **Two devices:** a minute that arrives as two separate samples (watch and iPhone) keeps both keys, and **both are counted in `value`**. It is flagged in `overlap_minutes` and `devices`, not resolved by guessing. **The one-day comparison against the Health app's step count (below) decides whether that happens and what to do.**
+- **Code:** `knowledge/watch_payload.py` (`HOURLY`, `is_hourly`, `bucket_hourly`, `merge_minutes`, `summarise_minutes`; `parse_counts` reports `hourly_samples`). `api/app/routers/health.py` (`_upsert_hourly`, called in the ingest transaction; the audit row and response report `hourly` = new / updated / unchanged / overlap_minutes). Tests in `tests/test_watch_ingest.py` (`TestStepsHourly`). Verified against RDS in a rolled-back transaction before the migration was applied.
+- **Before any report uses steps:** compare one full day's `sum(value)` for `step_count` with the Health app's step count for that day, and check `overlap_minutes`. Report whether the iPhone and the watch are double-counted.
 - **History:** none. Steps start on the deploy date; earlier days show "no data".
-- **Tests:** an overlapping re-push doesn't double-count; a partial push doesn't shrink an hour; the hour boundaries come out right in the active timezone; the audit counts.
 
 **SLEEP-PERF — does sleep show up in performance? (small; data only; NOT before ~4 weeks of watch sleep, so no earlier than ~2026-10-19).** Ryan, 2026-09-21: sleep < 6 was removed as a recovery trigger; energy drives recovery. This checks whether that was right.
 - **Data only:** per training day, performance — load, reps, RPE vs cap — beside watch sleep, typed sleep and typed energy for that morning. Tables and simple pairings; no model, no verdict.
@@ -562,8 +544,8 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
           - At 28–31 days, the per-bar labels go vertical in small type. If a month can't fit two pages, stop and raise it at build time; never drop days or labels to make it fit.
         - **Sources:**
           - Steps come from `step_count`, stored hourly (STEPS-HOURLY, below).
-          - **Active minutes, total (before ZONE-1): Apple's exercise minutes (`apple_exercise_time`).** It is also ignored at ingest today and would need the same hourly store, and its source is stated in the footer.
-          - Once ZONE-1 exists, the stack and its total both come from heart-rate minutes in zone. The footer states which definition a report uses. **Open, decide before build:** which ZONE-1 zones count as light / moderate / vigorous.
+          - **Active minutes, total, before ZONE-1 (decided 2026-09-21): Apple's exercise minutes (`apple_exercise_time`, from `health.watch_hourly`).** The chart shows this total unstacked, and **the footer names the definition**: "Active minutes: Apple Watch exercise minutes."
+          - Once ZONE-1 exists, the stack uses ZONE-1's bands (light < 64 %, moderate 64–76 %, vigorous ≥ 77 % of observed max HR), and its total comes from heart-rate minutes in those bands. The footer then names that definition instead.
       - **Per-day table:** date, day type, recording status, kcal, protein, carbohydrate, fat, fiber, and the share from `estimate`/`placeholder`.
       - **Recurring meals:** the default work day, each item with portion, kcal, protein and `macro_basis`, so she can see what "planned" contains. Below it, foods logged 2 or more times as deviations.
       - **Footer:** definitions of each recording status and basis. "Figures are recorded data only."

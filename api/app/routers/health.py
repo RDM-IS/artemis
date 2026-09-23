@@ -1918,6 +1918,55 @@ def _bulk_insert(db: Session, sql_head: str, cols: list[str], rows: list[dict]) 
     return inserted
 
 
+def _upsert_hourly(db: Session, buckets: dict, merge_minutes, summarise_minutes) -> dict:
+    """STEPS-HOURLY: write this push's hourly buckets into health.watch_hourly.
+
+    NEVER additive. Each stored hour keeps its per-minute values; the push's
+    minutes are MERGED in by key (a resent minute overwrites itself), and the
+    hour's total is recomputed from the merged map. So an overlapping push
+    can't double-count and a partial one can't shrink the hour. Rows are
+    locked FOR UPDATE so two concurrent pushes can't lose each other's minutes.
+    Returns {new, updated, unchanged, overlap_minutes}."""
+    result = {"new": 0, "updated": 0, "unchanged": 0, "overlap_minutes": 0}
+    if not buckets:
+        return result
+    stored_rows = db.execute(text(
+        "SELECT metric, hour_start, minutes FROM health.watch_hourly "
+        "WHERE metric = ANY(:metrics) AND hour_start = ANY(:hours) FOR UPDATE"),
+        {"metrics": sorted({m for m, _ in buckets}),
+         "hours": sorted({h for _, h in buckets})}).mappings().all()
+    stored = {}
+    for r in stored_rows:
+        mins = r["minutes"]
+        stored[(r["metric"], r["hour_start"])] = json.loads(mins) if isinstance(mins, str) else mins
+    for key, b in buckets.items():
+        previous = stored.get(key)
+        merged = merge_minutes(previous, b["minutes"])
+        if previous is not None and merged == previous:
+            result["unchanged"] += 1
+            continue
+        summary = summarise_minutes(merged)
+        result["overlap_minutes"] += summary["overlap_minutes"]
+        db.execute(text(
+            "INSERT INTO health.watch_hourly (metric, hour_start, local_date, value, unit, "
+            "sample_count, overlap_minutes, first_at, last_at, devices, minutes, updated_at) "
+            "VALUES (:metric, :hour_start, :local_date, :value, :unit, :sample_count, "
+            ":overlap_minutes, :first_at, :last_at, :devices, CAST(:minutes AS jsonb), now()) "
+            "ON CONFLICT (metric, hour_start) DO UPDATE SET "
+            "local_date = EXCLUDED.local_date, value = EXCLUDED.value, unit = EXCLUDED.unit, "
+            "sample_count = EXCLUDED.sample_count, overlap_minutes = EXCLUDED.overlap_minutes, "
+            "first_at = EXCLUDED.first_at, last_at = EXCLUDED.last_at, "
+            "devices = EXCLUDED.devices, minutes = EXCLUDED.minutes, updated_at = now()"),
+            {"metric": b["metric"], "hour_start": b["hour_start"], "local_date": b["local_date"],
+             "value": summary["value"], "unit": b["unit"],
+             "sample_count": summary["sample_count"],
+             "overlap_minutes": summary["overlap_minutes"],
+             "first_at": summary["first_at"], "last_at": summary["last_at"],
+             "devices": summary["devices"], "minutes": json.dumps(merged)})
+        result["updated" if previous is not None else "new"] += 1
+    return result
+
+
 @router.post("/ingest", response_model=IngestResponse)
 def post_ingest(
     payload: dict,
@@ -1936,8 +1985,8 @@ def post_ingest(
     silence. Unreadable samples and workouts are reported the same way.
     """
     from knowledge.watch_payload import (
-        HEART_RATE, decode_device, is_later_night, is_wanted, parse_counts, parse_samples,
-        parse_workouts,
+        HEART_RATE, bucket_hourly, decode_device, is_later_night, is_wanted, merge_minutes,
+        parse_counts, parse_samples, parse_workouts, summarise_minutes,
     )
 
     if not isinstance(payload, dict):
@@ -2048,6 +2097,8 @@ def post_ingest(
                                  "hr_avg", "hr_max", "kcal")},
             "local_date": local_day, "raw": json.dumps(w["raw"], default=str)})
 
+    hourly = _upsert_hourly(db, bucket_hourly(samples, tz), merge_minutes, summarise_minutes)
+
     ins_s = _bulk_insert(
         db, "INSERT INTO health.watch_sample (metric, measured_at, local_date, value, unit, "
             "device_raw, device, raw)",
@@ -2119,6 +2170,7 @@ def post_ingest(
                                             "workouts": len(workout_rows) - ins_w},
                              "replaced_sleep_nights": replaced_nights,
                              "workout_match": workout_match,
+                             "hourly": hourly,
                              "prefill": prefill},
                             default=str)})
     db.commit()
@@ -2132,12 +2184,16 @@ def post_ingest(
     if counts["heart_rate_samples"]:
         bits.append(f"{ins_hr} of {counts['heart_rate_samples']} heart-rate sample(s) stored "
                     f"in watch_heart_rate")
+    if counts["hourly_samples"]:
+        bits.append(f"{counts['hourly_samples']} step/exercise-minute sample(s) → "
+                    f"{hourly['new']} new, {hourly['updated']} updated, "
+                    f"{hourly['unchanged']} unchanged hour(s) in watch_hourly")
     if counts["ignored_samples"]:
         bits.append(f"{counts['ignored_samples']} sample(s) of metrics not on the list: "
                     + ", ".join(list(counts["ignored_metrics"])[:8]))
     return IngestResponse(
         received=counts,
-        inserted={"samples": ins_s, "workouts": ins_w, "heart_rate": ins_hr},
+        inserted={"samples": ins_s, "workouts": ins_w, "heart_rate": ins_hr, "hourly": hourly},
         duplicates={"samples": len(sample_rows) - ins_s, "workouts": len(workout_rows) - ins_w},
         ignored={"other": counts["ignored_metrics"]},
         note="; ".join(bits) or None,
