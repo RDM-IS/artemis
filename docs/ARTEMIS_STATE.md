@@ -540,7 +540,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       5. **Weight:** first weigh-in (date, lb), last weigh-in (date, lb), the change, the 7-day average and the number of weigh-ins. With fewer than 3 weigh-ins in a 7-day window, the values are listed instead of averaged.
     - **Page 2 — detail:**
       - **Activity (moved to the top of page 2, 2026-09-21, so the report stays at two pages):**
-        - **Summary table:** sessions completed of sessions planned; exercise minutes; daily average steps; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
+        - **Summary table:** sessions completed of sessions planned (**prescribed sessions only — walks are activity, never sessions**, WALK-RETIRE 2026-09-22); exercise minutes; daily average steps; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
         - **Two bar charts under the table, side by side:**
           1. **Daily steps:** one bar per day, with the value labelled on each bar.
           2. **Active minutes per day:** stacked by intensity (light, moderate, vigorous), with the total labelled on each bar. **Intensity comes from ZONE-1 heart-rate zones only.** Until ZONE-1 is unblocked, the chart shows total active minutes **unstacked**, with the note "Intensity breakdown not yet available." **The split is never estimated.**
@@ -725,6 +725,14 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - Recommendation: (i) with this permission now; (ii) only if a gateway-level rejection is ever suspected.
 - **Apply (when approved), from the Mac under `rdmis-admin`:** `aws iam put-role-policy --role-name acos-ec2-role --policy-name acos-lambda-logs-read --policy-document file://infrastructure/iam/acos-ec2-lambda-logs-read.json`. **Rollback:** `aws iam delete-role-policy --role-name acos-ec2-role --policy-name acos-lambda-logs-read`.
 - **Noticed alongside:** the log group has **no retention** (never expires) and holds 152 MB. Setting one (e.g. 90 days) is a separate decision.
+
+**WALK-RETIRE — walking is activity, never a planned session (Ryan, 2026-09-22).** Counting a walk against a plan makes adherence meaningless in both directions: a walked day reads as a session he was never told to do, and a day he walks instead of lifting reads as compliant. The reasoning is recorded in PB-009.
+- **`walk` is gone as a session type.** The generator's two walk slots (Sat at Brown Deer, the travel Monday) are mat Recovery Flows at the day's cycle location; `LEGAL_SESSION_TYPES`, the equipment/display maps, the light-session tuples and the swap-eligible list no longer name it, and `validate_rows` refuses a walk row.
+- **Six seeded rows change:** 9/26, 9/28, 10/10, 10/12, 10/24, 10/26 → `recovery_flow`, Brown Deer on the Saturdays and Richfield on the travel Mondays, mat only. None has a logged set. **Interim:** the morning/evening day structure will reseed several of these again.
+- **No walk workout ever matches a plan** (`knowledge/watch_match.py`). The 9/22 walk 11 s after the bike stays unattached, which is why the adjacent-workout rule (#163) was closed rather than trimmed.
+- **Activity is unaffected:** steps, active minutes, active energy and heart rate are read from the watch tables and include every walk. EVAL-1 leaves `ACTIVITY_ONLY_TYPES` rows out of sessions done vs planned entirely, and the dietitian report counts prescribed sessions only.
+- **Nothing planned is weather-dependent any more.** The indoor-walk swap (rain or < 40 °F → walking pad) went with the type, and `resolve_equipment_and_location` no longer takes `weather`.
+- **History is kept:** no past `health.plan` row is a walk (checked 2026-09-22 — all 6 are future), and the legacy baseline seeder (`scripts/seed_health_baseline.py`, 5/06–9/19) is untouched.
 
 ## 7. Operating disciplines (non-negotiable)
 

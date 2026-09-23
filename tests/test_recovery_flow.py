@@ -90,8 +90,8 @@ class TestBuilder(unittest.TestCase):
         by_type = {}
         for d in ROWS:
             by_type.setdefault(office.day_type(d), set()).add(ROWS[d]["session_type"])
-        self.assertEqual(by_type["wi"], {"recovery_flow", "walk"})
-        self.assertEqual(by_type["travel"], {"walk"})
+        self.assertEqual(by_type["wi"], {"recovery_flow"})
+        self.assertEqual(by_type["travel"], {"recovery_flow"})
 
     def test_steps_match_the_table(self):
         """YOGA-4 order: the lunges run R, R, L, L so the switch lands at the
@@ -422,11 +422,14 @@ class TestReseedDiff(unittest.TestCase):
     def test_only_flow_days_from_9_19(self):
         rs = _reseed()
         rows = rs.flow_rows(date(2026, 9, 19))
-        # SCHEDULE-2 flow days: the office non-lift day + the msp_home Sat/Sun.
+        # SCHEDULE-2 flow days: the office non-lift day + the msp_home Sat/Sun,
+        # plus the Brown Deer Saturday and the travel Monday since WALK-RETIRE
+        # (Ryan, 2026-09-22) turned those two walks into mat flows.
         self.assertEqual([r["plan_date"].isoformat() for r in rows], [
-            "2026-09-20", "2026-09-25", "2026-09-27", "2026-10-03",
-            "2026-10-04", "2026-10-09", "2026-10-11", "2026-10-17",
-            "2026-10-18", "2026-10-23", "2026-10-25", "2026-10-31"])
+            "2026-09-20", "2026-09-25", "2026-09-26", "2026-09-27", "2026-09-28",
+            "2026-10-03", "2026-10-04", "2026-10-09", "2026-10-10", "2026-10-11",
+            "2026-10-12", "2026-10-17", "2026-10-18", "2026-10-23", "2026-10-24",
+            "2026-10-25", "2026-10-26", "2026-10-31"])
         self.assertTrue(all(office.session_for(r["plan_date"]) == "recovery_flow" for r in rows))
         existing = {r["plan_date"]: {"phase": 1, "week_num": r["week_num"],
                                      "session_type": "rest_mobility",
@@ -435,7 +438,7 @@ class TestReseedDiff(unittest.TestCase):
         self.assertIn("2026-09-20 Sun", lines[2])
         self.assertIn("recovery_flow  Recovery Flow · home · 33 min · RPE 2", lines[2])
         self.assertIn("Recovery Flow · Richfield · 33 min · RPE 2", lines[3])
-        self.assertEqual(lines[-2], "12 Recovery Flow rows rewritten; no other dates touched.")
+        self.assertEqual(lines[-2], "18 Recovery Flow rows rewritten; no other dates touched.")
         self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
     def test_preflight_needs_migration_033(self):

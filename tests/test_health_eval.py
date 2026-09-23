@@ -18,9 +18,9 @@ from artemis import health_eval as ev  # noqa: E402
 
 WED = date(2026, 9, 16)
 TUE = WED + timedelta(days=6)
-PATTERN = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "walk", "strength_c",
-           "cardio_z2"]
-CAPS = [6.0, 2.0, 6.0, 2.0, None, 6.0, 4.0]
+PATTERN = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "recovery_flow",
+           "strength_c", "cardio_z2"]
+CAPS = [6.0, 2.0, 6.0, 2.0, 2.0, 6.0, 4.0]
 
 
 def plans(start=WED, adjust=None):
@@ -73,6 +73,20 @@ class TestWeek(unittest.TestCase):
         self.assertEqual(r["rpe"]["avg_session_rpe"], 6.1)
         self.assertEqual(r["rpe"]["avg_cap"], 5.5)
         self.assertEqual([o["date"] for o in r["rpe"]["over_cap"]], ["2026-09-16", "2026-09-18"])
+
+    def test_a_walk_row_is_not_a_session(self):
+        """WALK-RETIRE (Ryan, 2026-09-22): walking is daily life, not a
+        prescribed session. A legacy walk row counts as nothing — not done,
+        not missed, not planned, not rest — and never appears as a session."""
+        rows = plans()
+        walk = dict(rows[1], plan_id=999, session_type="walk",
+                    blocks={"type": "steady", "display_name": "Walk + mobility"})
+        r = ev.evaluate(rows + [walk], full_week_logs() + [summary(999, WED + timedelta(days=1))],
+                        [], start=WED, end=TUE, today=TUE + timedelta(days=1))
+        self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6,
+                                       "missed": 0, "upcoming": 0})
+        self.assertNotIn("walk", [x["session_type"] for x in r["sessions"]])
+        self.assertEqual(r["missed"], [])
 
     def test_partial_week_counts_only_what_is_due(self):
         logs = full_week_logs()[:4]                    # A and B logged

@@ -313,8 +313,9 @@ class TestConfirmFormatters(unittest.TestCase):
 # ============================================================================
 
 class TestResolveEquipment(unittest.TestCase):
-    """HEALTH-2: office gym fallback map; blocks.location/equipment win; weather
-    applies to walk only."""
+    """HEALTH-2: office gym fallback map; blocks.location/equipment win.
+    WALK-RETIRE (2026-09-22): walk is no longer a session type and no session
+    is weather-dependent — the resolver takes no weather at all."""
 
     def test_resolve_equipment_strength(self):
         """strength_a → office gym, leg press + DBs + flat bench, first lift leg press."""
@@ -335,15 +336,13 @@ class TestResolveEquipment(unittest.TestCase):
         self.assertNotIn("rower", joined)
         self.assertNotIn("trainer", joined)
 
-    def test_resolve_z2_office_machines_regardless_of_weather(self):
+    def test_resolve_z2_office_machines(self):
         from artemis.health import resolve_equipment_and_location
-        for w in ({"temp_f": 20.0, "precip_next_90min": True},
-                  {"temp_f": 75.0, "precip_next_90min": False}, None):
-            r = resolve_equipment_and_location("cardio_z2", weather=w)
-            self.assertEqual(r["location"], "office gym")
-            self.assertEqual(r["equipment"],
-                             ["treadmill", "elliptical", "recumbent bike", "upright bike"])
-            self.assertIsNone(r["notes"])
+        r = resolve_equipment_and_location("cardio_z2")
+        self.assertEqual(r["location"], "office gym")
+        self.assertEqual(r["equipment"],
+                         ["treadmill", "elliptical", "recumbent bike", "upright bike"])
+        self.assertIsNone(r["notes"])
 
     def test_blocks_location_and_equipment_preferred(self):
         from artemis.health import resolve_equipment_and_location
@@ -359,12 +358,15 @@ class TestResolveEquipment(unittest.TestCase):
         self.assertEqual(r["location"], "office gym")
         self.assertEqual(r["first_lift"], "DB Romanian deadlift")
 
-    def test_walk_session_returns_outside(self):
-        """walk → outside, just shoes."""
-        from artemis.health import resolve_equipment_and_location
-        r = resolve_equipment_and_location("walk")
-        self.assertEqual(r["location"], "outside")
-        self.assertIn("walking shoes", r["equipment"])
+    def test_walk_is_no_longer_a_session_type(self):
+        """WALK-RETIRE: walking is daily life, not a prescribed session. It has
+        no entry in the fallback map and never resolves to a session."""
+        from artemis import health, health_office
+        self.assertNotIn("walk", health_office.LEGAL_SESSION_TYPES)
+        self.assertNotIn("walk", health_office.NON_LIFT.values())
+        self.assertNotIn("walk", health.LIGHT_TYPES if hasattr(health, "LIGHT_TYPES") else ())
+        r = health.resolve_equipment_and_location("walk")
+        self.assertNotIn("walking shoes", r["equipment"])       # falls through to the default
 
     def test_rest_mobility_mat_and_stretch_trainer(self):
         from artemis.health import resolve_equipment_and_location
@@ -372,43 +374,13 @@ class TestResolveEquipment(unittest.TestCase):
         self.assertIn("mat", r["equipment"])
         self.assertIn("Stretch Trainer", r["equipment"])
 
-    def test_resolve_walk_outside_when_clear(self):
-        """walk + temp_f=65, no rain → outside, walking shoes."""
+    def test_removed_params_are_gone(self):
+        """user_override went with HEALTH-2; weather went with WALK-RETIRE."""
         from artemis.health import resolve_equipment_and_location
-        r = resolve_equipment_and_location(
-            "walk",
-            weather={"temp_f": 65.0, "precip_next_90min": False},
-        )
-        self.assertIn("outside", r["location"].lower())
-        self.assertIn("walking shoes", r["equipment"])
-        self.assertNotIn("walking pad", r["equipment"])
-
-    def test_resolve_walk_uses_pad_when_cold(self):
-        """walk + temp_f=35 → indoor walking pad, cold note."""
-        from artemis.health import resolve_equipment_and_location
-        r = resolve_equipment_and_location(
-            "walk",
-            weather={"temp_f": 35.0, "precip_next_90min": False},
-        )
-        self.assertIn("indoor", r["location"].lower())
-        self.assertIn("walking pad", r["equipment"])
-        self.assertIn("Cold", r["notes"])
-
-    def test_resolve_walk_uses_pad_when_rain(self):
-        """walk + precip_next_90min=True → indoor walking pad, rain note."""
-        from artemis.health import resolve_equipment_and_location
-        r = resolve_equipment_and_location(
-            "walk",
-            weather={"temp_f": 60.0, "precip_next_90min": True},
-        )
-        self.assertIn("indoor", r["location"].lower())
-        self.assertIn("walking pad", r["equipment"])
-        self.assertIn("Rain", r["notes"])
-
-    def test_user_override_param_removed(self):
-        from artemis.health import resolve_equipment_and_location
-        with self.assertRaises(TypeError):
-            resolve_equipment_and_location("cardio_z2", user_override="indoor")
+        for kwargs in ({"user_override": "indoor"}, {"weather": {"temp_f": 35.0}}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(TypeError):
+                    resolve_equipment_and_location("cardio_z2", **kwargs)
 
 
 # ============================================================================

@@ -11,8 +11,13 @@ The rules (design approved 2026-09-21, docs/ARTEMIS_STATE.md WATCH-1):
     of that plan's session_log rows has logged_at in [start, end + 10 min].
     Logging trails the set, so the window runs past the workout's end.
   * Kind gate: strength training -> strength_*, yoga/flexibility ->
-    recovery_flow, walking/cycling/elliptical -> cardio_z2 or walk. A kind
-    that doesn't fit the plan is not matched; it is reported.
+    recovery_flow, cycling/elliptical -> cardio_z2. A kind that doesn't fit the
+    plan is not matched; it is reported.
+  * A WALK NEVER MATCHES (Ryan, 2026-09-22). Walking is daily life, not a
+    prescribed session, so counting it against a plan makes adherence
+    meaningless in both directions. Walks still count as activity — steps,
+    active minutes, energy and heart rate all include them — they just never
+    attach to a session. See PB-009.
   * Several workouts on one plan: the one containing the most log rows wins;
     the others are reported. An exact tie matches none of them. Picking one
     would be a guess.
@@ -47,8 +52,10 @@ def kind_fits(kind: str | None, session_type: str | None) -> bool:
         return st.startswith("strength")
     if "yoga" in k or "flexibility" in k:
         return st == "recovery_flow"
-    if "walk" in k or "cycling" in k or "elliptical" in k:
-        return st in ("cardio_z2", "walk")
+    if "walk" in k:
+        return False                      # activity, never a session
+    if "cycling" in k or "elliptical" in k:
+        return st == "cardio_z2"
     return False
 
 

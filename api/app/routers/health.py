@@ -183,7 +183,6 @@ _LEGACY_PRETTY = {
     "strength_c": "Strength C — Full Body",
     "cardio_intervals": "Cardio Intervals",
     "cardio_z2": "Cardio Zone 2",
-    "walk": "Walk + mobility",
     "rest_mobility": "Rest / Mobility",
     "recovery_flow": "Recovery Flow",
 }
@@ -1043,7 +1042,7 @@ def _planned_set_count(blocks: Any) -> int:
         exs = blocks.get("exercises")
         if isinstance(exs, list):
             total += sum(_exercise_sets(ex, rounds) for ex in exs)
-    elif t in ("intervals", "steady", "walk", "mobility"):
+    elif t in ("intervals", "steady", "mobility"):
         total += 1
     # recovery_flow: 0 — a flow logs one session_summary, never sets, so a
     # planned set would read "0 of 1" on the Status page for a finished flow.

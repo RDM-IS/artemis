@@ -378,11 +378,36 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event", text)
         self.assertIn("Weather:", text)
 
-    def test_outside_walk_and_rest_days_follow_the_home_rule(self):
-        walk = {"session_type": "walk", "blocks": {"location": "outside"}}
+    def test_weather_is_fetched_and_shown_on_an_office_day(self):
+        """WALK-RETIRE: the departure weather is for the COMMUTE, not for an
+        outdoor session, so it must not depend on a walk row existing. This
+        test patches the weather module itself, never wake._weather_line."""
+        from artemis import wake as wake_mod
+        cal = MagicMock()
+        cal.service = True
+        cal.get_today_events.return_value = []
+        forecast = {"available": True, "high_f": 62, "low_f": 51,
+                    "summary": "moderate rain", "precip_pct": 58, "precip_in": 0.16}
+        weather_mod = MagicMock()
+        weather_mod.get_today_forecast.return_value = forecast
+        fetch = weather_mod.get_today_forecast
+        with patch.dict(sys.modules, {"artemis.weather": weather_mod}), \
+             patch("artemis.health.get_today_plan", return_value=self.PLAN), \
+             patch.object(wake_mod, "_depart_commitments", return_value=[]), \
+             patch.object(wake_mod, "get_timezone_override", return_value=None), \
+             patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 21, 4, 30)), \
+             patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)):
+            msg = wake_mod.build_wake_message(calendar=cal, held_health=[])
+        fetch.assert_called_once()
+        self.assertIn("Before you leave", msg)
+        self.assertIn("Weather: 62°/51°F", msg)
+        self.assertIn("moderate rain", msg)
+
+    def test_home_and_rest_days_follow_the_home_rule(self):
+        home_flow = {"session_type": "recovery_flow", "blocks": {"location": "home"}}
         rest_with_office_blocks = {"session_type": "rest_mobility",
                                    "blocks": {"location": "office gym"}}
-        for plan in (walk, rest_with_office_blocks, None):
+        for plan in (home_flow, rest_with_office_blocks, None):
             with self.subTest(plan=plan):
                 self.assertNotIn("gym bag", "\n".join(self._depart(plan)))
 
@@ -423,7 +448,7 @@ class TestWakeMessage(unittest.TestCase):
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "strength_b"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "cardio_z2"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "rest_mobility"}), "logging_only")
-        self.assertEqual(wake_mod.prompt_type_for({"session_type": "walk"}), "logging_only")
+        self.assertEqual(wake_mod.prompt_type_for({"session_type": "recovery_flow"}), "logging_only")
         self.assertEqual(wake_mod.prompt_type_for(None), "logging_only")
 
 
