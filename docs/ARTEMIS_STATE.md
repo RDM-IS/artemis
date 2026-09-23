@@ -274,6 +274,37 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - What equipment is at the **MSP home**.
   - Brown Deer's inventory (it's a fitness center, so probably machines and cables, but nothing is recorded).
 
+**SCHEDULE-3 — move a lift, don't add one (Ryan, 2026-09-23). PROPOSED; APPLIES ONLY ONCE LOCATION-1 IS LIVE.** Target pattern in **both** cycle weeks: **Mon A · Tue Z2 · Wed B · Thu rest · Fri C**, with week 1's Friday C at **Richfield** and week 2's Monday A at **Richfield**, on the travel morning before the 11:00 departure. It also removes the B/C back-to-back pair that SCHEDULE-2 accepted.
+
+  | pos | day | morning | where | evening |
+  |---|---|---|---|---|
+  | 0 | Sun | rest | home | flow |
+  | 1 | Mon | **Strength A** | office | — |
+  | 2 | Tue | **Zone 2** | office | flow |
+  | 3 | Wed | **Strength B** | office | — |
+  | 4 | Thu | **rest** *(was C)* | office | none — transit |
+  | 5 | Fri | **Strength C** *(was rest)* | **Richfield** | flow (Brown Deer) |
+  | 6 | Sat | rest | Brown Deer | flow |
+  | 7 | Sun | rest | Brown Deer | flow |
+  | 8 | Mon | **Strength A** *(was rest)* | **Richfield** | flow (home) |
+  | 9 | Tue | **Zone 2** *(was A)* | office | — |
+  | 10 | Wed | **Strength B** *(was Z2)* | office | flow |
+  | 11 | Thu | **rest** *(was B)* | office | — |
+  | 12 | Fri | Strength C | office | — |
+  | 13 | Sat | rest | home | flow |
+
+- **Reseed diff, computed read-only against RDS 2026-09-23** (window 9/24 → 10/31): **18 morning rows rewritten**, in six even groups of three — `strength_c→rest`, `rest→strength_c`, `rest→strength_a`, `strength_a→cardio_z2`, `cardio_z2→strength_b`, `strength_b→rest`. **Three lifts in every full program week** (weeks 3–7), unchanged. **Evenings untouched** — 4 a week, same dates, same locations. **Zero logged rows** in the window. Six sessions would land at Richfield: C on 9/25, 10/9, 10/23 and A on 9/28, 10/12, 10/26.
+- **BLOCKER — Richfield Strength A has no approved table.** Strength C's is approved and built; A's is not, and the diff's own check flags those three dates `NO TABLE YET`. Proposed, for Ryan's approval, from the inventory (PowerBlocks to 80, curl bar, flat bench, TRX, bands, stability ball, 6.5 ft ceiling):
+  - Leg press → **DB split squat** *(not goblet squat: that is Strength B's native lift, and reusing it would put the same movement on two days of one week)*
+  - DB bench press → **unchanged** (flat bench, native)
+  - Lat pulldown → **band pulldown** *(a vertical pull; TRX row is the horizontal one C already uses)*
+  - Seated leg curl → **ball hamstring curl**
+  - Cable face pull (rope) → **band face pull**
+  - Captain's chair knee raise → **lying leg raise** *(there is no chair and no bar)*
+  - New names needing a class and a region entry: DB split squat (`dumbbell`), band pulldown and band face pull (`bands`), ball hamstring curl and lying leg raise (`bodyweight`).
+- **Apply order, as Ryan set it:** LOCATION-1 lands and is deployed FIRST (artemis #177 + gym-display #26), so a Richfield session resolves properly the moment it exists; the Strength A table is approved and built; only then does the reseed run. Applying it before that would seed office exercises onto a farm morning.
+- **Not in this proposal:** the office program's total volume is unchanged — three lifts a week, one Z2, four evening flows. Only which day each lands on changes.
+
 **TRAVEL-1 — no travel handling in the office program (small; revisit by early November).** The ramp's travel-week templates are gone and the office program has none. The Paris trip is around Thanksgiving (note: Thanksgiving is Thu 2026-11-26, after this program's 11/03 end, so it lands in the next phase). A travel week needs a hand-chosen substitute: a bodyweight/hotel variant of Strength A/B/C, or Recovery Flows plus walks.
 
 **WATCH-1 — Apple Watch ingest via Health Auto Export — INGEST AND PRE-FILL LIVE; workout matching waits on the first workout.**
