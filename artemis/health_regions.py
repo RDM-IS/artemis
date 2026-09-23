@@ -76,6 +76,14 @@ _reg("Single-arm cable row", {"back"}, {"shoulder", "biceps", "arms", "core"})
 _reg("Seated DB shoulder press", {"shoulder"}, {"triceps", "arms"})
 _reg("Calf press", {"legs", "calves"})
 _reg("Ab machine crunch", {"core"})
+
+# ── LOCATION-1 (Richfield): each mirrors the office exercise it stands in for,
+# because the pain ladder reasons about REGIONS, not about equipment. A
+# shoulder that rules out Pec fly rules out DB fly for the same reason.
+_reg("DB fly", {"chest"}, {"shoulder"})                       # ← Pec fly
+_reg("1-arm DB row", {"back"}, {"shoulder", "biceps", "arms", "core"})   # ← Single-arm cable row
+_reg("Standing DB calf raise", {"legs", "calves"})            # ← Calf press
+_reg("Stability-ball crunch", {"core"})                       # ← Ab machine crunch
 # ── Weeks 5-6 finisher ──
 _reg("Stepmill or upright bike", {"legs"}, {"knee", "hip"})
 # ── Cardio (steady blocks; rules 2-4 never touch these, listed for coverage) ──
@@ -93,6 +101,21 @@ _reg("Rest / Mobility", set())
 
 # Substitutes, in preference order. Every name must exist in EXERCISE_REGIONS
 # and in health_office's exercise lists (so it can be built for any week).
+def substitution_pool(location_key: str | None = None) -> tuple[str, ...]:
+    """LOCATION-1: the pool the pain ladder may pick a replacement from,
+    FILTERED TO THE LOCATION'S INVENTORY.
+
+    Resolution is location first, then pain: a pain removal at Richfield must
+    be replaced by something Richfield HAS. Filtering by equipment CLASS is not
+    enough — the office and Richfield both have `bodyweight`, but only one has
+    a captain's chair and only one has a stability ball. So the pools are
+    explicit per location, like the substitution tables.
+    """
+    if not location_key or location_key == "office":
+        return SUBSTITUTION_POOL
+    return POOL_BY_LOCATION.get(location_key, ())
+
+
 SUBSTITUTION_POOL = (
     "Leg press",
     "Seated leg curl",
@@ -102,6 +125,15 @@ SUBSTITUTION_POOL = (
     "Seated back extension",
     "Cable Pallof press",
 )
+
+
+#: What the pain ladder may reach for at each non-office location. Explicit,
+#: like the substitution tables — Brown Deer and MSP home have no inventory on
+#: record, so they have no pool and a pain removal there becomes mobility.
+POOL_BY_LOCATION: dict[str, tuple[str, ...]] = {
+    "richfield": ("DB fly", "1-arm DB row", "Standing DB calf raise",
+                  "Stability-ball crunch"),
+}
 
 
 # ── PAIN-1: region -> mobility work (Stretch Trainer + mat) ──
@@ -172,14 +204,15 @@ def equipment_class(name: str, explicit: str | None = None) -> str:
     return "dumbbell"
 
 
-def _reachable_totals(bar: int) -> list[int]:
+def _reachable_totals(bar: int, plates: tuple = PLATES_PER_SIDE) -> list[int]:
     sums = {0}
-    for p in PLATES_PER_SIDE:
+    for p in plates:
         sums |= {s + p for s in sums}
     return sorted(bar + 2 * s for s in sums)
 
 
-def lighter_load(name: str, last: float, explicit_class: str | None = None) -> float | None:
+def lighter_load(name: str, last: float, explicit_class: str | None = None,
+                 load_config: dict | None = None) -> float | None:
     """80% of `last`, rounded DOWN to a load the office can actually make.
 
     Never returns `last` or more: if the rounding lands there, the next lower
@@ -187,11 +220,25 @@ def lighter_load(name: str, last: float, explicit_class: str | None = None) -> f
     None for bodyweight work (no load to lighten).
     """
     cls = equipment_class(name, explicit=explicit_class)
-    # bands / TRX carry no numeric load, so there is nothing to lighten.
+    # bands / TRX / cardio carry no numeric load, so there is nothing to lighten.
     if cls in NO_LOAD_CLASSES or last is None or last <= 0:
         return None
     goal = float(last) * 0.8
-    if cls == "dumbbell":
+    # LOCATION-1: the row's own config wins. Without it this is the office,
+    # which is what every row seeded before LOCATION-1 means.
+    cfg = (load_config or {}).get(cls) if load_config else None
+    if cfg and cfg.get("mode") == "none":
+        return None
+    if cfg:
+        if cfg.get("plates"):
+            options = [t for t in _reachable_totals(cfg.get("bar", 0), tuple(cfg["plates"]))
+                       if t > 0]
+        else:
+            step = cfg.get("step") or 5
+            lo = cfg.get("min") or step
+            hi = max(int(last), int(cfg.get("max") or last))
+            options = [lo + i * step for i in range(int((hi - lo) // step) + 1)]
+    elif cls == "dumbbell":
         options = list(range(DB_MIN, DB_MAX + 1, DB_STEP))
     elif cls in ("machine", "cable"):
         top = int(max(last, STACK_STEP))

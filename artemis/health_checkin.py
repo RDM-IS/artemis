@@ -388,15 +388,26 @@ def _set_note_sets(ex: dict, sets: int) -> None:
         ex["notes"] = f"{sets}×{notes[m.start(2):]}"
 
 
-def _office_exercise(name: str, sets: int, week_num: int) -> dict:
-    """Build a pool exercise exactly as health_office seeds it for this week."""
+def _pool_exercise(name: str, sets: int, week_num: int) -> dict:
+    """Build a pool exercise exactly as health_office seeds it for this week.
+
+    LOCATION-1: the pool is already filtered to the location, so a name from
+    another gym's table (DB fly, Stability-ball crunch) is built from that
+    table's rep range rather than from the office list."""
     from artemis import health_office as office
     for spec in (x for lst in office._EXERCISES.values() for x in lst):
         if spec[0] == name:
             ex = office._exercise(*spec, sets, week_num)
             ex["notes"] = re.sub(r"^\d+×", f"{sets}×", ex["notes"])
             return ex
-    raise KeyError(f"{name} is not an office exercise")
+    for table in office.LOCATION_SUBS.values():
+        for subs in table.values():
+            for sub_name, label, top in subs.values():
+                if sub_name == name:
+                    ex = office._exercise(name, label, top, False, False, sets, week_num)
+                    ex["notes"] = re.sub(r"^\d+×", f"{sets}×", ex["notes"])
+                    return ex
+    raise KeyError(f"{name} is in no session or substitution table")
 
 
 # ============================================================================
@@ -604,7 +615,8 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # ── 5. Pain 3 -> primary: mobility block; secondary only: substitute ────
     if pain_3 and not swapped and exercises:
         present = {e["name"] for e in exercises} | set(adj.removed)
-        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected, sides=sides)]
+        pool = [x for x in hr.substitution_pool(blocks.get("location_key"))
+                if not hr.uses_any(x, affected, sides=sides)]
         out_list, to_mobility, swaps = [], [], []
         for ex in exercises:
             name = ex["name"]
@@ -618,7 +630,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
                     to_mobility.append(name)          # nothing fits -> mobility
                     continue
                 present.add(sub)
-                new = _office_exercise(sub, exercise_sets(ex, blocks), week_num)
+                new = _pool_exercise(sub, exercise_sets(ex, blocks), week_num)
                 new["added_by"] = "checkin"
                 new["replaces"] = name
                 out_list.append(new)
@@ -659,7 +671,8 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     # ── 6. Soreness 4-5 -> replace from the pool ────────────────────────────
     if sore_heavy and not swapped and exercises:
         present = {e["name"] for e in exercises} | set(adj.removed)
-        pool = [x for x in hr.SUBSTITUTION_POOL if not hr.uses_any(x, affected, sides=sides)]
+        pool = [x for x in hr.substitution_pool(blocks.get("location_key"))
+                if not hr.uses_any(x, affected, sides=sides)]
         out_list, removed, added = [], [], []
         for ex in exercises:
             if hr.uses_any(ex["name"], sore_heavy, sides=sides):
@@ -667,7 +680,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
                 sub = next((x for x in pool if x not in present), None)
                 if sub is not None:
                     present.add(sub)
-                    new = _office_exercise(sub, exercise_sets(ex, blocks), week_num)
+                    new = _pool_exercise(sub, exercise_sets(ex, blocks), week_num)
                     new["added_by"] = "checkin"
                     new["replaces"] = ex["name"]
                     out_list.append(new)
