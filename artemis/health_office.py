@@ -152,9 +152,10 @@ DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
 
 
 def day_location(d: date) -> str:
-    """The seeded row's location: where he is in the MORNING, when the session
-    happens. Returns the display name the plan rows carry ("office gym")."""
-    key = _cycle.location_at(d, time(0, 0), use_overrides=False)
+    """The seeded row's location: the day's ANCHOR, where he wakes and where the
+    session happens. Returns the display name the plan rows carry ("office
+    gym"). Never a segment — an msp_work day starts at msp_home."""
+    key = _cycle.anchor_location(d, use_overrides=False)
     return (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
 
 
@@ -784,6 +785,12 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
         assert r["session_type"] != "walk", \
             f"{r['plan_date']}: walks are activity, never planned sessions"
+        # CYCLE-1: no session is ever placed in a transit segment. A seeded row
+        # carries the day's anchor, which is never transit, so this can only
+        # fire if the anchor table gains one.
+        assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"],
+                                                            use_overrides=False)), \
+            f"{r['plan_date']}: a session cannot be placed on the road"
         want, got = day_location(r["plan_date"]), r["blocks"].get("location")
         assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
     rejects, notes = duration_findings(rows)
