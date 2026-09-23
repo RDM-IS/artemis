@@ -441,10 +441,12 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertIn("removed", reply)
         self.assertIn("adjustment", self.db.plan[FRI]["blocks"])
 
-    def test_nudge_skips_rest_and_walk_days(self):
+    def test_nudge_skips_rest_days(self):
+        """WALK-RETIRE (2026-09-22): the walk day is gone — 9/28 is a mat flow
+        now, and the nudge does fire on a flow day (see test_recovery_flow).
+        Rest days remain the only silent day."""
         from artemis.scheduler import ArtemisScheduler
-        for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),
-                       (date(2026, 9, 28), office_row(date(2026, 9, 28), plan_id=107))):
+        for d, row in ((date(2026, 9, 17), rest_row(date(2026, 9, 17))),):
             db = FakeDB(row)
 
             @contextmanager
@@ -607,6 +609,35 @@ class TestFlows(unittest.TestCase):
 
 
 class TestParser(unittest.TestCase):
+    def test_bare_weight_from_the_922_checkin(self):
+        """9/22's exact reply: the bare 281.5 was dropped into free_text."""
+        ci = hc.parse_checkin("Sleep 6, energy 4, soreness 0, 281.5")
+        self.assertEqual((ci.sleep_hrs, ci.energy, ci.weight_lbs), (6.0, 4, 281.5))
+        self.assertEqual(ci.soreness, {"overall": 0})
+        self.assertIsNone(ci.free_text)
+        self.assertEqual(hc.classify("Sleep 6, energy 4, soreness 0, 281.5"), "checkin")
+
+    def test_bare_weight_is_stored_manual(self):
+        cur = MagicMock()
+        hc.store_checkin(cur, FRI, hc.parse_checkin("Sleep 6, energy 4, soreness 0, 281.5"))
+        sql, params = cur.execute.call_args[0]
+        self.assertIn("weight_source = CASE WHEN EXCLUDED.weight_lbs IS NOT NULL THEN 'manual'", sql)
+        self.assertEqual(params[1], 281.5)
+
+    def test_bare_weight_limits(self):
+        cases = {
+            "sleep 6, 149": None,                    # below range
+            "sleep 6, 401": None,                    # above range
+            "sleep 6, 150": 150.0,
+            "sleep 6, 400": 400.0,
+            "sleep 6, walked 200 steps": None,       # not a lone clause
+            "sleep 6, 281, 283": None,               # two candidates: ambiguous
+            "sleep 6, weight 283, 281": 283.0,       # labelled weight wins
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(hc.parse_checkin(text).weight_lbs, want)
+
     def test_scale(self):
         cases = {
             "sore 0": {"overall": 0},
@@ -778,6 +809,7 @@ class TestSchedulerRegistry(unittest.TestCase):
         s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
         kv = {}
         with patch("artemis.posting.take_holds", return_value=[]), \
+             patch("artemis.wake.checked_in_today", return_value=False), \
              patch("artemis.wake.build_wake_message", return_value="W"), \
              patch("artemis.quiet_hours.exit_quiet"), \
              patch("artemis.quiet_hours.set_system_value", side_effect=kv.__setitem__), \
@@ -786,6 +818,22 @@ class TestSchedulerRegistry(unittest.TestCase):
             s._do_wake()
         self.assertEqual(kv, {f"checkin_open:{FRI}": "open"})
         add_job.assert_not_called()
+
+    def test_wake_after_an_early_checkin_leaves_the_key_alone(self):
+        """9/22: Ryan checked in at 04:04, before the 04:30 wake."""
+        from artemis.scheduler import ArtemisScheduler
+        s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
+        kv = {}
+        with patch("artemis.posting.take_holds", return_value=[]), \
+             patch("artemis.wake.checked_in_today", return_value=True), \
+             patch("artemis.wake.build_wake_message", return_value="W") as build, \
+             patch("artemis.quiet_hours.exit_quiet"), \
+             patch("artemis.quiet_hours.set_system_value", side_effect=kv.__setitem__), \
+             patch("artemis.scheduler._local_today", return_value=FRI):
+            s._do_wake()
+        self.assertEqual(kv, {})
+        self.assertTrue(build.call_args.kwargs["checked_in"])
+        s.mm.post_message.assert_called_once()
 
 
 class TestRouting(unittest.TestCase):

@@ -292,7 +292,7 @@ class TestWakeMessage(unittest.TestCase):
         },
     }
 
-    def _build(self, plan=None, held=None):
+    def _build(self, plan=None, held=None, checked_in=False):
         from artemis import wake as wake_mod
         cal = MagicMock()
         cal.service = True
@@ -303,7 +303,8 @@ class TestWakeMessage(unittest.TestCase):
              patch.object(wake_mod, "get_timezone_override", return_value=None), \
              patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 21, 4, 30)), \
              patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)):
-            return wake_mod.build_wake_message(calendar=cal, held_health=held or [])
+            return wake_mod.build_wake_message(calendar=cal, held_health=held or [],
+                                              checked_in=checked_in)
 
     def test_contains_workout_checkin_and_departure(self):
         msg = self._build()
@@ -318,6 +319,13 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event: 9:00 AM", msg)
         self.assertIn("Weather:", msg)
         self.assertIn("dry cleaning", msg)
+
+    def test_no_checkin_prompt_once_checked_in(self):
+        msg = self._build(checked_in=True)
+        self.assertNotIn("sleep hrs", msg.lower())
+        self.assertNotIn("Morning check-in", msg)
+        self.assertIn("Office Strength A", msg)
+        self.assertIn("Before you leave", msg)
 
     def test_excludes_business_content(self):
         msg = self._build(held=["↔ Slid Strength A → Wed (makeup slot)."]).lower()
@@ -338,11 +346,14 @@ class TestWakeMessage(unittest.TestCase):
         self.assertNotIn("First lift", msg)
 
     # ── Departure block is location-aware ──
+    # The close is the real FLOW_CLOSE: since YOGA-4 every timed item carries its
+    # own transition_sec, and a hand-written close without one (this fixture's
+    # 9/18 shape) raised KeyError in flow_total_sec.
+    from artemis.health_office import FLOW_CLOSE as _FLOW_CLOSE
     HOME_FLOW = {"plan_id": 3, "session_type": "recovery_flow", "est_duration_min": 30,
                  "blocks": {"type": "recovery_flow", "display_name": "Recovery Flow",
                             "location": "home", "rounds": 2, "total_sec": 1770,
-                            "flow": [], "pre": [], "close": {"name": "Easy pose breathing",
-                                                              "duration_sec": 180}}}
+                            "flow": [], "pre": [], "close": dict(_FLOW_CLOSE)}}
 
     def _depart(self, plan, *, event=True, weather=True, commitments=()):
         from artemis import wake as wake_mod
@@ -367,11 +378,36 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event", text)
         self.assertIn("Weather:", text)
 
-    def test_outside_walk_and_rest_days_follow_the_home_rule(self):
-        walk = {"session_type": "walk", "blocks": {"location": "outside"}}
+    def test_weather_is_fetched_and_shown_on_an_office_day(self):
+        """WALK-RETIRE: the departure weather is for the COMMUTE, not for an
+        outdoor session, so it must not depend on a walk row existing. This
+        test patches the weather module itself, never wake._weather_line."""
+        from artemis import wake as wake_mod
+        cal = MagicMock()
+        cal.service = True
+        cal.get_today_events.return_value = []
+        forecast = {"available": True, "high_f": 62, "low_f": 51,
+                    "summary": "moderate rain", "precip_pct": 58, "precip_in": 0.16}
+        weather_mod = MagicMock()
+        weather_mod.get_today_forecast.return_value = forecast
+        fetch = weather_mod.get_today_forecast
+        with patch.dict(sys.modules, {"artemis.weather": weather_mod}), \
+             patch("artemis.health.get_today_plan", return_value=self.PLAN), \
+             patch.object(wake_mod, "_depart_commitments", return_value=[]), \
+             patch.object(wake_mod, "get_timezone_override", return_value=None), \
+             patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 21, 4, 30)), \
+             patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)):
+            msg = wake_mod.build_wake_message(calendar=cal, held_health=[])
+        fetch.assert_called_once()
+        self.assertIn("Before you leave", msg)
+        self.assertIn("Weather: 62°/51°F", msg)
+        self.assertIn("moderate rain", msg)
+
+    def test_home_and_rest_days_follow_the_home_rule(self):
+        home_flow = {"session_type": "recovery_flow", "blocks": {"location": "home"}}
         rest_with_office_blocks = {"session_type": "rest_mobility",
                                    "blocks": {"location": "office gym"}}
-        for plan in (walk, rest_with_office_blocks, None):
+        for plan in (home_flow, rest_with_office_blocks, None):
             with self.subTest(plan=plan):
                 self.assertNotIn("gym bag", "\n".join(self._depart(plan)))
 
@@ -412,7 +448,7 @@ class TestWakeMessage(unittest.TestCase):
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "strength_b"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "cardio_z2"}), "workout_am")
         self.assertEqual(wake_mod.prompt_type_for({"session_type": "rest_mobility"}), "logging_only")
-        self.assertEqual(wake_mod.prompt_type_for({"session_type": "walk"}), "logging_only")
+        self.assertEqual(wake_mod.prompt_type_for({"session_type": "recovery_flow"}), "logging_only")
         self.assertEqual(wake_mod.prompt_type_for(None), "logging_only")
 
 

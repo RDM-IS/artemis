@@ -1189,7 +1189,7 @@ def handle_fix_intent(message: str) -> str | None:
 
 # No debrief nag and no inferred "missed" summary on these days. A Recovery
 # Flow logs itself from gym-display (YOGA-1); a missed one is never a miss.
-_NO_FOLLOWUP_SESSIONS = ("rest_mobility", "walk", "recovery_flow")
+_NO_FOLLOWUP_SESSIONS = ("rest_mobility", "recovery_flow")
 
 
 def run_nag_check() -> Optional[str]:
@@ -1314,12 +1314,6 @@ _EQUIPMENT_MAP: dict[str, dict] = {
         "equipment": _office.SESSION_EQUIPMENT["cardio_intervals"],
         "first_lift": None,
     },
-    "walk": {
-        # Default = outside. Weather swaps to an indoor walk when cold or rainy.
-        "location": "outside",
-        "equipment": ["walking shoes"],
-        "first_lift": None,
-    },
     "rest_mobility": {
         "location": "office gym",
         "equipment": _office.SESSION_EQUIPMENT["rest_mobility"],
@@ -1335,7 +1329,6 @@ _EQUIPMENT_MAP: dict[str, dict] = {
 
 def resolve_equipment_and_location(
     session_type: str,
-    weather: dict | None = None,
     blocks: dict | None = None,
 ) -> dict:
     """Return {'location': str, 'equipment': list[str], 'notes': str | None,
@@ -1365,21 +1358,8 @@ def resolve_equipment_and_location(
         "notes": None,
     }
 
-    if session_type != "walk":
-        return result
-
-    # ── Walk branch: weather-driven indoor swap ────────────────────────
-    w = weather or {}
-    temp_f = w.get("temp_f", 50.0)
-    precip = bool(w.get("precip_next_90min", False))
-    if precip:
-        result["location"] = "indoors (walking pad)"
-        result["equipment"] = ["walking pad"]
-        result["notes"] = "Rain expected — walking pad indoor."
-    elif temp_f < 40:
-        result["location"] = "indoors (walking pad)"
-        result["equipment"] = ["walking pad"]
-        result["notes"] = f"Cold ({temp_f:.0f}°F) — walking pad indoor."
+    # WALK-RETIRE (2026-09-22): the weather-driven indoor-walk swap is gone with
+    # the walk session type. Every planned session is indoors.
     return result
 
 
@@ -1440,7 +1420,6 @@ def _session_pretty_name(session_type: str) -> str:
         "strength_c":       "Strength C — Full Body",
         "cardio_intervals": "Cardio Intervals",
         "cardio_z2":        "Cardio Zone 2",
-        "walk":             "Walk + mobility",
         "rest_mobility":    "Rest / Mobility",
         "recovery_flow":    "Recovery Flow",
     }.get(session_type, session_type)
@@ -1544,7 +1523,7 @@ def get_today_state() -> dict | None:
 # ============================================================================
 
 # Session-types that are NOT loggable lifting sessions (no conversational loop).
-_NON_WORKOUT_SESSIONS = ("rest_mobility", "walk", "recovery_flow")
+_NON_WORKOUT_SESSIONS = ("rest_mobility", "recovery_flow")
 
 
 # ----------------------------------------------------------------------------
@@ -3631,7 +3610,7 @@ INTENT_SWAP_REVERT = "swap_revert"
 
 # Swap-eligible session types. Strength days refuse; rest/no-plan falls forward
 # to the next cardio session.
-_SWAP_ELIGIBLE = ("cardio_z2", "cardio_intervals", "walk")
+_SWAP_ELIGIBLE = ("cardio_z2", "cardio_intervals")
 
 # The office cardio machines a session can be swapped to (HEALTH-2).
 _SWAP_TARGETS = ("treadmill", "elliptical", "upright_bike", "recumbent_bike", "stepmill")

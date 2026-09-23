@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SearchTheApiLambdaLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:095652687153:log-group:/aws/lambda/rdmis-crm-api:*"
+    }
+  ]
+}

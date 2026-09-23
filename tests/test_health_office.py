@@ -86,7 +86,7 @@ class TestSchedule(unittest.TestCase):
             if r["session_type"].startswith("strength"):
                 self.assertEqual(office.day_type(d), "msp_work", d)
             if office.day_type(d) in ("wi", "travel"):
-                self.assertIn(r["session_type"], ("recovery_flow", "cardio_z2", "walk"), d)
+                self.assertIn(r["session_type"], ("recovery_flow", "cardio_z2"), d)
 
     def test_exactly_one_back_to_back_pair_per_week(self):
         """SCHEDULE-2's 1st/3rd/4th office-day rule puts two lifts together:
@@ -106,8 +106,8 @@ class TestSchedule(unittest.TestCase):
     def test_weekly_pattern_and_weeks(self):
         # Sun..Sat. Odd cycle weeks lift Mon/Wed/Thu, even ones Tue/Thu/Fri.
         odd = ["recovery_flow", "strength_a", "cardio_z2", "strength_b",
-               "strength_c", "recovery_flow", "walk"]
-        even = ["recovery_flow", "walk", "strength_a", "cardio_z2", "strength_b",
+               "strength_c", "recovery_flow", "recovery_flow"]
+        even = ["recovery_flow", "recovery_flow", "strength_a", "cardio_z2", "strength_b",
                 "strength_c", "recovery_flow"]
         for wk in range(2, 8):
             pattern = odd if (wk % 2 == 0) else even
@@ -193,10 +193,10 @@ class TestSchedule(unittest.TestCase):
             for wd in (0, 2):   # strength_a, strength_b never carry it
                 self.assertNotIn("finisher", _BY_DATE[_wk_date(wk, wd)]["blocks"])
 
-    def test_walk_and_flow(self):
-        w = next(r for r in _ROWS if r["session_type"] == "walk")
-        self.assertEqual(w["blocks"]["location"], "outside")
-        self.assertEqual(w["est_duration_min"], 30)
+    def test_no_walk_rows_and_flows_are_flows(self):
+        """WALK-RETIRE (Ryan, 2026-09-22): the generator produces no walk row.
+        The Saturday and travel-Monday walks are mat flows now."""
+        self.assertEqual([r["plan_date"] for r in _ROWS if r["session_type"] == "walk"], [])
         f = next(r for r in _ROWS if r["session_type"] == "recovery_flow")
         self.assertEqual(f["blocks"]["type"], "recovery_flow")
 
@@ -262,19 +262,17 @@ class TestResolver(unittest.TestCase):
         self.assertIn("stepmill", health.resolve_equipment_and_location("cardio_intervals")["equipment"])
         self.assertNotIn("downstairs gym", json.dumps(health._EQUIPMENT_MAP))
 
-    def test_cardio_ignores_weather(self):
+    def test_cardio_is_indoors_and_takes_no_weather(self):
         r = health.resolve_equipment_and_location(
-            "cardio_z2", weather={"temp_f": 20.0, "precip_next_90min": True},
+            "cardio_z2",
             blocks=next(x for x in _ROWS if x["session_type"] == "cardio_z2")["blocks"])
         # SCHEDULE-2: Z2 runs at the office; the flows are what travel.
         self.assertEqual(r["location"], "office gym")
         self.assertIsNone(r["notes"])
-
-    def test_walk_weather_still_applies(self):
-        r = health.resolve_equipment_and_location(
-            "walk", weather={"temp_f": 30.0},
-            blocks=next(r for r in _ROWS if r["session_type"] == "walk")["blocks"])
-        self.assertIn("Cold", r["notes"])
+        # WALK-RETIRE: nothing planned is weather-dependent, so there is no
+        # weather parameter left to pass.
+        with self.assertRaises(TypeError):
+            health.resolve_equipment_and_location("cardio_z2", weather={"temp_f": 20.0})
 
 
 class TestRenders(unittest.TestCase):

@@ -244,6 +244,33 @@ crm_write_guard(entity_type, data, confidence, source_pb,
 `health.reflection` (migration 032). Isolated; no `public`
 or `acos` writes.
 
+### Walking is activity, not a session (WALK-RETIRE, Ryan 2026-09-22)
+
+**`walk` is not a session type.** Walking is daily life, not something the
+program prescribes, so counting it against a plan makes adherence meaningless
+in both directions: a walked day reads as a completed session he was never
+told to do, and a day he walks instead of lifting reads as compliant. Either
+way the number stops meaning "did the prescribed work".
+
+What follows from it:
+
+- **The generator produces no walk rows.** The Saturday (Brown Deer) and travel
+  Monday walks are mat Recovery Flows at the cycle location. `validate_rows`
+  refuses a walk row outright.
+- **A walk workout never matches a plan** (`knowledge/watch_match.py`): the
+  kind gate has no walk entry, so a walk is always reported, never attached —
+  including one that ends seconds before a session starts.
+- **Walks still count as activity.** Steps, active minutes, active energy and
+  heart rate come from the watch tables and include every walk. They appear in
+  the reports as activity.
+- **They never touch adherence.** EVAL-1 leaves `ACTIVITY_ONLY_TYPES` rows out
+  of sessions done vs planned entirely — not done, not missed, not planned, not
+  rest — and the dietitian report's "sessions completed of sessions planned"
+  counts only prescribed sessions.
+- **Nothing planned is weather-dependent any more.** The indoor-walk swap
+  (rain or under 40°F → walking pad) is gone with the type; every session is
+  indoors.
+
 ### Triggers — proactive (scheduled jobs)
 
 Health-tier jobs post in the **wake** and **open** phases; in **quiet** they
@@ -260,7 +287,7 @@ The morning is **event-driven**; the fixed 04:45 calibration post and its
 |---|---|
 | 04:30 (Sat/Sun 07:30) | **Wake post** (`job_wake` → `artemis/wake.py`): today's session rendered **plan-exact** from `health.plan` (every exercise, sets×reps, RPE cap, load), warmup/cooldown, **the watch line** (below), the check-in prompt, held health notices, pre-departure. Sets `checkin_open:<date>`. |
 | on the check-in reply | Parsed **deterministically** (`artemis/health_checkin.py`, no LLM) and stored in `health.daily_state`. **No sets logged today** → the rules run and today's plan row is rewritten; the reply is the plan-exact diff. **Sets already logged** → stored only, reply `Logged.` |
-| 05:15 (Sat/Sun 08:15) | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): **training days only**, if no check-in and no sets — one post, "No check-in yet — run Session X as written." Nothing on rest/walk days; never repeats. |
+| 05:15 (Sat/Sun 08:15) | `job_checkin_nudge` (WAKE + `CHECKIN_NUDGE_OFFSET_MIN`): **training days only**, if no check-in and no sets — one post, "No check-in yet — run Session X as written." Nothing on rest days; never repeats. |
 
 Prompt text:
 
@@ -340,7 +367,7 @@ long sleep never adds work — progression belongs to the program.
 |---|---|---|
 | 1 | **pain 4–5** in any region | **Day off**: the row becomes `rest_mobility`, blocks `{type: mobility, display_name: "Day off", duration_min: 0}`, no RPE, 0 min. No nudge. |
 | 2 | **rising pain** starting at ≥ 1 (below) | **Day off**, same as 1. The reply names the trend. |
-| 3 | **pain 3** in the **primary** region of **≥ 50%** of today's exercises (a Z2/walk block counts as one, by its primary region) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). Secondary use doesn't count toward the 50%: shoulder pain 3 on Session B (primary on 2 of 7) is rule 5, not a mobility day. |
+| 3 | **pain 3** in the **primary** region of **≥ 50%** of today's exercises (a Z2 block counts as one, by its primary region) | **Mobility / Yoga** day: `rest_mobility`, 30 min, Stretch Trainer + mat, `mobility_focus` = the region(s). Secondary use doesn't count toward the 50%: shoulder pain 3 on Session B (primary on 2 of 7) is rule 5, not a mobility day. |
 | 4 | 2+ **soreness** regions at 4–5 | Day swap → Recovery Z2 (20–30 min, recumbent bike) + 10 min mobility. |
 | 5 | **pain 3** (under 50%) | Exercises with the region as **primary** are removed and replaced by a **mobility block** for it: `mobility_focus`, `mobility_min` (10 min for one region, 15 for several), `mobility_notes` from the region→mobility map in `health_regions.py`; Stretch Trainer + mat added to equipment. Exercises with it as **secondary only** are **swapped** for the first pool exercise (list in rule 6) that avoids every sore and painful region and isn't already in the session; if none fits, that exercise goes to the mobility block instead. A finisher using the region is dropped. |
 | 6 | **soreness 4–5** | Remove every exercise with that region as primary **or** secondary (`health_regions.py`); refill to the same count from the pool (leg press, seated leg curl, leg extension, calf press, captain's chair knee raise, seated back extension, Pallof press), avoiding every sore **and painful** region and anything rule 5 removed or added. When the pool runs out the reply says how many slots stayed empty. A finisher using the region is dropped. |
@@ -371,7 +398,7 @@ check-ins (`health.daily_state`) count — in-session notes never do.
 > rising: shoulder 0→1→2
 > Reply `original` to undo.
 
-Rest days are never adjusted. A walk day only yields to the day-off rules
+Rest days are never adjusted. A Recovery Flow only yields to the day-off rules
 (1–2). A second check-in the same day recomputes from `blocks.original` (never
 stacks); a second check-in that no longer warrants a change restores the plan
 as written.
@@ -457,7 +484,7 @@ deterministic plan detail and logs a guardrail violation. Equipment words
 ("mat", "DBs") and greetings are not exercises; business replies aren't
 checked.
 
-Rest and walk days get the same check-in prompt — no "Today's workout is
+Rest days get the same check-in prompt — no "Today's workout is
 later" line.
 
 > The old weekday table (Tue 04:01 / Wed 07:00 / …) is gone: it encoded the
@@ -465,13 +492,13 @@ later" line.
 > is the only thing that decides.
 
 **`job_health_nag`** — 16:30 local, daily. Fires only if today's plan has no
-`session_log` row. Suppressed on `rest_mobility` and `walk`. It moved off
+`session_log` row. Suppressed on `rest_mobility`. It moved off
 21:00 because 21:00 now sits inside the quiet window (17:00–04:30) and would
 never post.
 
 **`job_health_inferred_summary`** — 21:50 local, daily. Backstop, writes
 only — it posts nothing, so the quiet window does not apply. If the
-plan exists, isn't rest/walk/skipped, and still has no log, write a
+plan exists, isn't rest/skipped, and still has no log, write a
 placeholder `session_summary` row with `logged_via='inferred'` and
 `notes='no debrief — assumed at baseline'`. Autoregulator treats these
 as low-confidence signal.
@@ -493,7 +520,7 @@ intent classifier (rules 9-11 in `artemis/intent.py`):
   the most recent matching `session_log` row via LIKE search; falls
   through to debrief handler if no match
 - **Modality swap** ("swap today to elliptical") → propose-then-confirm swap
-  of a cardio/walk session to another office machine: treadmill, elliptical,
+  of a cardio session to another office machine: treadmill, elliptical,
   upright bike, recumbent bike, or stepmill. Same stimulus; `swap revert` undoes.
 - **Retired: bike trainer override** (`trainer set indoor` / `trainer set
   outdoor`) — HEALTH-2 retired the home bike. The phrase is still matched
@@ -530,25 +557,24 @@ strength_c       -> office gym: DBs, pec fly, functional trainer, adjustable ben
                     calf press, ab machine                        (first: DB Romanian deadlift)
 cardio_z2        -> office gym: treadmill / elliptical / recumbent / upright bike
 cardio_intervals -> office gym: stepmill / upright bike
-walk             -> outside: walking shoes (rain or <40°F -> indoor walk)
 rest_mobility    -> office gym: mat / Stretch Trainer
 ```
 
-Weather is consulted for `walk` only. There is no bike indoor/outdoor decision
-and no `trainer set` override any more.
+No session is weather-dependent (WALK-RETIRE): every one is indoors. There is
+no bike indoor/outdoor decision and no `trainer set` override any more.
 
 **Office program — phase 1, anchored Wed 2026-09-16, seeded 9/16 → 11/03** —
 `scripts/reseed_health_plan_v2.py --office` (dry-run default, `--commit` to
 write; also deletes orphan rows past the program end), validated by
 `scripts/validate_health_plan.py`. All sessions are at the **office gym**
-(`blocks.location`); the Sunday walk is outside.
+(`blocks.location`) or, on a WI/home day, the flow's cycle location.
 
 Week windows run **Wed–Tue** from 2026-09-16 (week 1 = 9/16–9/22 … week 7 =
 10/28–11/03). There are no ramp-up days: 9/16 is week 1, day 1.
 
 | Wed | Thu | Fri | Sat | Sun | Mon | Tue |
 |---|---|---|---|---|---|---|
-| Strength A | Recovery Flow (office) | Strength B | Recovery Flow (home) | walk | Strength C | Z2 |
+| Strength A | Recovery Flow (office) | Strength B | Recovery Flow (home) | Recovery Flow | Strength C | Z2 |
 
 Thu and Sat are Recovery Flow days (YOGA-1, `session_type = recovery_flow`,
 replacing `rest_mobility`), so no two strength days are adjacent and every

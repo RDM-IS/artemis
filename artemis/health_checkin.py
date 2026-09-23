@@ -104,6 +104,11 @@ _WEIGHT_RE = re.compile(
     r"\b(?:weight|weighed|wt|scale)\s*(?:is|was|in\s+at|at|of|:)?\s*(\d{2,3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)?\b"
     r"|\b(\d{3}(?:\.\d{1,2})?)\s*(?:lbs?|pounds)\b",
     re.I)
+# A number on its own between commas — "sleep 6, energy 4, 281.5" — is the
+# weight when it is 150–400 lb. Only a whole clause counts: "walked 200 steps"
+# is not a weight.
+_BARE_WEIGHT_RE = re.compile(r"(?:^|[,;\n])\s*(\d{3}(?:\.\d{1,2})?)\s*(?=$|[,;\n])")
+_BARE_WEIGHT_RANGE = (150.0, 400.0)
 _RHR_RE = re.compile(r"\b(?:rhr|resting\s*(?:hr|heart\s*rate))\s*(?:is|was|of|:)?\s*(\d{2,3})\b", re.I)
 _ZERO_SORE_RE = re.compile(
     r"\b(?:sore(?:ness)?\s*(?:is|:)?\s*(?:0|zero|none)(?:\s*/\s*(?:10|5))?|no\s+soreness|not\s+sore|nothing\s+sore)\b",
@@ -268,6 +273,12 @@ def parse_checkin(text: str) -> CheckIn:
         if m:
             ci.weight_lbs = float(m.group(1) or m.group(2))
             work = _blank(work, m.span())
+        else:
+            bare = [b for b in _BARE_WEIGHT_RE.finditer(work)
+                    if _BARE_WEIGHT_RANGE[0] <= float(b.group(1)) <= _BARE_WEIGHT_RANGE[1]]
+            if len(bare) == 1:       # two candidates: guessing would be inventing
+                ci.weight_lbs = float(bare[0].group(1))
+                work = _blank(work, bare[0].span(1))
 
         zero = _ZERO_SORE_RE.search(work)
         if zero:
@@ -321,7 +332,8 @@ def parse_checkin(text: str) -> CheckIn:
         ci.soreness = {"overall": 0}
 
     leftover = " ".join(work.split())
-    ci.free_text = leftover or None
+    # Only separators left (", , ,") is nothing Ryan said.
+    ci.free_text = leftover if re.search(r"\w", leftover) else None
     return ci
 
 
@@ -330,7 +342,7 @@ def parse_checkin(text: str) -> CheckIn:
 # ============================================================================
 
 STRENGTH_TYPES = ("strength_a", "strength_b", "strength_c")
-LIGHT_TYPES = ("rest_mobility", "walk")
+LIGHT_TYPES = ("rest_mobility",)
 FLOW_TYPE = "recovery_flow"   # YOGA-1: only the day-off rules apply
 _SESSION_LETTER = {"strength_a": "A", "strength_b": "B", "strength_c": "C"}
 
@@ -521,7 +533,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     rising_notes = [f"rising: {_trend({r: seq})}" for r, seq in rising.items()]
 
     if session_type in LIGHT_TYPES or session_type == FLOW_TYPE:
-        # A walk or a Recovery Flow only yields to the day-off rules: pain 2-3
+        # A rest day or a Recovery Flow only yields to the day-off rules: pain 2-3
         # changes nothing (it is already mobility) and soreness/recovery rules
         # don't apply.
         adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3, sides) + rising_notes
@@ -1184,8 +1196,7 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
             logger.info("CHECKIN_ADJUST=0 — would have applied: %s", adj.reason)
             audit(cur, "checkin_adjust_suppressed", "flag_off",
                   {"plan_id": plan["plan_id"], "rules": adj.rules_fired})
-        what = ("walk as planned" if written_type == "walk"
-                else f"{label} as planned" if written_type == FLOW_TYPE
+        what = (f"{label} as planned" if written_type == FLOW_TYPE
                 else f"run {label} as written")
         if "adjustment" in plan["blocks"] and adjust:
             # A newer check-in that no longer warrants changes: back to as-written.

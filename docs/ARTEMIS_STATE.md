@@ -194,15 +194,31 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
   | | Week 1 | Week 2 |
   |---|---|---|
-  | Sun | MSP home | WI (Richfield) |
+  | Sun | MSP home | WI (**Brown Deer**; → Richfield 17:00) |
   | Mon | MSP work | Travel Richfield → MSP, leave 11:00 |
   | Tue–Thu | MSP work | MSP work |
   | Thu eve | drive to the farm, 5 h | — |
-  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 | MSP work |
+  | Fri | WI (farm = Richfield), day off work, → Brown Deer 16:00 (modelled 2026-09-22) | MSP work |
   | Sat | WI (Brown Deer) | MSP home |
 
 - **The Wisconsin stretch is continuous** from Thursday evening of week 1 to Monday midday of week 2. **Thursday itself is still an office day.**
 - **Each day type carries:** location, whether a departure checklist applies, and whether meals are pre-filled. **Wake time is not one of them — it follows the location** (below).
+- **A day's location is the WAKE location** (Ryan, 2026-09-22). `location_at(d)` with no time answers the morning; `wake_on` reads it at 00:00. A day with a move keeps that morning location as "the day's location".
+- **A move changes neither wake nor quiet.** Wake comes from the morning location; quiet-hours start comes from the DAY TYPE. On the wi Sunday the move at 17:00 leaves wake at 07:30 (Brown Deer) and quiet at 22:30 (`wi`); the wi Friday's 16:00 move leaves wake at 06:00 (Richfield). What a move changes is where he *is* in the evening — `boundaries()['evening_location']`.
+- **Where he is runs in two layers** (`DAY_SEGMENTS`, Ryan 2026-09-22), because the day structure becomes a **morning session plus an evening session** and an evening session must not read the office gym's inventory.
+  - **`DAY_LOCATIONS` is the day's ANCHOR** — where he wakes. It is what "the day's location" means: the wake time comes from it and a seeded plan row carries it. **Wake reads the anchor, never the 00:00 segment** — an `msp_work` day starts at `msp_home`, so a wake keyed off the segment would return 07:30 and move every weekday. `tests/test_cycle` pins 04:30 on all 8 office days.
+  - **`DAY_SEGMENTS` is where he is through the day**, as `(location, start)` in order, the first starting at local midnight. Overridable from `acos.system_state` under `cycle_day_segments` (same pattern as `cycle_locations`); a malformed table, an unknown location or a first segment that doesn't start at midnight falls back to the built-in rather than raising.
+
+  | position | segments |
+  |---|---|
+  | `msp_work` (8 of 14) | `msp_home` → **office 05:00** → **msp_home 17:00** (work ends 16:30, 30 min commute) |
+  | wk 1 Thursday | `msp_home` → office 05:00 → **transit 16:30** → **richfield 21:30** (the 5 h drive) |
+  | wk 1 Friday | `richfield` → `brown_deer` 16:00 |
+  | wk 1 Saturday, wk 2 Sunday | `brown_deer`; the Sunday moves to `richfield` 17:00 |
+  | travel Monday | `richfield` → **transit 11:00** → **msp_home 16:00** |
+  | `msp_home` Sun/Sat | `msp_home` all day |
+
+- **`transit` is a pseudo-location** (approved 2026-09-22): on the road, **no equipment**, never a day's anchor. **No session is ever placed in a transit segment. A session that would land there is reported, not relocated** — the same discipline as an unmatched workout: surface it, never invent a substitute. `health_office.validate_rows` refuses a row whose anchor is transit.
 - **Wake time follows the location, not the day type** (corrected 2026-09-19). The travel Monday is a Richfield morning, so keying wake off the day type would need a special case for it; keying off the location doesn't. **The resolver reads the location first, then takes the wake time from it.**
 
   | location | wake |
@@ -516,7 +532,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       5. **Weight:** first weigh-in (date, lb), last weigh-in (date, lb), the change, the 7-day average and the number of weigh-ins. With fewer than 3 weigh-ins in a 7-day window, the values are listed instead of averaged.
     - **Page 2 — detail:**
       - **Activity (moved to the top of page 2, 2026-09-21, so the report stays at two pages):**
-        - **Summary table:** sessions completed of sessions planned; exercise minutes; daily average steps; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
+        - **Summary table:** sessions completed of sessions planned (**prescribed sessions only — walks are activity, never sessions**, WALK-RETIRE 2026-09-22); exercise minutes; daily average steps; daily average watch active energy, with the number of days that had watch data. **No net-energy line** while the baseline is undefined; it is never estimated.
         - **Two bar charts under the table, side by side:**
           1. **Daily steps:** one bar per day, with the value labelled on each bar.
           2. **Active minutes per day:** stacked by intensity (light, moderate, vigorous), with the total labelled on each bar. **Intensity comes from ZONE-1 heart-rate zones only.** Until ZONE-1 is unblocked, the chart shows total active minutes **unstacked**, with the note "Intensity breakdown not yet available." **The split is never estimated.**
@@ -691,6 +707,24 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **What else would break, checked:** nothing in `artemis/` or `knowledge/` reads `health-api-key`, `watch-ingest-key` or `zoho-webhook-secret` — those are the Lambda's, which has its own role. `rdmis/dev/twilio` is referenced by `knowledge/secrets.py` but called from nowhere. The provisioning scripts (`scripts/provision_health_api_key.py`, `provision_openweather_key.py`) do write secrets, and after this change must be run from the Mac under `rdmis-admin`, which is where they already belong.
 - **Separately, a live bug this surfaced:** `artemis/voice.py` reads `rdmis/dev/deepgram-api-key` and `rdmis/dev/elevenlabs-api-key`. **Neither secret exists in the account.** That path is already broken today; the policy change is not what breaks it, but the policy should not list them either.
 - **Rollback** is one command — reattach the managed policy — and the blast radius of getting it wrong is the box losing a secret it needs, which is loud and immediate everywhere except the two OAuth refreshes.
+
+**LAMBDA-LOGS-READ — let the box search the API Lambda's logs (small; PROPOSED 2026-09-22, NOT APPLIED).** Policy drafted at `infrastructure/iam/acos-ec2-lambda-logs-read.json`: `logs:FilterLogEvents` on `/aws/lambda/rdmis-crm-api` only, as a new inline policy `acos-lambda-logs-read` on `acos-ec2-role`. It grants no write action and no other log group.
+- **Why.** On 9/22 the Health Auto Export workouts push had to be diagnosed blind. A request the API rejects writes no `watch_ingest` audit row, the box role is denied every `logs:` call, and the Mac's SSO login had lapsed. The only trace of a rejected upload is in CloudWatch, which nobody could read.
+- **What it would actually show today, checked 2026-09-22: less than the name suggests.** The function logs only the runtime's `START`/`REPORT` lines per invocation, plus any traceback or `Task timed out`. There is no path and no status code. So the permission alone surfaces crashes and timeouts. **It does not show a 401, 413 or 422** returned by the app, and it cannot show a gateway rejection at all: a throttled request (stage limit 5 req/s, burst 10) or one over the payload limit never reaches the function. Access logging is off on the `default` stage.
+- **To make rejected uploads visible, pair it with one of:**
+  - **(i) one log line per `/ingest` request, including refusals** (status, body size, metric/workout counts, never the key). This is a small handler change and covers everything the function sees.
+  - **(ii) API Gateway access logging** on the `default` stage, into its own log group. It covers throttles and oversize payloads too, and the policy would then also name that group.
+  - Recommendation: (i) with this permission now; (ii) only if a gateway-level rejection is ever suspected.
+- **Apply (when approved), from the Mac under `rdmis-admin`:** `aws iam put-role-policy --role-name acos-ec2-role --policy-name acos-lambda-logs-read --policy-document file://infrastructure/iam/acos-ec2-lambda-logs-read.json`. **Rollback:** `aws iam delete-role-policy --role-name acos-ec2-role --policy-name acos-lambda-logs-read`.
+- **Noticed alongside:** the log group has **no retention** (never expires) and holds 152 MB. Setting one (e.g. 90 days) is a separate decision.
+
+**WALK-RETIRE — walking is activity, never a planned session (Ryan, 2026-09-22).** Counting a walk against a plan makes adherence meaningless in both directions: a walked day reads as a session he was never told to do, and a day he walks instead of lifting reads as compliant. The reasoning is recorded in PB-009.
+- **`walk` is gone as a session type.** The generator's two walk slots (Sat at Brown Deer, the travel Monday) are mat Recovery Flows at the day's cycle location; `LEGAL_SESSION_TYPES`, the equipment/display maps, the light-session tuples and the swap-eligible list no longer name it, and `validate_rows` refuses a walk row.
+- **Six seeded rows change:** 9/26, 9/28, 10/10, 10/12, 10/24, 10/26 → `recovery_flow`, Brown Deer on the Saturdays and Richfield on the travel Mondays, mat only. None has a logged set. **Interim:** the morning/evening day structure will reseed several of these again.
+- **No walk workout ever matches a plan** (`knowledge/watch_match.py`). The 9/22 walk 11 s after the bike stays unattached, which is why the adjacent-workout rule (#163) was closed rather than trimmed.
+- **Activity is unaffected:** steps, active minutes, active energy and heart rate are read from the watch tables and include every walk. EVAL-1 leaves `ACTIVITY_ONLY_TYPES` rows out of sessions done vs planned entirely, and the dietitian report counts prescribed sessions only.
+- **Nothing planned is weather-dependent any more.** The indoor-walk swap (rain or < 40 °F → walking pad) went with the type, and `resolve_equipment_and_location` no longer takes `weather`.
+- **History is kept:** no past `health.plan` row is a walk (checked 2026-09-22 — all 6 are future), and the legacy baseline seeder (`scripts/seed_health_baseline.py`, 5/06–9/19) is untouched.
 
 ## 7. Operating disciplines (non-negotiable)
 
