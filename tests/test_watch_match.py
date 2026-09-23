@@ -279,7 +279,8 @@ class TestWiring(unittest.TestCase):
 
     def test_the_box_job_is_registered_and_silent(self):
         src = (self.ROOT / "artemis" / "scheduler.py").read_text()
-        self.assertIn('id="watch_workout_match"', src)
+        # declared in the interval registry (INTERVAL_SPECS), not inline
+        self.assertIn('IntervalSpec("watch_workout_match", "job_watch_workout_match"', src)
         job = src[src.index("def job_watch_workout_match"):src.index("def job_pain_pattern_recompute")]
         self.assertNotIn("_post(", job)
         self.assertNotIn("post_message", job)
