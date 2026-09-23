@@ -188,6 +188,7 @@ _LEGACY_PRETTY = {
     "cardio_intervals": "Cardio Intervals",
     "cardio_z2": "Cardio Zone 2",
     "rest_mobility": "Rest / Mobility",
+    "rest": "Rest",
     "recovery_flow": "Recovery Flow",
 }
 
@@ -227,7 +228,7 @@ def get_today(
                    target_rpe, target_hr_zone, est_duration_min,
                    is_skipped, blocks
             FROM health.plan
-            WHERE plan_date = :d
+            WHERE plan_date = :d AND slot = 'morning'
         """),
         {"d": today},
     ).mappings().first()
@@ -413,7 +414,7 @@ def get_status(
                        AND sl.log_type = 'session_summary'
                    ) AS is_logged
             FROM health.plan p
-            WHERE p.plan_date BETWEEN :s AND :e
+            WHERE p.plan_date BETWEEN :s AND :e AND p.slot = 'morning'
             ORDER BY p.plan_date
         """),
         {"s": window_start, "e": window_end},
@@ -456,7 +457,7 @@ def get_status(
         prev = db.execute(
             text("""
                 SELECT phase, week_num, plan_date FROM health.plan
-                WHERE plan_date <= :today
+                WHERE slot = 'morning' AND plan_date <= :today
                 ORDER BY plan_date DESC LIMIT 1
             """),
             {"today": today},
@@ -635,7 +636,7 @@ def _resolve_plan_id(db: Session, supplied: Optional[int]) -> Optional[int]:
         return supplied
     today = _today_ct()
     row = db.execute(
-        text("SELECT plan_id FROM health.plan WHERE plan_date = :d"),
+        text("SELECT plan_id FROM health.plan WHERE plan_date = :d AND slot = 'morning'"),
         {"d": today},
     ).mappings().first()
     return row["plan_id"] if row else None
@@ -803,7 +804,7 @@ def get_today_logged(
     """
     today = _today_ct()
     plan_row = db.execute(
-        text("SELECT plan_id FROM health.plan WHERE plan_date = :d"),
+        text("SELECT plan_id FROM health.plan WHERE plan_date = :d AND slot = 'morning'"),
         {"d": today},
     ).mappings().first()
     if plan_row is None:
@@ -1099,7 +1100,7 @@ def get_sessions(
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
                    target_rpe, target_hr_zone, is_skipped
             FROM health.plan
-            WHERE plan_date BETWEEN :s AND :e
+            WHERE plan_date BETWEEN :s AND :e AND slot = 'morning'
             ORDER BY plan_date
         """),
         {"s": window_start, "e": window_end},
@@ -1324,7 +1325,8 @@ def _is_rest_day(session_type: Optional[str], blocks: Any) -> bool:
     b = blocks if isinstance(blocks, dict) else {}
     if b.get("type") == "recovery_flow" or session_type == "recovery_flow":
         return False
-    return session_type == "rest_mobility" or b.get("type") == "mobility"
+    from knowledge.session_types import is_rest
+    return is_rest(session_type) or b.get("type") in ("mobility", "rest")
 
 
 def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: date) -> str:
@@ -1411,7 +1413,7 @@ def _plan_days(db: Session, start: date, end: date,
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
                    target_rpe, est_duration_min, is_skipped
             FROM health.plan
-            WHERE plan_date BETWEEN :s AND :e
+            WHERE plan_date BETWEEN :s AND :e AND slot = 'morning'
             ORDER BY plan_date
         """),
         {"s": start, "e": end},
@@ -1631,7 +1633,7 @@ def _program(db: Session, today: date) -> Optional[dict[str, Any]]:
     ref = db.execute(
         text("""
             SELECT phase, week_num, plan_date FROM health.plan
-            WHERE plan_date <= :t ORDER BY plan_date DESC LIMIT 1
+            WHERE slot = 'morning' AND plan_date <= :t ORDER BY plan_date DESC LIMIT 1
         """),
         {"t": today},
     ).mappings().first()

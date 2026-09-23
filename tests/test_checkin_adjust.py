@@ -40,8 +40,11 @@ B_NAMES = ["DB goblet squat", "Seated cable row", "Incline DB press", "Leg exten
            "Rear delt fly", "Cable Pallof press", "Seated back extension"]
 
 
-def office_row(d: date, plan_id: int = 105) -> dict:
-    r = next(x for x in office.build_rows() if x["plan_date"] == d)
+def office_row(d: date, plan_id: int = 105, slot: str = "morning") -> dict:
+    """A seeded row as the check-in sees it. EVENING-1: the MORNING by default —
+    the check-in is a morning thing — with `slot="evening"` for the flow."""
+    r = next(x for x in office.build_rows()
+             if x["plan_date"] == d and x.get("slot", "morning") == slot)
     return {"plan_id": plan_id, "plan_date": d, "phase": r["phase"], "week_num": r["week_num"],
             "session_type": r["session_type"], "target_rpe": r["target_rpe"],
             "target_hr_zone": r["target_hr_zone"], "est_duration_min": r["est_duration_min"],
@@ -63,6 +66,8 @@ def rest_row(d: date, plan_id: int = 104) -> dict:
 class FakeDB:
     def __init__(self, *rows):
         self.plan = {r["plan_date"]: copy.deepcopy(r) for r in rows}
+        # EVENING-1: evening rows live beside the mornings, keyed by date.
+        self.evening: dict[date, dict] = {}
         self.logs: list[dict] = []
         self.daily: dict[date, dict] = {}
         self.audit: list[tuple] = []
@@ -89,12 +94,14 @@ class FakeCursor:
         self.db = db
         self.description = None
         self._rows = []
+        self.rowcount = 0
 
     def execute(self, sql, params=()):
         s = " ".join(sql.split())
         self.description, self._rows = None, []
         if s.startswith("SELECT plan_id, plan_date, phase, week_num, session_type, target_rpe,"):
-            row = self.db.plan.get(params[0])
+            slot = params[1] if len(params) > 1 else "morning"
+            row = (self.db.plan if slot == "morning" else self.db.evening).get(params[0])
             self.description = [(c,) for c in self._PLAN_COLS]
             if row:
                 self._rows = [tuple(json.dumps(row[c]) if c == "blocks" else row[c]
@@ -206,6 +213,15 @@ class FakeCursor:
             if not any(r["source_post_id"] == src for r in self.db.reflections if src):
                 self.db.reflections.append({"pattern_id": pid, "text": text,
                                             "post_id": post_id, "source_post_id": src})
+        elif s.startswith("UPDATE health.plan SET session_type = %s, target_rpe = NULL"):
+            # EVENING-1 clear_evening: the day off stands the evening down too
+            day = params[2]
+            row = self.db.evening.get(day)
+            self.rowcount = 0
+            if row and row["session_type"] != params[0]:
+                row.update(session_type=params[0], target_rpe=None, est_duration_min=0,
+                           blocks=json.loads(params[1]))
+                self.rowcount = 1
         elif s == "SAVEPOINT pain_patterns":
             self.db._savepoint = copy.deepcopy(self.db.patterns)
         elif s == "RELEASE SAVEPOINT pain_patterns":
@@ -603,9 +619,38 @@ class TestFlows(unittest.TestCase):
     def test_nudge_text(self):
         self.assertEqual(hc.nudge_text(office_row(FRI)), "No check-in yet — run Session B as written.")
         self.assertIsNone(hc.nudge_text(rest_row(date(2026, 9, 17))))     # rest day
-        self.assertEqual(hc.nudge_text(office_row(date(2026, 9, 25))),     # YOGA-1 flow day
-                         "No check-in yet — run Recovery Flow as written.")
+        # EVENING-1: 9/25's flow moved to the evening, so its MORNING is a rest
+        # and the nudge — a morning thing — stays silent. The evening is
+        # unprompted by design.
+        self.assertIsNone(hc.nudge_text(office_row(date(2026, 9, 25))))
         self.assertIsNone(hc.nudge_text(None))
+
+    def test_a_pain_day_off_clears_the_evening_too(self):
+        """EVENING-1 (Ryan, 2026-09-23): a day off is a DAY off. The ladder
+        cannot stand the morning down and leave yoga on the plan."""
+        db = FakeDB(office_row(FRI))
+        db.evening[FRI] = {"plan_id": 900, "plan_date": FRI, "slot": "evening",
+                           "phase": 1, "week_num": 2, "session_type": "recovery_flow",
+                           "target_rpe": 2.0, "target_hr_zone": None,
+                           "est_duration_min": 33, "blocks": {"type": "recovery_flow"},
+                           "is_skipped": False}
+        cur = db.cursor()
+        hc.process_checkin(cur, "pain 5 knee", FRI, checkin_id="x", adjust=True)
+        self.assertIn(db.plan[FRI]["session_type"], hc.LIGHT_TYPES)     # morning stood down
+        self.assertEqual(db.evening[FRI]["session_type"], "rest")       # and the evening
+        self.assertEqual(db.evening[FRI]["est_duration_min"], 0)
+        self.assertIn("Day off", db.evening[FRI]["blocks"]["notes"])
+        self.assertEqual(json.loads(db.audit[-1][8])["evening_cleared"], 1)
+
+    def test_an_ordinary_adjustment_leaves_the_evening_alone(self):
+        db = FakeDB(office_row(FRI))
+        db.evening[FRI] = {"plan_id": 900, "plan_date": FRI, "slot": "evening",
+                           "phase": 1, "week_num": 2, "session_type": "recovery_flow",
+                           "target_rpe": 2.0, "target_hr_zone": None,
+                           "est_duration_min": 33, "blocks": {"type": "recovery_flow"},
+                           "is_skipped": False}
+        hc.process_checkin(db.cursor(), "sore shoulder 4", FRI, checkin_id="x", adjust=True)
+        self.assertEqual(db.evening[FRI]["session_type"], "recovery_flow")
 
 
 class TestParser(unittest.TestCase):

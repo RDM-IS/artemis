@@ -265,6 +265,47 @@ class TestStatus(Base):
         self.assertEqual(derive_day_status(p, [log(1, "session_summary", None)], TODAY), "done")
         self.assertEqual(derive_day_status(plan(2, TODAY, "rest_mobility", {"type": "mobility"}), [], TODAY), "today")
 
+    def test_a_rest_row_is_a_rest_day_like_rest_mobility(self):
+        """EVENING-1 (migration 042): a rest morning gets a REAL row typed
+        `rest`. The Lambda must read it as rest, or every rest day in the
+        Status page and the week view reads 'missed'."""
+        from api.app.routers.health import _is_rest_day, derive_day_status
+        self.assertTrue(_is_rest_day("rest", {"type": "rest"}))
+        self.assertTrue(_is_rest_day("rest_mobility", {"type": "mobility"}))
+        self.assertFalse(_is_rest_day("strength_a", {"type": "circuit"}))
+        # a flow is a session even on a rest-shaped row
+        self.assertFalse(_is_rest_day("recovery_flow", {"type": "recovery_flow"}))
+        # a past rest day reads "done", the same as rest_mobility does — the
+        # rest WAS the plan, so it is not a miss
+        yesterday = TODAY - timedelta(1)
+        for st, blocks in (("rest", {"type": "rest"}),
+                           ("rest_mobility", {"type": "mobility"})):
+            with self.subTest(session_type=st):
+                self.assertEqual(
+                    derive_day_status(plan(9, yesterday, st, blocks), [], TODAY), "done")
+
+    def test_the_display_map_names_rest(self):
+        from api.app.routers.health import _LEGACY_PRETTY
+        self.assertEqual(_LEGACY_PRETTY["rest"], "Rest")
+
+    def test_every_plan_read_is_pinned_to_one_slot(self):
+        """EVENING-1: two rows share a date now. A read that doesn't say which
+        slot it means gets an arbitrary one."""
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[2] / "api" / "app" / "routers" / "health.py"
+        text = src.read_text()
+        needle = "FROM health.plan"
+        i = text.find(needle)
+        while i != -1:
+            select = text[max(0, i - 260):i]          # the columns being read
+            where = text[i:i + 260]                   # …and the predicate
+            # aggregates over the whole program (min/max/count) read the same
+            # value from either slot; per-day reads must say which they mean
+            aggregate = any(f"{fn}(" in select for fn in ("min", "max", "count"))
+            if "plan_date" in where and not aggregate:
+                self.assertIn("slot", where, f"unslotted plan read: {where[:140]}")
+            i = text.find(needle, i + 1)
+
 
 class TestFlowPlannedSets(unittest.TestCase):
     def test_a_flow_plans_no_sets(self):

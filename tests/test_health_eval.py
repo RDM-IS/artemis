@@ -74,6 +74,47 @@ class TestWeek(unittest.TestCase):
         self.assertEqual(r["rpe"]["avg_cap"], 5.5)
         self.assertEqual([o["date"] for o in r["rpe"]["over_cap"]], ["2026-09-16", "2026-09-18"])
 
+    def test_evening_sessions_get_their_own_denominator(self):
+        """EVENING-1 (Ryan, 2026-09-23): separate denominators. A missed
+        evening yoga is not a missed lift, and 4 evenings a week would swamp
+        3 sessions if they were blended."""
+        rows = plans()
+        evenings = [
+            {"plan_id": 900 + i, "plan_date": WED + timedelta(days=i), "slot": "evening",
+             "session_type": "recovery_flow", "week_num": 1, "target_rpe": 2.0,
+             "blocks": {"display_name": "Recovery Flow"}}
+            for i in (0, 2, 4)
+        ]
+        logs = full_week_logs() + [summary(900, WED)]          # only the first evening done
+        r = ev.evaluate(rows + evenings, logs, [], start=WED, end=TUE,
+                        today=TUE + timedelta(days=1))
+        # the morning numbers are untouched by the evenings
+        self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6,
+                                       "missed": 0, "upcoming": 0})
+        self.assertEqual(r["evening"], {"planned": 3, "done": 1, "due": 3,
+                                        "missed": 2, "upcoming": 0})
+        # and they are never folded into one line
+        line = ev.render_lines(r)[0]
+        self.assertIn("6 of 6 sessions due done", line)
+        self.assertIn("Evenings: 1 of 3 due done", "\n".join(ev.render_lines(r)))
+
+    def test_no_evening_line_when_there_are_none(self):
+        r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE,
+                        today=TUE + timedelta(days=1))
+        self.assertEqual(r["evening"]["planned"], 0)
+        self.assertNotIn("Evenings:", "\n".join(ev.render_lines(r)))
+
+    def test_a_rest_morning_counts_like_rest_mobility(self):
+        """EVENING-1: `rest` is a real row and a real rest — never done, never
+        missed, never in the denominator."""
+        rows = plans()
+        rows[1] = dict(rows[1], session_type="rest", blocks={"display_name": "Rest"})
+        r = ev.evaluate(rows, full_week_logs(), [], start=WED, end=TUE,
+                        today=TUE + timedelta(days=1))
+        self.assertEqual(r["counts"]["planned"], 6)
+        self.assertEqual([s["status"] for s in r["sessions"]][1], "rest")
+        self.assertEqual(r["missed"], [])
+
     def test_a_walk_row_is_not_a_session(self):
         """WALK-RETIRE (Ryan, 2026-09-22): walking is daily life, not a
         prescribed session. A legacy walk row counts as nothing — not done,

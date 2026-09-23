@@ -493,8 +493,20 @@ def get_today_plan() -> dict | None:
     return execute_one(
         """SELECT plan_id, plan_date, phase, week_num, session_type,
                   target_rpe, target_hr_zone, est_duration_min, blocks, is_skipped
-           FROM health.plan WHERE plan_date = %s""",
+           FROM health.plan WHERE plan_date = %s AND slot = 'morning'""",
         (today,),
+    )
+
+
+def get_plan_for(day: date, slot: str = "morning") -> Optional[dict]:
+    """EVENING-1: one slot of one day. `get_today_plan` is the morning of today;
+    this is everything else, including tonight."""
+    from knowledge.db import execute_one
+    return execute_one(
+        """SELECT plan_id, plan_date, slot, phase, week_num, session_type,
+                  target_rpe, target_hr_zone, est_duration_min, blocks, is_skipped
+           FROM health.plan WHERE plan_date = %s AND slot = %s""",
+        (day, slot),
     )
 
 
@@ -1189,7 +1201,7 @@ def handle_fix_intent(message: str) -> str | None:
 
 # No debrief nag and no inferred "missed" summary on these days. A Recovery
 # Flow logs itself from gym-display (YOGA-1); a missed one is never a miss.
-_NO_FOLLOWUP_SESSIONS = ("rest_mobility", "recovery_flow")
+from knowledge.session_types import NO_FOLLOWUP_TYPES as _NO_FOLLOWUP_SESSIONS  # noqa: E402
 
 
 def run_nag_check() -> Optional[str]:
@@ -1204,7 +1216,8 @@ def run_nag_check() -> Optional[str]:
     today = datetime.now(_local_tz()).date()
 
     plan = execute_one(
-        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan WHERE plan_date = %s",
+        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan "
+        "WHERE plan_date = %s AND slot = 'morning'",
         (today,),
     )
 
@@ -1243,7 +1256,8 @@ def insert_inferred_summary() -> bool:
     today = datetime.now(_local_tz()).date()
 
     plan = execute_one(
-        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan WHERE plan_date = %s",
+        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan "
+        "WHERE plan_date = %s AND slot = 'morning'",
         (today,),
     )
 
@@ -1312,6 +1326,11 @@ _EQUIPMENT_MAP: dict[str, dict] = {
     "cardio_intervals": {
         "location": "office gym",
         "equipment": _office.SESSION_EQUIPMENT["cardio_intervals"],
+        "first_lift": None,
+    },
+    "rest": {
+        "location": "home",
+        "equipment": [],
         "first_lift": None,
     },
     "rest_mobility": {
@@ -1421,6 +1440,7 @@ def _session_pretty_name(session_type: str) -> str:
         "cardio_intervals": "Cardio Intervals",
         "cardio_z2":        "Cardio Zone 2",
         "rest_mobility":    "Rest / Mobility",
+        "rest":             "Rest",
         "recovery_flow":    "Recovery Flow",
     }.get(session_type, session_type)
 
@@ -1523,7 +1543,7 @@ def get_today_state() -> dict | None:
 # ============================================================================
 
 # Session-types that are NOT loggable lifting sessions (no conversational loop).
-_NON_WORKOUT_SESSIONS = ("rest_mobility", "recovery_flow")
+from knowledge.session_types import NO_FOLLOWUP_TYPES as _NON_WORKOUT_SESSIONS  # noqa: E402
 
 
 # ----------------------------------------------------------------------------
@@ -2311,7 +2331,7 @@ def handle_skip(message: str, today: date | None = None) -> str | None:
     from knowledge.db import execute_one, execute_write
     plan = execute_one(
         "SELECT plan_id, session_type, is_skipped, blocks FROM health.plan "
-        "WHERE plan_date = %s", (day,))
+        "WHERE plan_date = %s AND slot = 'morning'", (day,))
     if not plan:
         return f"No session planned for {day:%a %-m/%-d} — nothing to skip."
     try:
@@ -2415,7 +2435,8 @@ def _query_next_workout() -> str:
     row = execute_one(
         """SELECT * FROM health.plan
            WHERE plan_date >= %s AND is_skipped = FALSE
-             AND session_type NOT IN ('rest_mobility', 'walk', 'recovery_flow')
+             AND slot = 'morning'
+             AND session_type NOT IN ('rest', 'rest_mobility', 'walk', 'recovery_flow')
            ORDER BY plan_date LIMIT 1""",
         (today,),
     )
@@ -2427,7 +2448,8 @@ def _query_next_workout() -> str:
 def _query_day(target: date) -> str:
     from knowledge.db import execute_one
     today = datetime.now(_local_tz()).date()
-    row = execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (target,))
+    row = execute_one("SELECT * FROM health.plan WHERE plan_date = %s AND slot = 'morning'",
+                      (target,))
     if not row:
         return f"No plan for {target.strftime('%A %b %-d')}."
     return _format_plan_overview(row, today)
@@ -2605,7 +2627,7 @@ def _fetch_plan_row(d: date) -> dict | None:
     return execute_one(
         """SELECT plan_date, session_type, target_rpe, est_duration_min,
                   is_skipped, blocks
-           FROM health.plan WHERE plan_date = %s""",
+           FROM health.plan WHERE plan_date = %s AND slot = 'morning'""",
         (d,),
     )
 
@@ -2919,7 +2941,8 @@ def _coach_note(structured_text: str, display_name: str) -> str | None:
 
 def _fetch_plan_full(d: date) -> dict | None:
     from knowledge.db import execute_one
-    return execute_one("SELECT * FROM health.plan WHERE plan_date = %s", (d,))
+    return execute_one("SELECT * FROM health.plan WHERE plan_date = %s AND slot = 'morning'",
+                       (d,))
 
 
 def _plan_date_range() -> tuple[date, date] | None:
@@ -3876,7 +3899,7 @@ def _fetch_swap_plan_row(d: date) -> dict | None:
     from knowledge.db import execute_one
     return execute_one(
         """SELECT plan_id, plan_date, session_type, target_rpe, blocks
-           FROM health.plan WHERE plan_date = %s""",
+           FROM health.plan WHERE plan_date = %s AND slot = 'morning'""",
         (d,),
     )
 

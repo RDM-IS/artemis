@@ -184,6 +184,44 @@ def checked_in_today() -> bool:
         return False
 
 
+def _evening_section(day=None) -> list[str]:
+    """EVENING-1 (Ryan, 2026-09-23): the wake post NAMES tonight's session.
+
+    It is never prompted again — quiet hours start at 17:00 on a work day and
+    that is not changing for it — so this line is the only notice he gets.
+    On a day he is driving, it says so plainly rather than saying nothing: an
+    absent line reads like a bug, and "no evening session" is the plan."""
+    from artemis.health import get_plan_for
+    from artemis.quiet_hours import local_today
+
+    day = day or local_today()
+    try:
+        from artemis import health_office as office
+        row = get_plan_for(day, "evening")
+        possible = office.evening_is_possible(day)
+    except Exception:
+        logger.exception("wake: evening lookup failed")
+        return []
+
+    if row and not row.get("is_skipped"):
+        blocks = row.get("blocks") or {}
+        if isinstance(blocks, str):
+            import json
+            try:
+                blocks = json.loads(blocks)
+            except ValueError:
+                blocks = {}
+        name = blocks.get("display_name") or row["session_type"]
+        where = f" ({blocks['location']})" if blocks.get("location") else ""
+        mins = row.get("est_duration_min")
+        dur = f" — {mins} min" if mins else ""
+        return ["", f"\U0001f319 Tonight: **{name}**{where}{dur}. No reminder — do it when "
+                    "you get to it."]
+    if not possible:
+        return ["", "\U0001f319 No evening session — you're on the road tonight."]
+    return ["", "\U0001f319 No evening session tonight."]
+
+
 def _checkin_section(plan: dict | None, checked_in: bool = False) -> list[str]:
     from artemis.health import build_morning_survey_prompt
 
@@ -316,6 +354,7 @@ def build_wake_message(calendar=None, held_health: list[str] | None = None,
     lines.append("")
     lines.extend(_workout_section(plan))
     lines.extend(_watch_section())
+    lines.extend(_evening_section())
     lines.extend(_checkin_section(plan, checked_in))
     for notice in held_health or []:
         lines.extend(["", notice])

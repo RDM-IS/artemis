@@ -29,7 +29,9 @@ from datetime import date, timedelta
 from artemis import health_office as office
 from artemis import health_regions as hr
 
-REST_TYPES = {"rest_mobility"}
+from knowledge.session_types import REST_TYPES as _REST  # noqa: E402
+
+REST_TYPES = set(_REST)
 # WALK-RETIRE (Ryan, 2026-09-22): activity, never a prescribed session. Rows of
 # these types are left out of sessions done vs planned entirely — not counted
 # as done, missed, planned or rest. The activity totals (steps, active minutes,
@@ -116,6 +118,12 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
     by_plan: dict[int, list] = {}
     for l in logs:
         by_plan.setdefault(l["plan_id"], []).append(l)
+
+    # EVENING-1 (Ryan, 2026-09-23): the two slots get SEPARATE denominators.
+    # A blended figure would say nothing useful — a missed evening yoga is not
+    # a missed lift, and 4 evenings a week would swamp 3 sessions.
+    evening_plans = [p for p in plans if (p.get("slot") or "morning") == "evening"]
+    plans = [p for p in plans if (p.get("slot") or "morning") == "morning"]
 
     sessions, missed, skipped, adjustments = [], [], [], []
     done = due = upcoming = 0
@@ -207,6 +215,7 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
                  "through": min(today, end).isoformat(), "partial": end > today},
         "counts": {"planned": sum(1 for s in sessions if s["status"] != "rest"),
                    "done": done, "due": due, "missed": len(missed), "upcoming": upcoming},
+        "evening": _evening_counts(evening_plans, by_plan, today),
         "sessions": sessions,
         "recovery": recovery,
         "missed": missed,
@@ -215,6 +224,27 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
         "loads": loads,
         "adjustments": adjustments,
     }
+
+
+def _evening_counts(plans, by_plan, today: date) -> dict:
+    """EVENING-1: the evening slot's own denominator. Same rules as the
+    morning — a skip is not a miss, today is not yet late — reported apart."""
+    done = due = upcoming = missed = 0
+    for p in plans:
+        if p.get("is_skipped"):
+            continue
+        if any(not l.get("is_skipped") for l in by_plan.get(p["plan_id"], [])):
+            done += 1
+            due += 1
+        elif p["plan_date"] > today:
+            upcoming += 1
+        elif p["plan_date"] == today:
+            pass                      # tonight hasn't happened yet
+        else:
+            missed += 1
+            due += 1
+    return {"planned": sum(1 for p in plans if not p.get("is_skipped")),
+            "done": done, "due": due, "missed": missed, "upcoming": upcoming}
 
 
 # ── Loading (read-only) ─────────────────────────────────────────────────────
@@ -226,9 +256,10 @@ def load(start: date, end: date, today: date | None = None) -> dict:
 
     today = today or local_today()
     plans = execute_query(
-        "SELECT plan_id, plan_date, session_type, week_num, target_rpe, blocks, "
+        "SELECT plan_id, plan_date, slot, session_type, week_num, target_rpe, blocks, "
         "is_skipped, skip_reason "
-        "FROM health.plan WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date", (start, end))
+        "FROM health.plan WHERE plan_date BETWEEN %s AND %s "
+        "ORDER BY plan_date, slot DESC", (start, end))
     sql = ("SELECT p.plan_date, sl.plan_id, sl.log_type, sl.exercise, sl.weight_lbs, "
            "sl.reps_done, sl.rpe_actual, sl.is_skipped "
            "FROM health.session_log sl JOIN health.plan p ON p.plan_id = sl.plan_id "
@@ -269,6 +300,12 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
              f"{c['done']} of {c['due']} sessions due done"
              + (f" · {c['upcoming']} still to come" if c["upcoming"] else "")
              + f" · {c['planned']} planned"]
+    # EVENING-1: its own line, never folded into the morning's numbers.
+    ec = ev.get("evening") or {}
+    if ec.get("planned"):
+        lines.append(f"Evenings: {ec['done']} of {ec['due']} due done"
+                     + (f" · {ec['upcoming']} still to come" if ec.get("upcoming") else "")
+                     + f" · {ec['planned']} planned")
     rec = ev.get("recovery")
     if rec:
         bits = []

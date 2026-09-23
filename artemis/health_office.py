@@ -78,6 +78,7 @@ SESSION_EQUIPMENT: dict[str, list[str]] = {
     "cardio_z2": [EQ_TREADMILL, EQ_ELLIPTICAL, EQ_RECUMBENT, EQ_UPRIGHT],
     "cardio_intervals": [EQ_STEPMILL, EQ_UPRIGHT],
     "rest_mobility": [EQ_MAT, EQ_STRETCH],
+    "rest": [],                      # EVENING-1: a rest day needs nothing
     "recovery_flow": [EQ_MAT, EQ_STRETCH],
 }
 
@@ -133,6 +134,7 @@ _DISPLAY = {
     "strength_c": "Office Strength C",
     "cardio_z2": "Zone 2 Cardio",
     "rest_mobility": "Rest / Mobility",
+    "rest": "Rest",
     "recovery_flow": "Recovery Flow",
 }
 
@@ -151,12 +153,23 @@ CYCLE_ANCHOR = _cycle.DEFAULT_ANCHOR
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
 
 
-def day_location(d: date) -> str:
-    """The seeded row's location: the day's ANCHOR, where he wakes and where the
-    session happens. Returns the display name the plan rows carry ("office
-    gym"). Never a segment — an msp_work day starts at msp_home."""
-    key = _cycle.anchor_location(d, use_overrides=False)
+def day_location(d: date, slot: str = "morning") -> str:
+    """Where a seeded row happens, as the display name the rows carry.
+
+    The MORNING is the day's anchor — where he wakes. Never the 00:00 segment:
+    an msp_work day starts at msp_home and the session is at the office.
+
+    The EVENING is where he is when the evening session happens (EVENING-1),
+    which on a work day is home, not the office gym."""
+    key = (_cycle.anchor_location(d, use_overrides=False) if slot == "morning"
+           else _cycle.location_at(d, EVENING_AT, use_overrides=False))
     return (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
+
+
+def evening_is_possible(d: date) -> bool:
+    """False when he is on the road: no session is ever placed in a transit
+    segment — it is reported, never relocated (CYCLE-1)."""
+    return not _cycle.is_transit(_cycle.location_at(d, EVENING_AT, use_overrides=False))
 
 
 def is_office_day(d: date) -> bool:
@@ -173,16 +186,29 @@ LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
 # reliable; the flows sit on the wi days because a mat travels. Richfield's
 # rower and trainer stay available for extra cardio — the SEEDED session there
 # is a flow.
+# EVENING-1 (Ryan, 2026-09-23): the flows moved to the EVENING, so the days
+# that carried them are rest mornings now. Mornings are strength / cardio /
+# rest; evenings are yoga.
 NON_LIFT = {
-    0: "recovery_flow",   # Sun, msp_home — mat
+    0: "rest",            # Sun, msp_home — flow moved to the evening
     2: "cardio_z2",       # Tue, office — treadmill / elliptical
-    5: "recovery_flow",   # Fri, Richfield — mat
-    6: "recovery_flow",   # Sat, Brown Deer — mat
-    7: "recovery_flow",   # Sun, Brown Deer (morning) — mat
-    8: "recovery_flow",   # Mon, travel — mat, before the 11:00 drive
+    5: "rest",            # Fri, Richfield — flow moved to the evening
+    6: "rest",            # Sat, Brown Deer — flow moved to the evening
+    7: "rest",            # Sun, Brown Deer — flow moved to the evening
+    8: "rest",            # Mon, travel — flow moved to the evening
     10: "cardio_z2",      # Wed, office — treadmill / elliptical
-    13: "recovery_flow",  # Sat, msp_home — mat
+    13: "rest",           # Sat, msp_home — flow moved to the evening
 }
+
+# EVENING-1: FOUR evenings a week — the six days whose morning flow moved,
+# plus one training day in each program week (Tue of week 1, Wed of week 2).
+# Position 4 is the Thursday of week 1: he drives to the farm after work, and
+# NO SESSION IS EVER PLACED IN A TRANSIT SEGMENT, so it never gets one.
+EVENING_POS: frozenset[int] = frozenset({0, 2, 5, 6, 7, 8, 10, 13})
+EVENING_SESSION = "recovery_flow"
+#: When "the evening" is, for resolving where he is. After the work-day move
+#: home (17:00) and after the wi Friday's move to Brown Deer (16:00).
+EVENING_AT = time(19, 0)
 
 
 def session_for(d: date) -> str:
@@ -618,7 +644,16 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False,
         return _strength(session_type, week_num, wk0=wk0)
     if session_type == "cardio_z2":
         return _z2(week_num, location or LOCATION)
+    if session_type == "rest":
+        return _rest_day()
     return _rest(week_num)
+
+
+def _rest_day():
+    """EVENING-1: a planned rest morning. A REAL row — "no plan" and "rest
+    today" are different facts, and only one of them is a data problem."""
+    return ({"type": "rest", "display_name": _DISPLAY["rest"], "equipment": [],
+             "notes": "Rest. Nothing planned this morning."}, None, None, 0)
 
 
 # ============================================================================
@@ -644,9 +679,15 @@ def build_schedule() -> list[dict]:
     specs: list[dict] = []
     d = WEEK2_START
     while d <= OFFICE_END:
-        specs.append({"plan_date": d, "session_type": session_for(d),
+        specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
                       "week_num": week_num_for(d), "location": day_location(d),
                       "day_type": day_type(d), "wk0": False})
+        # EVENING-1: four evenings a week, and never one in a transit segment.
+        if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
+            specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
+                          "week_num": week_num_for(d),
+                          "location": day_location(d, "evening"),
+                          "day_type": day_type(d), "wk0": False})
         d += timedelta(days=1)
     return specs
 
@@ -665,6 +706,7 @@ def build_row(spec: dict) -> dict:
     tag = f"{spec.get('day_type', 'office')} wk{week_num}"
     return {
         "plan_date": spec["plan_date"],
+        "slot": spec.get("slot", "morning"),
         "phase": PHASE,
         "week_num": week_num,
         "session_type": session_type,
@@ -733,7 +775,7 @@ def format_estimate(minutes) -> str:
 
 
 LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_intervals",
-                       "cardio_z2", "rest_mobility", "recovery_flow"}
+                       "cardio_z2", "rest", "rest_mobility", "recovery_flow"}
 
 
 def forbidden_hits(blocks) -> list[str]:
@@ -754,16 +796,17 @@ def validate_rows(rows: list[dict]) -> list[str]:
     """Structural asserts so a bad edit fails loudly. Returns the TIME-CAP
     notes (45-59 min, and the CALIBRATION_PENDING 60+ rows); a 60+ row
     outside CALIBRATION_PENDING fails the assert."""
-    dates = [r["plan_date"] for r in rows]
-    assert len(dates) == len(set(dates)), "duplicate plan_date"
+    keys = [(r["plan_date"], r.get("slot", "morning")) for r in rows]
+    assert len(keys) == len(set(keys)), "duplicate (plan_date, slot)"
+    mornings = sorted(r["plan_date"] for r in rows if r.get("slot", "morning") == "morning")
     expected = [WEEK2_START + timedelta(days=i) for i in range((OFFICE_END - WEEK2_START).days + 1)]
-    assert sorted(dates) == expected, "office rows must cover every day 9/20..10/31"
+    assert mornings == expected, "every day 9/20..10/31 needs a MORNING row"
     for r in rows:
         b = r["blocks"]
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
         assert 1 <= r["week_num"] <= 7, r["week_num"]
         assert b.get("display_name"), "blocks must carry a display_name"
-        assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow"), b["type"]
+        assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow", "rest"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
         # SCHEDULE-2: a strength session only ever lands on an office day.
         if r["session_type"].startswith("strength"):
@@ -781,6 +824,21 @@ def validate_rows(rows: list[dict]) -> list[str]:
     lifts = Counter(r["week_num"] for r in rows if r["session_type"].startswith("strength"))
     for wk in sorted({r["week_num"] for r in rows}):
         assert lifts[wk] == 3, f"week {wk} has {lifts[wk]} lifts, expected 3"
+    # EVENING-1: evenings are yoga, four a week, and never on the road.
+    evenings = [r for r in rows if r.get("slot") == "evening"]
+    for r in evenings:
+        assert r["session_type"] == EVENING_SESSION, \
+            f"{r['plan_date']}: evening is {r['session_type']}, not {EVENING_SESSION}"
+        assert evening_is_possible(r["plan_date"]), \
+            f"{r['plan_date']}: an evening session cannot be placed in a transit segment"
+        assert r["blocks"].get("location") == day_location(r["plan_date"], "evening"), \
+            f"{r['plan_date']}: evening location {r['blocks'].get('location')!r}"
+    ev_per_week = Counter(r["week_num"] for r in evenings)
+    full_weeks = {r["week_num"] for r in rows
+                  if week_num_for(WEEK2_START) < r["week_num"] < week_num_for(OFFICE_END)}
+    for wk in sorted(full_weeks):
+        assert ev_per_week[wk] == 4, f"week {wk} has {ev_per_week[wk]} evenings, expected 4"
+
     for r in rows:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
         assert r["session_type"] != "walk", \
@@ -791,7 +849,8 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"],
                                                             use_overrides=False)), \
             f"{r['plan_date']}: a session cannot be placed on the road"
-        want, got = day_location(r["plan_date"]), r["blocks"].get("location")
+        want = day_location(r["plan_date"], r.get("slot", "morning"))
+        got = r["blocks"].get("location")
         assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
     rejects, notes = duration_findings(rows)
     assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)

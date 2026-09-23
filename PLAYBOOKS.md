@@ -244,6 +244,30 @@ crm_write_guard(entity_type, data, confidence, source_pb,
 `health.reflection` (migration 032). Isolated; no `public`
 or `acos` writes.
 
+### A morning session and an evening session (EVENING-1, Ryan 2026-09-23)
+
+The day has **two slots**. `health.plan` holds one row per `(plan_date, slot)`
+since migration 042; `slot` is `morning` or `evening`.
+
+- **Mornings** are strength / cardio / **rest**. A rest morning is a REAL row
+  typed `rest` — "no plan" and "rest today" are different facts, and only one
+  of them is a data problem. Everything that skips a rest day (the 16:30 nag,
+  the 21:50 inferred backstop, EVAL-1's denominator, the Lambda's day status)
+  treats `rest` exactly as it treats `rest_mobility`.
+- **Evenings** are yoga — Recovery Flow today, four a week. They are
+  **UNPROMPTED**: quiet hours start at 17:00 on a work day and that is not
+  changing for them. The 04:30 wake post NAMES tonight's session, and that is
+  the only notice; he does it when he gets to it.
+- **The evening is where he is in the evening**, which on a work day is home
+  on a mat, not the office gym. On the Thursday he drives to the farm there is
+  **no evening session at all** — no session is ever placed in a transit
+  segment — and the wake post says so plainly rather than saying nothing.
+- **Adherence counts the slots separately.** A missed evening yoga is not a
+  missed lift, and four evenings a week would swamp three sessions if they
+  were blended.
+- **A day off is a DAY off.** When the pain ladder stands the morning down, the
+  check-in clears the evening with it.
+
 ### Walking is activity, not a session (WALK-RETIRE, Ryan 2026-09-22)
 
 **`walk` is not a session type.** Walking is daily life, not something the
@@ -563,14 +587,14 @@ rest_mobility    -> office gym: mat / Stretch Trainer
 No session is weather-dependent (WALK-RETIRE): every one is indoors. There is
 no bike indoor/outdoor decision and no `trainer set` override any more.
 
-**Office program — phase 1, anchored Wed 2026-09-16, seeded 9/16 → 11/03** —
+**Office program — phase 1, anchored Wed 2026-09-16, seeded 9/16 → 10/31** (`OFFICE_END`; the last week boundary. The docs said 11/03 until 2026-09-23 — RDS has never had a row after 10/31) —
 `scripts/reseed_health_plan_v2.py --office` (dry-run default, `--commit` to
 write; also deletes orphan rows past the program end), validated by
 `scripts/validate_health_plan.py`. All sessions are at the **office gym**
 (`blocks.location`) or, on a WI/home day, the flow's cycle location.
 
 Week windows run **Wed–Tue** from 2026-09-16 (week 1 = 9/16–9/22 … week 7 =
-10/28–11/03). There are no ramp-up days: 9/16 is week 1, day 1.
+10/28–11/03, whose seeded rows stop at Sat 10/31). There are no ramp-up days: 9/16 is week 1, day 1.
 
 | Wed | Thu | Fri | Sat | Sun | Mon | Tue |
 |---|---|---|---|---|---|---|
@@ -692,7 +716,7 @@ adjustment above, and it does change `health.plan` (and therefore gym-display).
   based on rolling RPE / recovery signal. Will write to
   `health.adjustments` audit table.
 - **Workout creation/editing from chat** — only logging is supported.
-  The office program is seeded 2026-09-16 → 2026-11-03; future plan
+  The office program is seeded 2026-09-16 → 2026-10-31; future plan
   modifications go through the autoregulator or a reviewed reseed.
 - **Wake word ("Hey Artemis" voice mode)** — Picovoice Porcupine
   planned, not built.

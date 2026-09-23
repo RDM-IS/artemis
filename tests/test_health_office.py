@@ -29,7 +29,12 @@ import artemis.health_office as office  # noqa: E402
 from artemis import health  # noqa: E402
 
 _ROWS = office.build_rows()
-_BY_DATE = {r["plan_date"]: r for r in _ROWS}
+# EVENING-1: two rows share a date now. Most of this file is about the MORNING
+# session — the lifts, the cardio and the rest days — so it keys off those.
+_MORNINGS = [r for r in _ROWS if r["slot"] == "morning"]
+_EVENINGS = [r for r in _ROWS if r["slot"] == "evening"]
+_BY_DATE = {r["plan_date"]: r for r in _MORNINGS}
+_EVENING_BY_DATE = {r["plan_date"]: r for r in _EVENINGS}
 
 _A_EXERCISES = ["Leg press", "DB bench press", "Lat pulldown", "Seated leg curl",
                 "Cable face pull (rope)", "Captain's chair knee raise"]
@@ -43,7 +48,7 @@ def _wk_date(week_num: int, day_in_week: int) -> date:
 
 def _row(week_num: int, session_type: str) -> dict:
     """The row for a session type in a program week (SCHEDULE-2 moved the days)."""
-    return next(r for r in _ROWS if r["week_num"] == week_num
+    return next(r for r in _MORNINGS if r["week_num"] == week_num
                 and r["session_type"] == session_type)
 
 
@@ -51,7 +56,10 @@ class TestSchedule(unittest.TestCase):
     def test_window_and_count(self):
         # SCHEDULE-2: weeks 2..7 are Sun..Sat; the 9/16..9/19 week-1 stub is
         # logged history and is not regenerated.
-        self.assertEqual(len(_ROWS), 42)          # 6 weeks x 7 days
+        self.assertEqual(len(_MORNINGS), 42)      # 6 weeks x 7 days, one each
+        # EVENING-1: four evenings a week, and none on the Thursday drive
+        self.assertEqual(len(_EVENINGS), 24)      # 6 weeks x 4
+        self.assertTrue(all(r["session_type"] == "recovery_flow" for r in _EVENINGS))
         self.assertEqual(min(_BY_DATE), date(2026, 9, 20))
         self.assertEqual(max(_BY_DATE), date(2026, 10, 31))
         office.validate_rows(_ROWS)
@@ -61,7 +69,9 @@ class TestSchedule(unittest.TestCase):
         r = _BY_DATE[date(2026, 9, 20)]
         self.assertEqual(date(2026, 9, 20).weekday(), 6, "9/20 must be a Sunday")
         self.assertEqual(office.CYCLE_ANCHOR, date(2026, 9, 20))
-        self.assertEqual(r["session_type"], "recovery_flow")
+        # EVENING-1: the Sunday's flow moved to the evening; its morning rests
+        self.assertEqual(r["session_type"], "rest")
+        self.assertEqual(_EVENING_BY_DATE[date(2026, 9, 20)]["session_type"], "recovery_flow")
         self.assertEqual(r["week_num"], 2)
         # the first lift of the cycle is the Monday
         a = _BY_DATE[date(2026, 9, 21)]
@@ -80,13 +90,46 @@ class TestSchedule(unittest.TestCase):
     def test_strength_only_on_office_days(self):
         """SCHEDULE-2: strength lands only on msp_work days; wi and travel days
         get sessions that need no gym."""
-        for r in _ROWS:
+        for r in _MORNINGS:
             d = r["plan_date"]
             self.assertNotEqual(r["session_type"], "rest_mobility")
             if r["session_type"].startswith("strength"):
                 self.assertEqual(office.day_type(d), "msp_work", d)
+            # EVENING-1: the WI/travel flows moved to the evening, so those
+            # mornings are rest.
             if office.day_type(d) in ("wi", "travel"):
-                self.assertIn(r["session_type"], ("recovery_flow", "cardio_z2"), d)
+                self.assertIn(r["session_type"], ("rest", "cardio_z2"), d)
+
+    def test_four_evenings_a_week_and_never_on_the_drive(self):
+        """EVENING-1 (Ryan, 2026-09-23). Position 4 is the Thursday he drives
+        to the farm after work: no session is ever placed in a transit
+        segment, so it gets no evening row."""
+        from collections import Counter
+        per_week = Counter(r["week_num"] for r in _EVENINGS)
+        for wk in range(3, 8):                       # weeks 2 and 8 are partial
+            self.assertEqual(per_week[wk], 4, f"week {wk}")
+        for r in _EVENINGS:
+            self.assertTrue(office.evening_is_possible(r["plan_date"]), r["plan_date"])
+        drives = [d for d in _BY_DATE if not office.evening_is_possible(d)]
+        self.assertTrue(drives)
+        for d in drives:
+            self.assertNotIn(d, _EVENING_BY_DATE)
+
+    def test_an_evening_is_where_he_is_in_the_evening(self):
+        """Not the office gym — a work-day evening is at home, on a mat."""
+        for r in _EVENINGS:
+            self.assertEqual(r["blocks"]["location"],
+                             office.day_location(r["plan_date"], "evening"), r["plan_date"])
+            self.assertNotIn(office.LOCATION, [r["blocks"]["location"]])
+
+    def test_a_rest_morning_is_a_real_row(self):
+        """EVENING-1: "no plan" and "rest today" are different facts."""
+        rests = [r for r in _MORNINGS if r["session_type"] == "rest"]
+        self.assertEqual(len(rests), 18)
+        for r in rests:
+            self.assertEqual(r["blocks"]["type"], "rest")
+            self.assertEqual(r["est_duration_min"], 0)
+            self.assertIsNone(r["target_rpe"])
 
     def test_exactly_one_back_to_back_pair_per_week(self):
         """SCHEDULE-2's 1st/3rd/4th office-day rule puts two lifts together:
@@ -105,10 +148,11 @@ class TestSchedule(unittest.TestCase):
 
     def test_weekly_pattern_and_weeks(self):
         # Sun..Sat. Odd cycle weeks lift Mon/Wed/Thu, even ones Tue/Thu/Fri.
-        odd = ["recovery_flow", "strength_a", "cardio_z2", "strength_b",
-               "strength_c", "recovery_flow", "recovery_flow"]
-        even = ["recovery_flow", "recovery_flow", "strength_a", "cardio_z2", "strength_b",
-                "strength_c", "recovery_flow"]
+        # EVENING-1: every flow moved to the evening; those mornings are rest.
+        odd = ["rest", "strength_a", "cardio_z2", "strength_b",
+               "strength_c", "rest", "rest"]
+        even = ["rest", "rest", "strength_a", "cardio_z2", "strength_b",
+                "strength_c", "rest"]
         for wk in range(2, 8):
             pattern = odd if (wk % 2 == 0) else even
             for wd, st in enumerate(pattern):
@@ -232,7 +276,8 @@ class TestRegressionNoRetiredEquipment(unittest.TestCase):
 
     def test_validator_rejects_injected_rower(self):
         rows = office.build_rows()
-        rows[10]["blocks"].setdefault("equipment", []).append("water rower")
+        lift = next(r for r in rows if r["session_type"].startswith("strength"))
+        lift["blocks"].setdefault("equipment", []).append("water rower")
         with self.assertRaises(AssertionError):
             office.validate_rows(rows)
 
