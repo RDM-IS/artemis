@@ -443,7 +443,8 @@ class TestLiveRegistryMatchesTheCode(unittest.TestCase):
     def test_no_interval_job_is_registered_outside_the_registry(self):
         src = (_REPO_ROOT / "artemis" / "scheduler.py").read_text()
         body = src[src.index("    def start(self):"):src.index("    def stop(self):")]
-        self.assertEqual(body.count("add_job("), 1, "start() must add jobs only from INTERVAL_SPECS")
+        self.assertEqual(body.count("self.scheduler.add_job("), 1,
+                         "start() must add jobs only from INTERVAL_SPECS")
         self.assertIn("for spec in INTERVAL_SPECS:", body)
 
 
