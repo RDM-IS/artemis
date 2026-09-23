@@ -100,6 +100,27 @@ class TestSchedule(unittest.TestCase):
             if office.day_type(d) in ("wi", "travel"):
                 self.assertIn(r["session_type"], ("rest", "cardio_z2"), d)
 
+    def test_every_exercise_carries_its_equipment_class(self):
+        """EXERCISE-CLASS (Ryan, 2026-09-23): the class travels on the ROW for
+        every exercise. Inference from the name was written for the office and
+        misreads any other gym — "TRX row" reads as `machine`."""
+        entries = [e for r in _ROWS for e in (r["blocks"].get("exercises") or [])]
+        self.assertTrue(entries)
+        for e in entries:
+            with self.subTest(exercise=e["name"]):
+                self.assertEqual(e.get("equipment_class"), office.class_for(e["name"]))
+        self.assertEqual(sorted({e["equipment_class"] for e in entries}),
+                         ["bodyweight", "cable", "dumbbell", "machine"])
+
+    def test_an_unknown_exercise_is_a_build_error_not_a_guess(self):
+        with self.assertRaises(KeyError) as ctx:
+            office.class_for("Hack squat")
+        self.assertIn("equipment_class", str(ctx.exception))
+
+    def test_the_class_table_covers_every_name_in_the_generator(self):
+        names = {e["name"] for r in _ROWS for e in (r["blocks"].get("exercises") or [])}
+        self.assertTrue(names <= set(office.EQUIPMENT_CLASS))
+
     def test_four_evenings_a_week_and_never_on_the_drive(self):
         """EVENING-1 (Ryan, 2026-09-23). Position 4 is the Thursday he drives
         to the farm after work: no session is ever placed in a transit

@@ -697,7 +697,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
             name = ex["name"]
             if ex.get("added_by") == "checkin" or not hr.uses_any(name, pain_2, primary_only=True, sides=sides):
                 continue
-            if hr.equipment_class(name) == "bodyweight":
+            if hr.equipment_class(name, ex.get("equipment_class")) in ("bodyweight", "bands", "trx"):
                 continue
             last = last_loads.get(name)
             if last is None:
@@ -707,7 +707,8 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
                     ex["notes"] = f"{ex['notes']}; {LIGHTER_NOTE}" if ex.get("notes") else LIGHTER_NOTE
                 parts.append(f"{_join([name])}: {LIGHTER_NOTE}")
             else:
-                target = hr.lighter_load(name, float(last))
+                target = hr.lighter_load(name, float(last),
+                                         explicit_class=ex.get("equipment_class"))
                 ex["target_load_lbs"] = target
                 ex["load_from"] = float(last)
                 parts.append(f"{_join([name])} {_n(target)} lb (last {_n(last)})")

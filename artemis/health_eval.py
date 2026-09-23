@@ -187,7 +187,8 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
     for name, cur in now_w.items():
         prev = prev_w.get(name, "absent")
         if cur is None:
-            note = "bodyweight" if hr.equipment_class(name) == "bodyweight" else "no load logged"
+            note = ("bodyweight" if hr.equipment_class(name) in ("bodyweight", "bands", "trx")
+                    else "no load logged")
             change = None
         elif prev == "absent":
             note, change = "first week", None
