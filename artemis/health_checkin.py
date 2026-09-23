@@ -342,7 +342,7 @@ def parse_checkin(text: str) -> CheckIn:
 # ============================================================================
 
 STRENGTH_TYPES = ("strength_a", "strength_b", "strength_c")
-LIGHT_TYPES = ("rest_mobility", "walk")
+LIGHT_TYPES = ("rest_mobility",)
 FLOW_TYPE = "recovery_flow"   # YOGA-1: only the day-off rules apply
 _SESSION_LETTER = {"strength_a": "A", "strength_b": "B", "strength_c": "C"}
 
@@ -533,7 +533,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
     rising_notes = [f"rising: {_trend({r: seq})}" for r, seq in rising.items()]
 
     if session_type in LIGHT_TYPES or session_type == FLOW_TYPE:
-        # A walk or a Recovery Flow only yields to the day-off rules: pain 2-3
+        # A rest day or a Recovery Flow only yields to the day-off rules: pain 2-3
         # changes nothing (it is already mobility) and soreness/recovery rules
         # don't apply.
         adj.notes = _pain_notes(pain, pain_low + pain_2 + pain_3, sides) + rising_notes
@@ -1196,8 +1196,7 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
             logger.info("CHECKIN_ADJUST=0 — would have applied: %s", adj.reason)
             audit(cur, "checkin_adjust_suppressed", "flag_off",
                   {"plan_id": plan["plan_id"], "rules": adj.rules_fired})
-        what = ("walk as planned" if written_type == "walk"
-                else f"{label} as planned" if written_type == FLOW_TYPE
+        what = (f"{label} as planned" if written_type == FLOW_TYPE
                 else f"run {label} as written")
         if "adjustment" in plan["blocks"] and adjust:
             # A newer check-in that no longer warrants changes: back to as-written.

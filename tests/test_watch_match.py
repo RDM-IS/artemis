@@ -87,8 +87,17 @@ class TestFirstRealExport(unittest.TestCase):
             6: (108, wm.MATCHED),           # 9/21 strength A, 14 rows
             5: (None, wm.KIND_MISMATCH),    # 9/21 evening walk on a strength day
             4: (109, wm.MATCHED),           # 9/22 Z2 on the bike; summary at 10:48:48
-            3: (None, wm.NO_LOGGED_ROWS),   # 9/22 walk started after the summary
+            3: (None, wm.KIND_MISMATCH),    # 9/22 walk: activity, never a session
         })
+
+    def test_no_walk_ever_matches(self):
+        """WALK-RETIRE: every walk in the real export stays unattached — the
+        two evening ones and this morning's, which followed the bike by 11 s."""
+        got = by_id(wm.decide(WORKOUTS, PLANS, LOGS))
+        for wid in (8, 5, 3):
+            with self.subTest(workout=wid):
+                self.assertEqual((got[wid]["plan_id"], got[wid]["outcome"]),
+                                 (None, wm.KIND_MISMATCH))
 
     def test_the_921_evidence(self):
         """The design's check: 9/21 05:21-05:54 CDT, ~217 kcal, ~104 avg HR."""
@@ -138,7 +147,7 @@ class TestRules(unittest.TestCase):
 
     def test_most_rows_wins_the_rest_are_reported(self):
         a = W(1, "Indoor Cycling", "2026-09-22", "2026-09-22 10:00:00", "2026-09-22 10:20:00", 1200)
-        b = W(2, "Indoor Walk", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:40:00", 600)
+        b = W(2, "Elliptical", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:40:00", 600)
         logs = [{"plan_id": 109, "logged_at": ts(t)} for t in (
             "2026-09-22 10:05:00", "2026-09-22 10:10:00", "2026-09-22 10:35:00")]
         got = by_id(wm.decide([a, b], PLANS, logs))
@@ -147,7 +156,7 @@ class TestRules(unittest.TestCase):
 
     def test_a_tie_matches_neither(self):
         a = W(1, "Indoor Cycling", "2026-09-22", "2026-09-22 10:00:00", "2026-09-22 10:20:00", 1200)
-        b = W(2, "Indoor Walk", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:40:00", 600)
+        b = W(2, "Elliptical", "2026-09-22", "2026-09-22 10:30:00", "2026-09-22 10:40:00", 600)
         logs = [{"plan_id": 109, "logged_at": ts(t)}
                 for t in ("2026-09-22 10:05:00", "2026-09-22 10:35:00")]
         got = by_id(wm.decide([a, b], PLANS, logs))
@@ -162,11 +171,13 @@ class TestRules(unittest.TestCase):
             ("Yoga", "recovery_flow"): True,
             ("Flexibility", "recovery_flow"): True,
             ("Yoga", "strength_b"): False,
-            ("Outdoor Walk", "walk"): True,
-            ("Indoor Walk", "cardio_z2"): True,
+            # WALK-RETIRE (2026-09-22): a walk is activity, never a session
+            ("Outdoor Walk", "cardio_z2"): False,
+            ("Indoor Walk", "cardio_z2"): False,
+            ("Outdoor Walk", "recovery_flow"): False,
+            ("Outdoor Walk", "strength_a"): False,
             ("Indoor Cycling", "cardio_z2"): True,
             ("Elliptical", "cardio_z2"): True,
-            ("Outdoor Walk", "recovery_flow"): False,
             ("Swimming", "cardio_z2"): False,         # not in the approved list
             ("", "cardio_z2"): False,
         }
@@ -207,7 +218,7 @@ class TestRematch(unittest.TestCase):
         self.assertEqual(result["changed"], 0)
         self.assertEqual([m["workout_id"] for m in result["matched"]], [4])
         self.assertEqual([(u["workout_id"], u["outcome"]) for u in result["unmatched"]],
-                         [(3, wm.NO_LOGGED_ROWS)])
+                         [(3, wm.KIND_MISMATCH)])
         writes = [s for s, _ in cur.statements if not s.startswith("SELECT")]
         self.assertEqual(writes, [])
 
