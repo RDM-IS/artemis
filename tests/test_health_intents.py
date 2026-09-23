@@ -282,6 +282,50 @@ class TestNagLogic(unittest.TestCase):
         with patch("knowledge.db.execute_one", return_value=None):
             self.assertIsNone(health.run_nag_check())
 
+    # ── EVENING-1: `rest` is a rest, exactly like rest_mobility ────────────
+    def test_skip_when_rest_morning(self):
+        """A planned rest gets a REAL row typed `rest` (migration 042). If the
+        nag didn't know the type, a rest morning would be nagged every day."""
+        with patch("knowledge.db.execute_one") as mock_one:
+            mock_one.return_value = {"plan_id": 1, "session_type": "rest",
+                                     "target_rpe": None, "is_skipped": False}
+            self.assertIsNone(health.run_nag_check())
+
+    def test_rest_and_rest_mobility_are_both_no_followup(self):
+        from knowledge.session_types import NO_FOLLOWUP_TYPES, REST_TYPES, is_rest
+        self.assertIn("rest", REST_TYPES)
+        self.assertIn("rest_mobility", REST_TYPES)
+        for t in ("rest", "rest_mobility", "recovery_flow"):
+            self.assertIn(t, NO_FOLLOWUP_TYPES)
+        self.assertTrue(is_rest("rest"))
+        self.assertFalse(is_rest("strength_a"))
+
+    def test_the_inferred_backstop_skips_a_rest_morning(self):
+        """The 21:50 backstop writes an inferred 'missed' summary. A rest
+        morning must never get one — it would read as a missed session for
+        ever after."""
+        from knowledge import db as kdb
+        for st in ("rest", "rest_mobility"):
+            with self.subTest(session_type=st):
+                plan_row = {"plan_id": 7, "session_type": st, "target_rpe": None,
+                            "is_skipped": False}
+                with patch.object(kdb, "execute_one", return_value=plan_row), \
+                     patch.object(kdb, "execute_query", return_value=[]), \
+                     patch.object(kdb, "execute_write") as write:
+                    self.assertFalse(health.insert_inferred_summary())
+                    write.assert_not_called()
+
+    def test_the_inferred_backstop_still_fires_on_a_training_day(self):
+        from knowledge import db as kdb
+        plan_row = {"plan_id": 7, "session_type": "strength_a", "target_rpe": 6.0,
+                    "is_skipped": False}
+        # two reads: the plan, then "is there already a log?"
+        with patch.object(kdb, "execute_one", side_effect=[plan_row, None]), \
+             patch.object(kdb, "execute_query", return_value=[]), \
+             patch.object(kdb, "execute_write") as write:
+            self.assertTrue(health.insert_inferred_summary())
+            write.assert_called_once()
+
 
 # ============================================================================
 # Confirm formatters

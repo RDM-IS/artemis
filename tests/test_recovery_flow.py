@@ -32,7 +32,12 @@ from artemis import health_office as office  # noqa: E402
 THU = date(2026, 9, 25)   # Fri, Richfield — mat flow (name kept to limit churn)
 SAT = date(2026, 10, 3)   # Sat, msp_home — mat flow
 NOW = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)
-ROWS = {r["plan_date"]: r for r in office.build_rows()}
+_ALL = office.build_rows()
+# EVENING-1 (Ryan, 2026-09-23): the flows moved to the EVENING slot. This file
+# is about the flow itself, so it reads the evening rows; the mornings those
+# days now carry are rests and are covered in test_health_office.
+ROWS = {r["plan_date"]: r for r in _ALL if r["slot"] == "evening"}
+MORNINGS = {r["plan_date"]: r for r in _ALL if r["slot"] == "morning"}
 # The office (Stretch Trainer) variant, still supported by the builder.
 OFFICE_FLOW = office._recovery_flow(office.LOCATION)[0]
 
@@ -61,7 +66,9 @@ class TestBuilder(unittest.TestCase):
             self.assertEqual(r["blocks"]["rounds"], 2)
             self.assertEqual(len(r["blocks"]["flow"]), 20)
             self.assertEqual(r["blocks"]["close"]["duration_sec"], 180)
-        self.assertEqual(thu["blocks"]["location"], "Richfield")
+        # the wi Friday moves to Brown Deer at 16:00 (CYCLE-1), so its EVENING
+        # flow is there, not at the farm
+        self.assertEqual(thu["blocks"]["location"], "Brown Deer")
         self.assertEqual(sat["blocks"]["location"], "home")
         # Both seeded flows are the mat variant; no Stretch Trainer travels.
         for r in (thu, sat):
@@ -80,9 +87,9 @@ class TestBuilder(unittest.TestCase):
         variant) and the msp_home Saturday / Sunday (mat variant)."""
         for d, r in ROWS.items():
             is_flow = r["session_type"] == "recovery_flow"
-            self.assertEqual(is_flow, office.session_for(d) == "recovery_flow", d)
+            self.assertTrue(is_flow, d)            # every evening row is a flow
             if is_flow:
-                loc = office.day_location(d)
+                loc = office.day_location(d, "evening")
                 self.assertEqual(r["blocks"]["location"], loc)
                 # only the office has the Stretch Trainer
                 pre = [p["name"] for p in r["blocks"]["pre"]]
@@ -375,7 +382,7 @@ class TestProgramState(unittest.TestCase):
 class TestSideValidator(unittest.TestCase):
     def test_real_flow_passes(self):
         office.validate_flow(OFFICE_FLOW)
-        office.validate_rows(list(ROWS.values()))
+        office.validate_rows(_ALL)        # mornings and evenings together
 
     def test_rejects_a_missing_side(self):
         b = flow()
@@ -425,20 +432,26 @@ class TestReseedDiff(unittest.TestCase):
         # SCHEDULE-2 flow days: the office non-lift day + the msp_home Sat/Sun,
         # plus the Brown Deer Saturday and the travel Monday since WALK-RETIRE
         # (Ryan, 2026-09-22) turned those two walks into mat flows.
+        # EVENING-1: every flow is an EVENING row now — the six that moved
+        # plus the one training-day evening in each program week.
         self.assertEqual([r["plan_date"].isoformat() for r in rows], [
-            "2026-09-20", "2026-09-25", "2026-09-26", "2026-09-27", "2026-09-28",
-            "2026-10-03", "2026-10-04", "2026-10-09", "2026-10-10", "2026-10-11",
-            "2026-10-12", "2026-10-17", "2026-10-18", "2026-10-23", "2026-10-24",
-            "2026-10-25", "2026-10-26", "2026-10-31"])
-        self.assertTrue(all(office.session_for(r["plan_date"]) == "recovery_flow" for r in rows))
+            "2026-09-20", "2026-09-22", "2026-09-25", "2026-09-26", "2026-09-27",
+            "2026-09-28", "2026-09-30", "2026-10-03", "2026-10-04", "2026-10-06",
+            "2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-14",
+            "2026-10-17", "2026-10-18", "2026-10-20", "2026-10-23", "2026-10-24",
+            "2026-10-25", "2026-10-26", "2026-10-28", "2026-10-31"])
+        self.assertTrue(all(r["slot"] == "evening" for r in rows))
         existing = {r["plan_date"]: {"phase": 1, "week_num": r["week_num"],
                                      "session_type": "rest_mobility",
                                      "display_name": "Rest / Mobility"} for r in rows}
         lines = rs.flow_diff_lines(existing, rows)
         self.assertIn("2026-09-20 Sun", lines[2])
         self.assertIn("recovery_flow  Recovery Flow · home · 33 min · RPE 2", lines[2])
-        self.assertIn("Recovery Flow · Richfield · 33 min · RPE 2", lines[3])
-        self.assertEqual(lines[-2], "18 Recovery Flow rows rewritten; no other dates touched.")
+        # EVENING-1: line 3 is now 9/22's evening (a training-day evening at
+        # home); the Friday farm flow moved down the list and to Brown Deer.
+        self.assertIn("Recovery Flow · home · 33 min · RPE 2", lines[3])
+        self.assertTrue(any("Brown Deer" in ln for ln in lines))
+        self.assertEqual(lines[-2], "24 Recovery Flow rows rewritten; no other dates touched.")
         self.assertIn('"anchor": "2026-09-16"', lines[-1])
 
     def test_preflight_needs_migration_033(self):
@@ -458,7 +471,7 @@ class TestReseedDiff(unittest.TestCase):
 
 class TestRules(unittest.TestCase):
     def setUp(self):
-        self.db = FakeDB(office_row(THU, plan_id=104))
+        self.db = FakeDB(office_row(THU, plan_id=104, slot="evening"))
         self.cur = self.db.cursor()
         self.before = copy.deepcopy(self.db.plan[THU])
 
@@ -497,7 +510,7 @@ class TestRules(unittest.TestCase):
 class TestNudgeAndFollowups(unittest.TestCase):
     def test_nudge_fires_on_a_flow_day(self):
         from artemis.scheduler import ArtemisScheduler
-        db = FakeDB(office_row(THU, plan_id=104))
+        db = FakeDB(office_row(THU, plan_id=104, slot="evening"))
 
         @contextmanager
         def conn():
@@ -513,7 +526,7 @@ class TestNudgeAndFollowups(unittest.TestCase):
 
     def test_no_nudge_after_a_checkin(self):
         from artemis.scheduler import ArtemisScheduler
-        db = FakeDB(office_row(THU, plan_id=104))
+        db = FakeDB(office_row(THU, plan_id=104, slot="evening"))
         db.daily[THU] = {"energy": 4}
 
         @contextmanager
@@ -565,6 +578,7 @@ class TestWakePost(unittest.TestCase):
                     # Tonight's 9/17 row: rest_mobility carrying flow blocks.
                     {**rest_row(THU), "blocks": ROWS[THU]["blocks"], "est_duration_min": 42}):
             with patch("artemis.health.get_today_plan", return_value=row), \
+                 patch("artemis.health.get_plan_for", return_value=None), \
                  patch.object(wake, "_weather_line", return_value=None), \
                  patch.object(wake, "_depart_commitments", return_value=[]), \
                  patch.object(wake, "get_timezone_override", return_value=None), \
@@ -572,7 +586,8 @@ class TestWakePost(unittest.TestCase):
                               return_value=dt(2026, 9, 17, 4, 30, tzinfo=ZoneInfo("America/Chicago"))), \
                  patch.object(wake, "local_today", return_value=THU):
                 text = wake.build_wake_message(calendar=None, held_health=[])
-            self.assertIn("**Recovery Flow** (Richfield) — 32:27 total", text)
+            # the wi Friday moves to Brown Deer at 16:00 (CYCLE-1)
+            self.assertIn("**Recovery Flow** (Brown Deer) — 32:27 total", text)
             self.assertIn("Round 2 (12:40): same order, without easy pose", text)
             self.assertNotIn("workout is later", text.lower())
             self.assertEqual(wake.prompt_type_for(row), "logging_only")

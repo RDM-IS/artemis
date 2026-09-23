@@ -45,7 +45,9 @@ from artemis.health_office import format_estimate  # noqa: E402  (TIME-CAP wordi
 
 FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
               "strength_c": "DB Romanian deadlift"}
-REST_TYPES = {"rest_mobility"}
+from knowledge.session_types import REST_TYPES as _REST  # noqa: E402
+
+REST_TYPES = set(_REST)
 PROGRAM_START_FALLBACK = date(2026, 9, 16)   # health_office.WEEK1_START
 
 

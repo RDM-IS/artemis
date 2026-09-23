@@ -378,6 +378,46 @@ class TestWakeMessage(unittest.TestCase):
         self.assertIn("First event", text)
         self.assertIn("Weather:", text)
 
+    def _wake_with_evening(self, evening_row, *, possible=True):
+        """The wake post with tonight's slot stubbed (EVENING-1)."""
+        from artemis import wake as wake_mod
+        cal = MagicMock(); cal.service = True; cal.get_today_events.return_value = []
+        with patch("artemis.health.get_plan_for", return_value=evening_row), \
+             patch("artemis.health_office.evening_is_possible", return_value=possible), \
+             patch("artemis.health.get_today_plan", return_value=self.PLAN), \
+             patch.object(wake_mod, "_weather_line", return_value=None), \
+             patch.object(wake_mod, "_depart_commitments", return_value=[]), \
+             patch.object(wake_mod, "get_timezone_override", return_value=None), \
+             patch("artemis.quiet_hours.local_now", return_value=at(CHICAGO, 2026, 9, 21, 4, 30)), \
+             patch("artemis.quiet_hours.local_today", return_value=date(2026, 9, 21)):
+            return wake_mod.build_wake_message(calendar=cal, held_health=[])
+
+    def test_the_wake_post_names_tonights_session(self):
+        """EVENING-1: evenings are unprompted, so this line is the only notice."""
+        msg = self._wake_with_evening({
+            "plan_id": 900, "plan_date": date(2026, 9, 21), "slot": "evening",
+            "session_type": "recovery_flow", "est_duration_min": 33, "is_skipped": False,
+            "blocks": {"display_name": "Recovery Flow", "location": "home"}})
+        self.assertIn("Tonight: **Recovery Flow** (home) — 33 min", msg)
+        self.assertIn("No reminder", msg)
+
+    def test_a_transit_evening_says_so_plainly(self):
+        """9/24 is the Thursday drive. An absent line reads like a bug; "no
+        evening session" is the plan."""
+        msg = self._wake_with_evening(None, possible=False)
+        self.assertIn("No evening session — you're on the road tonight.", msg)
+
+    def test_a_day_with_no_evening_row_says_there_is_none(self):
+        msg = self._wake_with_evening(None, possible=True)
+        self.assertIn("No evening session tonight.", msg)
+
+    def test_a_skipped_evening_is_not_announced_as_on(self):
+        msg = self._wake_with_evening({
+            "plan_id": 900, "plan_date": date(2026, 9, 21), "slot": "evening",
+            "session_type": "recovery_flow", "est_duration_min": 33, "is_skipped": True,
+            "blocks": {"display_name": "Recovery Flow", "location": "home"}})
+        self.assertNotIn("Tonight: **Recovery Flow**", msg)
+
     def test_weather_is_fetched_and_shown_on_an_office_day(self):
         """WALK-RETIRE: the departure weather is for the COMMUTE, not for an
         outdoor session, so it must not depend on a walk row existing. This

@@ -342,7 +342,7 @@ def parse_checkin(text: str) -> CheckIn:
 # ============================================================================
 
 STRENGTH_TYPES = ("strength_a", "strength_b", "strength_c")
-LIGHT_TYPES = ("rest_mobility",)
+from knowledge.session_types import REST_TYPES as LIGHT_TYPES  # noqa: E402
 FLOW_TYPE = "recovery_flow"   # YOGA-1: only the day-off rules apply
 _SESSION_LETTER = {"strength_a": "A", "strength_b": "B", "strength_c": "C"}
 
@@ -508,7 +508,7 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
 
     adj = Adjustment(changed=False, blocks=copy.deepcopy(base), session_type=session_type,
                      target_rpe=base_rpe, est_duration_min=base_dur)
-    if session_type == "rest_mobility":
+    if session_type in LIGHT_TYPES:
         return adj
 
     sore = _scored(ci.soreness)
@@ -912,11 +912,13 @@ def _rows(cur) -> list[dict]:
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def load_plan(cur, day: date) -> dict | None:
+def load_plan(cur, day: date, slot: str = "morning") -> dict | None:
+    """The day's session. EVENING-1: the MORNING one unless asked otherwise —
+    the check-in is about the morning, and the evening is unprompted."""
     cur.execute(
         "SELECT plan_id, plan_date, phase, week_num, session_type, target_rpe, "
         "target_hr_zone, est_duration_min, blocks, is_skipped "
-        "FROM health.plan WHERE plan_date = %s", (day,))
+        "FROM health.plan WHERE plan_date = %s AND slot = %s", (day, slot))
     rows = _rows(cur)
     if not rows:
         return None
@@ -1028,6 +1030,20 @@ def write_plan(cur, plan_id: int, blocks: dict, session_type: str,
         "UPDATE health.plan SET blocks = %s::jsonb, session_type = %s, target_rpe = %s, "
         "est_duration_min = %s WHERE plan_id = %s",
         (json.dumps(blocks), session_type, target_rpe, est_duration_min, plan_id))
+
+
+def clear_evening(cur, day: date, reason: str) -> int:
+    """EVENING-1 (Ryan, 2026-09-23): a day off is a DAY off. When the pain
+    ladder stands the morning down, the evening goes with it — otherwise the
+    ladder says rest and the plan still asks for yoga. Returns rows changed."""
+    cur.execute(
+        "UPDATE health.plan SET session_type = %s, target_rpe = NULL, "
+        "est_duration_min = 0, blocks = %s::jsonb "
+        "WHERE plan_date = %s AND slot = 'evening' AND session_type <> %s",
+        ("rest", json.dumps({**copy.deepcopy(DAY_OFF_BLOCKS),
+                             "display_name": "Rest", "type": "rest",
+                             "notes": f"Day off — {reason}"}), day, "rest"))
+    return cur.rowcount
 
 
 def audit(cur, action: str, outcome: str, metadata: dict) -> None:
@@ -1186,7 +1202,7 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
         audit(cur, "checkin_logged", "no_adjust_sets_logged", {"plan_id": plan["plan_id"]})
         return "\n".join(["Logged."] + notes)
 
-    if written_type == "rest_mobility":
+    if written_type in LIGHT_TYPES:
         return "\n".join(["Check-in logged — rest day as planned."] + notes)
 
     adj = compute_adjustment(plan, ci, rising=rising_pain(cur, day, ci),
@@ -1207,9 +1223,14 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
     blocks = apply_to_blocks(adj, plan, checkin_id, now)
     write_plan(cur, plan["plan_id"], blocks, adj.session_type, adj.target_rpe,
                adj.est_duration_min)
+    # EVENING-1: a day off is a DAY off — the evening stands down with the
+    # morning, or the ladder says rest while the plan still asks for yoga.
+    evening_cleared = 0
+    if adj.rules_fired and adj.rules_fired[0] in DAY_OFF_RULES:
+        evening_cleared = clear_evening(cur, day, adj.rules_fired[0])
     audit(cur, "checkin_adjust", ",".join(adj.rules_fired),
           {"plan_id": plan["plan_id"], "checkin_id": checkin_id, "removed": adj.removed,
-           "added": adj.added, "eased": adj.eased})
+           "added": adj.added, "eased": adj.eased, "evening_cleared": evening_cleared})
     # Plan-exact diff only — no advice, no health text.
     if adj.rules_fired[0] in DAY_OFF_RULES and not notes:
         return f"{adj.lines[0]} Reply `original` to undo."
@@ -1260,7 +1281,7 @@ def process_ack(cur, day: date) -> str:
         return "Got it."
     label = session_label(plan["session_type"], plan["blocks"])
     if "adjustment" in plan["blocks"]:
-        if plan["session_type"] == "rest_mobility":
+        if plan["session_type"] in LIGHT_TYPES:
             return f"Got it — {label} today. Reply `original` to go back."
         return f"Got it — run the adjusted {label}. Reply `original` to go back."
     if plan["session_type"] in LIGHT_TYPES:
