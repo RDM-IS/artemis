@@ -252,6 +252,8 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Routing:** deterministic, like the other health commands — it must not go through the LLM classifier (HEALTH-1). `set` and `revoke` are destructive-ish, so they follow the existing confirm pattern and are added to the bare-control-word inventory in CONFIRM-ARB.
 - **After a write, re-point the schedule immediately** (`job_tz_sync` already detects location drift within 60 s; the command can call it directly, the way the `set timezone` command does, so there is no lag).
 - **Dates:** parse through `quiet_hours.parse_date_token` so `tuesday`, `11/23` and `2026-11-23` all work and anchor to the ACTIVE timezone.
+- **Override precedence is enforced by OWNERSHIP, not by resolver order (CYCLE-OVERRIDE-SOURCE, 2026-09-25).** `acos.cycle_day_overrides.source` is `manual` or `calendar`. The CALENDAR-1 reconciliation job may only insert, update or delete rows where `source = 'calendar'` — **it can never modify or remove a manual row.** `source_ref` holds the CalDAV event UID, so a derived override can be matched back to its event and removed when that event is deleted or retitled. Manual rows have `source_ref` NULL. **Whichever of CALENDAR-1 or CYCLE-2 is built first implements this; the second inherits it deliberately, not by accident.**
+- **Schema:** the `source` / `source_ref` / `updated_at` columns and their CHECKs are proposed under CALENDAR-1; whichever entry is built first applies them. CYCLE-2 writes `source = 'manual'` and `source_ref` NULL.
 
 **CALENDAR-1 — read location from iCloud (blocked on nothing; not started).** The box reads the `ryan@rdm.is` Google calendar, which has had **0 events since at least 2026-09-17**. Ryan's real calendar is **iCloud**, and location is already programmed there: all-day **@Jeni's** banners mark Richfield stays, **Driving to Richfield** / **Driving to MSP** mark transit. Supersedes the open question of which calendar his schedule lives on.
 - **Access:** CalDAV at `caldav.icloud.com`, **read-only**, with an app-specific password in **Secrets Manager only** — never on disk, never in `.env`.
@@ -259,6 +261,25 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Resolution order: manual override, then calendar-derived override, then the base cycle pattern.** The calendar **proposes**: a derived location is written as an override carrying a **source marker**, and every change is reported. A mis-titled event must never silently reprogram training.
 - **Nightly reconciliation job:** re-resolve the next N days, rebuild the plan rows whose location changed, **skip any day that already has logged sets**, and report what changed.
 - **Failure modes, each handled explicitly — none may silently fall back to the base cycle:** CalDAV unreachable; credential expired; an all-day event spanning a timezone boundary; two conflicting location events on one day; a transit event with no matching arrival.
+- **Override precedence is enforced by OWNERSHIP, not by resolver order (CYCLE-OVERRIDE-SOURCE, 2026-09-25).** `acos.cycle_day_overrides.source` is `manual` or `calendar`. The CALENDAR-1 reconciliation job may only insert, update or delete rows where `source = 'calendar'` — **it can never modify or remove a manual row.** `source_ref` holds the CalDAV event UID, so a derived override can be matched back to its event and removed when that event is deleted or retitled. Manual rows have `source_ref` NULL. **Whichever of CALENDAR-1 or CYCLE-2 is built first implements this; the second inherits it deliberately, not by accident.**
+- **Schema this needs — PROPOSED, NOT APPLIED (2026-09-25).** `acos.cycle_day_overrides` (migration 035) today carries `override_id, start_date, end_date, day_type, location, reason, set_by, created_at, revoked_at` and holds **0 rows**. It needs three columns. **Deliberately not committed to `migrations/`:** the deploy path runs `run_migrations.py`, so a file there is applied on the next deploy, which is not what "propose" means. It lands in a migration when CALENDAR-1 or CYCLE-2 is built.
+  ```sql
+  ALTER TABLE acos.cycle_day_overrides
+      ADD COLUMN IF NOT EXISTS source     TEXT NOT NULL DEFAULT 'manual',
+      ADD COLUMN IF NOT EXISTS source_ref TEXT,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+  ALTER TABLE acos.cycle_day_overrides
+      ADD CONSTRAINT cycle_day_overrides_source_check
+      CHECK (source IN ('manual', 'calendar'));
+  -- a calendar row must carry its event; a manual row must not
+  ALTER TABLE acos.cycle_day_overrides
+      ADD CONSTRAINT cycle_day_overrides_source_ref_check
+      CHECK ((source = 'calendar') = (source_ref IS NOT NULL));
+  CREATE INDEX IF NOT EXISTS cycle_day_overrides_calendar_idx
+      ON acos.cycle_day_overrides (source_ref) WHERE source = 'calendar';
+  ```
+- **ENUM-EXPAND, applied to that CHECK from the start.** Adding a third `source` later is a breaking change for everything that reads it, so the consumers are named now: **`artemis/cycle.py:override_for()`** (the only reader today — an explicit column list, no `SELECT *`, so these columns break nothing when added); **CYCLE-2's chat command** (writes `manual`, and `@artemis overrides` should show the source); **CALENDAR-1's reconciliation job** (writes and prunes `calendar` only). **No Lambda or frontend consumer exists** — the API serves plan rows, not overrides. A new value means updating this list in the same change.
+- **COLUMN-GREP on the existing table (2026-09-25):** one reader, `cycle.py:override_for()`, selecting `override_id, start_date, end_date, day_type, location, reason`. Nothing reads `set_by` or `revoked_at` by name outside that module, nothing uses `SELECT *`, and the table is empty — so the three columns can be added with no code change and no backfill.
 
 **SESSION-LIB — start any session on demand (blocked on LOCATION-1).** A launcher for sessions outside the schedule. It **replaces YOGA-LAUNCH rather than sitting beside it** — one launcher, not two — and carries YOGA-LAUNCH's logging rules forward.
 - **Buttons are session TYPE, not session × location:** Strength A/B/C, Core, Yoga, Cardio.
