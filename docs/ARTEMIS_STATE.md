@@ -296,6 +296,36 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **Open:** (a) whether ad-hoc sessions feed the pain ladder and the day-off rules; (b) **Core has no definition in any form today** and needs one before it can be generated. **Yoga A/B do not exist** — a registry-driven list shows Recovery now and the others when YOGA-6 lands.
 - **Also retires "Mobility 20 min or full rest" on the rest screen:** it either offers something tappable or says nothing.
 
+**CARDIO-LOC — cardio resolves by location (extends LOCATION-1; READ DONE 2026-09-25, NOT BUILT — two confirmations and a migration are outstanding).**
+- **Inventory, as it is today.** Config, not code. **The rower's possible move to MSP around 2026-10-04 is an INVENTORY EDIT and nothing more** — one line in this table, no deploy of logic.
+
+  | location | cardio |
+  |---|---|
+  | Richfield | water rower, road bike on indoor trainer |
+  | Brown Deer | treadmill |
+  | office | treadmill, elliptical, upright stationary bike, recumbent stationary bike |
+  | MSP home | none |
+
+- **Modalities: `row`, `bike`, `treadmill`, `elliptical`.** The device variant (indoor trainer, upright, recumbent, water) is an ATTRIBUTE on the log, not a modality: one progression per modality, the device captured for reference. **Open (Ryan to rule):** whether `recumbent` earns its own modality — the argument either way is in the report; the recommendation is to keep it a variant AND capture the device, so the data can answer the question later instead of the answer being assumed now.
+- **Resolution order — PROPOSED, NOT CONFIRMED: `row` → `elliptical` → `bike` → `treadmill`.** Rowing is primary: it is the modality carrying a real progression, and everything else is a substitute. The order lives in config so it can be reordered without a deploy. As written it resolves: Richfield → **row**; Brown Deer → **treadmill**; office → **elliptical**; MSP home → nothing.
+- **MSP home is an EXPLICIT state, never a silent fallback.** A Z2 morning there resolves to "no cardio equipment at this location", naming what the office has, exactly as a row with no `load_config` says so rather than borrowing another gym's numbers (LOCATION-1).
+- **What a cardio session logs:** duration, modality, device variant, effort 0–5, and average HR when watch data exists. **Duration is the target, never distance** — distance does not compare across modalities.
+- **The baseline, and how a substitute stays out of it.** Rowing carries the progression. A substitute logs against the SAME session target but must not advance the rowing baseline, so the baseline is derived from `health.session_log` rows **where `modality = 'row'`** and nothing else. That is a query, not a second store (one system of record), and it is only possible once `modality` is a column rather than free text in `exercise` — see the migration below.
+- **ZONE-1 forward compatibility.** Effort 0–5 stays in `rpe_actual`. Zone time arrives later as its own per-log structure keyed on `log_id`; **nothing about the cardio log is restructured when it does**, and effort is not overwritten by it.
+- **THE MIGRATION THIS NEEDS — proposed, NOT applied, and deliberately not in `migrations/` (PROPOSE-NOT-IN-MIGRATIONS).** `health.session_log` today has `exercise, duration_sec, distance_m, hr_avg, hr_peak, rpe_actual, notes` and **no modality and no device**: a cardio log's modality is free text in `exercise` (the session's display name, or "Run 1"). Substitutes therefore cannot be told from rowing except by string matching, which is the same failure shape as the deleted exercise-name rules.
+  ```sql
+  ALTER TABLE health.session_log
+      ADD COLUMN IF NOT EXISTS modality TEXT,
+      ADD COLUMN IF NOT EXISTS device   TEXT;
+  ALTER TABLE health.session_log
+      ADD CONSTRAINT session_log_modality_known
+      CHECK (modality IS NULL OR modality IN ('row', 'bike', 'treadmill', 'elliptical'));
+  CREATE INDEX IF NOT EXISTS idx_session_log_modality
+      ON health.session_log (modality) WHERE modality IS NOT NULL;
+  ```
+  **ENUM-EXPAND applied to that CHECK from the start** — a fifth modality is a breaking change for: the cardio resolver and its config (`knowledge/`), the seeder (`health_office`), the Lambda's log write (`api/app/routers/health.py`), gym-display's cardio panel (`LogPanel`), the rowing-baseline query, and EXPORT-1's report. A new value updates this list in the same change.
+- **Tests, when it is built:** each location resolving to its expected modality; MSP home producing the explicit no-equipment state; a substitute session NOT advancing the rowing baseline; and **a config reorder changing resolution with no code change**.
+
 **LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
 - **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, a **wake time** (CYCLE-1: wake follows the location, not the day type), an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
 - **`richfield` is the farm** — one place, not two. There is no fifth WI location.
