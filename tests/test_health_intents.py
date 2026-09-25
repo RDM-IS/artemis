@@ -285,10 +285,12 @@ class TestNagLogic(unittest.TestCase):
     # ── EXERCISE-CLASS: the row's class beats the name ────────────────────
     def test_the_rows_class_wins_over_the_name_rules(self):
         from artemis import health_regions as hr
-        # the office rules read these names wrong; the row says otherwise
-        self.assertEqual(hr.equipment_class("TRX row"), "machine")          # fallback
+        # LOCATION-1: there is no name fallback left to beat. A name alone
+        # yields None — the office rules that read "TRX row" as `machine` and
+        # "Band pulldown" as a 10 lb stack are deleted.
+        self.assertIsNone(hr.equipment_class("TRX row"))
         self.assertEqual(hr.equipment_class("TRX row", "trx"), "trx")       # the row
-        self.assertEqual(hr.equipment_class("Band pulldown"), "machine")
+        self.assertIsNone(hr.equipment_class("Band pulldown"))
         self.assertEqual(hr.equipment_class("Band pulldown", "bands"), "bands")
 
     def test_no_numeric_load_classes_have_nothing_to_lighten(self):

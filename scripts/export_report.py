@@ -251,10 +251,30 @@ def exercises_logged(logs: list[dict]) -> list[str]:
     return seen
 
 
-def no_load_label(name: str | None) -> str:
-    """Why a set has no weight: bodyweight by equipment class, else not logged."""
-    from artemis.health_regions import equipment_class
-    return "bodyweight" if equipment_class(name or "") == "bodyweight" else "no load logged"
+def classes_from(plans: list[dict]) -> dict[str, str]:
+    """LOCATION-1: exercise name -> equipment_class, from the ROWS themselves.
+    Names imply nothing now, so this is the only source the report has."""
+    out: dict[str, str] = {}
+    for p in plans or []:
+        b = p.get("blocks") if isinstance(p.get("blocks"), dict) else {}
+        for ex in (b.get("exercises") or []):
+            if ex.get("name") and ex.get("equipment_class"):
+                out[ex["name"]] = ex["equipment_class"]
+    return out
+
+
+def no_load_label(name: str | None, equipment_class: str | None = None) -> str:
+    """Why a set has no weight.
+
+    LOCATION-1 (2026-09-25): the class comes from the ROW. Nothing infers one
+    from the name any more, so a set whose row carries no class is reported as
+    unknown rather than quietly labelled "no load logged".
+    """
+    if equipment_class in ("bodyweight", "bands", "trx"):
+        return "bodyweight" if equipment_class == "bodyweight" else equipment_class
+    if not equipment_class:
+        return "no load logged (class unknown)"
+    return "no load logged"
 
 
 def settings_in(notes: str | None) -> str | None:
@@ -406,14 +426,18 @@ def _pre_program_note(data: Data) -> str:
             if n else "")
 
 
-def _set_table(sets: list[dict]) -> tuple:
+def _set_table(sets: list[dict], ex_classes: dict[str, str] | None = None) -> tuple:
+    """`ex_classes` is name -> equipment_class from the plan rows (LOCATION-1);
+    without it every unloaded set reads as "class unknown", which is honest."""
     rows = []
+    ex_classes = ex_classes or {}
     for l in sets:
         name = l["exercise"] or "—"
         if canon(name) != name:
             name = f"{name} *"
         rows.append([name, fmt(l["set_num"]), fmt(l["weight_lbs"], " lb") if l["weight_lbs"] is not None
-                     else no_load_label(canon(l["exercise"])), fmt(l["reps_done"]), fmt(l["rpe_actual"]),
+                     else no_load_label(canon(l["exercise"]), ex_classes.get(canon(l["exercise"]))),
+                     fmt(l["reps_done"]), fmt(l["rpe_actual"]),
                      "skipped" if l["is_skipped"] else (l["notes"] or "")])
     return ("table", ["Exercise", "Set", "Weight", "Reps", "Effort (RPE)", "Notes"], rows)
 
@@ -450,7 +474,7 @@ def build_daily(data: Data, generated: datetime | None = None) -> list:
                        + (f"{logged_span_min(logs)} min" if logged_span_min(logs) is not None else "—")
                        + f" ({SPAN_NOTE})"])]
     blocks += [("h2", "Sets")]
-    blocks += [_set_table(sets)] if sets else [("p", "No sets logged.")]
+    blocks += [_set_table(sets, classes_from(data.plans))] if sets else [("p", "No sets logged.")]
     blocks += _alias_note(sets)
     settings = [f"{canon(l['exercise'])}: {settings_in(l['notes'])}" for l in sets if settings_in(l["notes"])]
     blocks += [("h2", "Machine settings"), ("ul", settings) if settings else ("p", NOT_TRACKED)]
@@ -497,7 +521,7 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
     for name in exercises_logged(data.logs):
         cur, prev = now_w.get(name), prev_w.get(name)
         if cur is None:
-            change = no_load_label(name)
+            change = no_load_label(name, classes_from(data.plans).get(name))
         elif prev is None:
             change = "first week"
         else:
