@@ -1282,6 +1282,8 @@ class LoggedExercise(BaseModel):
 class PlanDay(BaseModel):
     plan_id: int
     plan_date: date
+    #: EVENING-1: "morning" | "evening". Two rows can share a date.
+    slot: Optional[str] = None
     session_type: str
     display_name: Optional[str] = None
     phase: int
@@ -1408,14 +1410,21 @@ def _parse_day(value: Optional[str], name: str) -> Optional[date]:
 def _plan_days(db: Session, start: date, end: date,
                today: date) -> tuple[list["PlanDay"], dict[int, list[dict[str, Any]]]]:
     """Plan rows in [start, end] as PlanDay (shared status derivation), plus
-    the raw session_log rows per plan_id. Used by /plan and /overview."""
+    the raw session_log rows per plan_id. Used by /plan and /overview.
+
+    BOTH SLOTS (2026-09-25). This filtered to `slot = 'morning'`, so the four
+    evening rows a week EVENING-1 creates were invisible to every consumer of
+    /plan — the week view, and the rest screen's "next session", which reported
+    Tuesday while a recovery flow sat on that same evening. Morning sorts before
+    evening within a day, so a client that wants one row per date can take the
+    first; `slot` says which one each row is."""
     plan_rows = db.execute(
         text("""
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
-                   target_rpe, est_duration_min, is_skipped
+                   target_rpe, est_duration_min, is_skipped, slot
             FROM health.plan
-            WHERE plan_date BETWEEN :s AND :e AND slot = 'morning'
-            ORDER BY plan_date
+            WHERE plan_date BETWEEN :s AND :e
+            ORDER BY plan_date, CASE WHEN slot = 'evening' THEN 1 ELSE 0 END
         """),
         {"s": start, "e": end},
     ).mappings().all()
@@ -1453,6 +1462,7 @@ def _plan_days(db: Session, start: date, end: date,
             target_rpe=float(p["target_rpe"]) if p["target_rpe"] is not None else None,
             est_duration_min=p["est_duration_min"],
             location=blocks.get("location"),
+            slot=p.get("slot"),
             is_skipped=bool(p["is_skipped"]),
             adjusted=isinstance(blocks.get("adjustment"), dict),
             status=derive_day_status(p, logs, today),

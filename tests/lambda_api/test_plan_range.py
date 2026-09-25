@@ -50,7 +50,13 @@ class FakeSession:
             return _Result([{"timezone": self.tz}] if self.tz else [])
         if "FROM health.plan" in sql:
             self.plan_queries.append(params)
-            return _Result([p for p in self.plans if params["s"] <= p["plan_date"] <= params["e"]])
+            self.plan_sql = sql
+            rows = [p for p in self.plans if params["s"] <= p["plan_date"] <= params["e"]]
+            # Postgres does the ordering; emulate it so a test can assert the
+            # contract (morning before evening within a date) rather than the
+            # order the fixture happened to be written in.
+            rows.sort(key=lambda r: (r["plan_date"], 1 if r.get("slot") == "evening" else 0))
+            return _Result(rows)
         if "FROM health.session_log" in sql:
             return _Result([l for l in self.logs if l["plan_id"] in params["pids"]])
         raise AssertionError(f"unexpected SQL: {sql[:80]}")
@@ -157,6 +163,39 @@ class TestAuthAndRange(Base):
     def test_bad_override_falls_back_home(self):
         body = self.get(self.client(tz="Mars/Olympus")).json()
         self.assertEqual(body["timezone"], "America/Chicago")
+
+
+class TestBothSlots(Base):
+    """EVENING-1 rows were invisible: /plan filtered to slot = 'morning', so the
+    four evening sessions a week never reached the week view or the rest
+    screen's "next session" (2026-09-25)."""
+
+    def test_the_query_does_not_filter_to_morning_and_orders_morning_first(self):
+        """The assertion that would have failed before the fix — the fake DB
+        never emulated the slot filter, so only the SQL itself shows it."""
+        c = self.client(plans=[plan(1, date(2026, 9, 25))])
+        self.get(c)
+        sql = self.session.plan_sql
+        self.assertNotIn("slot = 'morning'", sql)
+        self.assertIn("slot", sql)                       # it is selected
+        self.assertIn("ORDER BY plan_date, CASE WHEN slot = 'evening'", sql)
+
+    def test_both_rows_for_one_date_come_back_morning_first(self):
+        d = date(2026, 9, 25)
+        rows = [plan(2, d, st="recovery_flow", blocks={"type": "recovery_flow",
+                                                       "display_name": "Recovery Flow"},
+                     slot="evening"),
+                plan(1, d, st="rest", blocks={"type": "rest", "display_name": "Rest"},
+                     slot="morning")]
+        body = self.get(self.client(plans=rows)).json()
+        same_day = [x for x in body["days"] if x["plan_date"] == d.isoformat()]
+        self.assertEqual([x["slot"] for x in same_day], ["morning", "evening"])
+        self.assertEqual([x["session_type"] for x in same_day], ["rest", "recovery_flow"])
+
+    def test_slot_is_null_safe(self):
+        """A row seeded before EVENING-1 has no slot; it must still serialise."""
+        body = self.get(self.client(plans=[plan(1, date(2026, 9, 25), slot=None)])).json()
+        self.assertIsNone(body["days"][0]["slot"])
 
 
 class TestStatus(Base):
