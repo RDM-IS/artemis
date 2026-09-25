@@ -145,6 +145,13 @@ class CronSpec:
     # Once-per-local-day guard key. A weekend twin shares its weekday job's key
     # so the two can never both fire on one date (e.g. after a custom wake).
     guard: str | None = None
+    # DRIFT-ALARM: hourly at `minute`, every hour of the day. `hour` is then
+    # only documentation — the trigger uses "*".
+    hourly: bool = False
+    # False: the job is NOT once-per-local-day and owns its own guard. Only a
+    # job that repeats within a day may set this (DRIFT-ALARM keys its guard on
+    # the drift signature instead, so a new drift posts the hour it appears).
+    daily_guard: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +258,11 @@ class ArtemisScheduler:
             # only because it never posts; see job_nutrition_prefill.
             CronSpec("nutrition_prefill", "job_nutrition_prefill", 0, 15),
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
+            # DRIFT-ALARM: hourly, phase-gated to wake+open inside the job.
+            # tier="health" is the POSTING phase gate (wake as well as open),
+            # not a statement about the subject.
+            CronSpec("drift_alarm", "job_drift_alarm", 0, 7,
+                     tier="health", hourly=True, daily_guard=False),
             # wake: health holds flush + the wake post. Time follows the day's
             # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer / home 07:30).
             CronSpec("wake", "job_wake", *t["wake"], tier="health"),
@@ -294,7 +306,7 @@ class ArtemisScheduler:
         func = getattr(self, spec.func_name)
 
         def runner():
-            if not self._once_per_local_day(spec.guard or spec.id):
+            if spec.daily_guard and not self._once_per_local_day(spec.guard or spec.id):
                 return
             func()
 
@@ -332,7 +344,7 @@ class ArtemisScheduler:
         self._cron_specs = self.cron_specs()
         for spec in self._cron_specs:
             trigger = CronTrigger(
-                hour=spec.hour, minute=spec.minute,
+                hour="*" if spec.hourly else spec.hour, minute=spec.minute,
                 day_of_week=spec.day_of_week, timezone=tz,
             )
             if self.scheduler.get_job(spec.id):
@@ -1039,6 +1051,39 @@ class ArtemisScheduler:
                     logger.debug("last_morning_brief_at write failed", exc_info=True)
         except Exception:
             logger.exception("Morning brief generation failed")
+
+    def job_drift_alarm(self):
+        """DRIFT-ALARM — hourly in the wake and open phases: is what is running
+        what `main` says?
+
+        Posts ONLY when the drift state CHANGES. The guard is keyed on the
+        drift signature rather than the date, so the same drift is not reposted
+        every hour, while a new drift (or a recovery) is reported the hour it
+        appears. A deploy that lands cleanly is silent.
+
+        A check that cannot reach its target reports `unknown` — never "no
+        drift". Nothing in here may raise into the scheduler.
+        """
+        try:
+            # wake + open only; silent in quiet hours.
+            if self._is_quiet():
+                return
+            from artemis import drift
+            from artemis.quiet_hours import get_system_value, set_system_value
+
+            results = drift.check_all()
+            signature = drift.signature(results)
+            key = "drift_alarm:signature"
+            if get_system_value(key) == signature:
+                return                      # same state as last time — say nothing
+            set_system_value(key, signature)
+            if drift.all_clear(results):
+                logger.info("DRIFT-ALARM: all clear (%s)", signature)
+                return                      # a successful deploy is silent
+            logger.warning("DRIFT-ALARM: %s", signature)
+            self._post(config.CHANNEL_OPS, drift.format_message(results), tier="health")
+        except Exception:
+            logger.exception("Drift alarm failed")
 
     def job_vault_sync(self):
         """PB-011: 03:30 local vault ingest — fetch mirror, upsert notes, recompute
