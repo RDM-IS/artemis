@@ -80,7 +80,7 @@ class TestVersionJson(unittest.TestCase):
             self.assertEqual(drift.fetch_version_json()["sha"], MAIN)
 
     def test_a_stale_site_is_drift_and_a_current_one_is_ok(self):
-        with patch.object(drift, "github_main_sha", return_value=MAIN):
+        with patch.object(drift, "gym_display_main_sha", return_value=MAIN):
             with patch.object(drift, "fetch_version_json", return_value={"sha": OLD}):
                 self.assertEqual(drift.check_gym_display()["state"], drift.DRIFT)
             with patch.object(drift, "fetch_version_json", return_value={"sha": MAIN}):
@@ -91,17 +91,26 @@ class TestNothingRaises(unittest.TestCase):
     """A monitor that dies in the scheduler is worse than none."""
 
     def test_an_unreachable_target_is_unknown_not_ok(self):
-        with patch.object(drift, "github_main_sha",
+        with patch.object(drift, "gym_display_main_sha",
                           side_effect=urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b""))):
             r = drift._safe(drift.check_gym_display, "gym_display")
         self.assertEqual(r["state"], drift.UNKNOWN)
         self.assertIn("401", r["detail"])
 
+    def test_an_unwritten_ssm_parameter_is_unknown_not_ok(self):
+        """CI has not pushed to main yet: no parameter, so no answer — which is
+        unknown, not 'the site is current'."""
+        with patch.object(drift, "gym_display_main_sha",
+                          side_effect=RuntimeError("ParameterNotFound")):
+            r = drift._safe(drift.check_gym_display, "gym_display")
+        self.assertEqual(r["state"], drift.UNKNOWN)
+        self.assertIn("ParameterNotFound", r["detail"])
+
     def test_one_broken_check_still_reports_the_other_two(self):
         with patch.object(drift, "origin_main_sha", return_value=MAIN), \
              patch.object(drift, "check_box", return_value=drift._result("box", drift.OK, "on c69a86a", MAIN, MAIN)), \
              patch.object(drift, "lambda_description", side_effect=RuntimeError("boto3 exploded")), \
-             patch.object(drift, "github_main_sha", return_value=MAIN), \
+             patch.object(drift, "gym_display_main_sha", return_value=MAIN), \
              patch.object(drift, "fetch_version_json", return_value={"sha": MAIN}):
             results = drift.check_all()
         by = {r["component"]: r["state"] for r in results}
@@ -109,7 +118,7 @@ class TestNothingRaises(unittest.TestCase):
 
     def test_no_origin_main_makes_both_git_checks_unknown_and_still_checks_pages(self):
         with patch.object(drift, "origin_main_sha", side_effect=RuntimeError("no network")), \
-             patch.object(drift, "github_main_sha", return_value=MAIN), \
+             patch.object(drift, "gym_display_main_sha", return_value=MAIN), \
              patch.object(drift, "fetch_version_json", return_value={"sha": MAIN}):
             results = drift.check_all()
         by = {r["component"]: r["state"] for r in results}

@@ -4,7 +4,7 @@ Three components, three independent checks:
 
     box           the running sha in ~/artemis          vs origin/main
     lambda        `sha=` in the Lambda's Description    vs origin/main
-    gym_display   gym-display.pages.dev/version.json    vs gym-display main
+    gym_display   gym-display.pages.dev/version.json    vs the sha CI wrote to SSM
 
 Written 2026-09-25 after the Pages build had been failing silently since
 2026-09-23: the tests were green, the site was two merges stale, and nothing
@@ -32,12 +32,15 @@ UNKNOWN = "unknown"
 REPO_DIR = "/home/ec2-user/artemis"
 LAMBDA_NAME = "rdmis-crm-api"
 LAMBDA_REGION = "us-east-1"
-GYM_DISPLAY_REPO = "RDM-IS/gym-display"
 GYM_DISPLAY_VERSION_URL = "https://gym-display.pages.dev/version.json"
 # gym.rdm.is sits behind Cloudflare Access and answers 302 to anything
 # unauthenticated, so the check reads the Pages origin, which is public.
 
-GITHUB_SECRET = "rdmis/dev/github"
+# CI-1: gym-display's CI writes main's head here on every push to main, over
+# GitHub OIDC. The box reads it with ssm:GetParameter on this one parameter —
+# no GitHub credential, no PAT to expire. (Both stored GitHub tokens were dead
+# when this was written, which is exactly the failure mode being designed out.)
+MAIN_SHA_PARAMETER = "/artemis/gym-display/main-sha"
 HTTP_TIMEOUT = 15
 
 
@@ -72,33 +75,18 @@ def origin_main_sha(cwd: str = REPO_DIR) -> str:
     return line.split()[0]
 
 
-def _github_token() -> str | None:
-    try:
-        from knowledge.secrets import get_secret
-        value = get_secret(GITHUB_SECRET)
-        token = value.get("token") if isinstance(value, dict) else value
-        return (token or "").strip() or None
-    except Exception as exc:                                   # noqa: BLE001
-        logger.warning("Drift: no GitHub token (%s: %s)", type(exc).__name__, exc)
-        return None
+def gym_display_main_sha(parameter: str = MAIN_SHA_PARAMETER) -> str:
+    """`main`'s head for gym-display, as its CI last published it to SSM.
 
-
-def github_main_sha(repo: str = GYM_DISPLAY_REPO) -> str:
-    """`main`'s head for a repo, via the GitHub API.
-
-    gym-display is private, so this needs a token that can read it. An expired
-    one is an UNKNOWN, not a silent pass — the caller says so out loud.
+    A parameter that does not exist yet means CI has not pushed to main since
+    this was set up — that is UNKNOWN (the caller says so), never "no drift".
     """
-    token = _github_token()
-    if not token:
-        raise RuntimeError(f"no usable GitHub token in {GITHUB_SECRET}")
-    request = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/commits/main",
-        headers={"Authorization": f"Bearer {token}",
-                 "Accept": "application/vnd.github+json",
-                 "User-Agent": "artemis-drift-alarm"})
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as resp:
-        return json.load(resp)["sha"]
+    import boto3
+    client = boto3.client("ssm", region_name=LAMBDA_REGION)
+    value = client.get_parameter(Name=parameter)["Parameter"]["Value"].strip()
+    if len(value) < 7:
+        raise RuntimeError(f"{parameter} holds {value!r}, not a sha")
+    return value
 
 
 def fetch_version_json(url: str = GYM_DISPLAY_VERSION_URL) -> dict:
@@ -158,7 +146,7 @@ def check_lambda(expected: str) -> dict:
 
 
 def check_gym_display() -> dict:
-    expected = github_main_sha()
+    expected = gym_display_main_sha()
     live = fetch_version_json()["sha"]
     if live == expected:
         return _result("gym_display", OK, f"serving {_short(live)}", live, expected)

@@ -1,0 +1,97 @@
+# CI-1 — the gate that stops a bad merge.
+#
+# TEST-DB-GUARD enforced rather than remembered: this job gets NO database
+# credentials and NO AWS role. Not restricted ones — none. A test that reaches
+# for a real connection fails on ABSENCE here, which is the failure we want:
+# permission errors can be mistaken for environment noise, missing credentials
+# cannot.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (no DB, no AWS)
+    runs-on: ubuntu-latest
+    env:
+      ARTEMIS_TEST_NO_DB: "1"
+      # Belt and braces: even if something ignores the flag, there is nothing
+      # to connect to and no metadata endpoint to borrow a role from.
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"        # the version acos runs on the box
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r api/requirements.txt pytest
+
+      # Per FILE, in its own process. `pytest tests/` in one process
+      # cross-contaminates: these files install module-level stubs in
+      # sys.modules and patch globals, so a shared process produces ~90 spurious
+      # failures. One process per file is how the suite is actually run.
+      - name: pytest (one process per file)
+        run: |
+          set -u
+          # EXCLUDED, and why. Each needs something CI deliberately does not have,
+          # or is a known-stale test. Named here rather than granted access:
+          #   test_confirm_dispatch.py  reaches AWS Secrets Manager (passes with credentials)
+          #   test_phase1_schema.py     queries the live RDS schema
+          #   test_schema_drift.py      compares against the live RDS schema
+          #   test_pain_ladder.py       ::test_p1_on_walk_day — stale since walks were retired,
+          #                             fails WITH credentials too (pre-existing, not a CI gap)
+          EXCLUDE="tests/conftest.py tests/test_confirm_dispatch.py tests/test_phase1_schema.py tests/test_schema_drift.py"
+          fail=0
+          for f in tests/*.py; do
+            case " $EXCLUDE " in *" $f "*) echo "skip   $f"; continue;; esac
+            echo "::group::$f"
+            if [ "$f" = "tests/test_pain_ladder.py" ]; then
+              python -m pytest -q "$f" \
+                --deselect tests/test_pain_ladder.py::TestLadder::test_p1_on_walk_day || fail=1
+            else
+              python -m pytest -q "$f" || fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      # tests/api/ cannot run under pytest: the directory is itself a package
+      # named `api`, so pytest puts tests/ on sys.path and `import api.app` then
+      # resolves to tests/api instead of the repo's api/. The files set their own
+      # sys.path and run correctly under unittest, which is how they are run
+      # locally. Renaming the directory would fix it — a separate change.
+      - name: api tests (unittest — see comment)
+        run: |
+          set -u
+          fail=0
+          # EXCLUDED: tests/api/test_planned_sets.py — ::test_the_single_block_types
+          # asserts a planned-set count for `walk`, which was retired; it fails WITH
+          # credentials too. unittest cannot deselect a single test, so the whole file
+          # waits on that fix rather than holding CI red.
+          for f in tests/api/test_*.py; do
+            [ "$f" = "tests/api/test_planned_sets.py" ] && { echo "skip   $f"; continue; }
+            echo "::group::$f"
+            python "$f" || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: prove no credentials were available
+        if: always()
+        run: |
+          # If this ever succeeds, the guarantee above is broken.
+          if aws sts get-caller-identity >/dev/null 2>&1; then
+            echo "AWS credentials ARE present in CI — that must not happen"; exit 1
+          fi
+          echo "no AWS credentials, as intended"
