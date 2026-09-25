@@ -82,6 +82,36 @@ class TestRegistryShape(unittest.TestCase):
         # The debrief nag must sit OUTSIDE the quiet window.
         self.assertLess(by_id["health_nag"].hour, 17)
 
+    def test_drift_alarm_is_registered_hourly_in_the_active_timezone(self):
+        """DRIFT-ALARM: hourly, through apply_timezone like every other cron
+        job, and WITHOUT the once-per-local-day guard (it owns a guard keyed on
+        the drift signature instead, so a new drift posts the hour it appears)."""
+        spec = next(s for s in self.s.cron_specs() if s.id == "drift_alarm")
+        self.assertTrue(spec.hourly)
+        self.assertFalse(spec.daily_guard)
+        self.assertEqual(spec.func_name, "job_drift_alarm")
+
+        self.s.apply_timezone(SAO_PAULO)
+        job = self.s.scheduler.get_job("drift_alarm")
+        self.assertIsNotNone(job, "drift_alarm was not registered")
+        self.assertEqual(str(job.trigger.timezone), SAO_PAULO)
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        self.assertEqual(fields["hour"], "*")
+        self.assertEqual(fields["minute"], str(spec.minute))
+
+        # it must survive a timezone switch like the rest of the registry
+        self.s.apply_timezone(config.HOME_TIMEZONE)
+        job = self.s.scheduler.get_job("drift_alarm")
+        self.assertEqual(str(job.trigger.timezone), config.HOME_TIMEZONE)
+        self.assertEqual(str(next(f for f in job.trigger.fields if f.name == "hour")), "*")
+
+    def test_only_a_repeating_job_may_skip_the_daily_guard(self):
+        for spec in self.s.cron_specs():
+            with self.subTest(job=spec.id):
+                if not spec.daily_guard:
+                    self.assertTrue(spec.hourly,
+                                    f"{spec.id} skips the daily guard but is not hourly")
+
     def test_no_weekend_twins_remain(self):
         """CYCLE-1 collapsed them: one job per function, timed by location."""
         ids = [s.id for s in self.s.cron_specs()]
