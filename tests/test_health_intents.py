@@ -287,11 +287,11 @@ class TestNagLogic(unittest.TestCase):
         from artemis import health_regions as hr
         # LOCATION-1: there is no name fallback left to beat. A name alone
         # yields None — the office rules that read "TRX row" as `machine` and
-        # "Band pulldown" as a 10 lb stack are deleted.
+        # "TRX row" as a 10 lb stack step are deleted.
         self.assertIsNone(hr.equipment_class("TRX row"))
         self.assertEqual(hr.equipment_class("TRX row", "trx"), "trx")       # the row
-        self.assertIsNone(hr.equipment_class("Band pulldown"))
-        self.assertEqual(hr.equipment_class("Band pulldown", "bands"), "bands")
+        self.assertIsNone(hr.equipment_class("Band pull-apart"))
+        self.assertEqual(hr.equipment_class("Band pull-apart", "bands"), "bands")
 
     def test_no_numeric_load_classes_have_nothing_to_lighten(self):
         from artemis import health_regions as hr

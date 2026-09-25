@@ -942,7 +942,7 @@ class TestLighterLoad(unittest.TestCase):
     def test_bands_and_trx_carry_no_numeric_load(self):
         for cls in ("bands", "trx"):
             with self.subTest(cls=cls):
-                self.assertIsNone(hr.lighter_load("Band pulldown", 30, explicit_class=cls,
+                self.assertIsNone(hr.lighter_load("Band pull-apart", 30, explicit_class=cls,
                                                   load_config=self.RICHFIELD))
 
     def test_the_same_load_rounds_differently_at_the_two_gyms(self):

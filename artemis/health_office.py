@@ -131,9 +131,9 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
 # from the NAME stays only as a fallback for rows seeded before this.
 #
 # Why: the rules were written for the office and misread any other gym's
-# vocabulary — "Band pulldown" reads as `machine` (and would offer a 10 lb
-# stack step), "TRX row" as `machine`, "Ball hamstring curl" as `dumbbell`,
-# "Lying leg raise" as `dumbbell` rather than bodyweight. LOCATION-1 makes that
+# vocabulary — "TRX row" read as `machine` (a 10 lb stack step for a strap),
+# and both band exercises as `dumbbell`. Measured against the nine home-gym
+# exercises in RDS, five of nine were wrong. LOCATION-1 makes that
 # vocabulary real, so the guessing has to stop first.
 #
 # Every name this generator can emit, and every name already in RDS, is here.
