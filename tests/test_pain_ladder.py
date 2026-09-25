@@ -25,7 +25,8 @@ from test_checkin_adjust import B_NAMES, FRI, FakeDB, names, office_row, rest_ro
 
 from artemis import health_checkin as hc  # noqa: E402
 from artemis import health_patterns as hp  # noqa: E402
-from artemis import health_regions as hr  # noqa: E402
+from artemis import health_regions as hr
+from knowledge import load_config  # noqa: E402
 
 NOW = datetime(2026, 9, 18, 10, 10, tzinfo=timezone.utc)
 MON = date(2026, 9, 21)   # SCHEDULE-2: Strength A day (office)
@@ -883,7 +884,24 @@ class TestJobs(PatternDB):
 
 
 class TestLighterLoad(unittest.TestCase):
-    def test_reachable_rounding(self):
+    """LOCATION-1 (2026-09-25): the class and the gym's load config both come
+    from the ROW. These cases are the office numbers the old hardcoded tables
+    produced — unchanged, which is the point: the config moved, the maths did
+    not. Passing neither class nor config now yields NO recommendation."""
+
+    OFFICE = load_config.OFFICE
+    RICHFIELD = load_config.RICHFIELD
+    CLASS = {"Incline DB press": "dumbbell", "DB goblet squat": "dumbbell",
+             "Rear delt fly": "machine", "Leg press": "machine",
+             "Lat pulldown": "machine", "Cable face pull (rope)": "cable",
+             "Smith squat": "smith", "Barbell bench press": "barbell",
+             "Barbell row": "barbell", "Captain's chair knee raise": "bodyweight"}
+
+    def lighter(self, name, last, cfg=None):
+        return hr.lighter_load(name, last, explicit_class=self.CLASS[name],
+                               load_config=cfg or self.OFFICE)
+
+    def test_reachable_rounding_at_the_office(self):
         cases = [("Incline DB press", 25, 20), ("Incline DB press", 45, 35),
                  ("Incline DB press", 5, 5), ("DB goblet squat", 12.5, 10),
                  ("Rear delt fly", 70, 50), ("Leg press", 10, 10), ("Leg press", 200, 160),
@@ -892,19 +910,51 @@ class TestLighterLoad(unittest.TestCase):
                  ("Captain's chair knee raise", 20, None)]
         for name, last, want in cases:
             with self.subTest(name=name, last=last):
-                self.assertEqual(hr.lighter_load(name, last), want)
+                self.assertEqual(self.lighter(name, last), want)
 
     def test_lighter_than_last_unless_already_at_the_floor(self):
         floors = {"Incline DB press": 5, "Rear delt fly": 10, "Smith squat": 10,
                   "Barbell row": 45}
         for name, floor in floors.items():
             for last in range(5, 300, 5):
-                got = hr.lighter_load(name, last)
+                got = self.lighter(name, last)
                 with self.subTest(name=name, last=last):
                     if last > floor:
                         self.assertLess(got, last)
                     else:
                         self.assertEqual(got, floor)
+
+    # ── the unknown states: no recommendation, never a guessed number ────────
+    def test_no_class_means_no_recommendation(self):
+        """The name used to imply a class. It no longer does."""
+        self.assertIsNone(hr.lighter_load("Incline DB press", 45, load_config=self.OFFICE))
+
+    def test_no_load_config_means_no_recommendation(self):
+        """A row seeded before LOCATION-1. There is no office fallback."""
+        self.assertIsNone(hr.lighter_load("Incline DB press", 45, explicit_class="dumbbell"))
+
+    def test_a_class_this_gym_does_not_have_means_no_recommendation(self):
+        """Richfield has no cable stack, so a cable exercise has no load there."""
+        self.assertNotIn("cable", self.RICHFIELD)
+        self.assertIsNone(hr.lighter_load("Cable face pull (rope)", 30,
+                                          explicit_class="cable", load_config=self.RICHFIELD))
+
+    def test_bands_and_trx_carry_no_numeric_load(self):
+        for cls in ("bands", "trx"):
+            with self.subTest(cls=cls):
+                self.assertIsNone(hr.lighter_load("Band pulldown", 30, explicit_class=cls,
+                                                  load_config=self.RICHFIELD))
+
+    def test_the_same_load_rounds_differently_at_the_two_gyms(self):
+        """The reason the config travels: a PowerBlock is not a hex rack."""
+        office = hr.lighter_load("Incline DB press", 45, explicit_class="dumbbell",
+                                 load_config=self.OFFICE)
+        farm = hr.lighter_load("Incline DB press", 45, explicit_class="dumbbell",
+                               load_config=self.RICHFIELD)
+        self.assertIsNotNone(office)
+        self.assertIsNotNone(farm)
+        self.assertLess(office, 45)
+        self.assertLess(farm, 45)
 
 
 class BodyweightOnA(Base):
