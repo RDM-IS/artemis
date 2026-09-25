@@ -431,8 +431,12 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
             "type": "intervals",
             "display_name": "Conditioning finisher",
             "rounds": 6,
+            # LOCATION-1: the finisher's exercise carries its class like every
+            # other one. Nothing infers a class from a name any more, and the
+            # seeder gate (tests/test_seed_rows.py) found this row unclassed.
             "exercises": [{"name": "Stepmill or upright bike", "format": "duration",
                            "duration_sec": 30, "rest_after_sec": 90,
+                           "equipment_class": class_for("Stepmill or upright bike"),
                            "notes": "30s hard / 90s easy"}],
         }
         minutes += 12
