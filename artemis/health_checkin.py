@@ -723,11 +723,21 @@ def compute_adjustment(plan: dict, ci: CheckIn, *, rising: dict | None = None,
                     ex["notes"] = f"{ex['notes']}; {LIGHTER_NOTE}" if ex.get("notes") else LIGHTER_NOTE
                 parts.append(f"{_join([name])}: {LIGHTER_NOTE}")
             else:
+                # LOCATION-1: the ROW's load config decides what this gym can
+                # make. Without it lighter_load gives no recommendation rather
+                # than an office-shaped number for a PowerBlock.
                 target = hr.lighter_load(name, float(last),
-                                         explicit_class=ex.get("equipment_class"))
+                                         explicit_class=ex.get("equipment_class"),
+                                         load_config=blocks.get("load_config"))
                 ex["target_load_lbs"] = target
                 ex["load_from"] = float(last)
-                parts.append(f"{_join([name])} {_n(target)} lb (last {_n(last)})")
+                if target is None:
+                    # This gym has no numeric load for that class, or the row
+                    # carries no config: say so instead of printing "None lb".
+                    ex["load_note"] = LIGHTER_NOTE
+                    parts.append(f"{_join([name])}: {LIGHTER_NOTE}")
+                else:
+                    parts.append(f"{_join([name])} {_n(target)} lb (last {_n(last)})")
             lightened_pain.append(name)
             if name not in adj.eased:
                 adj.eased.append(name)
