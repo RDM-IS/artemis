@@ -174,13 +174,11 @@ class TestBaseline(unittest.TestCase):
         self.assertIsNone(cb.rowing_baseline(FakeCursor({})))
 
     def test_substitutes_are_still_counted_as_sessions_done(self):
-        """They are real training — they just do not move the rowing number."""
-        cur = FakeCursor({})
-        cur.rows_by_modality = {None: [("treadmill", 3), ("row", 1)]}
-        cur.execute("… GROUP BY 1", None)
-        self.assertEqual(cb.sessions_by_modality(FakeCursor({None: [("treadmill", 3), ("row", 1)]}),
-                                                 since=date(2026, 9, 20), until=date(2026, 9, 26)),
-                         {"treadmill": 3, "row": 1})
+        """They are real training — they just do not move the rowing number.
+        sessions_by_modality does not filter, so its first param is the window."""
+        cur = FakeCursor({date(2026, 9, 20): [("treadmill", 3), ("row", 1)]})
+        got = cb.sessions_by_modality(cur, since=date(2026, 9, 20), until=date(2026, 9, 26))
+        self.assertEqual(got, {"treadmill": 3, "row": 1})
 
 
 class TestZoneOneForwardCompatibility(unittest.TestCase):
