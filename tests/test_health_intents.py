@@ -300,7 +300,12 @@ class TestNagLogic(unittest.TestCase):
             with self.subTest(cls=cls):
                 self.assertIsNone(hr.lighter_load("Whatever", 100.0, explicit_class=cls))
         # a real load still lightens, rounded down to something reachable
-        self.assertEqual(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell"), 40.0)
+        # LOCATION-1: a recommendation needs the row's config; without it there
+        # is none, and with the office's it is the office's answer.
+        self.assertIsNone(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell"))
+        from knowledge import load_config
+        self.assertEqual(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell",
+                                         load_config=load_config.OFFICE), 40.0)
 
     # ── EVENING-1: `rest` is a rest, exactly like rest_mobility ────────────
     def test_skip_when_rest_morning(self):
