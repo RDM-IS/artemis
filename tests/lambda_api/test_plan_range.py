@@ -3,7 +3,7 @@
 Mocks the DB session; no AWS or RDS.
 
 Run:
-    python tests/api/test_plan_range.py
+    python tests/lambda_api/test_plan_range.py
 """
 
 import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB

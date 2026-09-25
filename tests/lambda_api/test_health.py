@@ -14,7 +14,7 @@ Mocks the DB session (FastAPI dependency_overrides) and the health-key
 Secrets Manager fetch. Does not require live AWS or RDS.
 
 Run:
-    python tests/api/test_health.py
+    python tests/lambda_api/test_health.py
 """
 
 import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB

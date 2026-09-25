@@ -770,7 +770,7 @@ Hosted on Cloudflare Pages, gated by Cloudflare Access OTP/SSO to
   routing, claim guard (FakeDB, no RDS)
 - `python3.11 tests/test_pain_ladder.py` — PAIN-1 ladder, rising pain, `pain=`
   notes, pattern tally/recompute/lifecycle, reflections, jobs
-- API: `tests/api/test_health.py` (auth envelopes, CORS, no_plan envelope,
+- API: `tests/lambda_api/test_health.py` (auth envelopes, CORS, no_plan envelope,
   JSONB serialization, pain-note outliers)
 
 ---

@@ -1032,7 +1032,8 @@ def _planned_set_count(blocks: Any) -> int:
                      NOT consult `ex.sets`, so neither does this; the asymmetry
                      is theirs and being wrong in the same direction is the
                      point of the word "mirrors".
-      intervals / steady / walk / mobility = 1.
+      intervals / steady / mobility = 1. A `walk` plans NO sets: WALK-RETIRE
+                     (2026-09-22) made walking activity, never a session.
 
     Until 2026-09-20 this multiplied rounds × len(exercises) flat while the
     docstring claimed it mirrored totalSetsFor. An adjusted session then read

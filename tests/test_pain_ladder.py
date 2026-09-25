@@ -112,9 +112,14 @@ class TestLadder(Base):
         self.assertEqual(names(self.db), B_NAMES)
         self.assertNotIn("adjustment", self.row()["blocks"])
 
-    def test_p1_on_walk_day(self):
+    def test_p1_on_a_flow_day(self):
+        """Was test_p1_on_walk_day. Sunday is no longer a walk — WALK-RETIRE
+        (2026-09-22) made walking activity, never a planned session, so the
+        scenario the old name described cannot occur. The live low-intensity
+        day is the evening recovery flow, where only the day-off rules apply
+        (health_checkin.FLOW_TYPE), so the coverage moves there."""
         sun = date(2026, 9, 20)
-        self.db = FakeDB(office_row(sun, plan_id=107))
+        self.db = FakeDB(office_row(sun, plan_id=107, slot="evening"))
         self.cur = self.db.cursor()
         reply = self.checkin("knee pain 4", day=sun)
         self.assertEqual(reply, "Pain knee 4/5 → day off. Reply `original` to undo.")

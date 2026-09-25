@@ -19,7 +19,7 @@ before the arithmetic runs. Weeks 5–6 (from 2026-10-11) put a 6-round finisher
 on strength_c, which is why this had a date on it.
 
 Run:
-    python3 tests/api/test_planned_sets.py
+    python3 tests/lambda_api/test_planned_sets.py
 """
 
 import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
@@ -147,7 +147,7 @@ class TestTheSkippedExerciseCase(unittest.TestCase):
     session of nothing but skips stays missed.
 
     The second half is not hypothetical. My first attempt made every skip
-    complete its slot, and tests/api/test_plan_range.py caught the cost: a
+    complete its slot, and tests/lambda_api/test_plan_range.py caught the cost: a
     `walk` is a single cardio_block, so a skipped walk read `done`. That case
     is pinned below and is the reason the rule has two halves.
     """
@@ -262,8 +262,15 @@ class TestUnchangedShapes(unittest.TestCase):
                                              "flow": [{}] * 20}), 0)
 
     def test_the_single_block_types(self):
-        for t in ("intervals", "steady", "walk", "mobility"):
+        # `walk` was removed from this list by 11a818b (WALK-RETIRE, 2026-09-22):
+        # walking is activity, never a planned session, so a walk block plans no
+        # sets. The test asserted the old behaviour and had been failing since.
+        for t in ("intervals", "steady", "mobility"):
             self.assertEqual(_planned_set_count({"type": t}), 1, t)
+
+    def test_a_walk_plans_no_sets(self):
+        """WALK-RETIRE: a walk is activity, so it contributes no planned set."""
+        self.assertEqual(_planned_set_count({"type": "walk"}), 0)
 
     def test_not_a_dict(self):
         self.assertEqual(_planned_set_count(None), 0)
