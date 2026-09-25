@@ -169,9 +169,11 @@ def mobility_minutes(regions) -> int:
 # gym-display's stepper). The office constants that used to live here are that
 # file's OFFICE entry; a second copy would drift the moment Richfield differs.
 #
-# The exercise-NAME rules are gone too. They only knew the office's vocabulary,
-# so "TRX row" read as `machine` and "Band pulldown" offered a 10 lb stack that
-# does not exist. EXERCISE-CLASS put a class on every row; the seeder's own
+# The exercise-NAME rules are gone too. They only knew the office's vocabulary:
+# of the nine home-gym exercises in RDS they misread five, reading "TRX row" as
+# `machine` (a 10 lb stack step for a strap), both band exercises as `dumbbell`
+# and "Reverse lunge" as `dumbbell` rather than bodyweight. EXERCISE-CLASS put
+# a class on every row; the seeder's own
 # inventory (health_office.class_for) assigns it, and an exercise with no class
 # is now an explicit UNKNOWN rather than a confident guess.
 
@@ -184,7 +186,7 @@ def equipment_class(name: str, explicit: str | None = None) -> str | None:
     """The exercise's class, or **None when the row does not carry one**.
 
     LOCATION-1 (2026-09-25): there is no name-based fallback. Guessing from the
-    name is what made "TRX row" a `machine` and "Band pulldown" a 10 lb stack.
+    name is what made "TRX row" a `machine`, i.e. a 10 lb stack step for a strap.
     A row without `equipment_class` is a seeding bug — `tests/test_seed_rows.py`
     fails on one — and callers report "unknown" rather than acting on a guess.
     """
