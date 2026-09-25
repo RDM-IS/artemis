@@ -387,6 +387,43 @@ class TestStatusEndpoint(unittest.TestCase):
         self.assertEqual(len(today_entries), 1)
         self.assertEqual(today_entries[0]["plan_date"], body["today"])
 
+    def test_a_logged_evening_session_shows_on_the_day_strip(self):
+        """EVENING-1 + 2026-09-25: the strip filtered to mornings and then keyed
+        a dict on date, so a rest morning beside a COMPLETED evening flow read
+        as a day on which nothing happened."""
+        today = date.today()
+        fixtures = {"plan_window": [
+            {"plan_id": 1, "plan_date": today, "session_type": "rest",
+             "is_skipped": False, "is_logged": False, "phase": 1, "week_num": 2,
+             "blocks": {"type": "rest", "display_name": "Rest"}},
+            {"plan_id": 2, "plan_date": today, "session_type": "recovery_flow",
+             "is_skipped": False, "is_logged": True, "phase": 1, "week_num": 2,
+             "blocks": {"type": "recovery_flow", "display_name": "Recovery Flow"}},
+        ]}
+        client, self.app = _build_status_client(fixtures)
+        body = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY}).json()
+        cell = next(d for d in body["day_strip"] if d["plan_date"] == body["today"])
+        self.assertTrue(cell["is_logged"], "a logged evening session must show on the day")
+        self.assertEqual(cell["session_type"], "recovery_flow",
+                         "the day's SESSION names the cell, not the rest morning")
+
+    def test_today_summary_stays_the_morning_row(self):
+        """The summary mirrors /today, which drives the workout screen, so it
+        must not follow the evening row even when that is the day's session."""
+        today = date.today()
+        fixtures = {"plan_window": [
+            {"plan_id": 1, "plan_date": today, "session_type": "rest",
+             "is_skipped": False, "is_logged": False, "phase": 1, "week_num": 2,
+             "blocks": {"type": "rest"}},
+            {"plan_id": 2, "plan_date": today, "session_type": "recovery_flow",
+             "is_skipped": False, "is_logged": True, "phase": 1, "week_num": 2,
+             "blocks": {"type": "recovery_flow"}},
+        ]}
+        client, self.app = _build_status_client(fixtures)
+        body = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY}).json()
+        self.assertEqual(body["today_summary"]["plan_id"], 1)
+        self.assertEqual(body["today_summary"]["session_type"], "rest")
+
     def test_with_today_plan_and_summary_populates_today_summary(self):
         today = date.today()
         fixtures = {
@@ -543,7 +580,13 @@ class TestLogEndpoint(unittest.TestCase):
         self.assertEqual(len(sess.inserted), 3)
         self.assertEqual(sess.inserted[2]["reps_done"], 8)
 
-    def test_resolves_plan_id_from_today_when_omitted(self):
+    def test_a_log_without_a_plan_id_is_refused_and_writes_nothing(self):
+        """Was test_resolves_plan_id_from_today_when_omitted. The handler used to
+        fall back to today's MORNING row, so a log with no plan_id attached to
+        whatever was scheduled that morning. EVENING-1 gave days two rows and
+        every caller sends an explicit plan_id, so the fallback was deleted
+        (2026-09-25) rather than made slot-aware — there is no right row to
+        guess at."""
         client, self.app, sess = _build_log_client(fixtures={
             "today_plan": {"plan_id": 99},
         })
@@ -556,9 +599,9 @@ class TestLogEndpoint(unittest.TestCase):
                 "sets": [{"set_num": 1, "duration_sec": 30, "rpe_actual": 7}],
             },
         )
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["plan_id"], 99)
-        self.assertEqual(sess.inserted[0]["plan_id"], 99)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["detail"]["error"], "plan_id_required")
+        self.assertEqual(sess.inserted, [], "nothing may be written")
 
     def test_cardio_block_single_row(self):
         client, self.app, sess = _build_log_client()

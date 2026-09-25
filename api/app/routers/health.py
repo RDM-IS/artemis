@@ -414,33 +414,43 @@ def get_status(
                        AND sl.log_type = 'session_summary'
                    ) AS is_logged
             FROM health.plan p
-            WHERE p.plan_date BETWEEN :s AND :e AND p.slot = 'morning'
-            ORDER BY p.plan_date
+            WHERE p.plan_date BETWEEN :s AND :e
+            ORDER BY p.plan_date, CASE WHEN p.slot = 'evening' THEN 1 ELSE 0 END
         """),
         {"s": window_start, "e": window_end},
     ).mappings().all()
 
-    rows_by_date = {r["plan_date"]: r for r in strip_rows}
+    # BOTH SLOTS (2026-09-25). This was a dict comprehension keyed on date,
+    # which silently dropped one of the two rows a date can now have — and the
+    # strip filtered to mornings before that, so a completed evening flow read
+    # as nothing happened. The cell shows the day's session and is_logged is
+    # true when EITHER slot was logged.
+    by_date: dict[date, list[dict[str, Any]]] = {}
+    for r in strip_rows:
+        by_date.setdefault(r["plan_date"], []).append(dict(r))
     day_strip: list[DayStripEntry] = []
     for i in range(WINDOW_DAYS * 2 + 1):
         d = window_start + timedelta(days=i)
-        r = rows_by_date.get(d)
-        if r is None:
+        rows = by_date.get(d)
+        if not rows:
             day_strip.append(DayStripEntry(plan_date=d, is_today=(d == today)))
         else:
+            r = _primary_of_day(rows)
             day_strip.append(DayStripEntry(
                 plan_date=r["plan_date"],
                 session_type=r["session_type"],
                 display_name=_display_name(r.get("blocks"), r["session_type"]),
                 is_skipped=bool(r["is_skipped"]),
-                is_logged=bool(r["is_logged"]),
+                is_logged=any(bool(x["is_logged"]) for x in rows),
                 is_today=(r["plan_date"] == today),
                 phase=r["phase"],
                 week_num=r["week_num"],
             ))
 
-    # 2) Today summary
-    today_row = rows_by_date.get(today)
+    # 2) Today summary — the MORNING row deliberately, because this mirrors
+    # /today, which drives the workout screen. Rows arrive morning-first.
+    today_rows = by_date.get(today) or []
+    today_row = today_rows[0] if today_rows else None
     today_summary = TodaySummary(
         plan_id=today_row["plan_id"] if today_row else None,
         session_type=today_row["session_type"] if today_row else None,
@@ -631,17 +641,6 @@ class LogResponse(BaseModel):
     rows: list[LogRowOut]
 
 
-def _resolve_plan_id(db: Session, supplied: Optional[int]) -> Optional[int]:
-    if supplied is not None:
-        return supplied
-    today = _today_ct()
-    row = db.execute(
-        text("SELECT plan_id FROM health.plan WHERE plan_date = :d AND slot = 'morning'"),
-        {"d": today},
-    ).mappings().first()
-    return row["plan_id"] if row else None
-
-
 @router.post("/log", response_model=LogResponse)
 def post_log(
     body: LogExerciseIn,
@@ -670,7 +669,19 @@ def post_log(
             detail={"error": "empty_sets"},
         )
 
-    plan_id = _resolve_plan_id(db, body.plan_id)
+    # DELETED 2026-09-25: this used to fall back to "today's morning row" when
+    # plan_id was omitted, so a log could attach to whatever happened to be
+    # scheduled that morning. Harmless while one row existed per day; EVENING-1
+    # made two, and every caller sends an explicit plan_id anyway (all six
+    # gym-display call sites, which are the only writers). A log with no
+    # plan_id is now a client bug and says so, rather than landing on the wrong
+    # session. Deliberately NOT slot-aware — there is no right row to guess.
+    if body.plan_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "plan_id_required",
+                    "fix": "send the plan_id of the session these sets belong to"})
+    plan_id = body.plan_id
     inserted_rows: list[dict[str, Any]] = []
 
     insert_sql = text("""
@@ -1101,13 +1112,18 @@ def get_sessions(
             SELECT plan_id, plan_date, phase, week_num, session_type, blocks,
                    target_rpe, target_hr_zone, is_skipped
             FROM health.plan
-            WHERE plan_date BETWEEN :s AND :e AND slot = 'morning'
-            ORDER BY plan_date
+            WHERE plan_date BETWEEN :s AND :e
+            ORDER BY plan_date, CASE WHEN slot = 'evening' THEN 1 ELSE 0 END
         """),
         {"s": window_start, "e": window_end},
     ).mappings().all()
 
-    plans_by_date: dict[date, dict[str, Any]] = {r["plan_date"]: dict(r) for r in plan_rows}
+    # BOTH SLOTS (2026-09-25): a date can carry two rows, and a dict keyed on
+    # date kept only the last. An evening session's sets were missing from
+    # history entirely, which reads as a day on which nothing was done.
+    plans_by_date: dict[date, list[dict[str, Any]]] = {}
+    for r in plan_rows:
+        plans_by_date.setdefault(r["plan_date"], []).append(dict(r))
     plan_ids = [p["plan_id"] for p in plan_rows]
 
     # All session_log rows tied to these plan_ids in one query.
@@ -1136,7 +1152,10 @@ def get_sessions(
     out_days: list[SessionDayRow] = []
     for i in range(days):
         d = window_start + timedelta(days=i)
-        plan = plans_by_date.get(d)
+        day_plans = plans_by_date.get(d) or []
+        # The row describes the DAY's session; its logs come from EVERY slot,
+        # so an evening flow's sets are in history rather than missing.
+        plan = _primary_of_day(day_plans) if day_plans else None
         sets: list[SessionSetRow] = []
         summary: Optional[SessionSummaryRow] = None
         avg_rpe: Optional[float] = None
@@ -1148,7 +1167,8 @@ def get_sessions(
         logged_set_count = 0
 
         if plan is not None:
-            for r in logs_by_plan.get(plan["plan_id"], []):
+            day_logs = [r for p in day_plans for r in logs_by_plan.get(p["plan_id"], [])]
+            for r in day_logs:
                 if r["log_type"] == "session_summary":
                     summary = SessionSummaryRow(
                         rpe_actual=float(r["rpe_actual"]) if r["rpe_actual"] is not None else None,
@@ -1405,6 +1425,23 @@ def _parse_day(value: Optional[str], name: str) -> Optional[date]:
         return date.fromisoformat(value)
     except ValueError:
         raise HTTPException(status_code=400, detail={"error": "bad_date", "param": name})
+
+
+#: Session types that are not a session: a day whose only row is one of these
+#: had nothing scheduled. EVENING-1 made this matter — a rest MORNING commonly
+#: has a real session that evening.
+_NOT_A_SESSION = ("rest", "rest_mobility")
+
+
+def _primary_of_day(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The row that represents a DATE when both slots have one.
+
+    A rest morning beside an evening recovery flow is a day on which something
+    was scheduled, so the flow is what the date shows. Both rest → the morning
+    (rows arrive morning-first). Callers that need per-slot detail read the
+    rows themselves; this is only for the one-cell-per-date views.
+    """
+    return next((r for r in rows if r["session_type"] not in _NOT_A_SESSION), rows[0])
 
 
 def _plan_days(db: Session, start: date, end: date,
