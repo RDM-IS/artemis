@@ -253,6 +253,22 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 - **After a write, re-point the schedule immediately** (`job_tz_sync` already detects location drift within 60 s; the command can call it directly, the way the `set timezone` command does, so there is no lag).
 - **Dates:** parse through `quiet_hours.parse_date_token` so `tuesday`, `11/23` and `2026-11-23` all work and anchor to the ACTIVE timezone.
 
+**CALENDAR-1 — read location from iCloud (blocked on nothing; not started).** The box reads the `ryan@rdm.is` Google calendar, which has had **0 events since at least 2026-09-17**. Ryan's real calendar is **iCloud**, and location is already programmed there: all-day **@Jeni's** banners mark Richfield stays, **Driving to Richfield** / **Driving to MSP** mark transit. Supersedes the open question of which calendar his schedule lives on.
+- **Access:** CalDAV at `caldav.icloud.com`, **read-only**, with an app-specific password in **Secrets Manager only** — never on disk, never in `.env`.
+- **Mapping:** event title → location in ONE config, beside the locations registry. No title matching scattered across modules.
+- **Resolution order: manual override, then calendar-derived override, then the base cycle pattern.** The calendar **proposes**: a derived location is written as an override carrying a **source marker**, and every change is reported. A mis-titled event must never silently reprogram training.
+- **Nightly reconciliation job:** re-resolve the next N days, rebuild the plan rows whose location changed, **skip any day that already has logged sets**, and report what changed.
+- **Failure modes, each handled explicitly — none may silently fall back to the base cycle:** CalDAV unreachable; credential expired; an all-day event spanning a timezone boundary; two conflicting location events on one day; a transit event with no matching arrival.
+
+**SESSION-LIB — start any session on demand (blocked on LOCATION-1).** A launcher for sessions outside the schedule. It **replaces YOGA-LAUNCH rather than sitting beside it** — one launcher, not two — and carries YOGA-LAUNCH's logging rules forward.
+- **Buttons are session TYPE, not session × location:** Strength A/B/C, Core, Yoga, Cardio.
+- **Location resolves from `cycle.py`** and is shown as a chip at the top, with a **one-tap override that applies to that launch only** and never mutates the cycle.
+- **Sessions the current location cannot support are ABSENT, not greyed** — Bike and Row simply do not appear at the office.
+- **Nothing is stored statically.** The launcher calls the **same builder that seeds plan rows** (type + location + current progression point), so Phase 2 Week 3 comes out right with no template to update.
+- **Logging rule, one rule for every type:** ad-hoc sets are **real** — they feed LAST and the effort trend. They do **not** complete a plan row or count toward scheduled adherence, **unless** today has an uncompleted row of that same type **in either slot**, in which case they complete it.
+- **Open:** (a) whether ad-hoc sessions feed the pain ladder and the day-off rules; (b) **Core has no definition in any form today** and needs one before it can be generated. **Yoga A/B do not exist** — a registry-driven list shows Recovery now and the others when YOGA-6 lands.
+- **Also retires "Mobility 20 min or full rest" on the rest screen:** it either offers something tappable or says nothing.
+
 **LOCATION-1 — locations, substitutions and per-location weight steps (companion to CYCLE-1; created 2026-09-19).** **Don't build yet** — the open questions below come first.
 - **Locations registry:** `office`, `richfield`, `brown_deer`, `msp_home`, `outside`. Each carries a display name, a timezone, a **wake time** (CYCLE-1: wake follows the location, not the day type), an equipment inventory **by class** (machine, cable, smith, barbell, dumbbell with min/max/step, bands, TRX, bodyweight, cardio machines) and constraints (Richfield: **6.5 ft ceiling → no standing overhead work**).
 - **`richfield` is the farm** — one place, not two. There is no fifth WI location.
