@@ -55,6 +55,20 @@ aws lambda update-function-code \
   --zip-file fileb://function.zip \
   --region us-east-1
 
+# DRIFT-ALARM (2026-09-25): record WHICH COMMIT this package was built from on
+# the function itself. Nothing recorded it before, so answering "is the live
+# Lambda current?" meant downloading the 24 MB package and diffing it file by
+# file. The Description is read by lambda:GetFunctionConfiguration, which the
+# box role already has. Keep `sha=<40 hex>` first — the drift check parses it.
+DEPLOYED_SHA="$(git -C "$REPO" rev-parse HEAD)"
+DEPLOYED_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+aws lambda wait function-updated-v2 --function-name rdmis-crm-api --region us-east-1
+aws lambda update-function-configuration \
+  --function-name rdmis-crm-api \
+  --region us-east-1 \
+  --description "sha=${DEPLOYED_SHA} branch=${DEPLOYED_BRANCH} deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --query '[Description,LastUpdateStatus]' --output text
+
 echo "Cleaning up..."
 rm -rf package function.zip
 
