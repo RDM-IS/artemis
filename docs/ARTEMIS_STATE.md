@@ -268,6 +268,11 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       ADD COLUMN IF NOT EXISTS source     TEXT NOT NULL DEFAULT 'manual',
       ADD COLUMN IF NOT EXISTS source_ref TEXT,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+  -- set_by is collapsed INTO source (Ryan, 2026-09-25): both answer "where did
+  -- this row come from", and keeping both guarantees they drift. COLUMN-GREP:
+  -- zero readers and zero writers anywhere in artemis/, api/ or scripts/ —
+  -- only migration 035 mentions it — and the table holds no rows.
+  ALTER TABLE acos.cycle_day_overrides DROP COLUMN IF EXISTS set_by;
   ALTER TABLE acos.cycle_day_overrides
       ADD CONSTRAINT cycle_day_overrides_source_check
       CHECK (source IN ('manual', 'calendar'));
@@ -279,7 +284,8 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
       ON acos.cycle_day_overrides (source_ref) WHERE source = 'calendar';
   ```
 - **ENUM-EXPAND, applied to that CHECK from the start.** Adding a third `source` later is a breaking change for everything that reads it, so the consumers are named now: **`artemis/cycle.py:override_for()`** (the only reader today — an explicit column list, no `SELECT *`, so these columns break nothing when added); **CYCLE-2's chat command** (writes `manual`, and `@artemis overrides` should show the source); **CALENDAR-1's reconciliation job** (writes and prunes `calendar` only). **No Lambda or frontend consumer exists** — the API serves plan rows, not overrides. A new value means updating this list in the same change.
-- **COLUMN-GREP on the existing table (2026-09-25):** one reader, `cycle.py:override_for()`, selecting `override_id, start_date, end_date, day_type, location, reason`. Nothing reads `set_by` or `revoked_at` by name outside that module, nothing uses `SELECT *`, and the table is empty — so the three columns can be added with no code change and no backfill.
+- **COLUMN-GREP on the existing table (2026-09-25):** one reader, `cycle.py:override_for()`, selecting `override_id, start_date, end_date, day_type, location, reason`. Nothing uses `SELECT *`, and the table is empty — so the columns can be added with no code change and no backfill.
+- **`set_by` is dropped, not kept beside `source` (Ryan, 2026-09-25).** 035 added it as "who/what set it, for the audit trail; 'ryan' for a chat command", and **nothing has ever read or written it** — the only mention in the repo is the migration itself. `source` answers the same question (`manual` = Ryan typed it, `calendar` = derived from iCloud), the chat command's audit trail already lives in `acos.audit_log`, and this is a solo system, so a column held for a multi-user future is two facts that will disagree. **Note this is specific to THIS table:** `nutrition.target.set_by` is different and stays — it distinguishes the dietitian (`joy`) from Ryan, `artemis/health.py` reads it, and no `source` column answers that.
 
 **SESSION-LIB — start any session on demand (blocked on LOCATION-1).** A launcher for sessions outside the schedule. It **replaces YOGA-LAUNCH rather than sitting beside it** — one launcher, not two — and carries YOGA-LAUNCH's logging rules forward.
 - **Buttons are session TYPE, not session × location:** Strength A/B/C, Core, Yoga, Cardio.
