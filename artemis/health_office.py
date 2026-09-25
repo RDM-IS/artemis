@@ -443,19 +443,38 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
     return blocks, rpe, 3, minutes
 
 
-def _z2(week_num: int, location: str = LOCATION):
+def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
+    """CARDIO-LOC (2026-09-25): the modality comes from the LOCATION'S INVENTORY
+    via `knowledge.cardio`, in the configured preference order.
+
+    This used to be a two-way branch — the office's equipment list, else the
+    literal ["rower", "bike on trainer"] — which is why a Richfield Z2 named a
+    rower that `FORBIDDEN_TOKENS` forbids in an office row. Inventory is config
+    now, so the rower moving to MSP is one line in `knowledge/cardio.py`.
+    """
+    from knowledge import cardio as cardio_cfg
+
     lo, hi = RAMP[week_num][2]
     office = location == LOCATION
+    resolved = cardio_cfg.resolve(location_key)
     blocks = {
         "type": "steady",
         "display_name": _DISPLAY["cardio_z2"],
         "location": location,
+        "location_key": location_key,
         "duration_min": hi,
         "intensity": "Zone 2",
-        "equipment": (list(SESSION_EQUIPMENT["cardio_z2"]) if office
-                      else ["rower", "bike on trainer"]),
-        "setup_notes": [Z2_NOTES],
+        # The resolved modality travels on the row, like load_config does, so
+        # the iPad and the box read one answer instead of deciding separately.
+        "cardio": resolved,
+        "equipment": [cardio_cfg.label_for(d) for _, d in cardio_cfg.available(location_key)],
+        "setup_notes": [Z2_NOTES if office else cardio_cfg.describe(resolved)],
     }
+    if not resolved.get("modality"):
+        # MSP home: an explicit state, never a silent fall-through to another
+        # location's equipment. The session still exists and says why.
+        blocks["setup_notes"] = [cardio_cfg.describe(resolved)]
+        blocks["no_equipment"] = True
     if office:
         # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that
         # the flows travel. Same cooldown the strength days use.
@@ -807,7 +826,7 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
         return _strength(session_type, week_num, wk0=wk0,
                          location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
-        return _z2(week_num, location or LOCATION)
+        return _z2(week_num, location or LOCATION, location_key=location_key)
     if session_type == "rest":
         return _rest_day()
     return _rest(week_num)
