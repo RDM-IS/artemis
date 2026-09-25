@@ -611,6 +611,13 @@ class LogExerciseIn(BaseModel):
     plan_id: Optional[int] = None
     exercise: Optional[str] = None
     log_type: str = Field(default="strength_set")
+    #: CARDIO-LOC: what a cardio session was done ON. `modality` is the thing
+    #: with a progression (row | bike | treadmill | elliptical); `device` is the
+    #: variant (water, indoor trainer, upright, recumbent). Both are per-log and
+    #: NULL on strength rows. A modality outside the four is refused rather than
+    #: written — the CHECK would reject it anyway, and a 400 says why.
+    modality: Optional[str] = None
+    device: Optional[str] = None
     sets: list[LogSetIn] = Field(default_factory=list)
     notes: Optional[str] = None
     session_rpe: Optional[float] = Field(default=None, ge=1, le=10)
@@ -676,6 +683,11 @@ def post_log(
     # gym-display call sites, which are the only writers). A log with no
     # plan_id is now a client bug and says so, rather than landing on the wrong
     # session. Deliberately NOT slot-aware — there is no right row to guess.
+    if body.modality is not None and body.modality not in CARDIO_MODALITIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "unknown_modality", "modality": body.modality,
+                    "known": list(CARDIO_MODALITIES)})
     if body.plan_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -690,13 +702,15 @@ def post_log(
             set_num, reps_done, weight_lbs,
             duration_sec, distance_m,
             hr_avg, hr_peak, rpe_actual,
-            notes, is_skipped, logged_via
+            notes, is_skipped, logged_via,
+            modality, device
         ) VALUES (
             :plan_id, :log_type, :exercise,
             :set_num, :reps_done, :weight_lbs,
             :duration_sec, :distance_m,
             :hr_avg, :hr_peak, :rpe_actual,
-            :notes, :is_skipped, :logged_via
+            :notes, :is_skipped, :logged_via,
+            :modality, :device
         )
         RETURNING log_id, plan_id, log_type, exercise,
                   set_num, reps_done, weight_lbs,
@@ -724,6 +738,8 @@ def post_log(
                     "notes": s.notes if s.notes is not None else body.notes,
                     "is_skipped": s.is_skipped,
                     "logged_via": LOGGED_VIA_GYM_DISPLAY,
+                    "modality": body.modality,
+                    "device": body.device,
                 },
             ).mappings().first()
             if row is not None:
@@ -1949,6 +1965,11 @@ def _patterns(db: Session) -> list[PatternOut]:
 # 8,986 samples took 20.3 s and anything larger hit the 30 s Lambda/gateway
 # ceiling (two timeouts, 2026-09-19 21:50). Batched, the same payload is a
 # handful of round-trips.
+#: CARDIO-LOC: kept in step with migration 043's CHECK and knowledge/cardio.py.
+#: ENUM-EXPAND — adding one here means adding it there and to every consumer
+#: named in the CARDIO-LOC entry, in the same change.
+CARDIO_MODALITIES = ("row", "bike", "treadmill", "elliptical")
+
 INSERT_CHUNK = 500
 # Refuse early, with a useful message, rather than hanging to the 30 s ceiling.
 MAX_SAMPLES_PER_REQUEST = 60_000
