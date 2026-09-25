@@ -3,7 +3,7 @@
 Three components, three independent checks:
 
     box           the running sha in ~/artemis          vs origin/main
-    lambda        `sha=` in the Lambda's Description    vs origin/main
+    lambda        `pkg=` in the Lambda's Description    vs origin/main's package
     gym_display   gym-display.pages.dev/version.json    vs the sha CI wrote to SSM
 
 Written 2026-09-25 after the Pages build had been failing silently since
@@ -64,15 +64,34 @@ def _git(*args: str, cwd: str = REPO_DIR) -> str:
 
 
 def origin_main_sha(cwd: str = REPO_DIR) -> str:
-    """The sha `origin/main` points at RIGHT NOW, read from the remote.
+    """The sha `origin/main` points at RIGHT NOW.
 
-    `git rev-parse origin/main` would answer from the last fetch, which is
-    exactly the staleness this alarm exists to catch.
+    Fetched every time: `git rev-parse origin/main` would answer from whenever
+    the box last pulled, which is exactly the staleness this alarm exists to
+    catch. The fetch also brings the objects `package_hash` needs. It touches
+    only refs — never the working tree.
     """
-    line = _git("ls-remote", "origin", "main", cwd=cwd)
-    if not line:
-        raise RuntimeError("ls-remote returned nothing for main")
-    return line.split()[0]
+    _git("fetch", "--quiet", "origin", "main", cwd=cwd)
+    sha = _git("rev-parse", "FETCH_HEAD", cwd=cwd)
+    if not sha:
+        raise RuntimeError("could not resolve FETCH_HEAD after fetching main")
+    return sha
+
+
+def package_hash(ref: str = "FETCH_HEAD", cwd: str = REPO_DIR) -> str:
+    """The Lambda package's identity at `ref` — see scripts/package_hash.sh.
+
+    The SAME script api/deploy.sh runs, so the two sides cannot drift apart.
+    Call it only after origin_main_sha() has fetched.
+    """
+    out = subprocess.run(["bash", f"{cwd}/scripts/package_hash.sh", ref], cwd=cwd,
+                         capture_output=True, text=True, timeout=HTTP_TIMEOUT)
+    if out.returncode != 0:
+        raise RuntimeError(f"package_hash.sh: {out.stderr.strip()[:200]}")
+    value = out.stdout.strip()
+    if not value:
+        raise RuntimeError("package_hash.sh returned nothing")
+    return value
 
 
 def gym_display_main_sha(parameter: str = MAIN_SHA_PARAMETER) -> str:
@@ -108,12 +127,23 @@ def fetch_version_json(url: str = GYM_DISPLAY_VERSION_URL) -> dict:
     return data
 
 
-def parse_lambda_sha(description: str | None) -> str | None:
-    """The `sha=<40 hex>` token deploy.sh writes into the Description."""
+def parse_lambda_token(description: str | None, name: str) -> str | None:
+    """A `<name>=<value>` token from the Description deploy.sh writes."""
+    prefix = f"{name}="
     for part in (description or "").split():
-        if part.startswith("sha=") and len(part) > 4:
-            return part[4:]
+        if part.startswith(prefix) and len(part) > len(prefix):
+            return part[len(prefix):]
     return None
+
+
+def parse_lambda_sha(description: str | None) -> str | None:
+    """`sha=` — which COMMIT built the package. Reported, not compared."""
+    return parse_lambda_token(description, "sha")
+
+
+def parse_lambda_pkg(description: str | None) -> str | None:
+    """`pkg=` — the package hash, which IS the comparison (CI-2)."""
+    return parse_lambda_token(description, "pkg")
 
 
 def lambda_description() -> str | None:
@@ -132,17 +162,31 @@ def check_box(expected: str) -> dict:
                    live, expected)
 
 
-def check_lambda(expected: str) -> dict:
+def check_lambda(expected_sha: str) -> dict:
+    """Compares the PACKAGE, not the commit.
+
+    A merge that touches only artemis/ or docs/ leaves the shipped paths
+    untouched, so the deployed package is still current and this says `ok`.
+    A change under api/, knowledge/, migrations/ or tests/ moves the hash and
+    this says `drift`. The commit sha is reported either way, because it is how
+    you know which commit built what is live.
+    """
     description = lambda_description()
-    live = parse_lambda_sha(description)
-    if not live:
+    live_sha = parse_lambda_sha(description)
+    live_pkg = parse_lambda_pkg(description)
+    if not live_pkg:
         return _result("lambda", UNKNOWN,
-                       f"Description carries no sha= token ({(description or '')[:40]!r})",
-                       None, expected)
-    if live == expected:
-        return _result("lambda", OK, f"deployed from {_short(live)}", live, expected)
-    return _result("lambda", DRIFT, f"deployed from {_short(live)}, main is {_short(expected)}",
-                   live, expected)
+                       f"Description carries no pkg= token ({(description or '')[:48]!r}) — "
+                       "deploy once with the current deploy.sh",
+                       live_sha, expected_sha)
+    expected_pkg = package_hash()
+    built = f"built from {_short(live_sha)}" if live_sha else "commit unrecorded"
+    if live_pkg == expected_pkg:
+        return _result("lambda", OK, f"package {live_pkg} current ({built})",
+                       live_pkg, expected_pkg)
+    return _result("lambda", DRIFT,
+                   f"package {live_pkg} ({built}), main ships {expected_pkg}",
+                   live_pkg, expected_pkg)
 
 
 def check_gym_display() -> dict:

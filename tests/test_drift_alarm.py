@@ -22,6 +22,8 @@ from artemis import drift  # noqa: E402
 
 MAIN = "c69a86a0d5871747351b56bc20c2e6935b6b33f3"
 OLD = "8e675df2b4b3b1f62c63981dce95491498381782"
+PKG = "87660535d8e8f6e9"          # the package hash main ships
+PKG_OLD = "919753c745f8b55e"      # an older one
 
 
 def _response(body: str):
@@ -34,27 +36,95 @@ def _response(body: str):
 
 
 class TestLambdaDescription(unittest.TestCase):
-    def test_the_sha_token_is_read(self):
-        self.assertEqual(
-            drift.parse_lambda_sha(f"sha={MAIN} branch=main deployed=2026-09-25T12:00:00Z"), MAIN)
+    """CI-2: the comparison is the PACKAGE hash. The sha is reported, not
+    compared, so a merge that ships nothing new does not cry drift."""
+
+    DESC = f"sha={MAIN} pkg={PKG} branch=main deployed=2026-09-25T12:00:00Z"
+
+    def test_both_tokens_are_read(self):
+        self.assertEqual(drift.parse_lambda_sha(self.DESC), MAIN)
+        self.assertEqual(drift.parse_lambda_pkg(self.DESC), PKG)
 
     def test_the_stale_force_refresh_string_yields_nothing(self):
-        self.assertIsNone(drift.parse_lambda_sha("force-refresh-1777952455"))
-        self.assertIsNone(drift.parse_lambda_sha(None))
-        self.assertIsNone(drift.parse_lambda_sha("sha="))
+        for parse in (drift.parse_lambda_sha, drift.parse_lambda_pkg):
+            self.assertIsNone(parse("force-refresh-1777952455"))
+            self.assertIsNone(parse(None))
+            self.assertIsNone(parse("sha= pkg="))
 
-    def test_a_description_without_a_sha_is_unknown_not_ok(self):
-        with patch.object(drift, "lambda_description", return_value="force-refresh-1777952455"):
+    def test_a_description_with_no_pkg_is_unknown_not_ok(self):
+        """A function last deployed before CI-2 cannot be judged — say so."""
+        with patch.object(drift, "lambda_description", return_value=f"sha={MAIN}"):
             r = drift.check_lambda(MAIN)
         self.assertEqual(r["state"], drift.UNKNOWN)
+        self.assertIn("pkg=", r["detail"])
 
-    def test_matching_and_mismatching_shas(self):
-        with patch.object(drift, "lambda_description", return_value=f"sha={MAIN}"):
-            self.assertEqual(drift.check_lambda(MAIN)["state"], drift.OK)
-        with patch.object(drift, "lambda_description", return_value=f"sha={OLD}"):
+    def test_a_merge_that_ships_nothing_new_is_ok_even_on_an_older_sha(self):
+        """THE false positive CI-2 removes: main moved (a commit under artemis/
+        or docs/), the package did not."""
+        with patch.object(drift, "lambda_description",
+                          return_value=f"sha={OLD} pkg={PKG}"), \
+             patch.object(drift, "package_hash", return_value=PKG):
+            r = drift.check_lambda(MAIN)
+        self.assertEqual(r["state"], drift.OK)
+        self.assertIn(OLD[:7], r["detail"])        # still says what built it
+
+    def test_a_change_under_a_shipped_path_is_drift(self):
+        with patch.object(drift, "lambda_description",
+                          return_value=f"sha={MAIN} pkg={PKG_OLD}"), \
+             patch.object(drift, "package_hash", return_value=PKG):
             r = drift.check_lambda(MAIN)
         self.assertEqual(r["state"], drift.DRIFT)
-        self.assertIn(OLD[:7], r["detail"])
+        self.assertIn(PKG, r["detail"])
+        self.assertIn(PKG_OLD, r["detail"])
+
+    def test_a_dirty_deploy_marks_itself_and_reports_drift(self):
+        """deploy.sh appends +dirty when shipped paths have uncommitted changes."""
+        with patch.object(drift, "lambda_description",
+                          return_value=f"sha={MAIN} pkg={PKG}+dirty"), \
+             patch.object(drift, "package_hash", return_value=PKG):
+            self.assertEqual(drift.check_lambda(MAIN)["state"], drift.DRIFT)
+
+
+def _has_commit(ref: str) -> bool:
+    """CI checks out shallow, so history-dependent tests skip rather than fail."""
+    import subprocess
+    return subprocess.run(["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+                          cwd=str(Path(__file__).resolve().parent.parent),
+                          capture_output=True).returncode == 0
+
+
+class TestPackageHashAgainstRealHistory(unittest.TestCase):
+    """The two cases CI-2 is judged on, run through the REAL script against the
+    REAL repo — not a fixture that could agree with a wrong formula.
+
+        992fc11  fix(diet1): format Decimal protein   — touches only artemis/
+        d524cb2  feat(deploy): record the deployed sha — touches only api/
+    """
+
+    ARTEMIS_ONLY = "992fc11"
+    API_ONLY = "d524cb2"
+
+    def _hash(self, ref: str) -> str:
+        import subprocess
+        root = Path(__file__).resolve().parent.parent
+        out = subprocess.run(["bash", str(root / "scripts" / "package_hash.sh"), ref],
+                             cwd=str(root), capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    @unittest.skipUnless(_has_commit(ARTEMIS_ONLY), "shallow checkout")
+    def test_a_commit_touching_only_artemis_leaves_the_package_identical(self):
+        self.assertEqual(self._hash(f"{self.ARTEMIS_ONLY}~1"), self._hash(self.ARTEMIS_ONLY))
+
+    @unittest.skipUnless(_has_commit(API_ONLY), "shallow checkout")
+    def test_a_commit_touching_api_changes_the_package(self):
+        self.assertNotEqual(self._hash(f"{self.API_ONLY}~1"), self._hash(self.API_ONLY))
+
+    @unittest.skipUnless(_has_commit("HEAD"), "no git")
+    def test_the_hash_is_stable_and_short(self):
+        first, second = self._hash("HEAD"), self._hash("HEAD")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 16)
 
 
 class TestVersionJson(unittest.TestCase):
@@ -109,6 +179,7 @@ class TestNothingRaises(unittest.TestCase):
     def test_one_broken_check_still_reports_the_other_two(self):
         with patch.object(drift, "origin_main_sha", return_value=MAIN), \
              patch.object(drift, "check_box", return_value=drift._result("box", drift.OK, "on c69a86a", MAIN, MAIN)), \
+             patch.object(drift, "package_hash", return_value=PKG), \
              patch.object(drift, "lambda_description", side_effect=RuntimeError("boto3 exploded")), \
              patch.object(drift, "gym_display_main_sha", return_value=MAIN), \
              patch.object(drift, "fetch_version_json", return_value={"sha": MAIN}):
