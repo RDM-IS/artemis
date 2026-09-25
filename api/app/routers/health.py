@@ -1568,6 +1568,13 @@ class ProgramInfo(BaseModel):
     week_end: date
     sessions_done: int = 0
     sessions_planned: int = 0
+    #: Split counts (2026-09-25). A recovery flow is a scheduled session but it
+    #: is not training, and counting both in one figure made "2 / 7" mean two
+    #: different things at once. Rest rows are in NEITHER denominator.
+    training_done: int = 0
+    training_scheduled: int = 0
+    recovery_done: int = 0
+    recovery_scheduled: int = 0
     source: str = "state"          # "state" | "derived"
 
 
@@ -2347,6 +2354,11 @@ def get_overview(
         history_days, logs_by_plan = _plan_days(db, anchor, max(today, week_end), today)
         week_days = [d for d in history_days if week_start <= d.plan_date <= week_end]
         sessions = [d for d in week_days if not _is_rest_day(d.session_type, d.blocks)]
+        # Strength and cardio in one bucket, flows in the other; a rest row is
+        # in neither, so training + recovery == the week's scheduled sessions.
+        training = [d for d in sessions if d.session_type != "recovery_flow"]
+        recovery = [d for d in sessions if d.session_type == "recovery_flow"]
+        _done = lambda rows: sum(1 for d in rows if d.status in ("done", "partial"))
         deload = prog.get("deload_week")
         program = ProgramInfo(
             name=prog.get("name"), phase=prog["phase"], week=week,
@@ -2354,7 +2366,10 @@ def get_overview(
             weeks_to_deload=max(0, deload - week) if deload else None,
             week_start=week_start, week_end=week_end,
             sessions_done=sum(1 for d in sessions if d.status == "done"),
-            sessions_planned=len(sessions), source=prog["source"],
+            sessions_planned=len(sessions),
+            training_done=_done(training), training_scheduled=len(training),
+            recovery_done=_done(recovery), recovery_scheduled=len(recovery),
+            source=prog["source"],
         )
 
     # Today
