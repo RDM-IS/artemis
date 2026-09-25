@@ -62,11 +62,22 @@ aws lambda update-function-code \
 # box role already has. Keep `sha=<40 hex>` first — the drift check parses it.
 DEPLOYED_SHA="$(git -C "$REPO" rev-parse HEAD)"
 DEPLOYED_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+# CI-2: `pkg` is what the alarm COMPARES — a hash of the four paths this script
+# zips. The sha stays because it is how you know which commit built the package;
+# it just is not the comparison any more, since a merge touching only artemis/
+# leaves the package identical.
+DEPLOYED_PKG="$(bash "$REPO/scripts/package_hash.sh" HEAD)"
+# A dirty tree ships files that are in no commit, so the hash would be a lie.
+# Say so in the Description instead: the alarm then reports drift, correctly.
+if [ -n "$(git -C "$REPO" status --porcelain -- api knowledge migrations tests)" ]; then
+  DEPLOYED_PKG="${DEPLOYED_PKG}+dirty"
+  echo "[deploy] WARNING: shipped paths have uncommitted changes — recording pkg=$DEPLOYED_PKG"
+fi
 aws lambda wait function-updated-v2 --function-name rdmis-crm-api --region us-east-1
 aws lambda update-function-configuration \
   --function-name rdmis-crm-api \
   --region us-east-1 \
-  --description "sha=${DEPLOYED_SHA} branch=${DEPLOYED_BRANCH} deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --description "sha=${DEPLOYED_SHA} pkg=${DEPLOYED_PKG} branch=${DEPLOYED_BRANCH} deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --query '[Description,LastUpdateStatus]' --output text
 
 echo "Cleaning up..."
