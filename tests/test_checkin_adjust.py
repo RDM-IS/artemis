@@ -873,7 +873,11 @@ class TestRegionMap(unittest.TestCase):
 
     def test_back_extension_is_the_seated_precor_machine(self):
         # There is no 45° back extension / roman chair in the office gym.
-        self.assertEqual(regions.equipment_class("Seated back extension"), "machine")
+        # LOCATION-1: a name no longer implies a class — health_regions returns
+        # None for one it is not given — so the inventory is asserted where it
+        # now lives, in the seeder, and on the row it seeds.
+        self.assertIsNone(regions.equipment_class("Seated back extension"))
+        self.assertEqual(office.class_for("Seated back extension"), "machine")
         self.assertIn("Seated back extension", regions.SUBSTITUTION_POOL)
         for r in office.build_rows():
             blob = json.dumps(r["blocks"], ensure_ascii=False)
