@@ -653,6 +653,85 @@ class TestFlows(unittest.TestCase):
         self.assertEqual(db.evening[FRI]["session_type"], "recovery_flow")
 
 
+class TestLocationThenPain(unittest.TestCase):
+    """LOCATION-1: resolution is LOCATION FIRST, THEN PAIN. The location
+    resolver produces the session for that gym; the pain ladder then applies
+    to the RESOLVED session, and its replacement comes from that gym too."""
+
+    def _richfield_c(self, week_num=4):
+        from artemis import health_office as office
+        blocks, rpe, zone, est = office._build("strength_c", week_num,
+                                               location="Richfield", location_key="richfield")
+        return copy.deepcopy(blocks), rpe, est
+
+    def test_the_session_resolves_to_richfields_inventory(self):
+        blocks, _, _ = self._richfield_c()
+        names = [e["name"] for e in blocks["exercises"]]
+        self.assertEqual(names, ["DB Romanian deadlift", "DB fly", "1-arm DB row",
+                                 "Seated DB shoulder press", "Standing DB calf raise",
+                                 "Stability-ball crunch"])
+        # …and the row says where it is, what it can load, and what it swapped
+        self.assertEqual(blocks["location_key"], "richfield")
+        self.assertEqual(blocks["load_config"]["dumbbell"]["max"], 80)
+        self.assertEqual(blocks["load_config"]["bands"], {"mode": "none"})
+        self.assertIn({"from": "Pec fly", "to": "DB fly"}, blocks["substitutions"])
+
+    def test_shoulder_pain_4_at_richfield(self):
+        """The specced test, day-off half: a pain-4 shoulder stands the session
+        down, and what `original` restores is the RICHFIELD session — not the
+        office one it was substituted from."""
+        blocks, rpe, est = self._richfield_c()
+        row = {"plan_id": 401, "plan_date": FRI, "slot": "morning", "phase": 1,
+               "week_num": 4, "session_type": "strength_c", "target_rpe": rpe,
+               "target_hr_zone": 3, "est_duration_min": est, "blocks": blocks,
+               "is_skipped": False}
+        db = FakeDB(row)
+        reply = hc.process_checkin(db.cursor(), "shoulder pain 4", FRI, checkin_id="x", adjust=True)
+        self.assertIn("day off", reply.lower())
+        self.assertIn(db.plan[FRI]["session_type"], hc.LIGHT_TYPES)
+        original = db.plan[FRI]["blocks"]["original"]
+        self.assertEqual([e["name"] for e in original["blocks"]["exercises"]],
+                         ["DB Romanian deadlift", "DB fly", "1-arm DB row",
+                          "Seated DB shoulder press", "Standing DB calf raise",
+                          "Stability-ball crunch"])
+        self.assertEqual(hc.process_original(db.cursor(), FRI),
+                         "Restored — run Session C as written.")
+        self.assertEqual(db.plan[FRI]["blocks"]["location_key"], "richfield")
+
+    def test_shoulder_pain_3_swaps_within_richfield(self):
+        """Pain 3 on a secondary region swaps the exercise out. The
+        replacement must be something Richfield HAS."""
+        blocks, rpe, est = self._richfield_c()
+        row = {"plan_id": 402, "plan_date": FRI, "slot": "morning", "phase": 1,
+               "week_num": 4, "session_type": "strength_c", "target_rpe": rpe,
+               "target_hr_zone": 3, "est_duration_min": est, "blocks": blocks,
+               "is_skipped": False}
+        db = FakeDB(row)
+        hc.process_checkin(db.cursor(), "shoulder pain 3", FRI, checkin_id="x", adjust=True)
+        after = db.plan[FRI]["blocks"]
+        added = [e for e in after["exercises"] if e.get("added_by") == "checkin"]
+        richfield_pool = set(regions.POOL_BY_LOCATION["richfield"])
+        for e in added:
+            with self.subTest(replacement=e["name"]):
+                self.assertIn(e["name"], richfield_pool)
+                self.assertNotIn(e["name"], regions.SUBSTITUTION_POOL)   # not the office's
+                self.assertTrue(e.get("equipment_class"))
+        # whatever happened, nothing office-only survived into the session
+        office_only = {"Leg press", "Seated leg curl", "Leg extension", "Calf press",
+                       "Seated back extension", "Cable Pallof press", "Pec fly"}
+        self.assertFalse(office_only & {e["name"] for e in after["exercises"]})
+
+    def test_the_pool_is_filtered_before_pain_picks(self):
+        from artemis import health_regions as hr
+        self.assertEqual(hr.substitution_pool("richfield"),
+                         ("DB fly", "1-arm DB row", "Standing DB calf raise",
+                          "Stability-ball crunch"))
+        # a location with no recorded inventory offers nothing, so a removal
+        # there becomes mobility rather than an invented exercise
+        self.assertEqual(hr.substitution_pool("brown_deer"), ())
+        self.assertEqual(hr.substitution_pool("office"), hr.SUBSTITUTION_POOL)
+
+
 class TestParser(unittest.TestCase):
     def test_bare_weight_from_the_922_checkin(self):
         """9/22's exact reply: the bare 281.5 was dropped into free_text."""
@@ -765,8 +844,19 @@ class TestRegionMap(unittest.TestCase):
         for name in regions.SUBSTITUTION_POOL:
             with self.subTest(exercise=name):
                 self.assertIn(name, regions.EXERCISE_REGIONS)
-                ex = hc._office_exercise(name, 2, 1)
+                ex = hc._pool_exercise(name, 2, 1)
                 self.assertEqual(ex["name"], name)
+
+    def test_every_location_pool_is_buildable_and_mapped(self):
+        """LOCATION-1: a pool name from another gym must build and map too —
+        the pain ladder picks from it exactly as it does at the office."""
+        for key, pool in regions.POOL_BY_LOCATION.items():
+            for name in pool:
+                with self.subTest(location=key, exercise=name):
+                    self.assertIn(name, regions.EXERCISE_REGIONS)
+                    ex = hc._pool_exercise(name, 2, 1)
+                    self.assertEqual(ex["name"], name)
+                    self.assertTrue(ex.get("equipment_class"))
 
     def test_spec_examples(self):
         p, s = regions.regions_for("DB goblet squat")
@@ -783,7 +873,11 @@ class TestRegionMap(unittest.TestCase):
 
     def test_back_extension_is_the_seated_precor_machine(self):
         # There is no 45° back extension / roman chair in the office gym.
-        self.assertEqual(regions.equipment_class("Seated back extension"), "machine")
+        # LOCATION-1: a name no longer implies a class — health_regions returns
+        # None for one it is not given — so the inventory is asserted where it
+        # now lives, in the seeder, and on the row it seeds.
+        self.assertIsNone(regions.equipment_class("Seated back extension"))
+        self.assertEqual(office.class_for("Seated back extension"), "machine")
         self.assertIn("Seated back extension", regions.SUBSTITUTION_POOL)
         for r in office.build_rows():
             blob = json.dumps(r["blocks"], ensure_ascii=False)

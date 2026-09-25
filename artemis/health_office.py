@@ -188,7 +188,58 @@ EQUIPMENT_CLASS: dict[str, str] = {
     # a legacy interval block, not a lift: duration work with no load. `cardio`
     # is a no-numeric-load class like bands and trx.
     "Stepmill or upright bike": "cardio",
+    # LOCATION-1 — Richfield (the farm)
+    "DB fly": "dumbbell",
+    "1-arm DB row": "dumbbell",
+    "Standing DB calf raise": "dumbbell",
+    "Stability-ball crunch": "bodyweight",
 }
+
+
+# ── LOCATION-1: the same session, at another gym ────────────────────────────
+#
+# Substitution is DETERMINISTIC AND FROM A TABLE, never invented. Resolution
+# order is LOCATION FIRST, THEN PAIN: the location resolver produces the
+# session for that day's inventory, and the pain ladder then applies to the
+# RESOLVED session (so a pain removal removes the substitute, and its own
+# replacement also comes from that location's pool).
+#
+# Richfield Strength C, approved by Ryan 2026-09-23. Three of the six are
+# native there; these are the three that are not, plus the ab machine.
+# (name at the office) -> (name at Richfield, rep-range label, top reps)
+RICHFIELD_SUBS: dict[str, tuple[str, str, int]] = {
+    "Pec fly": ("DB fly", "10-12", 12),
+    "Single-arm cable row": ("1-arm DB row", "10-12", 12),
+    "Calf press": ("Standing DB calf raise", "12-15", 15),
+    "Ab machine crunch": ("Stability-ball crunch", "10-12", 12),
+}
+
+#: What the gym is called on the row, per location. The office keeps its
+#: per-session equipment list; anywhere else names what the session uses.
+LOCATION_EQUIPMENT: dict[str, list[str]] = {
+    "richfield": ["PowerBlocks (to 80 lb)", "flat bench", "stability ball"],
+}
+
+#: Which office session each location can hold, and how.
+LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int]]]] = {
+    "richfield": {"strength_c": RICHFIELD_SUBS},
+}
+
+
+def subs_for(location_key: str, session_type: str) -> dict[str, tuple[str, str, int]]:
+    """The substitution table for a session at a location. Empty means the
+    session runs as written (the office), or that this location has no table
+    for it — `can_hold` is what decides whether it may be seeded at all."""
+    return LOCATION_SUBS.get(location_key, {}).get(session_type, {})
+
+
+def can_hold(location_key: str, session_type: str) -> bool:
+    """Whether a location can hold a session: the office holds everything it
+    was written for; anywhere else needs a table. Brown Deer and MSP home have
+    NO recorded inventory, so they hold nothing until Ryan supplies one."""
+    if location_key == "office":
+        return True
+    return bool(subs_for(location_key, session_type))
 
 
 def class_for(name: str) -> str:
@@ -222,9 +273,16 @@ from artemis.cycle import (  # noqa: E402
     day_type,
 )
 from artemis import cycle as _cycle  # noqa: E402
+from knowledge import load_config as _load_config  # noqa: E402
 
 CYCLE_ANCHOR = _cycle.DEFAULT_ANCHOR
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
+
+
+def day_location_key(d: date, slot: str = "morning") -> str:
+    """The location KEY (`office`, `richfield`, …) a row belongs to."""
+    return (_cycle.anchor_location(d, use_overrides=False) if slot == "morning"
+            else _cycle.location_at(d, EVENING_AT, use_overrides=False))
 
 
 def day_location(d: date, slot: str = "morning") -> str:
@@ -235,8 +293,7 @@ def day_location(d: date, slot: str = "morning") -> str:
 
     The EVENING is where he is when the evening session happens (EVENING-1),
     which on a work day is home, not the office gym."""
-    key = (_cycle.anchor_location(d, use_overrides=False) if slot == "morning"
-           else _cycle.location_at(d, EVENING_AT, use_overrides=False))
+    key = day_location_key(d, slot)
     return (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
 
 
@@ -330,9 +387,21 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
     return ex
 
 
-def _strength(session_type: str, week_num: int, *, wk0: bool = False):
+def _strength(session_type: str, week_num: int, *, wk0: bool = False,
+              location: str = LOCATION, location_key: str = "office"):
     sets, rpe, _ = RAMP[week_num]
-    exercises = [_exercise(*e, sets, week_num, wk0=wk0) for e in _EXERCISES[session_type]]
+    subs = subs_for(location_key, session_type)
+    specs = []
+    for spec in _EXERCISES[session_type]:
+        name, label, top, per_side, machine = spec
+        if name in subs:
+            sub_name, sub_label, sub_top = subs[name]
+            # a substitute is never a machine, and never per-side unless the
+            # table says so by name (1-arm DB row is logged as one load)
+            specs.append((sub_name, sub_label, sub_top, per_side, False))
+        else:
+            specs.append(spec)
+    exercises = [_exercise(*e, sets, week_num, wk0=wk0) for e in specs]
     setup = []
     if week_num <= 2:
         setup.append("Weeks 1-2: finding weights — stop 3-4 reps shy of failure.")
@@ -343,23 +412,31 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False):
     blocks = {
         "type": "circuit",
         "display_name": _DISPLAY[session_type],
-        "location": LOCATION,
+        "location": location,
         "rounds": sets,
         "warmup": WARMUP,
         "cooldown": COOLDOWN,
         "rest_between_rounds_sec": 90,
-        "equipment": list(SESSION_EQUIPMENT[session_type]),
+        "equipment": (list(SESSION_EQUIPMENT[session_type]) if location_key == "office"
+                      else list(LOCATION_EQUIPMENT.get(location_key, []))),
         "exercises": exercises,
         "setup_notes": setup,
     }
+    if subs:
+        blocks["substituted_from"] = "office"
+        blocks["substitutions"] = [{"from": k, "to": v[0]} for k, v in subs.items()]
     minutes = 10 + round(sets * len(exercises) * 2.5)
     if session_type == "strength_c" and week_num in (5, 6):
         blocks["finisher"] = {
             "type": "intervals",
             "display_name": "Conditioning finisher",
             "rounds": 6,
+            # LOCATION-1: the finisher's exercise carries its class like every
+            # other one. Nothing infers a class from a name any more, and the
+            # seeder gate (tests/test_seed_rows.py) found this row unclassed.
             "exercises": [{"name": "Stepmill or upright bike", "format": "duration",
                            "duration_sec": 30, "rest_after_sec": 90,
+                           "equipment_class": class_for("Stepmill or upright bike"),
                            "notes": "30s hard / 90s easy"}],
         }
         minutes += 12
@@ -709,11 +786,26 @@ def _recovery_flow(location: str = LOCATION):
 
 
 def _build(session_type: str, week_num: int, *, wk0: bool = False,
-           location: str | None = None):
+           location: str | None = None, location_key: str = "office"):
+    """Every blocks dict carries its location_key: the pain ladder reads it to
+    filter the substitution pool, and a row without one is an office row (which
+    is what every row seeded before LOCATION-1 is)."""
+    blocks, rpe, zone, est = _build_inner(session_type, week_num, wk0=wk0,
+                                          location=location, location_key=location_key)
+    blocks["location_key"] = location_key
+    cfg = _load_config.for_location(location_key)
+    if cfg:
+        blocks["load_config"] = copy.deepcopy(cfg)
+    return blocks, rpe, zone, est
+
+
+def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
+                 location: str | None = None, location_key: str = "office"):
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
     if session_type.startswith("strength"):
-        return _strength(session_type, week_num, wk0=wk0)
+        return _strength(session_type, week_num, wk0=wk0,
+                         location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
         return _z2(week_num, location or LOCATION)
     if session_type == "rest":
@@ -753,12 +845,14 @@ def build_schedule() -> list[dict]:
     while d <= OFFICE_END:
         specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
                       "week_num": week_num_for(d), "location": day_location(d),
-                      "day_type": day_type(d), "wk0": False})
+                      "location_key": day_location_key(d), "day_type": day_type(d),
+                      "wk0": False})
         # EVENING-1: four evenings a week, and never one in a transit segment.
         if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
             specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
                           "week_num": week_num_for(d),
                           "location": day_location(d, "evening"),
+                          "location_key": day_location_key(d, "evening"),
                           "day_type": day_type(d), "wk0": False})
         d += timedelta(days=1)
     return specs
@@ -769,10 +863,19 @@ def build_row(spec: dict) -> dict:
     week_num = spec["week_num"]
     session_type = spec["session_type"]
     location = spec.get("location") or LOCATION
-    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location)
+    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location,
+                                    location_key=spec.get("location_key", "office"))
     blocks = copy.deepcopy(blocks)
     # CYCLE-1: every row carries where it happens and the day type it came from.
     blocks["location"] = location
+    # LOCATION-1: …and what a load means there. Two consumers must agree —
+    # gym-display's stepper and the box's lighter_load() — so it travels on
+    # the row rather than being a table shipped to the client.
+    key = spec.get("location_key", "office")
+    blocks["location_key"] = key                       # _build sets it too; belt and braces
+    cfg = _load_config.for_location(key)
+    if cfg:
+        blocks["load_config"] = copy.deepcopy(cfg)
     if spec.get("day_type"):
         blocks["day_type"] = spec["day_type"]
     tag = f"{spec.get('day_type', 'office')} wk{week_num}"
