@@ -24,20 +24,27 @@ Migration discipline, because this rewrites rows the iPad reads:
 
 WHAT THIS SCRIPT OWNS
 ---------------------
-Everything in 9/26..10/04 EXCEPT 2026-09-29 morning. Specifically:
+THE WHOLE WINDOW — every row from 9/26 to 10/04, with no exceptions. An assert
+enforces it: a row may only escape the rebuild by carrying logged sets, which is
+history and is never rewritten. So "reseed, then re-run" is deterministic for
+every date, not for most of them.
 
   the four override spans     revoked and rewritten idempotently
-  every non-held row          rebuilt from the resolver, so locations, load
+  every row                   rebuilt from the resolver, so locations, load
                               configs, cardio modality and warmup/cooldown all
                               come from the location the cycle says the row is at
   SESSION_MOVES               TWO PLAN EDITS the seeder cannot produce (below)
-  SLOT_LOCATIONS              2026-10-04 evening, forced to msp_home (below)
+  SLOT_LOCATIONS              2026-10-04 evening and 2026-09-29 morning (below)
 
-  NOT owned: 2026-09-29 morning strength_a. Held until the Richfield A
-  substitution table exists (Ryan, 2026-09-26). The script neither rebuilds it
-  nor restores it, so a reseed WILL move it to Richfield — knowingly wrong
-  there rather than knowingly wrong at the office, and still not a session that
-  room can run.
+2026-09-29 was the last carve-out and is now owned (Ryan, 2026-09-26). It is
+strength_a at RICHFIELD with `prep_unknown`, and its SESSION AND EXERCISE LIST
+ARE UNCHANGED: `subs_for("richfield", "strength_a")` is empty, so the builder
+substitutes nothing, and the row keeps the six office movements. That row is
+still knowingly wrong — Richfield cannot run a leg press — but it is now wrong
+in the RIGHT PLACE, listing the equipment that room actually has instead of
+office machines it does not, and a reseed can no longer move it while this file
+says nothing. The A table is still outstanding; when it lands, the substitutions
+appear here automatically and nothing in this script changes.
 
 SESSION_MOVES — a PLAN EDIT, not a resolver change
 --------------------------------------------------
@@ -123,19 +130,29 @@ SESSION_MOVES: dict[tuple, str] = {
     (date(2026, 10, 3), "morning"): "strength_b",   # Richfield: still no B table
 }
 
-#: (date, slot) → a location the RESOLVER would get wrong, forced.
-#: Only WAKE-SLEEP needs this: an override's location wins for the whole day, so
-#: 10/04's evening resolves to Richfield when he sleeps in Minneapolis.
+#: (date, slot) → the location this row MUST carry, stated rather than resolved.
+#:
+#:   10/04 evening  the resolver gets it WRONG. WAKE-SLEEP: an override's
+#:                  location wins for the whole day, so it answers Richfield
+#:                  when he sleeps in Minneapolis.
+#:   09/29 morning  the resolver gets it RIGHT today (the 9/28-9/29 override
+#:                  says richfield), and it is listed anyway — belt and braces,
+#:                  so the row stays deterministic even if that override is ever
+#:                  revoked, and so the window has NO date this file is silent
+#:                  about (Ryan, 2026-09-26).
 SLOT_LOCATIONS: dict[tuple, str] = {
     (date(2026, 10, 4), "evening"): "msp_home",
+    (date(2026, 9, 29), "morning"): "richfield",
 }
 
-#: (date, slot) → why this row is left exactly as it is. Keyed by DATE, not by
-#: session type: holding by type would also have held 10/03's strength_b, which
-#: this script now deliberately writes.
-HOLD_SLOTS = {
-    (date(2026, 9, 29), "morning"): "strength_a: held until the Richfield A table exists",
-}
+#: EMPTY as of 2026-09-26. 9/29 morning was the last entry: strength_a held at
+#: the office while the Richfield A table is outstanding. Holding it there meant
+#: the row claimed office machines in a room that has none, AND that a reseed
+#: would move it while this script sat silent — the worst of both. It is owned
+#: now: Richfield, prep_unknown, and the SESSION AND ITS EXERCISES UNTOUCHED,
+#: because `subs_for("richfield", "strength_a")` is empty and a row nobody
+#: approved is not an improvement on a row that is honestly wrong.
+HOLD_SLOTS: dict[tuple, str] = {}
 
 
 def _spans() -> list[tuple[date, date, str, str]]:
@@ -221,6 +238,13 @@ def main() -> int:
                 held.append((r, HOLD_SLOTS[key]))
             else:
                 targets.append(r)
+
+        # EVERY row in the window is owned — no carve-outs (Ryan, 2026-09-26).
+        # A row may only escape the rebuild by carrying logged sets, which is
+        # history and is never rewritten.
+        unowned = [(r["plan_date"], r["slot"]) for r in rows
+                   if r not in targets and not r["logs"]]
+        assert not unowned, f"unowned rows in the window: {unowned}"
 
         target_ids = [r["plan_id"] for r in targets]          # PINNED
         before_pairs = _untouched(cur, target_ids)
