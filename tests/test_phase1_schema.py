@@ -1,296 +1,220 @@
-"""Phase 1 schema validation — 15 checks against the live acos schema.
+"""Phase 1 schema probe — the THIN test over the one implementation.
 
-Reads credentials from AWS Secrets Manager via knowledge.secrets.
+The 15 checks live in `api/app/schema_check.py`, because they are reachable over
+HTTP in production through `POST /admin/run-tests` and that makes them runtime
+code (PACKAGE-IDENTITY, 2026-09-26). This file used to BE that implementation: a
+296-line script with `print()` and `sys.exit()` that the endpoint ran with
+`subprocess.run([sys.executable, "/var/task/tests/test_phase1_schema.py"])`.
 
-Required env vars:
-    RDS_SECRET_ARN  — ARN of the RDS secret in Secrets Manager
-    RDS_HOST        — RDS endpoint hostname
-    RDS_DB          — database name (default: crm)
+Two things followed from that, and both are gone:
 
-Run: RDS_SECRET_ARN=arn:... RDS_HOST=... python tests/test_phase1_schema.py
+  * the Lambda package had to ship all of `tests/`, so a test-only commit moved
+    the package identity and DRIFT-ALARM reported drift for a change that cannot
+    affect runtime;
+  * this file needed the single TEST-DB-GUARD exemption, because it was runtime
+    code living in `tests/` and connecting to the real database on purpose.
+
+It is now an ordinary guarded unit test: it sets ARTEMIS_TEST_NO_DB like every
+other test file and drives `run_checks()` with a fake connection. It asserts on
+the CONTRACT — the shape, the accounting, the check set — not on a live schema.
+The live schema is what the endpoint checks, against the real database, which is
+the only place that assertion means anything.
+
+Run:
+    python3.11 -m unittest tests.test_phase1_schema
 """
+
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
 
 import os
 import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-import psycopg2
-import psycopg2.extras
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / "api"))      # the Lambda's own package root
 
-# Add parent dir so we can import knowledge
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from knowledge.secrets import get_rds_credentials
-
-
-def get_conn():
-    host = os.environ.get("RDS_HOST")
-    db = os.environ.get("RDS_DB", "crm")
-
-    if not host:
-        print("ERROR: RDS_HOST not set")
-        sys.exit(1)
-
-    try:
-        creds = get_rds_credentials()
-    except Exception as e:
-        print(f"ERROR: Failed to get RDS credentials: {e}")
-        sys.exit(1)
-
-    return psycopg2.connect(
-        host=host,
-        port=5432,
-        dbname=db,
-        user=creds["username"],
-        password=creds["password"],
-        connect_timeout=10,
-    )
+from app import schema_check  # noqa: E402
 
 
-def table_exists(cur, schema, table):
-    cur.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema=%s AND table_name=%s",
-        (schema, table),
-    )
-    return cur.fetchone() is not None
+class FakeCursor:
+    """Answers the probe's queries from a dict of canned rows.
 
+    `healthy=True` returns what a correct schema returns, so every check passes;
+    `healthy=False` breaks three of them in three different ways.
+    """
 
-def view_exists(cur, schema, view):
-    cur.execute(
-        "SELECT 1 FROM information_schema.views WHERE table_schema=%s AND table_name=%s",
-        (schema, view),
-    )
-    return cur.fetchone() is not None
+    def __init__(self, healthy=True):
+        self.healthy = healthy
+        self._rows: list = []
+        self.executed: list[str] = []
 
+    def execute(self, sql, params=()):
+        s = " ".join(sql.split())
+        self.executed.append(s)
+        h = self.healthy
+        if "information_schema.tables" in s:
+            schema, table = params
+            crm = table in ("contacts", "organizations", "deals")
+            # a CRM table in acos is the check-10 failure
+            self._rows = [{"1": 1}] if ((h and not crm) or (not h and crm)) else []
+        elif "information_schema.views" in s:
+            self._rows = [{"1": 1}] if h else []
+        elif "v_gold_contacts" in s:
+            self._rows = []
+        elif "acos.entities WHERE name = 'Brian Pivar'" in s:
+            self._rows = [{"id": "e-pivar", "layer": "gold", "confidence": 1.0,
+                           "osint_source": None, "tags": [], "domain": None}]
+        elif "TTI (Techtronic Industries)" in s:
+            self._rows = [{"id": "e-tti", "layer": "gold", "confidence": 1.0,
+                           "osint_source": None, "tags": [], "domain": None}]
+        elif "Lucint Pilot TTI" in s:
+            self._rows = [{"id": "e-lucint", "layer": "gold", "confidence": 1.0,
+                           "osint_source": None, "tags": [], "domain": "lucint"}]
+        elif "Bradley Spaits" in s:
+            # the check-7 failure: gold, but the mentor tag is gone
+            self._rows = [{"id": "e-spaits", "layer": "gold", "confidence": 1.0,
+                           "osint_source": None, "tags": ["mentor"] if h else [],
+                           "domain": None}]
+        elif "acos.relationships" in s:
+            self._rows = [{"relationship_context": "known via TTI"}]
+        elif "INSERT INTO acos.entities" in s:
+            self._rows = [{"id": "e-probe"}]
+        elif "circuit_breaker_status" in s:
+            self._rows = [{"cnt": 0 if h else 3}]      # the check-13 failure
+        elif "velocity_ledger" in s:
+            self._rows = [{"count": 0}]
+        elif "INSERT INTO acos.data_vault_satellites" in s:
+            import psycopg2
+            raise psycopg2.errors.CheckViolation("chk_sensitive_not_syncable")
+        else:
+            self._rows = []
 
-passed = 0
-failed = 0
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
 
+    def fetchall(self):
+        return self._rows
 
-def check(name, condition, detail=""):
-    global passed, failed
-    if condition:
-        print(f"  [PASS] {name}")
-        passed += 1
-    else:
-        print(f"  [FAIL] {name}{' — ' + detail if detail else ''}")
-        failed += 1
-
-
-def main():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    print("\n=== Phase 1 Schema Validation ===\n")
-
-    # 1. All 8 acos tables exist
-    expected_tables = [
-        "entities", "relationships", "osint_signals",
-        "data_vault_satellites", "audit_log", "velocity_ledger",
-        "circuit_breaker_status", "guardrail_violations",
-    ]
-    all_exist = True
-    missing = []
-    for t in expected_tables:
-        if not table_exists(cur, "acos", t):
-            all_exist = False
-            missing.append(t)
-    check("1. All 8 acos tables exist", all_exist, f"missing: {missing}" if missing else "")
-
-    # 2. schema_migrations table exists
-    check("2. acos.schema_migrations exists", table_exists(cur, "acos", "schema_migrations"))
-
-    # 3. v_gold_contacts view exists and is queryable
-    v_exists = view_exists(cur, "acos", "v_gold_contacts")
-    if v_exists:
-        try:
-            cur.execute("SELECT * FROM acos.v_gold_contacts LIMIT 1")
-            check("3. v_gold_contacts view queryable", True)
-        except Exception as e:
-            conn.rollback()
-            check("3. v_gold_contacts view queryable", False, str(e))
-    else:
-        check("3. v_gold_contacts view exists", False, "view not found")
-
-    # 4. Brian Pivar: gold, confidence 1.0, osint_source null
-    cur.execute(
-        "SELECT * FROM acos.entities WHERE name = 'Brian Pivar' AND entity_type = 'Person'"
-    )
-    pivar = cur.fetchone()
-    check(
-        "4. Brian Pivar entity: gold, confidence=1.0, osint_source=null",
-        pivar and pivar["layer"] == "gold" and pivar["confidence"] == 1.0 and pivar["osint_source"] is None,
-        f"got: {dict(pivar) if pivar else 'NOT FOUND'}",
-    )
-
-    # 5. TTI: gold, confidence 1.0
-    cur.execute(
-        "SELECT * FROM acos.entities WHERE name = 'TTI (Techtronic Industries)' AND entity_type = 'Organization'"
-    )
-    tti = cur.fetchone()
-    check(
-        "5. TTI entity: gold, confidence=1.0",
-        tti and tti["layer"] == "gold" and tti["confidence"] == 1.0,
-        f"got: {dict(tti) if tti else 'NOT FOUND'}",
-    )
-
-    # 6. Lucint Pilot TTI: gold, domain=lucint
-    cur.execute(
-        "SELECT * FROM acos.entities WHERE name = 'Lucint Pilot TTI' AND entity_type = 'Project'"
-    )
-    lucint = cur.fetchone()
-    check(
-        "6. Lucint Pilot TTI: gold, domain=lucint",
-        lucint and lucint["layer"] == "gold" and lucint["domain"] == "lucint",
-        f"got: {dict(lucint) if lucint else 'NOT FOUND'}",
-    )
-
-    # 7. Bradley Spaits: gold, tags contain 'mentor'
-    cur.execute(
-        "SELECT * FROM acos.entities WHERE name = 'Bradley Spaits' AND entity_type = 'Person'"
-    )
-    spaits = cur.fetchone()
-    check(
-        "7. Bradley Spaits: gold, tags contain 'mentor'",
-        spaits and spaits["layer"] == "gold" and "mentor" in (spaits["tags"] or []),
-        f"got: {dict(spaits) if spaits else 'NOT FOUND'}",
-    )
-
-    # 8. Brian Pivar → TTI relationship with non-empty context
-    if pivar and tti:
-        cur.execute(
-            """SELECT * FROM acos.relationships
-               WHERE source_entity_id = %s AND target_entity_id = %s""",
-            (pivar["id"], tti["id"]),
-        )
-        rel = cur.fetchone()
-        check(
-            "8. Pivar → TTI relationship exists with context",
-            rel and rel["relationship_context"] and len(rel["relationship_context"].strip()) > 0,
-            f"got: {dict(rel) if rel else 'NOT FOUND'}",
-        )
-    else:
-        check("8. Pivar → TTI relationship", False, "missing entities")
-
-    # 9. Brian Pivar → Lucint Pilot relationship with non-empty context
-    if pivar and lucint:
-        cur.execute(
-            """SELECT * FROM acos.relationships
-               WHERE source_entity_id = %s AND target_entity_id = %s""",
-            (pivar["id"], lucint["id"]),
-        )
-        rel = cur.fetchone()
-        check(
-            "9. Pivar → Lucint Pilot relationship exists with context",
-            rel and rel["relationship_context"] and len(rel["relationship_context"].strip()) > 0,
-            f"got: {dict(rel) if rel else 'NOT FOUND'}",
-        )
-    else:
-        check("9. Pivar → Lucint Pilot relationship", False, "missing entities")
-
-    # 10. crm tables NOT in acos schema
-    crm_in_acos = False
-    for t in ["contacts", "organizations", "deals"]:
-        if table_exists(cur, "acos", t):
-            crm_in_acos = True
-    check("10. CRM tables not in acos schema", not crm_in_acos)
-
-    # 11. promote_entity blocks silver→gold without ryan_confirmed
-    from knowledge.db import promote_entity, PromotionBlockedError
-    try:
-        # Create a test entity at silver layer
-        cur.execute(
-            """INSERT INTO acos.entities (entity_type, name, layer, confidence)
-               VALUES ('Person', '__test_promote__', 'silver', 0.5)
-               RETURNING id"""
-        )
-        test_id = str(cur.fetchone()["id"])
-        conn.commit()
-
-        blocked = False
-        try:
-            promote_entity(test_id, "gold", ryan_confirmed=False)
-        except PromotionBlockedError:
-            blocked = True
-        check("11. promote_entity blocks silver→gold without ryan_confirmed", blocked)
-
-        # Cleanup
-        cur.execute("DELETE FROM acos.entities WHERE id = %s", (test_id,))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        check("11. promote_entity blocks silver→gold", False, str(e))
-
-    # 12. create_relationship raises ValueError if context empty
-    from knowledge.db import create_relationship
-    raised = False
-    try:
-        create_relationship("00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", "Test", "")
-    except ValueError:
-        raised = True
-    except Exception:
-        pass  # FK violation is fine — we care about the ValueError
-    check("12. create_relationship raises ValueError on empty context", raised)
-
-    # Also test None
-    raised_none = False
-    try:
-        create_relationship("00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", "Test", None)
-    except ValueError:
-        raised_none = True
-    except Exception:
+    def close(self):
         pass
-    check("12b. create_relationship raises ValueError on None context", raised_none)
 
-    # 13. circuit_breaker_status exists and is empty
-    cur.execute("SELECT count(*) as cnt FROM acos.circuit_breaker_status")
-    cb_count = cur.fetchone()["cnt"]
-    check("13. circuit_breaker_status exists and is empty", cb_count == 0, f"count={cb_count}")
 
-    # 14. velocity_ledger exists and is queryable
-    try:
-        cur.execute("SELECT count(*) FROM acos.velocity_ledger")
-        check("14. velocity_ledger queryable", True)
-    except Exception as e:
-        conn.rollback()
-        check("14. velocity_ledger queryable", False, str(e))
+class FakeConn:
+    def __init__(self, healthy=True):
+        self.cur = FakeCursor(healthy)
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
 
-    # 15. sensitive satellite_type cannot be crm_syncable=true
-    blocked_insert = False
-    try:
-        cur.execute(
-            """INSERT INTO acos.data_vault_satellites
-               (entity_id, satellite_type, crm_syncable, content)
-               VALUES (
-                   (SELECT id FROM acos.entities LIMIT 1),
-                   'sensitive', true, 'test'
-               )"""
-        )
-        conn.commit()
-        # If we got here, the constraint didn't fire — FAIL
-        # Clean up the bad row
-        cur.execute("DELETE FROM acos.data_vault_satellites WHERE content = 'test' AND satellite_type = 'sensitive'")
-        conn.commit()
-    except psycopg2.errors.CheckViolation:
-        blocked_insert = True
-        conn.rollback()
-    except Exception as e:
-        conn.rollback()
-        # Some other error — still counts as blocked
-        if "chk_sensitive_not_syncable" in str(e):
-            blocked_insert = True
-    check("15. Sensitive satellite blocked from crm_syncable=true", blocked_insert)
+    def cursor(self, cursor_factory=None):
+        return self.cur
 
-    cur.close()
-    conn.close()
+    def commit(self):
+        self.commits += 1
 
-    total = passed + failed
-    print(f"\n{'='*40}")
-    print(f"Results: {passed}/{total} passed")
-    if failed > 0:
-        print(f"         {failed} FAILED")
-    print()
-    sys.exit(0 if failed == 0 else 1)
+    def rollback(self):
+        self.rollbacks += 1
 
+    def close(self):
+        self.closed = True
+
+
+def _run(healthy=True):
+    """The probe's two knowledge.db calls are patched: under TEST-DB-GUARD they
+    would be refused a connection, and their behaviour is not what this file is
+    asserting — that the probe REPORTS them is."""
+    from knowledge.db import PromotionBlockedError
+    conn = FakeConn(healthy)
+    with patch("knowledge.db.promote_entity",
+               side_effect=PromotionBlockedError("needs ryan_confirmed")), \
+         patch("knowledge.db.create_relationship", side_effect=ValueError("empty context")):
+        return schema_check.run_checks(conn=conn), conn
+
+
+class TestTheContract(unittest.TestCase):
+    def setUp(self):
+        self.result, self.conn = _run(healthy=True)
+
+    def test_it_returns_data_and_never_exits(self):
+        self.assertIsInstance(self.result, dict)
+        self.assertEqual(set(self.result), {"ok", "passed", "failed", "total", "checks"})
+
+    def test_a_healthy_schema_passes_every_check(self):
+        failed = [c["name"] for c in self.result["checks"] if not c["ok"]]
+        self.assertEqual(failed, [], f"unexpected failures: {failed}")
+        self.assertTrue(self.result["ok"])
+
+    def test_the_accounting_adds_up(self):
+        self.assertEqual(self.result["passed"] + self.result["failed"],
+                         self.result["total"])
+        self.assertEqual(self.result["total"], len(self.result["checks"]))
+
+    def test_all_sixteen_checks_run(self):
+        """15 numbered checks, and 12 has an 'a'/'b' pair — 16 results."""
+        self.assertEqual(self.result["total"], 16)
+        names = " ".join(c["name"] for c in self.result["checks"])
+        for n in range(1, 16):
+            with self.subTest(check=n):
+                self.assertIn(f"{n}. ", names)
+        self.assertIn("12b.", names)
+
+    def test_an_injected_connection_is_left_open_for_its_owner_to_close(self):
+        self.assertFalse(self.conn.closed)
+
+
+class TestItReportsFailuresRatherThanRaising(unittest.TestCase):
+    def setUp(self):
+        self.result, _ = _run(healthy=False)
+
+    def test_a_broken_schema_is_reported_not_raised(self):
+        self.assertFalse(self.result["ok"])
+        self.assertGreater(self.result["failed"], 0)
+
+    def test_each_break_lands_on_its_own_check(self):
+        failed = {c["name"].split(".")[0] for c in self.result["checks"] if not c["ok"]}
+        # 1/2 missing tables, 3 no view, 7 no mentor tag, 10 CRM tables in acos,
+        # 13 circuit_breaker not empty
+        for n in ("7", "10", "13"):
+            with self.subTest(check=n):
+                self.assertIn(n, failed)
+
+    def test_a_failed_check_carries_a_detail_and_a_passing_one_does_not(self):
+        for c in self.result["checks"]:
+            with self.subTest(check=c["name"]):
+                if c["ok"]:
+                    self.assertEqual(c["detail"], "")
+
+
+class TestTheReport(unittest.TestCase):
+    def test_it_renders_the_same_shape_the_script_printed(self):
+        result, _ = _run(healthy=True)
+        text = schema_check.format_report(result)
+        self.assertIn("=== Phase 1 Schema Validation ===", text)
+        self.assertIn("[PASS] 1. All 8 acos tables exist", text)
+        self.assertIn(f"Results: {result['passed']}/{result['total']} passed", text)
+        self.assertNotIn("FAILED", text)
+
+    def test_a_failure_is_marked_and_counted(self):
+        result, _ = _run(healthy=False)
+        text = schema_check.format_report(result)
+        self.assertIn("[FAIL]", text)
+        self.assertIn(f"{result['failed']} FAILED", text)
+
+
+class TestItNeedsNoDatabaseToBeImported(unittest.TestCase):
+    """The reason the TEST-DB-GUARD exemption is gone."""
+
+    def test_importing_the_probe_opens_nothing(self):
+        self.assertTrue(hasattr(schema_check, "run_checks"))
+        self.assertTrue(hasattr(schema_check, "format_report"))
+
+    def test_a_missing_rds_host_is_a_clear_error_not_a_crash(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(schema_check.SchemaCheckError):
+                schema_check.run_checks()
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
