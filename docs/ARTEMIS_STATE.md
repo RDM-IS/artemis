@@ -806,6 +806,17 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 ---
 
+**CHECKIN-GATE — pain and tightness reach the check-in; the prompt asks only what the watch can't measure (2026-09-26; `feat/checkin-gate`). BUILT, NOT DEPLOYED.** Priority #1 of the 2026-09-26 health backlog. From the CHECKIN-DEAD diagnostic.
+- **The gate.** `classify()` gated on a hand-kept token list whose only body-state words were `sore`/`soreness`. **15 of the 17 words the parser honours** (`SORE_WORDS`, which includes `PAIN_WORDS`) failed it: "knee pain 3" or "back tight 2" parsed cleanly and were then dropped with no reply. PAIN-1 has never run on real input. The gate's vocabulary is now **derived** from `SORE_WORDS` and `health_regions.ALIASES`, never hand-kept, and a test iterates `SORE_WORDS` so a new word is covered without an edit.
+- **Why a region is required for the new words.** The channel is always-listen and `pulled`, `sharp`, `strain`, `tight`, `injury` are ordinary English; with the gate simply widened, "I pulled the Q3 report, 3 pages" stored **soreness overall 3**. A body word now opens the gate only alongside a known body region. The original tokens (`sleep`, `energy`, `sore`, `soreness`, `rhr`, `weight N`) are unchanged.
+- **A second bug the probes found: pain leaked across regions in dictated replies.** "knee pain 3 back sore 1" stored **back = PAIN 3** — enough to convert every back exercise to mobility — because clauses split only on commas. A score that closes a clause that already names a region now ends it. The score-first form ("sore 1 right knee", "pain 5 knee") stays one clause.
+- **The prompt.** Now asks for energy and sore/pain by area only: sleep, RHR and weight are pre-filled by the watch, and the check-in reply already reports what the watch found. Typing them still overrides (`*_source='manual'`). Pain is asked for for the first time. PLAYBOOKS.md PB-009 updated to match.
+- **Deploy:** box only (`artemis/`), no migration, no Lambda change. **Verify on the box:** the next wake post shows the new prompt; reply `energy 3 knee pain 1` and confirm `health.daily_state.soreness` for the day carries the pain entry.
+- **Not done — Ryan's call:**
+  - `hurt` / `hurts` / `hurting` are not in the vocabulary, so "my knee hurts 2" is still unclaimed. Is it pain (ladder) or soreness?
+  - A bare positional reply ("4, sore 0") still drops the energy silently. Accepting a bare 0–5 as energy only while today's check-in is open would cut the reply to one character.
+  - **Elbow, wrist, ankle and foot are not regions** (`health_regions.ALIASES` has none of them), so "elbow pain 3" is still unclaimed — only `sore`/`soreness` open the gate without a known region. Adding them means mapping exercises to them in `EXERCISE_REGIONS`, or the pain ladder has nothing to act on.
+
 **PAIN-1 follow-ups (open).**
 - **Rising pain is explicit-only** — every day of the chain must name the region with a number; a day that doesn't mention it breaks the chain. If Ryan tends to omit a region on low-pain days, real rises will go unflagged.
 - **Load rounding is a Python port** of gym-display `equipment.ts` (`health_regions.lighter_load`); the office `TODO(office)` values (stack step, Smith bar) live in both places until they're measured.
