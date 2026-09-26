@@ -28,15 +28,34 @@ class TestConfigIsTheSourceOfTruth(unittest.TestCase):
         self.assertEqual(office.COOLDOWN, prep.OFFICE["cooldown"])
         self.assertEqual(office.COOLDOWN_MIN, prep.OFFICE["cooldown_min"])
 
-    def test_only_the_office_has_an_entry_today(self):
-        """The three rooms Ryan is inventorying must NOT have invented entries."""
-        self.assertEqual(set(prep.BY_LOCATION), {"office"})
-        for key in ("richfield", "brown_deer", "msp_home", "outside", "hotel"):
+    def test_only_measured_rooms_have_an_entry(self):
+        """A room with no confirmed inventory must NOT have an invented entry."""
+        self.assertEqual(set(prep.BY_LOCATION), {"office", "brown_deer"})
+        for key in ("richfield", "msp_home", "outside", "hotel"):
             with self.subTest(location=key):
                 self.assertFalse(prep.is_known(key))
                 self.assertIsNone(prep.warmup_for(key))
                 self.assertIsNone(prep.cooldown_for(key))
                 self.assertEqual(prep.cooldown_min(key), 0)
+
+    def test_brown_deer_uses_what_is_in_the_room_and_nothing_else(self):
+        """Confirmed 2026-09-26: a treadmill and a mat. No Stretch Trainer, no
+        elliptical — the two things the office warmup and cooldown name."""
+        self.assertTrue(prep.is_known("brown_deer"))
+        self.assertIn("treadmill", prep.warmup_for("brown_deer"))
+        self.assertIn("mat", prep.cooldown_for("brown_deer"))
+        for absent in ("elliptical", "Stretch Trainer"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, prep.warmup_for("brown_deer"))
+                self.assertNotIn(absent, prep.cooldown_for("brown_deer"))
+
+    def test_a_brown_deer_row_carries_its_own_prep_not_the_unknown_state(self):
+        b, *_ = office._build("cardio_z2", 3, location="Brown Deer",
+                              location_key="brown_deer")
+        self.assertNotIn("prep_unknown", b)
+        self.assertEqual(b["cooldown"], "5 min mat mobility")
+        self.assertIn("mat", b["equipment"])
+        self.assertNotIn("Stretch Trainer", b["equipment"])
 
     def test_adding_a_location_needs_no_code_change(self):
         added = dict(prep.BY_LOCATION, richfield={"warmup": "3 min easy row",

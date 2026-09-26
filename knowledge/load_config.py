@@ -60,11 +60,48 @@ RICHFIELD: dict[str, dict] = {
     "cardio": _NONE,
 }
 
+#: Brown Deer — CONFIRMED 2026-09-26. A treadmill, a yoga mat, and nothing else:
+#: no dumbbells, no bar, no bench, no machines, no cables, no anchor for bands or
+#: a strap. 7 ft ceiling.
+#:
+#: PRESENT AND EMPTY OF NUMERIC LOAD, which is NOT the same as absent (Ryan,
+#: 2026-09-26). An absent key means "we do not know what is there"; this entry
+#: means "we know, and there is nothing to load". The loadable classes —
+#: `dumbbell`, `barbell`, `machine`, `cable`, `smith` — are deliberately not
+#: listed, because a class absent from a location's config is not available
+#: there, and here that absence is a measured fact rather than a gap.
+BROWN_DEER: dict[str, dict] = {
+    "bodyweight": _NONE,
+    "cardio": _NONE,          # the treadmill; see knowledge/cardio.py
+}
+
 BY_LOCATION: dict[str, dict] = {
     "office": OFFICE,
     "richfield": RICHFIELD,
-    # brown_deer and msp_home have NO recorded inventory (Ryan owes both), so
-    # they get no config: nothing may be seeded there until they do.
+    "brown_deer": BROWN_DEER,
+    # msp_home has NO recorded inventory, so it gets no config and
+    # for_location() returns None for it — "unknown", not "empty".
+}
+
+#: Room constraints that are not loads, kept OUT of BY_LOCATION so `classes_at()`
+#: cannot mistake one for an equipment class.
+#:
+#: The ceiling decides whether overhead work is possible, and it belongs in the
+#: inventory rather than in someone's memory (Ryan, 2026-09-26) — Richfield's
+#: 6.5 ft lived only in a comment until now.
+#:
+#: `standing_overhead` is THREE-STATE on purpose: True, False, or None for "not
+#: determined". None is never read as permission.
+CONSTRAINTS: dict[str, dict] = {
+    "office": {"ceiling_ft": None, "standing_overhead": True,
+               "note": "commercial gym; height never measured because it has never mattered"},
+    "richfield": {"ceiling_ft": 6.5, "standing_overhead": False,
+                  "note": "no STANDING overhead work; whether a SEATED press clears "
+                          "6.5 ft is still unconfirmed"},
+    "brown_deer": {"ceiling_ft": 7.0, "standing_overhead": None,
+                   "note": "confirmed 2026-09-26. Undetermined rather than assumed: "
+                           "7 ft is marginal and depends on reach. Moot in practice — "
+                           "there is nothing here to press overhead."},
 }
 
 
@@ -82,3 +119,24 @@ def classes_at(key: str | None) -> tuple[str, ...]:
 
 def is_no_load(cls: str | None) -> bool:
     return (cls or "") in NO_LOAD_CLASSES
+
+
+def has_numeric_load(key: str | None) -> bool:
+    """Does this location have ANY class that carries a numeric load?
+
+    False for a location we know is bodyweight-only (Brown Deer). Also False for
+    one we know nothing about — so never use this alone to decide whether a
+    session may be seeded; ask `for_location()` first, where None means unknown.
+    """
+    cfg = for_location(key) or {}
+    return any(v.get("mode") == "numeric" for v in cfg.values())
+
+
+def ceiling_ft(key: str | None) -> float | None:
+    """Recorded ceiling height, or None when it was never measured."""
+    return (CONSTRAINTS.get(key or "") or {}).get("ceiling_ft")
+
+
+def standing_overhead(key: str | None) -> bool | None:
+    """True / False / None, where None means NOT DETERMINED — never permission."""
+    return (CONSTRAINTS.get(key or "") or {}).get("standing_overhead")
