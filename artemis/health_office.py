@@ -240,9 +240,27 @@ def subs_for(location_key: str, session_type: str) -> dict[str, tuple[str, str, 
 
 
 def can_hold(location_key: str, session_type: str) -> bool:
-    """Whether a location can hold a session: the office holds everything it
-    was written for; anywhere else needs a table. Brown Deer and MSP home have
-    NO recorded inventory, so they hold nothing until Ryan supplies one."""
+    """**"Is there an APPROVED SUBSTITUTION TABLE for this session here?" — that
+    is all this answers.** It reads like a general capability question and it is
+    not (Ryan, 2026-09-26). Three things follow, and each has bitten:
+
+    * **False does not mean impossible.** It is False for `rest` and
+      `recovery_flow` at every non-office location, both of which are seeded
+      there constantly and need nothing but a mat. Only the STRENGTH branch of
+      `validate_rows` consults this, which is why that is not a bug — but do not
+      reuse it as "can this room run this session".
+    * **True does not mean every movement is possible.** A table maps names, and
+      `equipment_class` describes what an implement IS, not what it can do. An
+      exercise can pass both and still be undoable in the room: *Incline DB
+      press* is class `dumbbell`, Richfield has dumbbells, and Richfield's bench
+      is flat. See CLASS-ATTRIBUTES in docs/ARTEMIS_STATE.md.
+    * **It never reads the room's constraints.** `load_config.CONSTRAINTS` holds
+      the ceiling heights and `standing_overhead`, and nothing here consults
+      them, so an overhead movement at a 6.5 ft location passes.
+
+    The office holds everything it was written for; anywhere else needs a table.
+    A location with no recorded inventory holds nothing.
+    """
     if location_key == "office":
         return True
     return bool(subs_for(location_key, session_type))

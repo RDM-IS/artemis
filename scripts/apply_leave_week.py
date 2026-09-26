@@ -22,28 +22,58 @@ Migration discipline, because this rewrites rows the iPad reads:
   * one `acos.audit_log` row records exactly what moved;
   * --commit is required; without it nothing is written at all.
 
-Rows deliberately NOT rebuilt:
+WHAT THIS SCRIPT OWNS
+---------------------
+Everything in 9/26..10/04 EXCEPT 2026-09-29 morning. Specifically:
 
-  every strength row    9/29 strength_a, 10/01 strength_b, 10/02 strength_c.
-                        Held pending the Richfield substitution tables (Ryan,
-                        2026-09-26): report them as knowingly-wrong rather than
-                        converting them. 10/02 was already converted to
-                        Richfield in the earlier write under the prior
-                        instruction — it is left as it stands, not re-reverted,
-                        and reported.
-  2026-10-04 evening    WAKE-SLEEP: the model stores only the wake anchor and
-                        an override's location wins for the whole day, so
-                        rebuilding this row would move it to Richfield. He
-                        sleeps in Minneapolis. Its current `home` is the
-                        CORRECT sleep location, so touching it would break it.
+  the four override spans     revoked and rewritten idempotently
+  every non-held row          rebuilt from the resolver, so locations, load
+                              configs, cardio modality and warmup/cooldown all
+                              come from the location the cycle says the row is at
+  SESSION_MOVES               TWO PLAN EDITS the seeder cannot produce (below)
+  SLOT_LOCATIONS              2026-10-04 evening, forced to msp_home (below)
 
-Reseeding, as of OVERRIDE-DURABILITY (2026-09-26): the seeder resolves WITH
-overrides now, so a full reseed no longer reverts this window — all eleven
-rebuilt rows come back byte-identical (proved against a TEMP-table reseed).
-A reseed is still not a no-op for the three HELD rows: it would move 9/29 to
-Richfield and 10/01 to Brown Deer (flagged knowingly-wrong, no substitution
-table) and would break 10/04's evening by moving it to Richfield, which is the
-open WAKE-SLEEP defect. Reseed the window only if you are prepared for those.
+  NOT owned: 2026-09-29 morning strength_a. Held until the Richfield A
+  substitution table exists (Ryan, 2026-09-26). The script neither rebuilds it
+  nor restores it, so a reseed WILL move it to Richfield — knowingly wrong
+  there rather than knowingly wrong at the office, and still not a session that
+  room can run.
+
+SESSION_MOVES — a PLAN EDIT, not a resolver change
+--------------------------------------------------
+`session_for()` picks the session POSITIONALLY from `cycle.DAY_TYPES` and
+deliberately ignores overrides, which is what stops an override from silently
+reshuffling which lift falls where. So moving a lift between dates is an
+explicit edit that the seeder does not know about and will undo:
+
+    2026-10-01 morning   strength_b -> rest         (Brown Deer: a treadmill, a
+                                                     mat and bodyweight; it can
+                                                     hold no lift at all)
+    2026-10-03 morning   rest       -> strength_b   (Richfield)
+
+10/03 is NOT a fix, and the report says so: `can_hold("richfield",
+"strength_b")` is still False and the Richfield B table is still empty. It moves
+the session from a room where 0 of 7 movements are possible to one where 1 is
+native, 5 are substitutable once a table is approved, and 1 (Incline DB press)
+needs an adjustable bench that room does not have — see CLASS-ATTRIBUTES.
+
+RESEED, THEN RE-RUN THIS SCRIPT
+------------------------------
+This replaces the old "do not reseed" note. A reseed is now safe and expected:
+the seeder resolves locations WITH overrides, so the location rows come back
+byte-identical. What a reseed undoes is exactly what this script owns — the two
+session moves and 10/04's evening location — and re-running restores both. The
+script is idempotent: it asserts the target state rather than diffing against
+what happens to be there, so running it twice changes nothing the second time.
+
+  reseed the window  ->  python3.11 scripts/apply_leave_week.py --commit
+
+SLOT_LOCATIONS — 2026-10-04 evening
+-----------------------------------
+WAKE-SLEEP: the model stores only the wake anchor and an override's location
+wins for the whole day, so the resolver puts this row at Richfield. He wakes at
+Richfield and sleeps in Minneapolis. The row is FORCED to msp_home rather than
+merely skipped, because skipping it meant a reseed silently broke it.
 
 Usage:
     python3.11 scripts/apply_leave_week.py [--commit]
@@ -84,14 +114,27 @@ WANT: dict[date, tuple[str, str]] = {
 #: asserted against it, so the two cannot drift.
 REASON = "leave week"
 
-#: (date, slot) → why this row is left exactly as it is.
-HOLD_SLOTS = {
-    (date(2026, 10, 4), "evening"): "WAKE-SLEEP: sleeps in Minneapolis; `home` is already correct",
+#: PLAN EDITS this script owns: (date, slot) → the session that date must carry.
+#: `session_for()` is positional and will undo these on a reseed, which is why
+#: they live here and why re-running restores them. Keyed by date, not by what is
+#: currently in the row, so the script asserts a target rather than diffing.
+SESSION_MOVES: dict[tuple, str] = {
+    (date(2026, 10, 1), "morning"): "rest",         # Brown Deer holds no lift
+    (date(2026, 10, 3), "morning"): "strength_b",   # Richfield: still no B table
 }
-HOLD_SESSIONS = {
-    "strength_a": "held pending the Richfield A table",
-    "strength_b": "held pending the Richfield B table",
-    "strength_c": "held per 2026-09-26; already converted to Richfield in the earlier write",
+
+#: (date, slot) → a location the RESOLVER would get wrong, forced.
+#: Only WAKE-SLEEP needs this: an override's location wins for the whole day, so
+#: 10/04's evening resolves to Richfield when he sleeps in Minneapolis.
+SLOT_LOCATIONS: dict[tuple, str] = {
+    (date(2026, 10, 4), "evening"): "msp_home",
+}
+
+#: (date, slot) → why this row is left exactly as it is. Keyed by DATE, not by
+#: session type: holding by type would also have held 10/03's strength_b, which
+#: this script now deliberately writes.
+HOLD_SLOTS = {
+    (date(2026, 9, 29), "morning"): "strength_a: held until the Richfield A table exists",
 }
 
 
@@ -154,6 +197,7 @@ def main() -> int:
         cur = conn.cursor()
         cur.execute("""
             SELECT plan_id, plan_date, slot, session_type, week_num, blocks,
+                   est_duration_min AS est,
                    (SELECT count(*) FROM health.session_log l
                      WHERE l.plan_id = p.plan_id) AS logs
             FROM health.plan p
@@ -166,12 +210,15 @@ def main() -> int:
         targets, held, logged = [], [], []
         for r in rows:
             r["slot"] = r["slot"] or "morning"
+            key = (r["plan_date"], r["slot"])
+            #: what this row MUST end up as — a move target ignores what is
+            #: there, which is what makes a re-run after a reseed restorative.
+            r["want_session"] = SESSION_MOVES.get(key, r["session_type"])
+            r["want_key"] = SLOT_LOCATIONS.get(key)      # None = ask the resolver
             if r["logs"]:
                 logged.append(r)                              # never rebuilt
-            elif (r["plan_date"], r["slot"]) in HOLD_SLOTS:
-                held.append((r, HOLD_SLOTS[(r["plan_date"], r["slot"])]))
-            elif r["session_type"] in HOLD_SESSIONS:
-                held.append((r, HOLD_SESSIONS[r["session_type"]]))
+            elif key in HOLD_SLOTS:
+                held.append((r, HOLD_SLOTS[key]))
             else:
                 targets.append(r)
 
@@ -248,34 +295,47 @@ def main() -> int:
         # 3. Rebuild the pinned rows.
         changed = []
         for r in targets:
-            key = (cycle.location_at(r["plan_date"], office.EVENING_AT)
-                   if r["slot"] == "evening" else cycle.anchor_location(r["plan_date"]))
+            # A forced location wins; otherwise the resolver answers — the anchor
+            # for a morning, the 19:00 segment for an evening.
+            key = r["want_key"] or (
+                cycle.location_at(r["plan_date"], office.EVENING_AT)
+                if r["slot"] == "evening" else cycle.anchor_location(r["plan_date"]))
             label = (cycle.locations().get(key) or {}).get("display", key)
+            session = r["want_session"]
             spec = {"plan_date": r["plan_date"], "slot": r["slot"],
-                    "session_type": r["session_type"], "week_num": r["week_num"],
+                    "session_type": session, "week_num": r["week_num"],
                     "location": label, "location_key": key,
                     "day_type": cycle.day_type(r["plan_date"]), "wk0": False}
             new = office.build_row(spec)
             b = new["blocks"]
             assert b["location"] == label and b["location_key"] == key, r["plan_id"]
-            if r["session_type"] == "cardio_z2":
+            if session == "cardio_z2":
                 assert "cardio" in b, "cardio_z2 must carry a resolved modality or the no-equipment state"
+            # session_type is in the UPDATE because SESSION_MOVES changes it; the
+            # notes line carries the display name, so it moves with it.
             cur.execute("""
                 UPDATE health.plan
-                SET blocks = %s::jsonb, target_rpe = %s, target_hr_zone = %s,
-                    est_duration_min = %s, notes = %s
+                SET session_type = %s, blocks = %s::jsonb, target_rpe = %s,
+                    target_hr_zone = %s, est_duration_min = %s, notes = %s
                 WHERE plan_id = %s
-            """, (json.dumps(b, default=str), new["target_rpe"], new["target_hr_zone"],
-                  new["est_duration_min"], new["notes"], r["plan_id"]))
+            """, (session, json.dumps(b, default=str), new["target_rpe"],
+                  new["target_hr_zone"], new["est_duration_min"], new["notes"],
+                  r["plan_id"]))
             old = _as_dict(r["blocks"])
             changed.append({
                 "plan_id": r["plan_id"], "date": str(r["plan_date"]), "slot": r["slot"],
-                "session_type": r["session_type"],
+                "session_from": r["session_type"], "session_to": session,
+                "moved": session != r["session_type"],
                 "from": old.get("location"), "to": b["location"], "location_key": key,
+                "forced_location": bool(r["want_key"]),
+                "est_from": r["est"], "est_to": new["est_duration_min"],
                 "cardio": (b.get("cardio") or {}).get("modality"),
                 "device": (b.get("cardio") or {}).get("device"),
                 "no_equipment": b.get("no_equipment"),
+                "prep_unknown": bool(b.get("prep_unknown")),
                 "has_load_config": "load_config" in b,
+                "gained_load_config": "load_config" in b and "load_config" not in old,
+                "can_hold": office.can_hold(key, session) if session.startswith("strength") else None,
             })
 
         after = _md5(_untouched(cur, target_ids))
@@ -292,23 +352,29 @@ def main() -> int:
         # and eleven wrong rows in the same breath. So re-read the pinned rows and
         # assert each one against what was ASKED FOR, not against what was built.
         cur.execute("""
-            SELECT plan_id, plan_date, coalesce(slot,'morning'), blocks->>'location_key'
+            SELECT plan_id, plan_date, coalesce(slot,'morning'), blocks->>'location_key',
+                   session_type
             FROM health.plan WHERE plan_id = ANY(%s)
         """, (target_ids,))
+        by_id = {c["plan_id"]: c for c in changed}
         bad = []
-        for pid, d, slot, got in cur.fetchall():
-            want_key = WANT[d][0] if slot == "morning" else (
-                cycle.location_at(d, office.EVENING_AT))
+        for pid, d, slot, got, got_session in cur.fetchall():
+            want_key = SLOT_LOCATIONS.get((d, slot)) or (
+                WANT[d][0] if slot == "morning" else cycle.location_at(d, office.EVENING_AT))
             if got != want_key:
                 bad.append(f"{d} {slot}: location_key {got!r}, asked for {want_key!r}")
+            # the plan edits are the whole point of the re-run, so assert them too
+            want_session = SESSION_MOVES.get((d, slot), (by_id.get(pid) or {}).get("session_to"))
+            if want_session and got_session != want_session:
+                bad.append(f"{d} {slot}: session_type {got_session!r}, asked for {want_session!r}")
         if bad:
             conn.rollback()
             print("REBUILD WRONG — rolled back; the overrides stand, no row rebuilt:")
             for b in bad:
                 print("    " + b)
             return 1
-        print(f"  verified: all {len(target_ids)} rebuilt rows carry the "
-              "location that was asked for")
+        print(f"  verified: all {len(target_ids)} rebuilt rows carry the session "
+              "AND the location that were asked for")
 
         cur.execute("""
             INSERT INTO acos.audit_log (agent, persona, action, domain, confidence,
@@ -324,6 +390,8 @@ def main() -> int:
             "override_ids": override_ids,
             "rebuilt": changed,
             "rebuilt_plan_ids": target_ids,
+            "session_moves": {f"{d} {slot}": sess for (d, slot), sess in SESSION_MOVES.items()},
+            "forced_locations": {f"{d} {slot}": k for (d, slot), k in SLOT_LOCATIONS.items()},
             "held_back": [{"date": str(r["plan_date"]), "slot": r["slot"],
                            "session_type": r["session_type"], "why": w} for r, w in held],
             "logged_rows_skipped": [r["plan_id"] for r in logged],
@@ -339,9 +407,38 @@ def main() -> int:
             extra = f"  [{c['cardio']}/{c['device']}]" if c["cardio"] else ""
             if c["no_equipment"]:
                 extra = "  [NO CARDIO EQUIPMENT]"
+            if c["prep_unknown"]:
+                extra += "  [PREP-UNKNOWN]"
             cfg = "" if c["has_load_config"] else "  (no load_config)"
-            print(f"    {c['date']} {c['slot']:<8} {c['session_type']:<14} "
-                  f"{c['from']} → {c['to']}{extra}{cfg}")
+            if c["gained_load_config"]:
+                cfg = "  (+load_config)"
+            sess = (f"{c['session_from']} → {c['session_to']}" if c["moved"]
+                    else c["session_to"])
+            est = f"  est {c['est_from']}→{c['est_to']}" if c["est_from"] != c["est_to"] else ""
+            loc = (f"{c['from']} → {c['to']}" + ("  [FORCED]" if c["forced_location"] else "")
+                   if c["from"] != c["to"] or c["forced_location"] else c["to"])
+            print(f"    {c['date']} {c['slot']:<8} {sess:<26} {loc}{est}{extra}{cfg}")
+
+        moves = [c for c in changed if c["moved"]]
+        if moves:
+            print("\n  PLAN EDITS — the seeder will undo these; re-run after a reseed:")
+            for c in moves:
+                hold = ("" if c["can_hold"] is None
+                        else f"   can_hold({c['location_key']}, {c['session_to']})={c['can_hold']}")
+                print(f"    {c['date']} {c['slot']}: {c['session_from']} → "
+                      f"{c['session_to']} @ {c['to']}{hold}")
+        ests = [c for c in changed if c["est_from"] != c["est_to"]]
+        if ests:
+            print("\n  DURATION CHANGES (a real number moved):")
+            for c in ests:
+                print(f"    {c['date']} {c['slot']} {c['session_to']}: "
+                      f"est_duration_min {c['est_from']} → {c['est_to']}")
+        gained = [c for c in changed if c["gained_load_config"]]
+        if gained:
+            print(f"\n  GAINED load_config ({len(gained)} rows — their location had no "
+                  "entry until its inventory was confirmed):")
+            for c in gained:
+                print(f"    {c['date']} {c['slot']} {c['session_to']} @ {c['to']}")
     return 0
 
 
