@@ -35,15 +35,26 @@ OFFICE: dict = {
     "cooldown_equipment": "Stretch Trainer",
 }
 
+#: Brown Deer — CONFIRMED 2026-09-26, from what is actually in the room: a
+#: treadmill and a yoga mat. No Stretch Trainer and no elliptical, so neither the
+#: office warmup nor the office cooldown can appear here.
+BROWN_DEER: dict = {
+    "warmup": "5 min treadmill, easy",
+    "cooldown": "5 min mat mobility",
+    "cooldown_min": 5,
+    "cooldown_equipment": "mat",
+}
+
 #: EDIT THIS when an inventory lands, not the code.
 #:
-#: TODO(inventory 2026-09-26) — richfield, brown_deer and msp_home have NO entry
-#: on purpose. Ryan is walking those three rooms today. Until a warmup and a
-#: cooldown are confirmed for each, every non-office row carries the explicit
-#: unknown state. DO NOT invent one: "5 min easy on the rower" is a guess about
-#: what is in the room and how much of it he wants before a lift.
+#: TODO(inventory) — richfield and msp_home still have NO entry, deliberately.
+#: Until a warmup and a cooldown are confirmed for each, their rows carry the
+#: explicit unknown state. DO NOT invent one: "5 min easy on the rower" is a
+#: guess about both what is in the room and how much of it he wants before a
+#: lift. Brown Deer left this list on 2026-09-26 because it was measured.
 BY_LOCATION: dict[str, dict] = {
     "office": OFFICE,
+    "brown_deer": BROWN_DEER,
 }
 
 
