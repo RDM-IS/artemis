@@ -806,6 +806,12 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 
 ---
 
+**CARDIO-REQUIRED — a cardio row finishes only with its cardio block (2026-09-26; artemis `feat/cardio-required`, gym-display `feat/cardio-required`). BUILT, NOT DEPLOYED.** Priority #2 of the 2026-09-26 health backlog; the fix for CARDIO-UNLOGGED.
+- **gym-display.** On a `steady` / `intervals` row, DoneScreen and the log panel show one **Finish cardio** card in place of the summary: minutes (pre-filled from the workout timer), optional distance and HR, an effort, one POST — `cardio_block` carrying the row's `modality`/`device`, with `session_rpe` so the Lambda writes the summary row in the same transaction. The summary-only finish is gone for cardio rows. A row finished the old way (summary, no block — 2026-09-22) still offers the card and sends no second summary; once a block exists the plain summary card returns. **No Lambda change.**
+- **artemis — `scripts/backfill_cardio_blocks.py`.** The client never picks a modality (CARDIO-LOC), and only 1 of 36 `cardio_z2` rows carried `blocks.cardio`, so the iPad would still log `modality: null` on the rest. The script writes `knowledge.cardio.resolve(location_key)` onto future `cardio_z2` rows that lack it: pinned ids, rows with logs skipped, a row with no `location_key` reported and skipped (never defaulted), md5 over untouched rows **and** a re-read asserting each written row equals its resolution, one audit row, dry run unless `--commit`.
+- **Deploy order:** (1) on the box, dry-run the backfill and read the list; (2) `--commit`; (3) merge and deploy gym-display (**run `npm run build`, not just the tests — TYPE-GATE**; it passed here). **Verify:** the next Z2 day's DoneScreen shows Finish cardio; after finishing, `health.session_log` holds one `cardio_block` with `modality` set and `duration_sec` > 0, plus one `session_summary`.
+- **Not in scope:** HR is still typed or left blank — the watch workout match (WATCH-1) is what should fill it.
+
 **PAIN-1 follow-ups (open).**
 - **Rising pain is explicit-only** — every day of the chain must name the region with a number; a day that doesn't mention it breaks the chain. If Ryan tends to omit a region on low-pain days, real rises will go unflagged.
 - **Load rounding is a Python port** of gym-display `equipment.ts` (`health_regions.lighter_load`); the office `TODO(office)` values (stack step, Smith bar) live in both places until they're measured.
