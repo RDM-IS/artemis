@@ -1,9 +1,17 @@
-"""CYCLE-2 — write the leave-week overrides and rebuild the rows that can be.
+"""CYCLE-2 — the leave-week overrides, and a rebuild of what can be rebuilt.
 
-Approved by Ryan 2026-09-26:
+Wake locations as Ryan gave them (2026-09-26, superseding the earlier
+"continuous at the farm" pair, which was wrong and is revoked by this script):
 
-    2026-09-26 → 2026-10-03   wi       richfield   leave at the farm, continuous
-    2026-10-04 → 2026-10-04   travel   richfield   wake Richfield, drive to MSP
+    09-26 brown_deer wi     09-30 brown_deer wi     10-04 richfield travel
+    09-27 brown_deer wi     10-01 brown_deer wi
+    09-28 richfield  wi     10-02 richfield  wi
+    09-29 richfield  wi     10-03 richfield  wi
+
+LOCATION IS THE WAKE LOCATION and an override applies to the whole day.
+9/26 and 9/27 already resolve to brown_deer/wi from the base pattern, so they
+get NO row — an override that merely restates the base is noise that has to be
+revoked later. The remaining seven days collapse into four spans.
 
 Migration discipline, because this rewrites rows the iPad reads:
 
@@ -14,21 +22,25 @@ Migration discipline, because this rewrites rows the iPad reads:
   * one `acos.audit_log` row records exactly what moved;
   * --commit is required; without it nothing is written at all.
 
-Rows deliberately NOT rebuilt, which is the point rather than an omission:
+Rows deliberately NOT rebuilt:
 
-  2026-09-29 strength_a   Richfield has no approved substitution table for A
-  2026-10-01 strength_b   or B. They stay as office sessions: KNOWINGLY WRONG
-                          beats silently rebuilt into something nobody approved.
-  2026-10-04 evening      He drives to Minneapolis that day. An override's
-                          location wins for the WHOLE day (cycle.location_at),
-                          so the resolver cannot say "Richfield in the morning,
-                          Minneapolis by evening" — it would move this row to
-                          Richfield, where he will not be. Left at home.
+  every strength row    9/29 strength_a, 10/01 strength_b, 10/02 strength_c.
+                        Held pending the Richfield substitution tables (Ryan,
+                        2026-09-26): report them as knowingly-wrong rather than
+                        converting them. 10/02 was already converted to
+                        Richfield in the earlier write under the prior
+                        instruction — it is left as it stands, not re-reverted,
+                        and reported.
+  2026-10-04 evening    WAKE-SLEEP: the model stores only the wake anchor and
+                        an override's location wins for the whole day, so
+                        rebuilding this row would move it to Richfield. He
+                        sleeps in Minneapolis. Its current `home` is the
+                        CORRECT sleep location, so touching it would break it.
 
 Note for whoever reseeds next: health_office.day_location_key() resolves with
 `use_overrides=False` — the seeder builds the BASE pattern. A full reseed of
-this window will therefore revert these rows. That is the CYCLE-OVERRIDE-SOURCE
-question, still open; until it is settled, do not reseed 9/26..10/04.
+this window therefore reverts these rows. That is the open CYCLE-OVERRIDE-SOURCE
+question; until it is settled, do not reseed 9/26..10/04.
 
 Usage:
     python3.11 scripts/apply_leave_week.py [--commit]
@@ -51,17 +63,53 @@ from knowledge.db import get_connection                # noqa: E402
 
 WINDOW = (date(2026, 9, 26), date(2026, 10, 4))
 
-OVERRIDES = [
-    ("2026-09-26", "2026-10-03", "wi", "richfield", "leave at the farm, continuous"),
-    ("2026-10-04", "2026-10-04", "travel", "richfield", "wake Richfield, drive to Minneapolis"),
-]
+#: The wake location and day type for every day of the leave, as given.
+WANT: dict[date, tuple[str, str]] = {
+    date(2026, 9, 26): ("brown_deer", "wi"),
+    date(2026, 9, 27): ("brown_deer", "wi"),
+    date(2026, 9, 28): ("richfield", "wi"),
+    date(2026, 9, 29): ("richfield", "wi"),
+    date(2026, 9, 30): ("brown_deer", "wi"),
+    date(2026, 10, 1): ("brown_deer", "wi"),
+    date(2026, 10, 2): ("richfield", "wi"),
+    date(2026, 10, 3): ("richfield", "wi"),
+    date(2026, 10, 4): ("richfield", "travel"),
+}
+
+#: The minimal spans: contiguous runs of days that (a) differ from the base
+#: pattern and (b) want the same values. Derived from WANT by _spans() below and
+#: asserted against it, so the two cannot drift.
+REASON = "leave week"
 
 #: (date, slot) → why this row is left exactly as it is.
-HOLD = {
-    (date(2026, 9, 29), "morning"): "strength_a: no approved Richfield table",
-    (date(2026, 10, 1), "morning"): "strength_b: no approved Richfield table",
-    (date(2026, 10, 4), "evening"): "in Minneapolis by evening; an override is day-wide",
+HOLD_SLOTS = {
+    (date(2026, 10, 4), "evening"): "WAKE-SLEEP: sleeps in Minneapolis; `home` is already correct",
 }
+HOLD_SESSIONS = {
+    "strength_a": "held pending the Richfield A table",
+    "strength_b": "held pending the Richfield B table",
+    "strength_c": "held per 2026-09-26; already converted to Richfield in the earlier write",
+}
+
+
+def _spans() -> list[tuple[date, date, str, str]]:
+    """Fewest override rows that make WANT true, skipping days the base pattern
+    already satisfies. Merges only adjacent days wanting identical values."""
+    out: list[list] = []
+    for d in sorted(WANT):
+        loc, dt = WANT[d]
+        if (cycle.anchor_location(d, use_overrides=False) == loc
+                and cycle.day_type(d, use_overrides=False) == dt):
+            continue                       # base pattern already says this
+        if out and out[-1][1] == d - _ONE and out[-1][2:] == [dt, loc]:
+            out[-1][1] = d                 # extend the run
+        else:
+            out.append([d, d, dt, loc])
+    return [(a, b, dt, loc) for a, b, dt, loc in out]
+
+
+from datetime import timedelta as _td                  # noqa: E402
+_ONE = _td(days=1)
 
 
 def _as_dict(b) -> dict:
@@ -88,6 +136,17 @@ def main() -> int:
     args = ap.parse_args()
     start, end = WINDOW
 
+    spans = _spans()
+    skipped = [d for d in sorted(WANT)
+               if not any(a <= d <= b for a, b, _, _ in spans)]
+    print("minimal override set — %d span(s); %d day(s) need none"
+          % (len(spans), len(skipped)))
+    for a, b, dt, loc in spans:
+        print("    %s → %s  %-7s @ %s" % (a, b, dt, loc))
+    for d in skipped:
+        loc, dt = WANT[d]
+        print("    %s  no row: the base pattern already gives %s / %s" % (d, loc, dt))
+
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -106,8 +165,10 @@ def main() -> int:
             r["slot"] = r["slot"] or "morning"
             if r["logs"]:
                 logged.append(r)                              # never rebuilt
-            elif (r["plan_date"], r["slot"]) in HOLD:
-                held.append((r, HOLD[(r["plan_date"], r["slot"])]))
+            elif (r["plan_date"], r["slot"]) in HOLD_SLOTS:
+                held.append((r, HOLD_SLOTS[(r["plan_date"], r["slot"])]))
+            elif r["session_type"] in HOLD_SESSIONS:
+                held.append((r, HOLD_SESSIONS[r["session_type"]]))
             else:
                 targets.append(r)
 
@@ -115,7 +176,7 @@ def main() -> int:
         before_pairs = _untouched(cur, target_ids)
         before = _md5(before_pairs)
 
-        print(f"window {start} .. {end}: {len(rows)} rows")
+        print(f"\nwindow {start} .. {end}: {len(rows)} rows")
         print(f"  to rebuild : {len(targets)}")
         print(f"  held back  : {len(held)}")
         for r, why in held:
@@ -125,54 +186,65 @@ def main() -> int:
         print(f"  md5(untouched) BEFORE : {before}")
 
         if not args.commit:
-            print("\ndry run — no overrides written, no rows rebuilt (pass --commit)")
+            print("\ndry run — nothing revoked, nothing written (pass --commit)")
             return 0
 
-        # IDEMPOTENT. These rows must be COMMITTED before the rebuild resolves
-        # anything: cycle.override_for() goes through execute_one(), which opens
-        # its OWN connection, so it cannot see this transaction's uncommitted
-        # inserts — and it is fail-open, so it returns "no override" silently
-        # rather than raising. Run 1 (2026-09-26) rebuilt 12 rows against an
-        # empty override table for exactly that reason.
+        # 1. Revoke any live override touching the window that is not in the
+        #    minimal set. Soft delete: the ledger keeps the wrong ones visible.
+        keep = {(a, b, dt, loc) for a, b, dt, loc in spans}
+        cur.execute("""
+            SELECT override_id, start_date, end_date, day_type, location
+            FROM acos.cycle_day_overrides
+            WHERE revoked_at IS NULL AND start_date <= %s AND end_date >= %s
+        """, (end, start))
+        for oid, s, e, dt, loc in cur.fetchall():
+            if (s, e, dt, loc) in keep:
+                continue
+            cur.execute("UPDATE acos.cycle_day_overrides SET revoked_at = now() "
+                        "WHERE override_id = %s", (oid,))
+            print(f"  revoked override {oid}: {s} → {e}  {dt} @ {loc}")
+
+        # 2. Insert the minimal set, idempotently.
         override_ids = []
-        for s, e, day_type, loc, reason in OVERRIDES:
+        for a, b, dt, loc in spans:
             cur.execute("""
                 SELECT override_id FROM acos.cycle_day_overrides
                 WHERE revoked_at IS NULL AND start_date = %s AND end_date = %s
                   AND day_type = %s AND location = %s
-            """, (s, e, day_type, loc))
+            """, (a, b, dt, loc))
             existing = cur.fetchone()
             if existing:
                 override_ids.append(existing[0])
-                print(f"  override {existing[0]}: {s} → {e}  {day_type} @ {loc}  (already present)")
+                print(f"  override {existing[0]}: {a} → {b}  {dt} @ {loc}  (already present)")
                 continue
             cur.execute("""
                 INSERT INTO acos.cycle_day_overrides
                     (start_date, end_date, day_type, location, reason, set_by)
                 VALUES (%s, %s, %s, %s, %s, 'ryan')
                 RETURNING override_id
-            """, (s, e, day_type, loc, reason))
+            """, (a, b, dt, loc, f"{REASON}: wake {loc}"))
             oid = cur.fetchone()[0]
             override_ids.append(oid)
-            print(f"  override {oid}: {s} → {e}  {day_type} @ {loc}  ({reason})")
-        conn.commit()      # so the resolver below can actually SEE them
+            print(f"  override {oid}: {a} → {b}  {dt} @ {loc}")
 
-        # Prove it, rather than assuming: resolve one leave day and one travel
-        # day and refuse to rebuild anything if the override is not visible.
-        for probe in (start, date(2026, 10, 4)):
-            ov = cycle.override_for(probe)
-            if not ov or ov.get("location") != "richfield":
-                print(f"ABORT — override not visible to the resolver for {probe}: {ov!r}. "
-                      "Nothing rebuilt.")
+        # cycle.override_for() reads through execute_one(), which opens its OWN
+        # connection — it cannot see this transaction's uncommitted rows, and it
+        # is fail-open, so it returns "no override" SILENTLY rather than raising.
+        # Run 1 on 2026-09-26 rebuilt 12 rows against an empty table for exactly
+        # that reason. Commit first, then prove the resolver agrees with WANT
+        # for every single day before touching a plan row.
+        conn.commit()
+        for d, (loc, dt) in sorted(WANT.items()):
+            got = (cycle.anchor_location(d), cycle.day_type(d))
+            if got != (loc, dt):
+                print(f"ABORT — {d} resolves to {got}, wanted {(loc, dt)}. Nothing rebuilt.")
                 return 1
+        print("  resolver agrees with the requested table on all "
+              f"{len(WANT)} days")
 
+        # 3. Rebuild the pinned rows.
         changed = []
         for r in targets:
-            # Resolve WITH the committed overrides. The morning is the day's
-            # anchor (where he wakes); the evening asks the segment-aware
-            # resolver at 19:00 — an override's location wins for the whole day,
-            # so during the leave both answer richfield, but asking the right
-            # question keeps this correct if an override is ever absent.
             key = (cycle.location_at(r["plan_date"], office.EVENING_AT)
                    if r["slot"] == "evening" else cycle.anchor_location(r["plan_date"]))
             label = (cycle.locations().get(key) or {}).get("display", key)
@@ -184,7 +256,7 @@ def main() -> int:
             b = new["blocks"]
             assert b["location"] == label and b["location_key"] == key, r["plan_id"]
             if r["session_type"] == "cardio_z2":
-                assert b.get("cardio"), "cardio_z2 must carry a resolved modality"
+                assert "cardio" in b, "cardio_z2 must carry a resolved modality or the no-equipment state"
             cur.execute("""
                 UPDATE health.plan
                 SET blocks = %s::jsonb, target_rpe = %s, target_hr_zone = %s,
@@ -196,10 +268,11 @@ def main() -> int:
             changed.append({
                 "plan_id": r["plan_id"], "date": str(r["plan_date"]), "slot": r["slot"],
                 "session_type": r["session_type"],
-                "from": old.get("location"), "to": b["location"],
-                "location_key": key,
+                "from": old.get("location"), "to": b["location"], "location_key": key,
                 "cardio": (b.get("cardio") or {}).get("modality"),
                 "device": (b.get("cardio") or {}).get("device"),
+                "no_equipment": b.get("no_equipment"),
+                "has_load_config": "load_config" in b,
             })
 
         after = _md5(_untouched(cur, target_ids))
@@ -207,7 +280,7 @@ def main() -> int:
         if after != before:
             conn.rollback()
             print("MISMATCH — a row outside the pinned set changed. "
-                  "Rolled back; nothing written.")
+                  "Rolled back; the overrides stand, no plan row was rebuilt.")
             return 1
 
         cur.execute("""
@@ -217,8 +290,10 @@ def main() -> int:
                     0, 0, CAST(%s AS jsonb))
         """, (json.dumps({
             "window": [str(start), str(end)],
-            "overrides": [dict(zip(("start", "end", "day_type", "location", "reason"), o))
-                          for o in OVERRIDES],
+            "requested": {str(d): list(v) for d, v in WANT.items()},
+            "spans_written": [{"start": str(a), "end": str(b), "day_type": dt, "location": loc}
+                              for a, b, dt, loc in spans],
+            "days_needing_no_row": [str(d) for d in skipped],
             "override_ids": override_ids,
             "rebuilt": changed,
             "rebuilt_plan_ids": target_ids,
@@ -235,8 +310,11 @@ def main() -> int:
               f"{len(before_pairs)} untouched and verified")
         for c in changed:
             extra = f"  [{c['cardio']}/{c['device']}]" if c["cardio"] else ""
+            if c["no_equipment"]:
+                extra = "  [NO CARDIO EQUIPMENT]"
+            cfg = "" if c["has_load_config"] else "  (no load_config)"
             print(f"    {c['date']} {c['slot']:<8} {c['session_type']:<14} "
-                  f"{c['from']} → {c['to']}{extra}")
+                  f"{c['from']} → {c['to']}{extra}{cfg}")
     return 0
 
 
