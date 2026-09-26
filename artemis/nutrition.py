@@ -129,7 +129,7 @@ def day_totals(cur, d: date) -> dict:
 
 @dataclass
 class PrefillResult:
-    outcome: str            # planned | not_work_day | unavailable | no_plan | already
+    outcome: str            # planned | unavailable | no_plan | already (not_work_day: pre-NUTRITION-2 rows)
     entries_written: int = 0
     note: str | None = None
 
@@ -138,32 +138,63 @@ class PrefillResult:
         return self.entries_written > 0
 
 
-def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
-    """Pre-fill `d` from the Notion default day. Silent — the caller posts
-    nothing. Idempotent: a day that already has entries is left alone.
+# NUTRITION-2 (2026-09-26): where a day's meals come from depends on its KIND.
+# Leave days are off days (Ryan). The cycle's day types map onto three kinds.
+KIND_WORK, KIND_TRAVEL, KIND_OFF = "work", "travel", "off"
 
-    Work-day scope: only `msp_work` days are pre-filled. Every other day type
-    records `not_work_day` and stays empty, because no non-work meal set
-    exists yet — inventing one is exactly what this module must not do.
+
+def day_kind(day_type: str | None) -> str:
+    if day_type == "msp_work":
+        return KIND_WORK
+    if day_type == "travel":
+        return KIND_TRAVEL
+    return KIND_OFF
+
+
+def _default_row_for(kind: str) -> str | None:
+    from artemis import notion_meal_plan as nmp
+    return {KIND_WORK: nmp.DEFAULT_DAY_NAME,
+            KIND_TRAVEL: nmp.TRAVEL_DAY_NAME}.get(kind)
+
+
+def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
+    """Pre-fill `d` from Notion. Silent — the caller posts nothing. Idempotent:
+    a day that already has entries is left alone.
+
+    NUTRITION-2 source order:
+      1. a `meal planning` row DATED `d` — the menu Ryan picked (any day kind);
+      2. the kind's undated default row — work day, or travel day;
+      3. an off day has no default: it records `no_plan` and stays empty, and
+         logging fills it. Nothing is ever invented.
     """
     from artemis import cycle
+    from artemis import notion_meal_plan as nmp
 
     existing = get_day(cur, d)
     if existing and existing.get("prefilled"):
         return PrefillResult("already", 0, "day already pre-filled")
+    # A day Ryan has already logged into is his; the pre-fill must not replace it.
+    cur.execute("SELECT count(*) FROM nutrition.entry WHERE day_date = %s", (d,))
+    row = cur.fetchone()
+    if (row[0] if not isinstance(row, dict) else list(row.values())[0]):
+        return PrefillResult("already", 0, "day already has logged entries")
 
     day_type = cycle.day_type(d)
-    if day_type != "msp_work":
-        _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                    prefilled=False, outcome="not_work_day",
-                    note=f"{day_type} — no non-work meal set exists yet",
-                    plan_source_id=None)
-        return PrefillResult("not_work_day", 0, f"{d} is {day_type}")
-
-    from artemis import notion_meal_plan as nmp
+    kind = day_kind(day_type)
 
     try:
-        plan = nmp.fetch_default_day()
+        plan = nmp.fetch_dated_day(d)
+        picked = plan is not None
+        if plan is None:
+            name = _default_row_for(kind)
+            if name is None:
+                _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
+                            prefilled=False, outcome="no_plan",
+                            note=(f"{day_type} — an off day: pick a menu for "
+                                  f"{d.isoformat()} in Notion, or log meals as you go"),
+                            plan_source_id=None)
+                return PrefillResult("no_plan", 0, f"{d} is an off day with no picked menu")
+            plan = nmp.fetch_default_day(name)
     except nmp.NotionUnavailable as exc:
         # The specced degradation: nothing pre-filled, the day says so.
         _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
@@ -175,7 +206,7 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
         _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
                     prefilled=False, outcome="no_plan",
                     note=str(exc)[:500], plan_source_id=None)
-        logger.warning("nutrition pre-fill %s: no default day — %s", d, exc)
+        logger.warning("nutrition pre-fill %s: no plan row — %s", d, exc)
         return PrefillResult("no_plan", 0, str(exc))
 
     foods = plan.all_foods()
@@ -186,10 +217,11 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
                     plan_source_id=plan.page_id)
         return PrefillResult("no_plan", 0, "default day links no usable recipes")
 
+    notes = [f"picked: {plan.name}" if picked else f"default: {plan.name}"]
+    if plan.skipped:
+        notes.append("skipped (no macros): " + ", ".join(plan.skipped))
     _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                prefilled=True, outcome="planned",
-                note=("skipped (no macros): " + ", ".join(plan.skipped))
-                     if plan.skipped else None,
+                prefilled=True, outcome="planned", note="; ".join(notes),
                 plan_source_id=plan.page_id)
 
     # Replace rather than append: pre-fill owns an untouched day outright.
@@ -492,9 +524,16 @@ def apply_deviation(cur, d: date, dev: Deviation) -> str:
         _mark_corrected(cur, d)
         return f"{dev.slot}: skipped."
 
-    resolved = resolve_food(cur, dev.text)
+    # NUTRITION-2: "+ 120 g banana" is 120 grams, not 120 bananas.
+    item = parse_item(dev.text) or Item(1.0, None, dev.text, dev.text)
+    qty = dev.quantity * item.qty
+    resolved = resolve_food(cur, item.name)
     if resolved is None:
-        return _ask_about(dev.text)
+        return _ask_about(item.name)
+    factor = portion_factor(qty, item.unit, resolved)
+    if factor is None:
+        return unit_question(item, resolved)
+    dev = Deviation(dev.kind, dev.slot, item.name, factor)
 
     slot = dev.slot or "snacks"
     if dev.kind == "replace":
@@ -515,6 +554,13 @@ def apply_deviation(cur, d: date, dev: Deviation) -> str:
             f"{protein:g} g protein{mark}.")
 
 
+def unit_question(item: "Item", food: dict) -> str:
+    """The question for a food found, but in a basis the amount can't reach."""
+    per = food.get("portion") or ("100 g" if food.get("basis") == "100g" else "one portion")
+    return (f"I found “{food['name']}” (macros per {per}) but can't turn "
+            f"“{item.raw}” into that without guessing. How many grams or ounces?")
+
+
 def _ask_about(text: str) -> str:
     """The ONE question an unmatched food gets before anything is stored."""
     return (f"I don't have macros for “{text}”. How big was the portion, or "
@@ -527,7 +573,7 @@ def resolve_food(cur, text: str) -> dict | None:
     saved = find_saved_food(cur, text)
     if saved:
         return {**saved, "confidence": "exact", "source": "saved",
-                "source_id": saved.get("source_id")}
+                "source_id": saved.get("source_id"), "basis": "portion"}
 
     hit = lookup_usda(text)
     if hit:
@@ -570,7 +616,9 @@ def lookup_usda(text: str) -> dict | None:
             "kcal": int(round(kcal)), "protein_g": protein,
             "carb_g": by_id.get("205"), "fat_g": by_id.get("204"),
             "fiber_g": by_id.get("291"),
-            "source": "usda", "source_id": str(f.get("fdcId") or "")}
+            "source": "usda", "source_id": str(f.get("fdcId") or ""),
+            # The search API's nutrient values are per 100 g (NUTRITION-2).
+            "basis": "100g", "portion": "100 g"}
 
 
 def lookup_off(text: str) -> dict | None:
@@ -593,16 +641,134 @@ def lookup_off(text: str) -> dict | None:
         return None
     p = products[0]
     n = p.get("nutriments") or {}
-    kcal = n.get("energy-kcal_serving") or n.get("energy-kcal_100g")
-    protein = n.get("proteins_serving") or n.get("proteins_100g")
+    # NUTRITION-2: one basis per product, never a mix. Per serving when the
+    # product states serving values, else per 100 g — the caller scales.
+    per = "serving" if n.get("energy-kcal_serving") is not None else "100g"
+    sfx = "_serving" if per == "serving" else "_100g"
+    kcal = n.get("energy-kcal" + sfx)
+    protein = n.get("proteins" + sfx)
     if kcal is None or protein is None:
         return None
     return {"name": p.get("product_name") or text,
             "kcal": int(round(float(kcal))), "protein_g": float(protein),
-            "carb_g": n.get("carbohydrates_serving") or n.get("carbohydrates_100g"),
-            "fat_g": n.get("fat_serving") or n.get("fat_100g"),
-            "fiber_g": n.get("fiber_serving") or n.get("fiber_100g"),
-            "source": "off", "source_id": str(p.get("code") or "")}
+            "carb_g": n.get("carbohydrates" + sfx),
+            "fat_g": n.get("fat" + sfx),
+            "fiber_g": n.get("fiber" + sfx),
+            "source": "off", "source_id": str(p.get("code") or ""),
+            "basis": per,
+            "portion": (p.get("serving_size") if per == "serving" else "100 g")}
+
+
+# ============================================================================
+# NUTRITION-2 — quantities and units. A macro is scaled only when the unit the
+# food was eaten in can be converted to the basis its macros are per; anything
+# else is a question, never a guess.
+# ============================================================================
+
+_WEIGHT_G = {"g": 1.0, "gram": 1.0, "grams": 1.0,
+             "oz": 28.3495, "ounce": 28.3495, "ounces": 28.3495,
+             "lb": 453.592, "lbs": 453.592, "pound": 453.592, "pounds": 453.592}
+_VOLUME = {"cup": "cup", "cups": "cup", "tbsp": "tbsp", "tablespoon": "tbsp",
+           "tablespoons": "tbsp", "tsp": "tsp", "teaspoon": "tsp", "teaspoons": "tsp"}
+_PORTION_G_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(g|grams?|oz|ounces?)\b", re.I)
+_PORTION_VOL_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?|\d+/\d+)?\s*(cups?|tbsp|tablespoons?|tsp|teaspoons?)\b", re.I)
+
+
+def is_weight_unit(unit: str | None) -> bool:
+    return (unit or "").lower() in _WEIGHT_G
+
+
+def is_volume_unit(unit: str | None) -> bool:
+    return (unit or "").lower() in _VOLUME
+
+
+def _num(tok: str) -> float:
+    if "/" in tok:
+        a, b = tok.split("/", 1)
+        return float(a) / float(b)
+    return float(tok)
+
+
+def portion_grams(portion: str | None) -> float | None:
+    """Grams in a portion description: "1 bar (68 g)" -> 68, "100 g" -> 100."""
+    m = _PORTION_G_RE.search(portion or "")
+    if not m:
+        return None
+    return float(m.group(1)) * _WEIGHT_G[m.group(2).lower()]
+
+
+_WORD_QTY = {"a": 1.0, "an": 1.0, "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0,
+             "five": 5.0, "six": 6.0, "half": 0.5, "half a": 0.5, "half an": 0.5,
+             "a half": 0.5, "a couple": 2.0, "a couple of": 2.0}
+_COUNT_UNITS = ("slices", "slice", "pieces", "piece", "servings", "serving",
+                "scoops", "scoop", "cans", "can", "bottles", "bottle")
+_ITEM_RE = re.compile(
+    r"^\s*(?P<qty>\d+/\d+|\d+(?:\.\d+)?|half\s+an?|a\s+half|a\s+couple(?:\s+of)?"
+    r"|an|a|one|two|three|four|five|six|half)?\s*"
+    r"(?P<unit>" + "|".join(sorted(list(_WEIGHT_G) + list(_VOLUME) + list(_COUNT_UNITS),
+                                   key=len, reverse=True)) + r")?\.?\b\s*"
+    r"(?:of\s+)?(?P<name>.+?)\s*[.!]*\s*$", re.I)
+
+
+@dataclass
+class Item:
+    qty: float
+    unit: str | None       # a weight/volume/count unit, or None for a plain count
+    name: str
+    raw: str
+
+
+def parse_item(text: str) -> Item | None:
+    """"3 oz of strawberry" -> (3, oz, strawberry); "2 eggs" -> (2, None,
+    eggs); "an asiago bagel" -> (1, None, asiago bagel)."""
+    raw = (text or "").strip()
+    m = _ITEM_RE.match(raw)
+    if not m or not m.group("name").strip():
+        return None
+    q = (m.group("qty") or "").lower()
+    q = re.sub(r"\s+", " ", q)
+    if not q:
+        qty = 1.0
+    elif q in _WORD_QTY:
+        qty = _WORD_QTY[q]
+    else:
+        qty = _num(q)
+    unit = (m.group("unit") or "").lower() or None
+    if unit in _COUNT_UNITS:
+        unit = None if unit.rstrip("s") in ("serving",) else unit
+    name = re.sub(r"^(?:the|some|my)\s+", "", m.group("name").strip(), flags=re.I)
+    return Item(qty=qty, unit=unit, name=name, raw=raw)
+
+
+def portion_factor(qty: float, unit: str | None, food: dict) -> float | None:
+    """How many of `food`'s macro bases `qty unit` is — or None when that
+    can't be known without guessing.
+
+    `food["basis"]`: "portion" (a saved food: one recipe portion, or the
+    ingredient's Notion `serving`), "serving" (a product's stated serving), or
+    "100g" (USDA search values; Open Food Facts without serving data).
+    """
+    basis = food.get("basis") or "portion"
+    portion = food.get("portion")
+    u = (unit or "").lower() or None
+    if is_weight_unit(u):
+        grams = qty * _WEIGHT_G[u]
+        if basis == "100g":
+            return grams / 100.0
+        pg = portion_grams(portion)
+        return grams / pg if pg else None
+    if is_volume_unit(u):
+        if basis == "100g":
+            return None
+        m = _PORTION_VOL_RE.match(portion or "")
+        if m and _VOLUME[m.group(2).lower()] == _VOLUME[u]:
+            return qty / (_num(m.group(1)) if m.group(1) else 1.0)
+        return None
+    # A count (no unit, or slice / piece / serving / scoop): one per portion.
+    if basis == "100g":
+        return None
+    return qty
 
 
 def _insert_entry(cur, d: date, slot: str, food: dict, qty: float) -> None:

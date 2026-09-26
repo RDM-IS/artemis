@@ -487,24 +487,34 @@ class TestFixTargetsYesterday(unittest.TestCase):
 
 
 class TestPrefillScope(unittest.TestCase):
-    """Work-day scope: nothing is invented for a day with no meal set."""
+    """Nothing is invented for a day with no meal set. NUTRITION-2: an off day
+    with no picked menu records `no_plan` (was `not_work_day`)."""
 
-    def test_non_work_day_is_recorded_and_left_empty(self):
+    def _cur(self):
         cur = mock.Mock()
+        cur.fetchone.return_value = (0,)     # no logged entries yet
+        return cur
+
+    def test_off_day_without_a_pick_is_recorded_and_left_empty(self):
+        cur = self._cur()
+        from artemis import notion_meal_plan as nmp
         with mock.patch("artemis.cycle.day_type", return_value="wi"), \
              mock.patch.object(nutrition, "get_day", return_value=None), \
+             mock.patch.object(nmp, "fetch_dated_day", return_value=None), \
+             mock.patch.object(nmp, "fetch_default_day") as default, \
              mock.patch.object(nutrition, "_upsert_day") as upsert:
             result = nutrition.prefill_day(cur, date(2026, 9, 25))
-        self.assertEqual(result.outcome, "not_work_day")
+        self.assertEqual(result.outcome, "no_plan")
         self.assertEqual(result.entries_written, 0)
-        self.assertEqual(upsert.call_args.kwargs["outcome"], "not_work_day")
+        self.assertEqual(upsert.call_args.kwargs["outcome"], "no_plan")
+        default.assert_not_called()          # an off day has NO default row
 
     def test_notion_unavailable_writes_no_entries_and_says_why(self):
-        cur = mock.Mock()
+        cur = self._cur()
         from artemis import notion_meal_plan as nmp
         with mock.patch("artemis.cycle.day_type", return_value="msp_work"), \
              mock.patch.object(nutrition, "get_day", return_value=None), \
-             mock.patch.object(nmp, "fetch_default_day",
+             mock.patch.object(nmp, "fetch_dated_day",
                                side_effect=nmp.NotionUnavailable("no token")), \
              mock.patch.object(nutrition, "_upsert_day") as upsert:
             result = nutrition.prefill_day(cur, date(2026, 9, 22))
