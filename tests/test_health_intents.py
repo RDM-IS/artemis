@@ -285,11 +285,13 @@ class TestNagLogic(unittest.TestCase):
     # ── EXERCISE-CLASS: the row's class beats the name ────────────────────
     def test_the_rows_class_wins_over_the_name_rules(self):
         from artemis import health_regions as hr
-        # the office rules read these names wrong; the row says otherwise
-        self.assertEqual(hr.equipment_class("TRX row"), "machine")          # fallback
+        # LOCATION-1: there is no name fallback left to beat. A name alone
+        # yields None — the office rules that read "TRX row" as `machine` and
+        # "TRX row" as a 10 lb stack step are deleted.
+        self.assertIsNone(hr.equipment_class("TRX row"))
         self.assertEqual(hr.equipment_class("TRX row", "trx"), "trx")       # the row
-        self.assertEqual(hr.equipment_class("Band pulldown"), "machine")
-        self.assertEqual(hr.equipment_class("Band pulldown", "bands"), "bands")
+        self.assertIsNone(hr.equipment_class("Band pull-apart"))
+        self.assertEqual(hr.equipment_class("Band pull-apart", "bands"), "bands")
 
     def test_no_numeric_load_classes_have_nothing_to_lighten(self):
         from artemis import health_regions as hr
@@ -298,7 +300,12 @@ class TestNagLogic(unittest.TestCase):
             with self.subTest(cls=cls):
                 self.assertIsNone(hr.lighter_load("Whatever", 100.0, explicit_class=cls))
         # a real load still lightens, rounded down to something reachable
-        self.assertEqual(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell"), 40.0)
+        # LOCATION-1: a recommendation needs the row's config; without it there
+        # is none, and with the office's it is the office's answer.
+        self.assertIsNone(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell"))
+        from knowledge import load_config
+        self.assertEqual(hr.lighter_load("DB bench press", 50.0, explicit_class="dumbbell",
+                                         load_config=load_config.OFFICE), 40.0)
 
     # ── EVENING-1: `rest` is a rest, exactly like rest_mobility ────────────
     def test_skip_when_rest_morning(self):

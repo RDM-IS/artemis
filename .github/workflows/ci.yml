@@ -1,0 +1,73 @@
+# CI-1 — the gate that stops a bad merge.
+#
+# TEST-DB-GUARD enforced rather than remembered: this job gets NO database
+# credentials and NO AWS role. Not restricted ones — none. A test that reaches
+# for a real connection fails on ABSENCE here, which is the failure we want:
+# permission errors can be mistaken for environment noise, missing credentials
+# cannot.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (no DB, no AWS)
+    runs-on: ubuntu-latest
+    env:
+      ARTEMIS_TEST_NO_DB: "1"
+      # Belt and braces: even if something ignores the flag, there is nothing
+      # to connect to and no metadata endpoint to borrow a role from.
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"        # the version acos runs on the box
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r api/requirements.txt pytest
+
+      # Per FILE, in its own process. `pytest tests/` in one process
+      # cross-contaminates: these files install module-level stubs in
+      # sys.modules and patch globals, so a shared process produces ~90 spurious
+      # failures. One process per file is how the suite is actually run.
+      - name: pytest (one process per file)
+        run: |
+          set -u
+          # EXCLUDED, and why. Each needs something CI deliberately does not have,
+          # or is a known-stale test. Named here rather than granted access:
+          #   test_confirm_dispatch.py  reaches AWS Secrets Manager (passes with credentials)
+          #   test_phase1_schema.py     queries the live RDS schema
+          #   test_schema_drift.py      compares against the live RDS schema
+          EXCLUDE="tests/conftest.py tests/test_confirm_dispatch.py tests/test_phase1_schema.py tests/test_schema_drift.py"
+          fail=0
+          for f in tests/*.py tests/lambda_api/test_*.py; do
+            case " $EXCLUDE " in *" $f "*) echo "skip   $f"; continue;; esac
+            echo "::group::$f"
+            python -m pytest -q "$f" || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      # tests/lambda_api/ runs under pytest like everything else. It used to be
+      # tests/api/, which is a package named `api`: pytest put tests/ on sys.path
+      # and `import api.app` then resolved to the test directory instead of the
+      # repo's api/. Renaming it removed the collision and the special case.
+      - name: prove no credentials were available
+        if: always()
+        run: |
+          # If this ever succeeds, the guarantee above is broken.
+          if aws sts get-caller-identity >/dev/null 2>&1; then
+            echo "AWS credentials ARE present in CI — that must not happen"; exit 1
+          fi
+          echo "no AWS credentials, as intended"

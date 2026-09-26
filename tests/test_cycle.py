@@ -221,10 +221,28 @@ class TestOverrides(unittest.TestCase):
         with patch.object(cycle, "override_for", return_value=ov):
             self.assertEqual(cycle.location_at(OFFICE_TUE), "office")
 
-    def test_a_db_failure_means_no_override_never_an_exception(self):
+    def test_a_db_failure_RAISES_and_never_answers_no_override(self):
+        """FAIL-CLOSED-RESOLVERS. This test asserted the opposite until
+        2026-09-26, and the behaviour it was protecting is what let eleven plan
+        rows be rebuilt against the base pattern: a failed read answered "no
+        override", which is a real answer that resolves and writes cleanly."""
         with patch("knowledge.db.execute_one", side_effect=RuntimeError("no db")):
-            self.assertIsNone(cycle.override_for(OFFICE_TUE))
-            self.assertEqual(cycle.day_type(OFFICE_TUE), "msp_work")
+            with self.assertRaises(cycle.OverrideLookupError):
+                cycle.override_for(OFFICE_TUE)
+            # and it propagates — no resolver quietly substitutes the base pattern
+            for call in (lambda: cycle.day_type(OFFICE_TUE),
+                         lambda: cycle.anchor_location(OFFICE_TUE),
+                         lambda: cycle.location_at(OFFICE_TUE),
+                         lambda: cycle.wake_on(OFFICE_TUE),
+                         lambda: cycle.boundaries(OFFICE_TUE)):
+                with self.assertRaises(cycle.OverrideLookupError):
+                    call()
+
+    def test_the_base_pattern_is_still_reachable_but_only_on_purpose(self):
+        """The escape hatch is explicit, and works even with the table dead."""
+        with patch("knowledge.db.execute_one", side_effect=RuntimeError("no db")):
+            self.assertEqual(cycle.day_type(OFFICE_TUE, use_overrides=False), "msp_work")
+            self.assertEqual(cycle.anchor_location(OFFICE_TUE, use_overrides=False), "office")
 
 
 class TestOverrideTiming(unittest.TestCase):

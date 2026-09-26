@@ -23,10 +23,18 @@ PATTERN = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "recove
 CAPS = [6.0, 2.0, 6.0, 2.0, 2.0, 6.0, 4.0]
 
 
+#: LOCATION-1: the class travels on the row, so the fixture carries it too —
+#: names no longer imply a class anywhere.
+EX_CLASSES = {"Captain's chair knee raise": "bodyweight",
+              "Seated back extension": "machine",
+              "Leg press": "machine"}
+
+
 def plans(start=WED, adjust=None):
     rows = []
     for i, (st, cap) in enumerate(zip(PATTERN, CAPS)):
-        b = {"display_name": st}
+        b = {"display_name": st,
+             "exercises": [{"name": n, "equipment_class": c} for n, c in EX_CLASSES.items()]}
         if adjust and i in adjust:
             b["adjustment"] = adjust[i]
         rows.append({"plan_id": 100 + i + (start - WED).days, "plan_date": start + timedelta(days=i),

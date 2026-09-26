@@ -18,11 +18,20 @@ sys.path.insert(0, str(_REPO_ROOT))
 from knowledge import dbguard as test_guard  # noqa: E402
 
 # Test files allowed to open a real connection, and why. Keep this short.
-EXEMPT = {
-    "test_phase1_schema.py": "intentional live-schema smoke check, run by the Lambda's "
-                             "/admin/run-tests (inserts then deletes a probe row); "
-                             "connects with its own psycopg2.connect, never knowledge.db",
-}
+#
+# EMPTY as of 2026-09-26 (PACKAGE-IDENTITY). The single entry was
+# test_phase1_schema.py, and it existed only because RUNTIME CODE was living in
+# tests/: the file was the 15-check live-schema probe that the Lambda's
+# /admin/run-tests ran with subprocess, so it connected to the real database on
+# purpose. The probe moved to api/app/schema_check.py, where it belongs — it is
+# reachable over HTTP in production — and the test beside it now drives
+# run_checks() with a fake connection like any other guarded test.
+#
+# Adding an entry back means a test needs the real database. Say which database
+# and why, and prefer the shape test_quiet_hours_rds uses: a live tier that
+# SKIPS unless a throwaway local Postgres is reachable, so CI and the box never
+# touch production.
+EXEMPT: dict[str, str] = {}
 
 
 class TestEveryTestFileIsGuarded(unittest.TestCase):

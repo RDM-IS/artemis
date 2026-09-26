@@ -15,6 +15,7 @@ from artemis import config
 from artemis import morning_brief
 from artemis.briefs import generate_meeting_brief, generate_morning_brief, triage_emails
 from artemis.calendar import CalendarClient
+from artemis.cycle import OverrideLookupError
 from artemis.commitments import (
     add_commitment,
     get_due_soon,
@@ -145,6 +146,13 @@ class CronSpec:
     # Once-per-local-day guard key. A weekend twin shares its weekday job's key
     # so the two can never both fire on one date (e.g. after a custom wake).
     guard: str | None = None
+    # DRIFT-ALARM: hourly at `minute`, every hour of the day. `hour` is then
+    # only documentation — the trigger uses "*".
+    hourly: bool = False
+    # False: the job is NOT once-per-local-day and owns its own guard. Only a
+    # job that repeats within a day may set this (DRIFT-ALARM keys its guard on
+    # the drift signature instead, so a new drift posts the hour it appears).
+    daily_guard: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +201,11 @@ class ArtemisScheduler:
         self._cron_specs: list[CronSpec] = []
         self._applied_tz: str | None = None
         self._applied_cron_times: dict[str, tuple[int, int]] = {}
+        # Location-dependent cron jobs: whether they are currently unregistered
+        # because the cycle could not be read, and the last state reported. The
+        # signature lives in memory on purpose — see _report_location_jobs.
+        self._location_degraded: bool = False
+        self._location_signature: str | None = None
         self._pending_triage: list[dict] = []
         self._seen_message_ids: set[str] = set()
         self._pending_availability: dict[str, dict] = {}
@@ -242,8 +255,10 @@ class ArtemisScheduler:
                 out[job_id] = (t.hour, t.minute)
         return out
 
-    def cron_specs(self, now=None) -> list[CronSpec]:
-        t = self.cron_times(now)
+    def cron_specs(self, now=None, *, skip_location: bool = False) -> list[CronSpec]:
+        """The registry. With `skip_location`, the six jobs whose times come from
+        the cycle are OMITTED rather than guessed — see apply_timezone()."""
+        t = None if skip_location else self.cron_times(now)
         specs = [
             # 03:30 — silent vault ingest, before the wake window.
             # 00:15 — DIET-1 pre-fill + the 48h correction lock. SILENT: this
@@ -251,16 +266,11 @@ class ArtemisScheduler:
             # only because it never posts; see job_nutrition_prefill.
             CronSpec("nutrition_prefill", "job_nutrition_prefill", 0, 15),
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
-            # wake: health holds flush + the wake post. Time follows the day's
-            # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer / home 07:30).
-            CronSpec("wake", "job_wake", *t["wake"], tier="health"),
-            # wake + 45 min — one nudge if no check-in arrived (FRIDAY-1).
-            CronSpec("checkin_nudge", "job_checkin_nudge", *t["checkin_nudge"], tier="health"),
-            # open: business holds flush, then the brief. Follows the DAY TYPE
-            # (work 06:30 · non-work 08:30).
-            CronSpec("inbox_zero_morning", "job_inbox_zero_morning", *t["inbox_zero_morning"]),
-            CronSpec("open", "job_open", *t["open"]),
-            CronSpec("morning_brief", "job_morning_brief", *t["open"]),
+            # DRIFT-ALARM: hourly, phase-gated to wake+open inside the job.
+            # tier="health" is the POSTING phase gate (wake as well as open),
+            # not a statement about the subject.
+            CronSpec("drift_alarm", "job_drift_alarm", 0, 7,
+                     tier="health", hourly=True, daily_guard=False),
             # 08:00 / 08:05 — weekdays only (open-only checks).
             CronSpec("ssl_check", "job_ssl_check", 8, 0, "mon-fri"),
             CronSpec("domain_check", "job_domain_check", 8, 5, "mon-fri"),
@@ -270,8 +280,6 @@ class ArtemisScheduler:
             # 16:30 — workouts are AM now, so the debrief nag moved off 21:00.
             CronSpec("health_nag", "job_health_nag", 16, 30, tier="health"),
             CronSpec("vault_coverage", "job_vault_coverage", 16, 30, "mon-fri"),
-            # quiet: follows the DAY TYPE (work 17:00 · non-work 22:30).
-            CronSpec("quiet_hours_start", "job_quiet_hours_start", *t["quiet_hours_start"]),
             # 21:50 — silent DB backstop; writes only, posts nothing.
             CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
             # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
@@ -285,6 +293,24 @@ class ArtemisScheduler:
             CronSpec("health_review", "job_health_review", 8, 30, "sun", tier="health"),
             CronSpec("weekly_eval", "job_weekly_eval", 8, 35, "sun", tier="health"),
         ]
+        if t is not None:
+            specs += [
+                # wake: health holds flush + the wake post. Time follows the day's
+                # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer/home 07:30).
+                CronSpec("wake", "job_wake", *t["wake"], tier="health"),
+                # wake + 45 min — one nudge if no check-in arrived (FRIDAY-1).
+                CronSpec("checkin_nudge", "job_checkin_nudge", *t["checkin_nudge"],
+                         tier="health"),
+                # open: business holds flush, then the brief. Follows the DAY TYPE
+                # (work 06:30 · non-work 08:30).
+                CronSpec("inbox_zero_morning", "job_inbox_zero_morning",
+                         *t["inbox_zero_morning"]),
+                CronSpec("open", "job_open", *t["open"]),
+                CronSpec("morning_brief", "job_morning_brief", *t["open"]),
+                # quiet: follows the DAY TYPE (work 17:00 · non-work 22:30).
+                CronSpec("quiet_hours_start", "job_quiet_hours_start",
+                         *t["quiet_hours_start"]),
+            ]
         if config.FOCUS_CLIENT:
             specs.append(CronSpec("focus_reminder", "job_focus_reminder", 9, 0, "mon-fri"))
         return specs
@@ -294,7 +320,7 @@ class ArtemisScheduler:
         func = getattr(self, spec.func_name)
 
         def runner():
-            if not self._once_per_local_day(spec.guard or spec.id):
+            if spec.daily_guard and not self._once_per_local_day(spec.guard or spec.id):
                 return
             func()
 
@@ -329,10 +355,26 @@ class ArtemisScheduler:
             logger.error("apply_timezone: unknown zone %r — keeping %s", tz_name, self._applied_tz)
             return
 
-        self._cron_specs = self.cron_specs()
+        # FAIL-CLOSED-RESOLVERS, softened at THIS boundary only (Ryan, 2026-09-26).
+        # cron_times() reads the cycle, which reads acos.cycle_day_overrides, which
+        # RAISES when it cannot be read. Letting that propagate killed the service
+        # at startup — the whole box for a subset of jobs, which is the wrong trade.
+        # So: boot, register everything that does not depend on location, SKIP the
+        # six that do, and say so. The base pattern is never substituted; not dying
+        # is not the same as guessing.
+        skipped: list[str] = []
+        reason = ""
+        try:
+            self._cron_specs = self.cron_specs()
+        except OverrideLookupError as exc:
+            reason = str(exc)
+            self._cron_specs = self.cron_specs(skip_location=True)
+            skipped = sorted(self.LOCATION_JOBS)
+            logger.error("Location-dependent cron jobs SKIPPED (%s) — %s",
+                         ", ".join(skipped), reason)
         for spec in self._cron_specs:
             trigger = CronTrigger(
-                hour=spec.hour, minute=spec.minute,
+                hour="*" if spec.hourly else spec.hour, minute=spec.minute,
                 day_of_week=spec.day_of_week, timezone=tz,
             )
             if self.scheduler.get_job(spec.id):
@@ -343,8 +385,16 @@ class ArtemisScheduler:
                 )
         self._applied_tz = tz_name
         self._applied_cron_times = {sp.id: (sp.hour, sp.minute) for sp in self._cron_specs}
-        set_system_value("scheduler_tz", tz_name)
-        logger.info("Scheduler timezone applied: %s", tz_name)
+        # Drives the retry in job_tz_sync: the 60 s timer already runs, so the jobs
+        # come back on the first cycle read that succeeds. No new timer needed.
+        self._location_degraded = bool(skipped)
+        self._report_location_jobs(skipped, reason)
+        try:
+            set_system_value("scheduler_tz", tz_name)
+        except Exception:
+            logger.warning("could not record scheduler_tz — continuing", exc_info=True)
+        logger.info("Scheduler timezone applied: %s%s", tz_name,
+                    f" (SKIPPED {len(skipped)} location jobs)" if skipped else "")
         for line in self.job_dump():
             logger.info("  %s", line)
 
@@ -417,6 +467,43 @@ class ArtemisScheduler:
             return is_open()
         except Exception:
             return False
+
+    def _report_location_jobs(self, skipped: list[str], reason: str) -> None:
+        """Post ONCE when the location jobs get skipped, and ONCE when they come
+        back. DRIFT-ALARM's signature guard, with one difference that matters: the
+        guard is IN MEMORY, not in `acos.system_state`, because the very condition
+        being reported is that the database cannot be read — a system_state guard
+        would fail in exactly the case it exists for.
+
+        The signature deliberately excludes the exception text, which carries a
+        date and would churn daily and repost. Nothing in here may raise: it runs
+        inside startup, and a failed post must not do what the raise it is
+        reporting was stopped from doing.
+        """
+        try:
+            signature = "skipped:" + ",".join(skipped) if skipped else "ok"
+            previous = self._location_signature
+            if previous == signature:
+                return
+            self._location_signature = signature
+            if skipped:
+                self._post(config.CHANNEL_OPS, (
+                    "**Location-dependent jobs are NOT registered.**\n"
+                    f"Skipped: `{'`, `'.join(skipped)}`\n"
+                    f"Why: the cycle could not be read — {reason}\n"
+                    "Everything else is running. No times were guessed: the base "
+                    "pattern was **not** substituted, so no wake post, nudge, brief "
+                    "or quiet-hours transition will fire until the read succeeds. "
+                    "Retrying every 60 s; I will post again when they register."
+                ), tier="health")
+            elif previous is not None and previous.startswith("skipped:"):
+                self._post(config.CHANNEL_OPS, (
+                    "**Location-dependent jobs are registered again.** "
+                    f"Back: `{'`, `'.join(sorted(self.LOCATION_JOBS))}`. "
+                    "The cycle read succeeded and the times came from it."
+                ), tier="health")
+        except Exception:
+            logger.exception("could not report the location-job state")
 
     def _post(self, channel: str, text: str, tier: str = "business") -> bool:
         """Scheduled posts go through the phase gate: post now, or hold durably."""
@@ -525,6 +612,11 @@ class ArtemisScheduler:
                 logger.info("Timezone change: %s → %s — rescheduling crons",
                             self._applied_tz, active)
                 self.apply_timezone(active)
+            elif self._location_degraded:
+                # RETRY. The location jobs are unregistered because the cycle could
+                # not be read; re-attempt on this 60 s tick. apply_timezone() posts
+                # the recovery once it succeeds, and stays silent while it does not.
+                self.apply_timezone(active)
             elif self._location_drift():
                 logger.info("Location drift: %s — rescheduling crons", self._location_drift())
                 self.apply_timezone(active)
@@ -541,7 +633,15 @@ class ArtemisScheduler:
         """
         if not self._applied_cron_times:
             return {}
-        want = self.cron_times()
+        try:
+            want = self.cron_times()
+        except OverrideLookupError:
+            # "I cannot tell" is not "no drift", and it is not a reason to raise
+            # every 60 s either. The real state is carried by _location_degraded,
+            # which apply_timezone sets and the retry above acts on — so nothing
+            # is lost by returning empty here.
+            logger.debug("location drift check: cycle unreadable", exc_info=True)
+            return {}
         return {job_id: (self._applied_cron_times.get(job_id), t)
                 for job_id, t in want.items()
                 if self._applied_cron_times.get(job_id) != t}
@@ -1039,6 +1139,39 @@ class ArtemisScheduler:
                     logger.debug("last_morning_brief_at write failed", exc_info=True)
         except Exception:
             logger.exception("Morning brief generation failed")
+
+    def job_drift_alarm(self):
+        """DRIFT-ALARM — hourly in the wake and open phases: is what is running
+        what `main` says?
+
+        Posts ONLY when the drift state CHANGES. The guard is keyed on the
+        drift signature rather than the date, so the same drift is not reposted
+        every hour, while a new drift (or a recovery) is reported the hour it
+        appears. A deploy that lands cleanly is silent.
+
+        A check that cannot reach its target reports `unknown` — never "no
+        drift". Nothing in here may raise into the scheduler.
+        """
+        try:
+            # wake + open only; silent in quiet hours.
+            if self._is_quiet():
+                return
+            from artemis import drift
+            from artemis.quiet_hours import get_system_value, set_system_value
+
+            results = drift.check_all()
+            signature = drift.signature(results)
+            key = "drift_alarm:signature"
+            if get_system_value(key) == signature:
+                return                      # same state as last time — say nothing
+            set_system_value(key, signature)
+            if drift.all_clear(results):
+                logger.info("DRIFT-ALARM: all clear (%s)", signature)
+                return                      # a successful deploy is silent
+            logger.warning("DRIFT-ALARM: %s", signature)
+            self._post(config.CHANNEL_OPS, drift.format_message(results), tier="health")
+        except Exception:
+            logger.exception("Drift alarm failed")
 
     def job_vault_sync(self):
         """PB-011: 03:30 local vault ingest — fetch mirror, upsert notes, recompute

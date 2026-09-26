@@ -45,7 +45,12 @@ cd package && zip -r ../function.zip . -x "*.pyc" -x "*/__pycache__/*" > /dev/nu
 cd ..
 zip -r function.zip app/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 zip -r function.zip ../migrations/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
-zip -r function.zip ../tests/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+# PACKAGE-IDENTITY (2026-09-26): tests/ is NOT shipped. It was here only because
+# /admin/run-tests shelled out to /var/task/tests/test_phase1_schema.py; that
+# probe is api/app/schema_check.py now and the endpoint imports it. Shipping
+# tests/ meant a test-only commit moved the package hash, so DRIFT-ALARM
+# reported drift for a change that cannot affect runtime — 8 of the last 13
+# hashed-path commits were exactly that. An alarm that cries wolf gets ignored.
 zip -r function.zip ../knowledge/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 
 export PATH="$PATH:/usr/local/bin:$HOME/.local/bin"
@@ -54,6 +59,31 @@ aws lambda update-function-code \
   --function-name rdmis-crm-api \
   --zip-file fileb://function.zip \
   --region us-east-1
+
+# DRIFT-ALARM (2026-09-25): record WHICH COMMIT this package was built from on
+# the function itself. Nothing recorded it before, so answering "is the live
+# Lambda current?" meant downloading the 24 MB package and diffing it file by
+# file. The Description is read by lambda:GetFunctionConfiguration, which the
+# box role already has. Keep `sha=<40 hex>` first — the drift check parses it.
+DEPLOYED_SHA="$(git -C "$REPO" rev-parse HEAD)"
+DEPLOYED_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+# CI-2: `pkg` is what the alarm COMPARES — a hash of the four paths this script
+# zips. The sha stays because it is how you know which commit built the package;
+# it just is not the comparison any more, since a merge touching only artemis/
+# leaves the package identical.
+DEPLOYED_PKG="$(bash "$REPO/scripts/package_hash.sh" HEAD)"
+# A dirty tree ships files that are in no commit, so the hash would be a lie.
+# Say so in the Description instead: the alarm then reports drift, correctly.
+if [ -n "$(git -C "$REPO" status --porcelain -- api knowledge migrations)" ]; then
+  DEPLOYED_PKG="${DEPLOYED_PKG}+dirty"
+  echo "[deploy] WARNING: shipped paths have uncommitted changes — recording pkg=$DEPLOYED_PKG"
+fi
+aws lambda wait function-updated-v2 --function-name rdmis-crm-api --region us-east-1
+aws lambda update-function-configuration \
+  --function-name rdmis-crm-api \
+  --region us-east-1 \
+  --description "sha=${DEPLOYED_SHA} pkg=${DEPLOYED_PKG} branch=${DEPLOYED_BRANCH} deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --query '[Description,LastUpdateStatus]' --output text
 
 echo "Cleaning up..."
 rm -rf package function.zip

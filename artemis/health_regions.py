@@ -76,6 +76,14 @@ _reg("Single-arm cable row", {"back"}, {"shoulder", "biceps", "arms", "core"})
 _reg("Seated DB shoulder press", {"shoulder"}, {"triceps", "arms"})
 _reg("Calf press", {"legs", "calves"})
 _reg("Ab machine crunch", {"core"})
+
+# ── LOCATION-1 (Richfield): each mirrors the office exercise it stands in for,
+# because the pain ladder reasons about REGIONS, not about equipment. A
+# shoulder that rules out Pec fly rules out DB fly for the same reason.
+_reg("DB fly", {"chest"}, {"shoulder"})                       # ← Pec fly
+_reg("1-arm DB row", {"back"}, {"shoulder", "biceps", "arms", "core"})   # ← Single-arm cable row
+_reg("Standing DB calf raise", {"legs", "calves"})            # ← Calf press
+_reg("Stability-ball crunch", {"core"})                       # ← Ab machine crunch
 # ── Weeks 5-6 finisher ──
 _reg("Stepmill or upright bike", {"legs"}, {"knee", "hip"})
 # ── Cardio (steady blocks; rules 2-4 never touch these, listed for coverage) ──
@@ -93,6 +101,21 @@ _reg("Rest / Mobility", set())
 
 # Substitutes, in preference order. Every name must exist in EXERCISE_REGIONS
 # and in health_office's exercise lists (so it can be built for any week).
+def substitution_pool(location_key: str | None = None) -> tuple[str, ...]:
+    """LOCATION-1: the pool the pain ladder may pick a replacement from,
+    FILTERED TO THE LOCATION'S INVENTORY.
+
+    Resolution is location first, then pain: a pain removal at Richfield must
+    be replaced by something Richfield HAS. Filtering by equipment CLASS is not
+    enough — the office and Richfield both have `bodyweight`, but only one has
+    a captain's chair and only one has a stability ball. So the pools are
+    explicit per location, like the substitution tables.
+    """
+    if not location_key or location_key == "office":
+        return SUBSTITUTION_POOL
+    return POOL_BY_LOCATION.get(location_key, ())
+
+
 SUBSTITUTION_POOL = (
     "Leg press",
     "Seated leg curl",
@@ -102,6 +125,15 @@ SUBSTITUTION_POOL = (
     "Seated back extension",
     "Cable Pallof press",
 )
+
+
+#: What the pain ladder may reach for at each non-office location. Explicit,
+#: like the substitution tables — Brown Deer and MSP home have no inventory on
+#: record, so they have no pool and a pain removal there becomes mobility.
+POOL_BY_LOCATION: dict[str, tuple[str, ...]] = {
+    "richfield": ("DB fly", "1-arm DB row", "Standing DB calf raise",
+                  "Stability-ball crunch"),
+}
 
 
 # ── PAIN-1: region -> mobility work (Stretch Trainer + mat) ──
@@ -131,78 +163,81 @@ def mobility_minutes(regions) -> int:
     return 10 if len(list(regions)) <= 1 else 15
 
 
-# ── PAIN-1: reachable loads (a port of gym-display src/lib/equipment.ts) ──
-PLATES_PER_SIDE = (45, 35, 25, 10, 5)
-OLYMPIC_BAR_LBS = 45
-SMITH_BAR_LBS = 0          # TODO(office): Icarian Smith effective bar weight
-DB_MIN, DB_MAX, DB_STEP = 5, 45, 5
-STACK_STEP = 10            # machines + functional trainer, until measured
-
-_EXACT_CLASS = {"seated cable row": "machine"}
-_CLASS_RULES = (
-    ("smith", ("smith",)),
-    ("bodyweight", ("captain's chair", "captains chair", "plank",
-                    "push-up", "pushup", "dead bug", "bird dog", "hollow",
-                    "mountain climber", "glute bridge")),
-    ("cable", ("cable", "rope", "pallof", "face pull")),
-    ("dumbbell", ("db ", "dumbbell", "goblet")),
-    ("barbell", ("barbell", "back squat", "front squat")),
-    ("machine", ("leg press", "pulldown", "row", "leg curl", "leg extension", "pec fly",
-                 "rear delt", "calf press", "ab crunch", "ab machine", "back extension")),
-)
+# ── LOCATION-1 (2026-09-25): there is NO load table here any more. ──
+# What a load looks like travels on the plan row (`blocks.load_config`), from
+# knowledge/load_config.py — one source, two consumers (this module and
+# gym-display's stepper). The office constants that used to live here are that
+# file's OFFICE entry; a second copy would drift the moment Richfield differs.
+#
+# The exercise-NAME rules are gone too. They only knew the office's vocabulary:
+# of the nine home-gym exercises in RDS they misread five, reading "TRX row" as
+# `machine` (a 10 lb stack step for a strap), both band exercises as `dumbbell`
+# and "Reverse lunge" as `dumbbell` rather than bodyweight. EXERCISE-CLASS put
+# a class on every row; the seeder's own
+# inventory (health_office.class_for) assigns it, and an exercise with no class
+# is now an explicit UNKNOWN rather than a confident guess.
 
 
 #: Classes that carry no numeric load — there is nothing to step or lighten.
 NO_LOAD_CLASSES = ("bodyweight", "bands", "trx", "cardio")
 
 
-def equipment_class(name: str, explicit: str | None = None) -> str:
-    """The exercise's class. EXERCISE-CLASS (2026-09-23): the ROW's
-    `equipment_class` wins; the keyword rules below are a fallback for rows
-    seeded before the class travelled, and they only know the office's
-    vocabulary — "TRX row" reads as `machine` to them."""
-    if explicit:
-        return explicit
-    n = (name or "").lower().strip()
-    if n in _EXACT_CLASS:
-        return _EXACT_CLASS[n]
-    for cls, keys in _CLASS_RULES:
-        if any(k in n for k in keys):
-            return cls
-    return "dumbbell"
+def equipment_class(name: str, explicit: str | None = None) -> str | None:
+    """The exercise's class, or **None when the row does not carry one**.
+
+    LOCATION-1 (2026-09-25): there is no name-based fallback. Guessing from the
+    name is what made "TRX row" a `machine`, i.e. a 10 lb stack step for a strap.
+    A row without `equipment_class` is a seeding bug — `tests/test_seed_rows.py`
+    fails on one — and callers report "unknown" rather than acting on a guess.
+    """
+    return explicit or None
 
 
-def _reachable_totals(bar: int) -> list[int]:
+def _reachable_totals(bar: int, plates: tuple) -> list[int]:
     sums = {0}
-    for p in PLATES_PER_SIDE:
+    for p in plates:
         sums |= {s + p for s in sums}
     return sorted(bar + 2 * s for s in sums)
 
 
-def lighter_load(name: str, last: float, explicit_class: str | None = None) -> float | None:
-    """80% of `last`, rounded DOWN to a load the office can actually make.
+def lighter_load(name: str, last: float, explicit_class: str | None = None,
+                 load_config: dict | None = None) -> float | None:
+    """80 % of `last`, rounded DOWN to a load THIS GYM can actually make.
 
     Never returns `last` or more: if the rounding lands there, the next lower
     reachable load is used; at the bottom of the range the minimum stays.
-    None for bodyweight work (no load to lighten).
+
+    **Returns None — no recommendation — rather than a computed guess** when
+    the row does not say enough (LOCATION-1, 2026-09-25):
+      * the exercise carries no `equipment_class`;
+      * the row carries no `load_config`;
+      * this gym has no entry for the class (it does not have that equipment);
+      * the class carries no numeric load (bodyweight / bands / trx / cardio).
+    There is no office fallback. A PowerBlock is not a hex dumbbell rack, and
+    inventing one number rather than saying "no recommendation" is how the
+    wrong weight reaches a set.
     """
     cls = equipment_class(name, explicit=explicit_class)
-    # bands / TRX carry no numeric load, so there is nothing to lighten.
-    if cls in NO_LOAD_CLASSES or last is None or last <= 0:
+    if cls is None or cls in NO_LOAD_CLASSES or last is None or last <= 0:
+        return None
+    cfg = (load_config or {}).get(cls)
+    if not cfg or cfg.get("mode") == "none":
         return None
     goal = float(last) * 0.8
-    if cls == "dumbbell":
-        options = list(range(DB_MIN, DB_MAX + 1, DB_STEP))
-    elif cls in ("machine", "cable"):
-        top = int(max(last, STACK_STEP))
-        options = list(range(STACK_STEP, top + STACK_STEP, STACK_STEP))
-    else:
-        options = [t for t in _reachable_totals(OLYMPIC_BAR_LBS if cls == "barbell" else SMITH_BAR_LBS)
+    if cfg.get("plates"):
+        options = [t for t in _reachable_totals(int(cfg.get("bar") or 0), tuple(cfg["plates"]))
                    if t > 0]
+    else:
+        step = int(cfg.get("step") or 0)
+        if step <= 0:
+            return None
+        lo = int(cfg.get("min") or step)
+        hi = max(int(last), int(cfg.get("max") or last))
+        options = [lo + i * step for i in range(int((hi - lo) // step) + 1)]
+    if not options:
+        return None
     below = [o for o in options if o <= goal and o < last]
-    if below:
-        return float(below[-1])
-    return float(options[0])
+    return float(below[-1] if below else options[0])
 
 
 def canonical_region(word: str) -> str | None:
