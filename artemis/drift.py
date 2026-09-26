@@ -165,11 +165,17 @@ def check_box(expected: str) -> dict:
 def check_lambda(expected_sha: str) -> dict:
     """Compares the PACKAGE, not the commit.
 
-    A merge that touches only artemis/ or docs/ leaves the shipped paths
+    A merge that touches only artemis/, docs/ or tests/ leaves the shipped paths
     untouched, so the deployed package is still current and this says `ok`.
-    A change under api/, knowledge/, migrations/ or tests/ moves the hash and
-    this says `drift`. The commit sha is reported either way, because it is how
-    you know which commit built what is live.
+    A change under api/, knowledge/ or migrations/ moves the hash and this says
+    `drift`. The commit sha is reported either way, because it is how you know
+    which commit built what is live.
+
+    `tests/` left that list on 2026-09-26 (PACKAGE-IDENTITY): it used to be
+    shipped and hashed, so a test-only commit reported drift for a change that
+    cannot affect runtime — 8 of the 13 preceding hashed-path commits were
+    exactly that. If this docstring and scripts/package_hash.sh ever disagree,
+    the script is right and this is stale.
     """
     description = lambda_description()
     live_sha = parse_lambda_sha(description)
