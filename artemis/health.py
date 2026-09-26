@@ -1452,9 +1452,15 @@ def _plan_session_name(plan: dict) -> str:
     return blocks.get("display_name") or _session_pretty_name(plan.get("session_type", "?"))
 
 
+# CHECKIN-GATE (2026-09-26): ask only for what the watch cannot measure.
+# Sleep, RHR and weight are pre-filled from the watch (watch_prefill) and the
+# check-in reply reports what it found; typing them still overrides. Energy
+# and soreness/pain are the only fields the adjustment rules act on, and pain
+# was never asked for at all — so PAIN-1 had never run on real input.
 _SURVEY_QUESTIONS = (
-    "Reply with: sleep hrs, energy 0–5, soreness by area 0–5 (0 = none), weight, RHR.\n"
-    "Example: `slept 7 energy 4 sore 0 weight 283`"
+    "Reply with: energy 0–5, and any sore or pain by area 0–5 (0 = none).\n"
+    "Example: `energy 4 sore 0` · `energy 3 knee pain 2`\n"
+    "_Sleep, weight and RHR come from the watch — add them only to correct it._"
 )
 
 
