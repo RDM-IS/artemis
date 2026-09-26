@@ -201,6 +201,13 @@ def override_for(d: date) -> dict | None:
         # It cannot fire in production — the guard needs ARTEMIS_TEST_NO_DB or
         # pytest imported. Every real failure mode (refused, auth, timeout,
         # UndefinedTable, permission) still raises below.
+        #
+        # NARROW ON PURPOSE: this catches one exception type, raised by one guard
+        # whose entire job is to say "you are in a test". WIDENING IT — to
+        # Exception, to psycopg2.Error, to anything that can occur in production —
+        # RE-CREATES THE 2026-09-26 DEFECT, where a failed read answered "no
+        # override" and eleven plan rows were rebuilt against the base pattern and
+        # committed. See FAIL-CLOSED-RESOLVERS in CLAUDE.md.
         return None
     except Exception as exc:
         raise OverrideLookupError(
