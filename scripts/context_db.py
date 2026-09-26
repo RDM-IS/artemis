@@ -7,10 +7,20 @@ except Exception as e:
     print(f"- (could not import knowledge.db: {e})"); sys.exit(0)
 
 def main():
+    # EVERY application schema, discovered rather than listed. The hardcoded
+    # list ('public','acos','health') silently excluded `nutrition` and `vault`,
+    # so this file — which CLAUDE.md ranks at precedence level 2, ABOVE every
+    # authored doc — listed the DEAD health.nutrition_log / nutrition_target and
+    # showed nothing of the live nutrition.day / entry / food / target. A
+    # level-2 document pointing at dead tables is worse than a stale one
+    # (Ryan, 2026-09-26). Excluding by pattern means a new schema appears on the
+    # next run instead of waiting for someone to remember this list.
     schemas = execute_query("""
         select table_schema, table_name
         from information_schema.tables
-        where table_schema in ('public','acos','health')
+        where table_type = 'BASE TABLE'
+          and table_schema not like 'pg_%'
+          and table_schema <> 'information_schema'
         order by table_schema, table_name
     """)
     cur = None
