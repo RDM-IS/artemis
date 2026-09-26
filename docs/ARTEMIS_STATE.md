@@ -104,7 +104,7 @@ Each boundary belongs to the local date it falls on: Friday night goes quiet at 
 
 ## 5. In flight 🚧
 
-Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in order: **WATCH-1 → EVAL-1 → REPORT-1 → DIET-1** (backlog).
+Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build order is HEALTH-PRIORITY at the top of §6 (set by Ryan 2026-09-26)**; it supersedes the earlier WATCH-1 → EVAL-1 → REPORT-1 → DIET-1 order (WATCH-1 and EVAL-1 are built, and DIET-1's work-day scope is live).
 
 **Shipped 2026-09-17 → 09-19** (all merged and live; details in the PRs):
 - **STATUS-1** — the Status page rebuild: `GET /health/overview` on the Lambda (#98, key-gated, reads `acos.system_state.health_program` with a plan-row fallback) and gym-display #10.
@@ -141,6 +141,39 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
 ---
 
 ## 6. Backlog (prioritized)
+
+**HEALTH-PRIORITY — the build order for the health program (Ryan, 2026-09-26). This list governs; entries below carry the detail.**
+
+**The goal** is outcomes — weight loss, strength, mobility, sleep — and the three surfaces that serve them: **gym.rdm.is** (workouts, plus on-demand yoga / core / mobility for evenings and rest days), a **dietitian report** for the VA MOVE! nutritionist (meals + macros, exercise, health metrics; daily / weekly / monthly; detailed or summary), and a **nutrition tracker** driven by defaults and `@artemis` overrides. **Capture comes first:** every report and screen is only as good as the rows under it, and on 2026-09-26 subjective capture had been dead for four days, cardio was 1 of 36 logged, and intake covered 3 days.
+
+**Systems before content (Ryan, 2026-09-26):** build the workflows so they function the moment the inputs exist — menus, recipes and the travel set are filled in later and must not block the plumbing.
+
+| # | Item | Why | Size | Status |
+|---|---|---|---|---|
+| 1 | **CHECKIN-GATE** — pain/tightness reach the check-in; the prompt asks only what the watch can't measure | No subjective data ⇒ PAIN-1 and EVAL-1's subjective lines are empty | S | PR #205 |
+| 2 | **CARDIO-REQUIRED** — a cardio day can't be finished without duration + modality | 36 planned, 1 logged, 0 with modality (CARDIO-UNLOGGED) | S | |
+| 3 | **NUTRITION-2** — meal source by day kind (work default / off-day pick / travel prepped set), free-text meal logging, remaining-vs-target with suggestions from the recipe DB | The tracker Ryan described; replaces the old "defaults for every day type" + "same-day overrides" items | M–L | spec below |
+| 4 | **MENUS** — the content: off-day from-scratch recipes, the drive-friendly travel set, recipe tags. High protein and fiber, LDL/triglyceride-friendly fats, a planned peanut-butter-cup substitute, a satiating evening protein for sleep. **Ryan's inputs, reviewed with the dietitian.** HDL is moved mostly by weight loss and aerobic work (#2), not food | Pure content; the #3 plumbing runs without it | M | Ryan |
+| 5 | **DIETITIAN-REPORT** — REPORT-1 + DIET-1's report: daily / weekly / monthly × detailed / summary, PDF | REPORT-1's prerequisites are done; needs #3 and the window decision (DIETITIAN-DATA) | M–L | |
+| 6 | **ADHOC-LOG** — sets logged outside the plan | Blocks #7 | S–M | decision needed |
+| 7 | **SESSION-LIB** — the on-demand launcher at gym.rdm.is (yoga, core, mobility) | Ryan's web-app goal | M | |
+| 8 | **New flows** — core, standalone mobility, YOGA-6 higher-intensity | Content for #7 | M each | |
+| 9 | **RICHFIELD-CAPTURE** (Monday inventory) + SCHEDULE-3 recompute | 3 wrong leave-week days | S | |
+| 10 | ZONE-1 → SLEEP-PERF | Need data first; not before mid-October | S | |
+
+**NUTRITION-2 — the tracker as Ryan described it (spec 2026-09-26; systems only, content later).**
+- **Day kind decides the meal source.** `cycle.day_type(d)` maps to three kinds: `msp_work` → **work**; `travel` → **travel**; everything else (`msp_home`, `wi`, and leave-week override days) → **off**. Leave days are off days (Ryan).
+- **Source resolution, in order, for day `d`:**
+  1. **A dated `meal planning` row** in Notion whose `date` is `d` — Ryan picked the menu. Wins on any day kind. This is how an off day gets a menu without Artemis inventing one.
+  2. **The kind's default row:** `default day — work day` (exists), `default day — travel day` (to be created by Ryan: bowls, wraps, smoothies — nothing that needs a spoon while driving). A kind whose default row doesn't exist records `no_plan` and pre-fills nothing.
+  3. **Off days have no default.** Unpicked, the day records `off_day_unplanned` and stays empty — honest, not guessed. Logging fills it.
+- **Free-text meal logging.** `for breakfast I had an asiago bagel, 2 eggs, 1 slice of cheese, and turkey sandwich with a fruit bowl that had 3 oz of strawberry and 6 ounces of green grapes`, or `making <recipe> for dinner`. Routed deterministically (a slot word + `had` / `ate` / `making` / `having`), never by the LLM classifier. The message is split into items with a quantity and unit; each item resolves through the existing source order (saved foods → USDA → Open Food Facts). **Macros are never estimated by a model.** An item with no match is listed back as a question, and the rest are stored.
+- **Units.** A weight (`oz`, `g`, `lb`) scales a per-100 g source; a count (`2 eggs`, `1 slice`) needs a saved-food portion. A count against a source with no portion is a question, not a guess. *(Found while speccing: `lookup_usda` returns the search API's per-100 g values and `lookup_off` returns per-serving values when the product has them and per-100 g otherwise, and `apply_deviation` treats either as one portion — `+ banana` via USDA stores 100 g of banana. Fixed with the unit work.)*
+- **The reply:** what was stored (per item, flagged `estimated`/`matched` where not a saved food), the day's running totals (kcal, protein, fiber), **remaining against the open `nutrition.target`**, and one or two suggestions for the next slot. With no target set, it says so and gives totals only — **Artemis never sets a target** (040).
+- **Suggestions come only from the recipe DB** (`nutrition.food`, kind `recipe`): fit to remaining kcal, ranked by protein and fiber density, **excluding anything eaten in the last 3 days** so off days don't repeat robotically, and filtered to travel-suitable recipes on travel days once recipes carry a tag. No recipe fits ⇒ no suggestion, never an invented meal.
+- **Unchanged:** the 00:15 pre-fill stays silent; `fix` and the 48 h window stay; the morning check-in line is unchanged.
+
+---
 
 **SCHEDULE-2 — reschedule the lifting days for the cycle — DONE 2026-09-19 (#119, #121, #122).** Decided, built, reseeded and verified in RDS; the Z2 days later gained the 5 min Stretch Trainer cooldown. History follows. **Was urgent:** with the anchor confirmed, **Fri 2026-09-25 is Richfield** and **Mon 2026-09-28 is a travel day**, and both are seeded with office-equipment strength sessions (B, 7 exercises; C, 6). That's 6 and 9 days out. The plan is Wed A / Fri B / Mon C, but under CYCLE-1 Friday is a `wi` day and Monday is `travel` or Richfield, so two of three lifting days fall outside the office gym. **Tue/Wed/Thu are the only days that are office days in both weeks.** Decide the lifting days first: it shrinks LOCATION-1, because the substitution table then only has to cover what's genuinely needed (mostly the WI days' flows and cardio) instead of every office strength exercise. The conflict repeats every cycle: per 14 days, the `wi` Friday and the `travel` Monday collide with 2 of the 6 lifting sessions. **DECIDED 2026-09-19 and built (#119):** lift on the 1st, 3rd and 4th office day of each cycle week — wk 1 Mon/Wed/Thu, wk 2 Tue/Thu/Fri — as A, B, C. Z2 takes the office non-lift days; Recovery Flows take the `wi` days (mat travels); walks cover Brown Deer and the travel Monday. Program weeks moved to Sun–Sat and the program now ends Sat 10/31. The B/C back-to-back pair each week is **accepted and intentional**.
 - ~~**Known gap — wake times are not yet cycle-aware.**~~ **Closed 2026-09-19 by CYCLE-1 (#123):** the wake, nudge, open, brief and quiet jobs are location-derived, so Fri 9/25 wakes at Richfield's 06:00.
