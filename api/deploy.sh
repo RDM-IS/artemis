@@ -45,7 +45,12 @@ cd package && zip -r ../function.zip . -x "*.pyc" -x "*/__pycache__/*" > /dev/nu
 cd ..
 zip -r function.zip app/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 zip -r function.zip ../migrations/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
-zip -r function.zip ../tests/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+# PACKAGE-IDENTITY (2026-09-26): tests/ is NOT shipped. It was here only because
+# /admin/run-tests shelled out to /var/task/tests/test_phase1_schema.py; that
+# probe is api/app/schema_check.py now and the endpoint imports it. Shipping
+# tests/ meant a test-only commit moved the package hash, so DRIFT-ALARM
+# reported drift for a change that cannot affect runtime — 8 of the last 13
+# hashed-path commits were exactly that. An alarm that cries wolf gets ignored.
 zip -r function.zip ../knowledge/ -x "*.pyc" -x "*/__pycache__/*" > /dev/null
 
 export PATH="$PATH:/usr/local/bin:$HOME/.local/bin"
@@ -69,7 +74,7 @@ DEPLOYED_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
 DEPLOYED_PKG="$(bash "$REPO/scripts/package_hash.sh" HEAD)"
 # A dirty tree ships files that are in no commit, so the hash would be a lie.
 # Say so in the Description instead: the alarm then reports drift, correctly.
-if [ -n "$(git -C "$REPO" status --porcelain -- api knowledge migrations tests)" ]; then
+if [ -n "$(git -C "$REPO" status --porcelain -- api knowledge migrations)" ]; then
   DEPLOYED_PKG="${DEPLOYED_PKG}+dirty"
   echo "[deploy] WARNING: shipped paths have uncommitted changes — recording pkg=$DEPLOYED_PKG"
 fi
