@@ -26,6 +26,8 @@ import json
 import logging
 from datetime import date, time, timedelta
 
+from knowledge import warmup as _prep
+
 logger = logging.getLogger(__name__)
 
 LOCATION = "office gym"
@@ -89,9 +91,13 @@ FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
 FORBIDDEN_TOKENS = ("rower", "bike on trainer", "road bike", "indoor trainer",
                     "powerblock", "trx", "walking pad")
 
-WARMUP = "5 min elliptical, easy"
-COOLDOWN = "5 min Stretch Trainer"
-COOLDOWN_MIN = 5
+# LOCATION-1 (2026-09-26): warmup and cooldown resolve PER LOCATION from
+# knowledge/warmup.py. These three stay as the OFFICE values, read from that
+# config rather than duplicated here, because a lot of call sites and tests name
+# them. A location with no entry gets the explicit unknown state, never these.
+WARMUP = _prep.OFFICE["warmup"]
+COOLDOWN = _prep.OFFICE["cooldown"]
+COOLDOWN_MIN = _prep.OFFICE["cooldown_min"]
 Z2_NOTES = "treadmill incline walk, elliptical, recumbent, or upright bike — conversational pace"
 MACHINE_NOTE = "log seat + pin setting"
 
@@ -432,17 +438,23 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
         "display_name": _DISPLAY[session_type],
         "location": location,
         "rounds": sets,
-        "warmup": WARMUP,
-        "cooldown": COOLDOWN,
         "rest_between_rounds_sec": 90,
         "equipment": (list(SESSION_EQUIPMENT[session_type]) if location_key == "office"
                       else list(LOCATION_EQUIPMENT.get(location_key, []))),
         "exercises": exercises,
         "setup_notes": setup,
     }
+    # LOCATION-1 (2026-09-26): the warmup and cooldown come from THIS location's
+    # config. Absent means absent — the keys are omitted and `prep_unknown` is set,
+    # so nothing renders another gym's equipment as this session's warmup.
+    _apply_prep(blocks, location_key, location)
     if subs:
         blocks["substituted_from"] = "office"
         blocks["substitutions"] = [{"from": k, "to": v[0]} for k, v in subs.items()]
+    # The leading 10 is ALREADY the warmup + cooldown allowance for a strength
+    # session, so cooldown_min is deliberately NOT added here — doing so pushed
+    # every office lift from ~55 to ~60 and tripped the TIME-CAP reject. Only the
+    # Z2 estimate adds it, because that one counts work minutes alone.
     minutes = 10 + round(sets * len(exercises) * 2.5)
     if session_type == "strength_c" and week_num in (5, 6):
         blocks["finisher"] = {
@@ -493,14 +505,14 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
         # location's equipment. The session still exists and says why.
         blocks["setup_notes"] = [cardio_cfg.describe(resolved)]
         blocks["no_equipment"] = True
-    if office:
-        # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that
-        # the flows travel. Same cooldown the strength days use.
-        blocks["cooldown"] = COOLDOWN
-        blocks["equipment"].append(EQ_STRETCH)
+    # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that the
+    # flows travel. Same cooldown the strength days use — and, since 2026-09-26,
+    # the same per-location resolution: it appears because the OFFICE config has
+    # a cooldown, not because the code says "if office".
+    _apply_prep(blocks, location_key, location, warmup=False, add_equipment=True)
     if lo != hi:
         blocks["target_range_min"] = [lo, hi]
-    est = hi + (COOLDOWN_MIN if office else 0)
+    est = hi + _prep.cooldown_min(location_key)
     return blocks, 4.0, 2, est
 
 
@@ -850,6 +862,37 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
     return _rest(week_num)
 
 
+def _apply_prep(blocks: dict, location_key: str, location: str,
+                *, warmup: bool = True, add_equipment: bool = False) -> None:
+    """Put this LOCATION's warmup and cooldown on a row, or the explicit unknown
+    state when it has none (LOCATION-1, 2026-09-26).
+
+    Never falls back to the office. A missing key is the signal every consumer
+    reads: gym-display renders "not configured" the way it does for a row with no
+    `load_config`, rather than telling Ryan to use an elliptical that is not in
+    the room. `prep_unknown` makes it positive rather than merely absent, so a
+    validator and a screen can both see it without inferring from a missing key.
+    """
+    if not _prep.is_known(location_key):
+        blocks["prep_unknown"] = True
+        note = _prep.unknown_note(location_key, location)
+        blocks.setdefault("setup_notes", []).append(note)
+        return
+    if warmup and _prep.warmup_for(location_key):
+        blocks["warmup"] = _prep.warmup_for(location_key)
+    cool = _prep.cooldown_for(location_key)
+    if cool:
+        blocks["cooldown"] = cool
+        # Only Z2 lists the cooldown's equipment, which is what it did before this
+        # refactor: SESSION_EQUIPMENT already fixes a strength row's list, and
+        # appending here would change every existing office lift and show up as a
+        # reseed diff for no reason.
+        if add_equipment:
+            eq = _prep.cooldown_equipment(location_key)
+            if eq and eq not in blocks.get("equipment", []):
+                blocks.setdefault("equipment", []).append(eq)
+
+
 def _rest_day():
     """EVENING-1: a planned rest morning. A REAL row — "no plan" and "rest
     today" are different facts, and only one of them is a data problem."""
@@ -1092,8 +1135,16 @@ def validate_rows(rows: list[dict]) -> list[str]:
                  f"substitution table — the row is knowingly wrong")
             notes.append(n)
             logger.warning("LOCATION-1: %s", n)
+        if b.get("prep_unknown"):
+            n = (f"{r['plan_date']}: {r['session_type']} at {key} has NO configured "
+                 f"warmup or cooldown — the row says so rather than guessing")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
+        # Belt and braces: after 2026-09-26 the office strings can only reach a
+        # non-office row through a hand-edit or a stale row, so if one shows up it
+        # is a real defect and not an unconfigured location.
         if key != "office" and (b.get("warmup") == WARMUP or b.get("cooldown") == COOLDOWN):
-            n = (f"{r['plan_date']}: {r['session_type']} at {key} still carries the OFFICE "
+            n = (f"{r['plan_date']}: {r['session_type']} at {key} carries the OFFICE "
                  f"warmup/cooldown ({WARMUP!r} / {COOLDOWN!r}) — neither exists there")
             notes.append(n)
             logger.warning("LOCATION-1: %s", n)
