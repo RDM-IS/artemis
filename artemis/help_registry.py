@@ -64,12 +64,16 @@ COMMANDS: list[Command] = [
     Command("vault", "proposals [expired]", "List pending (or expired) proposals", "proposals"),
     Command("vault", "approve <n> / approve all / reject <n>", "Adjudicate a live digest", "approve 1-3"),
 
-    # ── health / training ── (handlers: health_conversation, nutrition, capture_propose, grocery_staples)
-    Command("health", "<morning check-in>", "Log morning state", "slept 6.5 energy 3"),
+    # ── health / training ── (handlers: health_conversation, meal_log, nutrition, capture_propose, grocery_staples)
+    Command("health", "<morning check-in>", "Log energy and soreness / pain by area", "energy 3 knee pain 2"),
     Command("health", "what's my plan today", "Show the training plan for a day", "what's my plan today"),
     Command("health", "done", "End the active workout session", "done"),
     Command("health", "fix <exercise> rpe <n>", "Correct a logged set", "fix squat rpe 8"),
-    Command("health", "log <n> cal / set target …", "Log nutrition / set a target", "log 500 cal"),
+    Command("health", "for <meal> I had …", "Log a meal; get totals, what's left and what fits",
+            "for lunch I had 2 eggs, 3 oz strawberries"),
+    Command("health", "making <recipe> for <meal>", "Log a planned meal from your recipes", "making chicken bowl for dinner"),
+    Command("health", "what's left", "Today's totals and remaining vs target", "what's left"),
+    Command("health", "set target …", "Set a nutrition target (confirmed)", "new target 2000 cal, 190 protein, 40 fiber"),
     Command("health", "build grocery list", "Propose the week's staples from the meal plan", "build grocery list"),
 
     # ── rules ── (handler: rule_command)

@@ -4138,6 +4138,43 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
     return True
 
 
+def _handle_meal_log(post: dict, question: str) -> bool:
+    """NUTRITION-2 — free-text meal logging and "what's left", into nutrition.*.
+
+    Deterministic gate (`meal_log.parse_meal_log` / `is_status_request`); no
+    LLM classifier and no model-estimated macros. Ahead of the legacy
+    `_handle_nutrition`, whose "i had" path wrote LLM-estimated rows to the
+    retired health.* tables. A DB failure after the gate matched is claimed
+    and reported, never passed on to that legacy path.
+    """
+    from artemis import meal_log
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+
+    status = meal_log.is_status_request(question)
+    if not status and meal_log.parse_meal_log(question) is None:
+        return False
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    today = local_today()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            reply = (meal_log.status_reply(cur, today) if status
+                     else meal_log.handle(cur, question, today))
+    except Exception:
+        # The text already passed the deterministic gate, so it IS a meal log:
+        # claim it and say nothing was stored. Falling through would hand it to
+        # the legacy handler, which LLM-estimates macros into health.*.
+        logger.exception("meal_log failed on post %s", post.get("id"))
+        reply = "⚠️ Couldn't log that meal — nothing was stored. Try again in a minute."
+    if reply is None:
+        return False
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_nutrition(post: dict, question: str) -> bool:
     """PB-009 nutrition: set target (propose-then-confirm), log intake
     (append-only), or budget status. Runs before _try_life_ops so the dynamic
@@ -4238,6 +4275,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
         # resolved). After morning_flow so a check-in in the thread is a check-in.
         ("pattern_thread", _handle_pattern_thread),
+        # NUTRITION-2: meal logs and "what's left" into nutrition.*, AHEAD of the
+        # legacy handler (its log/status paths read and wrote health.*).
+        ("meal_log", _handle_meal_log),
         ("nutrition", _handle_nutrition),
         ("health_conversation", _handle_health_conversation),
         ("capture_propose", _handle_capture_propose),

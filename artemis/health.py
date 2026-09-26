@@ -3395,6 +3395,24 @@ def insert_nutrition_target_tx(target: NutritionTarget) -> int:
                  target.fat_g, target.fiber_g, target.set_by, target.notes),
             )
             new_id = cur.fetchone()[0]
+            # NUTRITION-2: nutrition.target (040) is what logging and "what's
+            # left" read. The health.* write above stays only because the
+            # grocery-staples generator (life_ops) still reads it; both retire
+            # together in the coverage-checked health.* retirement. Same
+            # transaction, so the two can never disagree.
+            cur.execute(
+                "UPDATE nutrition.target "
+                "SET effective_to = (%s::date - INTERVAL '1 day')::date "
+                "WHERE effective_to IS NULL",
+                (eff_from,),
+            )
+            cur.execute(
+                "INSERT INTO nutrition.target "
+                "(effective_from, kcal, protein_g, carb_g, fat_g, fiber_g, set_by, notes) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (eff_from, target.kcal, target.protein_g, target.carb_g,
+                 target.fat_g, target.fiber_g, target.set_by, target.notes),
+            )
             for m in target.meals:
                 cur.execute(
                     "INSERT INTO health.meal "

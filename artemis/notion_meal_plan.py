@@ -36,6 +36,10 @@ INGREDIENTS_DB = "4bdd6a3a-c4e7-4cb6-9e5c-2d101e93ed11"
 
 # The undated row the 00:15 pre-fill reads on msp_work days.
 DEFAULT_DAY_NAME = "default day — work day"
+# NUTRITION-2: the undated row for travel days — prepped, drive-friendly food
+# (bowls, wraps, smoothies). Created by Ryan; until it exists a travel day
+# records `no_plan` and pre-fills nothing.
+TRAVEL_DAY_NAME = "default day — travel day"
 
 SLOTS = ("breakfast", "lunch", "dinner", "snacks")
 
@@ -232,8 +236,34 @@ def fetch_default_day(name: str = DEFAULT_DAY_NAME) -> DefaultDay:
     if len(rows) > 1:
         # Ambiguity is a data problem, not something to resolve by guessing.
         raise LookupError(f"{len(rows)} meal-planning rows named {name!r}")
+    return _resolve_day(rows[0], name, token)
 
+
+def fetch_dated_day(d) -> DefaultDay | None:
+    """NUTRITION-2: the `meal planning` row whose `date` is `d` — the menu Ryan
+    picked for that day in Notion. None when there is no such row.
+
+    Raises NotionUnavailable like every read here, and LookupError when two
+    rows share the date (ambiguity is a data problem, never resolved by
+    picking one).
+    """
+    token = _token()
+    result = _post(f"/databases/{MEAL_PLANNING_DB}/query", token, {
+        "filter": {"property": "date", "date": {"equals": d.isoformat()}},
+        "page_size": 2,
+    })
+    rows = result.get("results") or []
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise LookupError(f"{len(rows)} meal-planning rows dated {d.isoformat()}")
     row = rows[0]
+    name = _plain_title((row.get("properties") or {}).get("name")) or d.isoformat()
+    return _resolve_day(row, name, token)
+
+
+def _resolve_day(row: dict, name: str, token: str) -> DefaultDay:
+    """One `meal planning` row -> its slots resolved to recipe rows."""
     props = row.get("properties") or {}
     day = DefaultDay(page_id=row.get("id", ""), name=name)
 
