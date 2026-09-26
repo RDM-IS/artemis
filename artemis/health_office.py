@@ -280,9 +280,19 @@ DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
 
 
 def day_location_key(d: date, slot: str = "morning") -> str:
-    """The location KEY (`office`, `richfield`, …) a row belongs to."""
-    return (_cycle.anchor_location(d, use_overrides=False) if slot == "morning"
-            else _cycle.location_at(d, EVENING_AT, use_overrides=False))
+    """The location KEY (`office`, `richfield`, …) a row belongs to.
+
+    OVERRIDE-AWARE (2026-09-26). This resolved on the base pattern, which made a
+    full reseed silently revert every override: the leave week was rebuilt to
+    Richfield and Brown Deer, and `build_rows()` would have put it back to
+    office/msp_home without a word. The seeder now resolves the same way the
+    scheduler, the wake post and the plan API do. The one thing that must NOT
+    follow an override is which SESSION a day gets — `session_for()` reads the
+    positional `DAY_TYPES` table, so the program shape is fixed and only the
+    location moves.
+    """
+    return (_cycle.anchor_location(d) if slot == "morning"
+            else _cycle.location_at(d, EVENING_AT))
 
 
 def day_location(d: date, slot: str = "morning") -> str:
@@ -299,12 +309,20 @@ def day_location(d: date, slot: str = "morning") -> str:
 
 def evening_is_possible(d: date) -> bool:
     """False when he is on the road: no session is ever placed in a transit
-    segment — it is reported, never relocated (CYCLE-1)."""
-    return not _cycle.is_transit(_cycle.location_at(d, EVENING_AT, use_overrides=False))
+    segment — it is reported, never relocated (CYCLE-1).
+
+    Override-aware for the same reason as `day_location_key`: an override that
+    says he is at the farm all day means he is NOT in a transit segment that
+    evening, and the base pattern is not entitled to a vote on that."""
+    return not _cycle.is_transit(_cycle.location_at(d, EVENING_AT))
 
 
 def is_office_day(d: date) -> bool:
-    return day_type(d, use_overrides=False) == "msp_work"
+    """Override-aware, like every other day-type question. UNUSED as of
+    2026-09-26 — `wake.py` has its own `_is_office_day(plan)` that reads the
+    plan row. Kept override-aware rather than left on the base pattern so it
+    cannot become the next silent reverter if something starts calling it."""
+    return day_type(d) == "msp_work"
 
 
 # SCHEDULE-2: lift on the 1st, 3rd and 4th OFFICE day of each cycle week —
@@ -1003,11 +1021,17 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow", "rest"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
         # SCHEDULE-2: a strength session only ever lands on an office day.
+        #
+        # POSITIONAL FRAME (2026-09-26). `session_for()` picks the session from
+        # the positional `DAY_TYPES` table, so WHICH session a date gets is fixed
+        # program shape; an override relocates the day, it does not re-choose the
+        # session. Asserting against the override-resolved `day_type` compared
+        # two different frames and rejected the leave week outright — 9/29 is a
+        # `wi` day carrying the positionally-correct strength_a.
         if r["session_type"].startswith("strength"):
-            assert b.get("day_type") == "msp_work", \
-                f"{r['plan_date']}: {r['session_type']} on a {b.get('day_type')} day"
-            assert b.get("location") == LOCATION
-            assert b.get("warmup") == WARMUP and b.get("cooldown") == COOLDOWN
+            base_type = _cycle.DAY_TYPES[cycle_pos(r["plan_date"])]
+            assert base_type == "msp_work", \
+                f"{r['plan_date']}: {r['session_type']} on a positional {base_type} day"
             assert b["exercises"] and all("name" in e and "format" in e for e in b["exercises"])
             # EXERCISE-CLASS: the class travels on the row, always.
             for e in b["exercises"]:
@@ -1041,11 +1065,11 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
         assert r["session_type"] != "walk", \
             f"{r['plan_date']}: walks are activity, never planned sessions"
-        # CYCLE-1: no session is ever placed in a transit segment. A seeded row
-        # carries the day's anchor, which is never transit, so this can only
-        # fire if the anchor table gains one.
-        assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"],
-                                                            use_overrides=False)), \
+        # CYCLE-1: no session is ever placed in a transit segment. Resolved WITH
+        # overrides, because nothing constrains an override's `location` to a
+        # non-transit one — the table's CHECK covers `day_type` only. On the base
+        # pattern this can still only fire if DAY_LOCATIONS gains a transit entry.
+        assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"])), \
             f"{r['plan_date']}: a session cannot be placed on the road"
         want = day_location(r["plan_date"], r.get("slot", "morning"))
         got = r["blocks"].get("location")
@@ -1054,6 +1078,25 @@ def validate_rows(rows: list[dict]) -> list[str]:
     assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)
     for n in notes:
         logger.warning("TIME-CAP: %s", n)
+
+    # LOCATION-1 findings. These are REPORTED, not asserted: a strength session
+    # at a location with no substitution table is exactly the state Ryan chose
+    # to keep during the leave ("knowingly wrong beats silently rebuilt"), and a
+    # validator that crashed on it would make a reseed impossible — which is how
+    # the seeder came to ignore overrides in the first place. Silence is the one
+    # thing that is not allowed.
+    for r in rows:
+        b, key = r["blocks"], r["blocks"].get("location_key", "office")
+        if r["session_type"].startswith("strength") and not can_hold(key, r["session_type"]):
+            n = (f"{r['plan_date']}: {r['session_type']} is at {key}, which has no "
+                 f"substitution table — the row is knowingly wrong")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
+        if key != "office" and (b.get("warmup") == WARMUP or b.get("cooldown") == COOLDOWN):
+            n = (f"{r['plan_date']}: {r['session_type']} at {key} still carries the OFFICE "
+                 f"warmup/cooldown ({WARMUP!r} / {COOLDOWN!r}) — neither exists there")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
     return notes
 
 

@@ -37,10 +37,13 @@ Rows deliberately NOT rebuilt:
                         sleeps in Minneapolis. Its current `home` is the
                         CORRECT sleep location, so touching it would break it.
 
-Note for whoever reseeds next: health_office.day_location_key() resolves with
-`use_overrides=False` — the seeder builds the BASE pattern. A full reseed of
-this window therefore reverts these rows. That is the open CYCLE-OVERRIDE-SOURCE
-question; until it is settled, do not reseed 9/26..10/04.
+Reseeding, as of OVERRIDE-DURABILITY (2026-09-26): the seeder resolves WITH
+overrides now, so a full reseed no longer reverts this window — all eleven
+rebuilt rows come back byte-identical (proved against a TEMP-table reseed).
+A reseed is still not a no-op for the three HELD rows: it would move 9/29 to
+Richfield and 10/01 to Brown Deer (flagged knowingly-wrong, no substitution
+table) and would break 10/04's evening by moving it to Richfield, which is the
+open WAKE-SLEEP defect. Reseed the window only if you are prepared for those.
 
 Usage:
     python3.11 scripts/apply_leave_week.py [--commit]
@@ -282,6 +285,30 @@ def main() -> int:
             print("MISMATCH — a row outside the pinned set changed. "
                   "Rolled back; the overrides stand, no plan row was rebuilt.")
             return 1
+
+        # The md5 proves NO COLLATERAL DAMAGE and nothing else: it hashes the rows
+        # OUTSIDE the pinned set, so it cannot see whether the rebuilt rows are
+        # right. The first leave-week run reported an identical hash either side
+        # and eleven wrong rows in the same breath. So re-read the pinned rows and
+        # assert each one against what was ASKED FOR, not against what was built.
+        cur.execute("""
+            SELECT plan_id, plan_date, coalesce(slot,'morning'), blocks->>'location_key'
+            FROM health.plan WHERE plan_id = ANY(%s)
+        """, (target_ids,))
+        bad = []
+        for pid, d, slot, got in cur.fetchall():
+            want_key = WANT[d][0] if slot == "morning" else (
+                cycle.location_at(d, office.EVENING_AT))
+            if got != want_key:
+                bad.append(f"{d} {slot}: location_key {got!r}, asked for {want_key!r}")
+        if bad:
+            conn.rollback()
+            print("REBUILD WRONG — rolled back; the overrides stand, no row rebuilt:")
+            for b in bad:
+                print("    " + b)
+            return 1
+        print(f"  verified: all {len(target_ids)} rebuilt rows carry the "
+              "location that was asked for")
 
         cur.execute("""
             INSERT INTO acos.audit_log (agent, persona, action, domain, confidence,

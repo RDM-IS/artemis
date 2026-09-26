@@ -37,6 +37,11 @@ os.environ.setdefault("RDS_DB", "test-db")
 from artemis import config, quiet_hours  # noqa: E402
 
 _MIG_019 = (_REPO_ROOT / "migrations" / "019_quiet_hours_state.sql").read_text()
+#: FAIL-CLOSED-RESOLVERS (2026-09-26): quiet_hours reaches cycle.wake_on(), which
+#: reads `acos.cycle_day_overrides` and now RAISES if it cannot. The live fixture
+#: therefore has to apply 035 as well — the table's absence used to be swallowed
+#: into "no override", so these tests passed against a schema they only half had.
+_MIG_035 = (_REPO_ROOT / "migrations" / "035_cycle_day_overrides.sql").read_text()
 
 
 # ============================================================================
@@ -218,6 +223,7 @@ def setUpModule():
         with conn.cursor() as cur:
             cur.execute("CREATE SCHEMA IF NOT EXISTS acos")
             cur.execute(_MIG_019)
+            cur.execute(_MIG_035)
         conn.close()
         _LIVE = True
     except Exception as e:
