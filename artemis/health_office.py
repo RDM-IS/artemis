@@ -26,6 +26,8 @@ import json
 import logging
 from datetime import date, time, timedelta
 
+from knowledge import warmup as _prep
+
 logger = logging.getLogger(__name__)
 
 LOCATION = "office gym"
@@ -89,9 +91,13 @@ FIRST_LIFT = {"strength_a": "Leg press", "strength_b": "DB goblet squat",
 FORBIDDEN_TOKENS = ("rower", "bike on trainer", "road bike", "indoor trainer",
                     "powerblock", "trx", "walking pad")
 
-WARMUP = "5 min elliptical, easy"
-COOLDOWN = "5 min Stretch Trainer"
-COOLDOWN_MIN = 5
+# LOCATION-1 (2026-09-26): warmup and cooldown resolve PER LOCATION from
+# knowledge/warmup.py. These three stay as the OFFICE values, read from that
+# config rather than duplicated here, because a lot of call sites and tests name
+# them. A location with no entry gets the explicit unknown state, never these.
+WARMUP = _prep.OFFICE["warmup"]
+COOLDOWN = _prep.OFFICE["cooldown"]
+COOLDOWN_MIN = _prep.OFFICE["cooldown_min"]
 Z2_NOTES = "treadmill incline walk, elliptical, recumbent, or upright bike — conversational pace"
 MACHINE_NOTE = "log seat + pin setting"
 
@@ -124,9 +130,134 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
     ],
 }
 
-# Explicit blocks.exercises[].equipment_class for names the keyword rules
-# once read differently ("back extension" used to mean bodyweight).
-EQUIPMENT_CLASS = {"Seated back extension": "machine"}
+# ── The equipment class of every exercise, explicitly ───────────────────────
+#
+# EXERCISE-CLASS (Ryan, 2026-09-23): the class travels ON THE ROW for every
+# exercise, not just for the handful the keyword rules once misread. Inference
+# from the NAME stays only as a fallback for rows seeded before this.
+#
+# Why: the rules were written for the office and misread any other gym's
+# vocabulary — "TRX row" read as `machine` (a 10 lb stack step for a strap),
+# and both band exercises as `dumbbell`. Measured against the nine home-gym
+# exercises in RDS, five of nine were wrong. LOCATION-1 makes that
+# vocabulary real, so the guessing has to stop first.
+#
+# Every name this generator can emit, and every name already in RDS, is here.
+# `class_for` raises on anything unknown: a new exercise without a class is a
+# build error, not a silent `dumbbell`.
+EQUIPMENT_CLASS: dict[str, str] = {
+    # office — machines
+    "Leg press": "machine",
+    "Lat pulldown": "machine",
+    "Seated leg curl": "machine",
+    "Leg extension": "machine",
+    "Pec fly": "machine",
+    "Rear delt fly": "machine",
+    "Calf press": "machine",
+    "Ab machine crunch": "machine",
+    "Seated back extension": "machine",
+    # the Pulldown/Seated Row machine, despite "cable" in the name
+    "Seated cable row": "machine",
+    # office — functional trainer
+    "Cable face pull (rope)": "cable",
+    "Cable Pallof press": "cable",
+    "Single-arm cable row": "cable",
+    # office — dumbbells
+    "DB bench press": "dumbbell",
+    "Incline DB press": "dumbbell",
+    "DB goblet squat": "dumbbell",
+    "DB Romanian deadlift": "dumbbell",
+    "Seated DB shoulder press": "dumbbell",
+    # bodyweight
+    "Captain's chair knee raise": "bodyweight",
+    # ── pre-office history (the home-gym baseline, 5/06-9/15). Kept so the
+    # backfill can class every row in RDS, not only the current program.
+    "Band chest press": "bands",
+    "Band pull-apart": "bands",
+    "TRX row": "trx",
+    "TRX single-leg DL": "trx",
+    "DB floor press": "dumbbell",
+    "DB RDL": "dumbbell",
+    "Goblet squat": "dumbbell",
+    "Bicep curl": "dumbbell",
+    "Reverse lunge": "bodyweight",
+    # core / finisher work, office and home: no load of its own
+    "Plank": "bodyweight",
+    "Side plank": "bodyweight",
+    "Hollow hold": "bodyweight",
+    "Dead bug": "bodyweight",
+    "Bird dog": "bodyweight",
+    "Ball plank": "bodyweight",
+    "TRX fallout": "trx",
+    # the home-gym Pallof was a band; the office one is "Cable Pallof press"
+    "Pallof press": "bands",
+    # a legacy interval block, not a lift: duration work with no load. `cardio`
+    # is a no-numeric-load class like bands and trx.
+    "Stepmill or upright bike": "cardio",
+    # LOCATION-1 — Richfield (the farm)
+    "DB fly": "dumbbell",
+    "1-arm DB row": "dumbbell",
+    "Standing DB calf raise": "dumbbell",
+    "Stability-ball crunch": "bodyweight",
+}
+
+
+# ── LOCATION-1: the same session, at another gym ────────────────────────────
+#
+# Substitution is DETERMINISTIC AND FROM A TABLE, never invented. Resolution
+# order is LOCATION FIRST, THEN PAIN: the location resolver produces the
+# session for that day's inventory, and the pain ladder then applies to the
+# RESOLVED session (so a pain removal removes the substitute, and its own
+# replacement also comes from that location's pool).
+#
+# Richfield Strength C, approved by Ryan 2026-09-23. Three of the six are
+# native there; these are the three that are not, plus the ab machine.
+# (name at the office) -> (name at Richfield, rep-range label, top reps)
+RICHFIELD_SUBS: dict[str, tuple[str, str, int]] = {
+    "Pec fly": ("DB fly", "10-12", 12),
+    "Single-arm cable row": ("1-arm DB row", "10-12", 12),
+    "Calf press": ("Standing DB calf raise", "12-15", 15),
+    "Ab machine crunch": ("Stability-ball crunch", "10-12", 12),
+}
+
+#: What the gym is called on the row, per location. The office keeps its
+#: per-session equipment list; anywhere else names what the session uses.
+LOCATION_EQUIPMENT: dict[str, list[str]] = {
+    "richfield": ["PowerBlocks (to 80 lb)", "flat bench", "stability ball"],
+}
+
+#: Which office session each location can hold, and how.
+LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int]]]] = {
+    "richfield": {"strength_c": RICHFIELD_SUBS},
+}
+
+
+def subs_for(location_key: str, session_type: str) -> dict[str, tuple[str, str, int]]:
+    """The substitution table for a session at a location. Empty means the
+    session runs as written (the office), or that this location has no table
+    for it — `can_hold` is what decides whether it may be seeded at all."""
+    return LOCATION_SUBS.get(location_key, {}).get(session_type, {})
+
+
+def can_hold(location_key: str, session_type: str) -> bool:
+    """Whether a location can hold a session: the office holds everything it
+    was written for; anywhere else needs a table. Brown Deer and MSP home have
+    NO recorded inventory, so they hold nothing until Ryan supplies one."""
+    if location_key == "office":
+        return True
+    return bool(subs_for(location_key, session_type))
+
+
+def class_for(name: str) -> str:
+    """The exercise's equipment class. Raises on an unknown name — a new
+    exercise without a class is a build error, never a silent `dumbbell`."""
+    try:
+        return EQUIPMENT_CLASS[name]
+    except KeyError:
+        raise KeyError(
+            f"{name!r} has no equipment_class. Add it to health_office."
+            "EQUIPMENT_CLASS — guessing from the name is what LOCATION-1 removes."
+        ) from None
 
 _DISPLAY = {
     "strength_a": "Office Strength A",
@@ -148,9 +279,26 @@ from artemis.cycle import (  # noqa: E402
     day_type,
 )
 from artemis import cycle as _cycle  # noqa: E402
+from knowledge import load_config as _load_config  # noqa: E402
 
 CYCLE_ANCHOR = _cycle.DEFAULT_ANCHOR
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
+
+
+def day_location_key(d: date, slot: str = "morning") -> str:
+    """The location KEY (`office`, `richfield`, …) a row belongs to.
+
+    OVERRIDE-AWARE (2026-09-26). This resolved on the base pattern, which made a
+    full reseed silently revert every override: the leave week was rebuilt to
+    Richfield and Brown Deer, and `build_rows()` would have put it back to
+    office/msp_home without a word. The seeder now resolves the same way the
+    scheduler, the wake post and the plan API do. The one thing that must NOT
+    follow an override is which SESSION a day gets — `session_for()` reads the
+    positional `DAY_TYPES` table, so the program shape is fixed and only the
+    location moves.
+    """
+    return (_cycle.anchor_location(d) if slot == "morning"
+            else _cycle.location_at(d, EVENING_AT))
 
 
 def day_location(d: date, slot: str = "morning") -> str:
@@ -161,19 +309,26 @@ def day_location(d: date, slot: str = "morning") -> str:
 
     The EVENING is where he is when the evening session happens (EVENING-1),
     which on a work day is home, not the office gym."""
-    key = (_cycle.anchor_location(d, use_overrides=False) if slot == "morning"
-           else _cycle.location_at(d, EVENING_AT, use_overrides=False))
+    key = day_location_key(d, slot)
     return (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
 
 
 def evening_is_possible(d: date) -> bool:
     """False when he is on the road: no session is ever placed in a transit
-    segment — it is reported, never relocated (CYCLE-1)."""
-    return not _cycle.is_transit(_cycle.location_at(d, EVENING_AT, use_overrides=False))
+    segment — it is reported, never relocated (CYCLE-1).
+
+    Override-aware for the same reason as `day_location_key`: an override that
+    says he is at the farm all day means he is NOT in a transit segment that
+    evening, and the base pattern is not entitled to a vote on that."""
+    return not _cycle.is_transit(_cycle.location_at(d, EVENING_AT))
 
 
 def is_office_day(d: date) -> bool:
-    return day_type(d, use_overrides=False) == "msp_work"
+    """Override-aware, like every other day-type question. UNUSED as of
+    2026-09-26 — `wake.py` has its own `_is_office_day(plan)` that reads the
+    plan row. Kept override-aware rather than left on the base pattern so it
+    cannot become the next silent reverter if something starts calling it."""
+    return day_type(d) == "msp_work"
 
 
 # SCHEDULE-2: lift on the 1st, 3rd and 4th OFFICE day of each cycle week —
@@ -250,17 +405,27 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
     if name == "DB goblet squat" and week_num in (5, 6):
         notes.append("alt: Smith squat")
     ex = {"name": name, "format": "reps", "target_reps": top, "rest_after_sec": 60,
-          "notes": "; ".join(notes)}
-    if name in EQUIPMENT_CLASS:
-        ex["equipment_class"] = EQUIPMENT_CLASS[name]
+          "notes": "; ".join(notes), "equipment_class": class_for(name)}
     if week_num <= 2:
         ex["target_load_lbs"] = None  # finding weights
     return ex
 
 
-def _strength(session_type: str, week_num: int, *, wk0: bool = False):
+def _strength(session_type: str, week_num: int, *, wk0: bool = False,
+              location: str = LOCATION, location_key: str = "office"):
     sets, rpe, _ = RAMP[week_num]
-    exercises = [_exercise(*e, sets, week_num, wk0=wk0) for e in _EXERCISES[session_type]]
+    subs = subs_for(location_key, session_type)
+    specs = []
+    for spec in _EXERCISES[session_type]:
+        name, label, top, per_side, machine = spec
+        if name in subs:
+            sub_name, sub_label, sub_top = subs[name]
+            # a substitute is never a machine, and never per-side unless the
+            # table says so by name (1-arm DB row is logged as one load)
+            specs.append((sub_name, sub_label, sub_top, per_side, False))
+        else:
+            specs.append(spec)
+    exercises = [_exercise(*e, sets, week_num, wk0=wk0) for e in specs]
     setup = []
     if week_num <= 2:
         setup.append("Weeks 1-2: finding weights — stop 3-4 reps shy of failure.")
@@ -271,50 +436,83 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False):
     blocks = {
         "type": "circuit",
         "display_name": _DISPLAY[session_type],
-        "location": LOCATION,
+        "location": location,
         "rounds": sets,
-        "warmup": WARMUP,
-        "cooldown": COOLDOWN,
         "rest_between_rounds_sec": 90,
-        "equipment": list(SESSION_EQUIPMENT[session_type]),
+        "equipment": (list(SESSION_EQUIPMENT[session_type]) if location_key == "office"
+                      else list(LOCATION_EQUIPMENT.get(location_key, []))),
         "exercises": exercises,
         "setup_notes": setup,
     }
+    # LOCATION-1 (2026-09-26): the warmup and cooldown come from THIS location's
+    # config. Absent means absent — the keys are omitted and `prep_unknown` is set,
+    # so nothing renders another gym's equipment as this session's warmup.
+    _apply_prep(blocks, location_key, location)
+    if subs:
+        blocks["substituted_from"] = "office"
+        blocks["substitutions"] = [{"from": k, "to": v[0]} for k, v in subs.items()]
+    # The leading 10 is ALREADY the warmup + cooldown allowance for a strength
+    # session, so cooldown_min is deliberately NOT added here — doing so pushed
+    # every office lift from ~55 to ~60 and tripped the TIME-CAP reject. Only the
+    # Z2 estimate adds it, because that one counts work minutes alone.
     minutes = 10 + round(sets * len(exercises) * 2.5)
     if session_type == "strength_c" and week_num in (5, 6):
         blocks["finisher"] = {
             "type": "intervals",
             "display_name": "Conditioning finisher",
             "rounds": 6,
+            # LOCATION-1: the finisher's exercise carries its class like every
+            # other one. Nothing infers a class from a name any more, and the
+            # seeder gate (tests/test_seed_rows.py) found this row unclassed.
             "exercises": [{"name": "Stepmill or upright bike", "format": "duration",
                            "duration_sec": 30, "rest_after_sec": 90,
+                           "equipment_class": class_for("Stepmill or upright bike"),
                            "notes": "30s hard / 90s easy"}],
         }
         minutes += 12
     return blocks, rpe, 3, minutes
 
 
-def _z2(week_num: int, location: str = LOCATION):
+def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
+    """CARDIO-LOC (2026-09-25): the modality comes from the LOCATION'S INVENTORY
+    via `knowledge.cardio`, in the configured preference order.
+
+    This used to be a two-way branch — the office's equipment list, else the
+    literal ["rower", "bike on trainer"] — which is why a Richfield Z2 named a
+    rower that `FORBIDDEN_TOKENS` forbids in an office row. Inventory is config
+    now, so the rower moving to MSP is one line in `knowledge/cardio.py`.
+    """
+    from knowledge import cardio as cardio_cfg
+
     lo, hi = RAMP[week_num][2]
     office = location == LOCATION
+    resolved = cardio_cfg.resolve(location_key)
     blocks = {
         "type": "steady",
         "display_name": _DISPLAY["cardio_z2"],
         "location": location,
+        "location_key": location_key,
         "duration_min": hi,
         "intensity": "Zone 2",
-        "equipment": (list(SESSION_EQUIPMENT["cardio_z2"]) if office
-                      else ["rower", "bike on trainer"]),
-        "setup_notes": [Z2_NOTES],
+        # The resolved modality travels on the row, like load_config does, so
+        # the iPad and the box read one answer instead of deciding separately.
+        "cardio": resolved,
+        "equipment": [cardio_cfg.label_for(d) for _, d in cardio_cfg.available(location_key)],
+        "setup_notes": [Z2_NOTES if office else cardio_cfg.describe(resolved)],
     }
-    if office:
-        # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that
-        # the flows travel. Same cooldown the strength days use.
-        blocks["cooldown"] = COOLDOWN
-        blocks["equipment"].append(EQ_STRETCH)
+    if not resolved.get("modality"):
+        # MSP home: an explicit state, never a silent fall-through to another
+        # location's equipment. The session still exists and says why.
+        blocks["setup_notes"] = [cardio_cfg.describe(resolved)]
+        blocks["no_equipment"] = True
+    # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that the
+    # flows travel. Same cooldown the strength days use — and, since 2026-09-26,
+    # the same per-location resolution: it appears because the OFFICE config has
+    # a cooldown, not because the code says "if office".
+    _apply_prep(blocks, location_key, location, warmup=False, add_equipment=True)
     if lo != hi:
         blocks["target_range_min"] = [lo, hi]
-    est = hi + (COOLDOWN_MIN if office else 0)
+    est = hi + _prep.cooldown_min(location_key)
     return blocks, 4.0, 2, est
 
 
@@ -637,16 +835,62 @@ def _recovery_flow(location: str = LOCATION):
 
 
 def _build(session_type: str, week_num: int, *, wk0: bool = False,
-           location: str | None = None):
+           location: str | None = None, location_key: str = "office"):
+    """Every blocks dict carries its location_key: the pain ladder reads it to
+    filter the substitution pool, and a row without one is an office row (which
+    is what every row seeded before LOCATION-1 is)."""
+    blocks, rpe, zone, est = _build_inner(session_type, week_num, wk0=wk0,
+                                          location=location, location_key=location_key)
+    blocks["location_key"] = location_key
+    cfg = _load_config.for_location(location_key)
+    if cfg:
+        blocks["load_config"] = copy.deepcopy(cfg)
+    return blocks, rpe, zone, est
+
+
+def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
+                 location: str | None = None, location_key: str = "office"):
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
     if session_type.startswith("strength"):
-        return _strength(session_type, week_num, wk0=wk0)
+        return _strength(session_type, week_num, wk0=wk0,
+                         location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
-        return _z2(week_num, location or LOCATION)
+        return _z2(week_num, location or LOCATION, location_key=location_key)
     if session_type == "rest":
         return _rest_day()
     return _rest(week_num)
+
+
+def _apply_prep(blocks: dict, location_key: str, location: str,
+                *, warmup: bool = True, add_equipment: bool = False) -> None:
+    """Put this LOCATION's warmup and cooldown on a row, or the explicit unknown
+    state when it has none (LOCATION-1, 2026-09-26).
+
+    Never falls back to the office. A missing key is the signal every consumer
+    reads: gym-display renders "not configured" the way it does for a row with no
+    `load_config`, rather than telling Ryan to use an elliptical that is not in
+    the room. `prep_unknown` makes it positive rather than merely absent, so a
+    validator and a screen can both see it without inferring from a missing key.
+    """
+    if not _prep.is_known(location_key):
+        blocks["prep_unknown"] = True
+        note = _prep.unknown_note(location_key, location)
+        blocks.setdefault("setup_notes", []).append(note)
+        return
+    if warmup and _prep.warmup_for(location_key):
+        blocks["warmup"] = _prep.warmup_for(location_key)
+    cool = _prep.cooldown_for(location_key)
+    if cool:
+        blocks["cooldown"] = cool
+        # Only Z2 lists the cooldown's equipment, which is what it did before this
+        # refactor: SESSION_EQUIPMENT already fixes a strength row's list, and
+        # appending here would change every existing office lift and show up as a
+        # reseed diff for no reason.
+        if add_equipment:
+            eq = _prep.cooldown_equipment(location_key)
+            if eq and eq not in blocks.get("equipment", []):
+                blocks.setdefault("equipment", []).append(eq)
 
 
 def _rest_day():
@@ -681,12 +925,14 @@ def build_schedule() -> list[dict]:
     while d <= OFFICE_END:
         specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
                       "week_num": week_num_for(d), "location": day_location(d),
-                      "day_type": day_type(d), "wk0": False})
+                      "location_key": day_location_key(d), "day_type": day_type(d),
+                      "wk0": False})
         # EVENING-1: four evenings a week, and never one in a transit segment.
         if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
             specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
                           "week_num": week_num_for(d),
                           "location": day_location(d, "evening"),
+                          "location_key": day_location_key(d, "evening"),
                           "day_type": day_type(d), "wk0": False})
         d += timedelta(days=1)
     return specs
@@ -697,10 +943,19 @@ def build_row(spec: dict) -> dict:
     week_num = spec["week_num"]
     session_type = spec["session_type"]
     location = spec.get("location") or LOCATION
-    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location)
+    blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location,
+                                    location_key=spec.get("location_key", "office"))
     blocks = copy.deepcopy(blocks)
     # CYCLE-1: every row carries where it happens and the day type it came from.
     blocks["location"] = location
+    # LOCATION-1: …and what a load means there. Two consumers must agree —
+    # gym-display's stepper and the box's lighter_load() — so it travels on
+    # the row rather than being a table shipped to the client.
+    key = spec.get("location_key", "office")
+    blocks["location_key"] = key                       # _build sets it too; belt and braces
+    cfg = _load_config.for_location(key)
+    if cfg:
+        blocks["load_config"] = copy.deepcopy(cfg)
     if spec.get("day_type"):
         blocks["day_type"] = spec["day_type"]
     tag = f"{spec.get('day_type', 'office')} wk{week_num}"
@@ -809,12 +1064,22 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow", "rest"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
         # SCHEDULE-2: a strength session only ever lands on an office day.
+        #
+        # POSITIONAL FRAME (2026-09-26). `session_for()` picks the session from
+        # the positional `DAY_TYPES` table, so WHICH session a date gets is fixed
+        # program shape; an override relocates the day, it does not re-choose the
+        # session. Asserting against the override-resolved `day_type` compared
+        # two different frames and rejected the leave week outright — 9/29 is a
+        # `wi` day carrying the positionally-correct strength_a.
         if r["session_type"].startswith("strength"):
-            assert b.get("day_type") == "msp_work", \
-                f"{r['plan_date']}: {r['session_type']} on a {b.get('day_type')} day"
-            assert b.get("location") == LOCATION
-            assert b.get("warmup") == WARMUP and b.get("cooldown") == COOLDOWN
+            base_type = _cycle.DAY_TYPES[cycle_pos(r["plan_date"])]
+            assert base_type == "msp_work", \
+                f"{r['plan_date']}: {r['session_type']} on a positional {base_type} day"
             assert b["exercises"] and all("name" in e and "format" in e for e in b["exercises"])
+            # EXERCISE-CLASS: the class travels on the row, always.
+            for e in b["exercises"]:
+                assert e.get("equipment_class") == class_for(e["name"]), \
+                    f"{r['plan_date']}: {e['name']} carries {e.get('equipment_class')!r}"
         if r["session_type"] == "recovery_flow":
             assert b["type"] == "recovery_flow"
             validate_flow(b)
@@ -843,11 +1108,11 @@ def validate_rows(rows: list[dict]) -> list[str]:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
         assert r["session_type"] != "walk", \
             f"{r['plan_date']}: walks are activity, never planned sessions"
-        # CYCLE-1: no session is ever placed in a transit segment. A seeded row
-        # carries the day's anchor, which is never transit, so this can only
-        # fire if the anchor table gains one.
-        assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"],
-                                                            use_overrides=False)), \
+        # CYCLE-1: no session is ever placed in a transit segment. Resolved WITH
+        # overrides, because nothing constrains an override's `location` to a
+        # non-transit one — the table's CHECK covers `day_type` only. On the base
+        # pattern this can still only fire if DAY_LOCATIONS gains a transit entry.
+        assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"])), \
             f"{r['plan_date']}: a session cannot be placed on the road"
         want = day_location(r["plan_date"], r.get("slot", "morning"))
         got = r["blocks"].get("location")
@@ -856,6 +1121,33 @@ def validate_rows(rows: list[dict]) -> list[str]:
     assert not rejects, "est_duration_min >= 60: " + "; ".join(rejects)
     for n in notes:
         logger.warning("TIME-CAP: %s", n)
+
+    # LOCATION-1 findings. These are REPORTED, not asserted: a strength session
+    # at a location with no substitution table is exactly the state Ryan chose
+    # to keep during the leave ("knowingly wrong beats silently rebuilt"), and a
+    # validator that crashed on it would make a reseed impossible — which is how
+    # the seeder came to ignore overrides in the first place. Silence is the one
+    # thing that is not allowed.
+    for r in rows:
+        b, key = r["blocks"], r["blocks"].get("location_key", "office")
+        if r["session_type"].startswith("strength") and not can_hold(key, r["session_type"]):
+            n = (f"{r['plan_date']}: {r['session_type']} is at {key}, which has no "
+                 f"substitution table — the row is knowingly wrong")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
+        if b.get("prep_unknown"):
+            n = (f"{r['plan_date']}: {r['session_type']} at {key} has NO configured "
+                 f"warmup or cooldown — the row says so rather than guessing")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
+        # Belt and braces: after 2026-09-26 the office strings can only reach a
+        # non-office row through a hand-edit or a stale row, so if one shows up it
+        # is a real defect and not an unconfigured location.
+        if key != "office" and (b.get("warmup") == WARMUP or b.get("cooldown") == COOLDOWN):
+            n = (f"{r['plan_date']}: {r['session_type']} at {key} carries the OFFICE "
+                 f"warmup/cooldown ({WARMUP!r} / {COOLDOWN!r}) — neither exists there")
+            notes.append(n)
+            logger.warning("LOCATION-1: %s", n)
     return notes
 
 

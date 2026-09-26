@@ -23,7 +23,15 @@ TYPES = ["strength_a", "rest_mobility", "strength_b", "recovery_flow", "recovery
 
 def plans(start=WED):
     return [{"plan_id": 100 + i, "plan_date": start + timedelta(days=i), "phase": 1, "week_num": 1,
-             "session_type": st, "blocks": {"display_name": st, "location": "office gym"},
+             "session_type": st,
+             # LOCATION-1: the class travels on the row — names imply nothing.
+             "blocks": {"display_name": st, "location": "office gym",
+                        "exercises": [{"name": n, "equipment_class": c} for n, c in (
+                            ("Captain's chair knee raise", "bodyweight"),
+                            ("Seated back extension", "machine"),
+                            ("45° back extension", "machine"),
+                            ("Leg press", "machine"),
+                            ("DB bench press", "dumbbell"))]},
              "target_rpe": 6.0, "est_duration_min": 40} for i, st in enumerate(TYPES)]
 
 

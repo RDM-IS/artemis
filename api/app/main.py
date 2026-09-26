@@ -97,15 +97,28 @@ async def run_migrations(api_key: str = Depends(verify_api_key)):
     }
 @app.post("/admin/run-tests")
 async def run_tests(api_key: str = Depends(verify_api_key)):
-    env = os.environ.copy()
-    env["PYTHONPATH"] = ":".join(sys.path)
-    result = subprocess.run(
-        [sys.executable, "/var/task/tests/test_phase1_schema.py"],
-        capture_output=True, text=True, env=env
-    )
+    """PACKAGE-IDENTITY (2026-09-26): imports and calls the probe instead of
+    shelling out to `/var/task/tests/test_phase1_schema.py` with sys.executable.
+    That subprocess was the only reason the Lambda package shipped `tests/`, and
+    shipping it meant a test-only commit moved the package hash and DRIFT-ALARM
+    reported drift for a change that cannot affect runtime.
+
+    Same path, same auth, same response shape — `returncode`/`stdout`/`stderr`
+    are preserved for anything parsing them, with the structured results added
+    beside them.
+    """
+    from .schema_check import SchemaCheckError, format_report, run_checks
+    try:
+        result = run_checks()
+    except SchemaCheckError as exc:
+        # The probe could not run. That is NOT "the schema is fine" and not
+        # "the schema is broken" — say which it is.
+        return {"returncode": 2, "stdout": "", "stderr": f"probe could not run: {exc}",
+                "ok": False, "error": str(exc)}
     return {
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr
+        "returncode": 0 if result["ok"] else 1,
+        "stdout": format_report(result),
+        "stderr": "",
+        **result,
     }
 handler = Mangum(app, lifespan="off", api_gateway_base_path="/default/rdmis-crm-api")

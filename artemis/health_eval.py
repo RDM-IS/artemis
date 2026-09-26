@@ -182,12 +182,24 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
         elif status in ("upcoming", "today"):
             upcoming += 1
 
+    # LOCATION-1: the class comes from the ROW, because names no longer imply
+    # one. An exercise absent here is reported as unknown, not as bodyweight.
+    classes_by_exercise: dict[str, str] = {}
+    for p_row in list(plans) + list(evening_plans):
+        b = p_row.get("blocks") if isinstance(p_row.get("blocks"), dict) else {}
+        for ex in (b.get("exercises") or []):
+            if ex.get("name") and ex.get("equipment_class"):
+                classes_by_exercise[ex["name"]] = ex["equipment_class"]
+
     now_w, prev_w = _top_weights(logs), _top_weights(prior_logs)
     loads = []
     for name, cur in now_w.items():
         prev = prev_w.get(name, "absent")
         if cur is None:
-            note = "bodyweight" if hr.equipment_class(name) == "bodyweight" else "no load logged"
+            cls = classes_by_exercise.get(name)
+            note = ("bodyweight" if cls in hr.NO_LOAD_CLASSES
+                    else "no load logged" if cls
+                    else "no load logged (class unknown)")
             change = None
         elif prev == "absent":
             note, change = "first week", None

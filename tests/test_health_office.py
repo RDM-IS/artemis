@@ -28,6 +28,23 @@ os.environ.setdefault("RDS_DB", "test-db")
 import artemis.health_office as office  # noqa: E402
 from artemis import health  # noqa: E402
 
+# FAIL-CLOSED-RESOLVERS (2026-09-26): the seeder resolves locations WITH
+# overrides now, so building or validating rows reaches
+# `acos.cycle_day_overrides` and a failed read RAISES instead of answering "no
+# override". This whole file is about the BASE program shape — which lift falls
+# on which day, the cardio, the rest days, the evening count — so it declares
+# "no overrides" once, here, for every test in it. It used to get the same
+# answer from a swallowed DB error, which is the bug this rule exists for.
+from artemis import cycle as _cycle_for_build  # noqa: E402
+
+_NO_OVERRIDES = patch.object(_cycle_for_build, "override_for", return_value=None)
+_NO_OVERRIDES.start()
+
+
+def tearDownModule():
+    _NO_OVERRIDES.stop()
+
+
 _ROWS = office.build_rows()
 # EVENING-1: two rows share a date now. Most of this file is about the MORNING
 # session — the lifts, the cardio and the rest days — so it keys off those.
@@ -99,6 +116,27 @@ class TestSchedule(unittest.TestCase):
             # mornings are rest.
             if office.day_type(d) in ("wi", "travel"):
                 self.assertIn(r["session_type"], ("rest", "cardio_z2"), d)
+
+    def test_every_exercise_carries_its_equipment_class(self):
+        """EXERCISE-CLASS (Ryan, 2026-09-23): the class travels on the ROW for
+        every exercise. Inference from the name was written for the office and
+        misreads any other gym — "TRX row" reads as `machine`."""
+        entries = [e for r in _ROWS for e in (r["blocks"].get("exercises") or [])]
+        self.assertTrue(entries)
+        for e in entries:
+            with self.subTest(exercise=e["name"]):
+                self.assertEqual(e.get("equipment_class"), office.class_for(e["name"]))
+        self.assertEqual(sorted({e["equipment_class"] for e in entries}),
+                         ["bodyweight", "cable", "dumbbell", "machine"])
+
+    def test_an_unknown_exercise_is_a_build_error_not_a_guess(self):
+        with self.assertRaises(KeyError) as ctx:
+            office.class_for("Hack squat")
+        self.assertIn("equipment_class", str(ctx.exception))
+
+    def test_the_class_table_covers_every_name_in_the_generator(self):
+        names = {e["name"] for r in _ROWS for e in (r["blocks"].get("exercises") or [])}
+        self.assertTrue(names <= set(office.EQUIPMENT_CLASS))
 
     def test_four_evenings_a_week_and_never_on_the_drive(self):
         """EVENING-1 (Ryan, 2026-09-23). Position 4 is the Thursday he drives

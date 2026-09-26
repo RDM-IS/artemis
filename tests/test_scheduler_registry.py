@@ -42,6 +42,118 @@ def make_scheduler() -> ArtemisScheduler:
     return ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
 
 
+class TestLocationJobsWhenTheCycleCannotBeRead(unittest.TestCase):
+    """OVERRIDE-DURABILITY (Ryan, 2026-09-26): an unreadable cycle must not kill
+    the service, and must not be guessed around either.
+
+    Losing the whole box — check-ins, the health API, Mattermost — to protect six
+    jobs is the wrong trade. So apply_timezone boots, registers everything that
+    does not depend on location, SKIPS the six that do, and posts. It never
+    substitutes the base pattern: not dying is not the same as guessing.
+    """
+
+    LOCATION_IDS = {"wake", "checkin_nudge", "inbox_zero_morning", "open",
+                    "morning_brief", "quiet_hours_start"}
+
+    def setUp(self):
+        self.s = make_scheduler()
+        self.s.mm = MagicMock()
+        self._posts = []
+        # _post is the Mattermost boundary; record what would be sent.
+        patcher = patch.object(self.s, "_post",
+                               side_effect=lambda ch, text, tier="business":
+                               self._posts.append((ch, text, tier)) or True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _dead_cycle(self):
+        from artemis import cycle
+        return patch.object(cycle, "override_for",
+                            side_effect=cycle.OverrideLookupError("overrides unreadable"))
+
+    # ── the failure path ────────────────────────────────────────────────────
+    def test_a_dead_cycle_leaves_the_service_up_with_the_other_jobs_registered(self):
+        with self._dead_cycle():
+            self.s.apply_timezone(config.HOME_TIMEZONE)          # must NOT raise
+        registered = {j.id for j in self.s.scheduler.get_jobs()}
+        self.assertTrue(registered, "nothing registered at all")
+        self.assertFalse(registered & self.LOCATION_IDS,
+                         f"location jobs registered from an unreadable cycle: "
+                         f"{sorted(registered & self.LOCATION_IDS)}")
+        # the jobs that do not depend on location are all there
+        for job_id in ("vault_sync", "drift_alarm", "health_nag", "location_recompute",
+                       "nutrition_prefill", "weekly_eval"):
+            self.assertIn(job_id, registered, job_id)
+
+    def test_it_posts_and_names_the_skipped_jobs(self):
+        with self._dead_cycle():
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+        self.assertEqual(len(self._posts), 1, self._posts)
+        _, text, tier = self._posts[0]
+        self.assertEqual(tier, "health")          # posts in the wake phase, not open-only
+        for job_id in self.LOCATION_IDS:
+            self.assertIn(job_id, text, f"{job_id} not named in the message")
+        self.assertIn("not** substituted", text)  # states that nothing was guessed
+
+    def test_no_time_is_ever_guessed_from_the_base_pattern(self):
+        """The failure mode this replaced: resolving without overrides."""
+        with self._dead_cycle():
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+        self.assertNotIn("wake", {sp.id for sp in self.s._cron_specs})
+        self.assertTrue(self.s._location_degraded)
+
+    def test_a_long_outage_posts_once_not_every_retry(self):
+        with self._dead_cycle():
+            for _ in range(5):
+                self.s.apply_timezone(config.HOME_TIMEZONE)
+        self.assertEqual(len(self._posts), 1, "the signature guard did not hold")
+
+    # ── recovery ────────────────────────────────────────────────────────────
+    def test_a_later_successful_read_registers_them_and_reports_recovery(self):
+        from artemis import cycle
+        with self._dead_cycle():
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+        self.assertTrue(self.s._location_degraded)
+
+        with patch.object(cycle, "override_for", return_value=None):
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+
+        registered = {j.id for j in self.s.scheduler.get_jobs()}
+        self.assertTrue(self.LOCATION_IDS <= registered,
+                        f"missing after recovery: {sorted(self.LOCATION_IDS - registered)}")
+        self.assertFalse(self.s._location_degraded)
+        self.assertEqual(len(self._posts), 2, self._posts)
+        self.assertIn("registered again", self._posts[1][1])
+
+    def test_recovery_is_reported_once_and_a_clean_boot_is_silent(self):
+        from artemis import cycle
+        with patch.object(cycle, "override_for", return_value=None):
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+            self.assertEqual(self._posts, [], "a clean boot must say nothing")
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+            self.assertEqual(self._posts, [], "still nothing on a second clean pass")
+
+    def test_the_60s_sync_tick_is_what_retries(self):
+        """No new timer: job_tz_sync already runs every 60 s."""
+        from artemis import cycle
+        with self._dead_cycle():
+            self.s.apply_timezone(config.HOME_TIMEZONE)
+        calls = []
+        with patch.object(cycle, "override_for", return_value=None), \
+             patch.object(self.s, "apply_timezone",
+                          side_effect=lambda tz: calls.append(tz)), \
+             patch("artemis.quiet_hours.check_expired_overrides", return_value=None), \
+             patch("artemis.quiet_hours.get_active_timezone",
+                   return_value=self.s._applied_tz):
+            self.s.job_tz_sync()
+        self.assertEqual(len(calls), 1, "the degraded state did not trigger a retry")
+
+    def test_the_drift_check_does_not_raise_while_the_cycle_is_unreadable(self):
+        self.s._applied_cron_times = {"wake": (4, 30)}
+        with self._dead_cycle():
+            self.assertEqual(self.s._location_drift(), {})
+
+
 class TestRegistryShape(unittest.TestCase):
     def setUp(self):
         self.s = make_scheduler()
@@ -81,6 +193,36 @@ class TestRegistryShape(unittest.TestCase):
         self.assertEqual((by_id["vault_sync"].hour, by_id["vault_sync"].minute), (3, 30))
         # The debrief nag must sit OUTSIDE the quiet window.
         self.assertLess(by_id["health_nag"].hour, 17)
+
+    def test_drift_alarm_is_registered_hourly_in_the_active_timezone(self):
+        """DRIFT-ALARM: hourly, through apply_timezone like every other cron
+        job, and WITHOUT the once-per-local-day guard (it owns a guard keyed on
+        the drift signature instead, so a new drift posts the hour it appears)."""
+        spec = next(s for s in self.s.cron_specs() if s.id == "drift_alarm")
+        self.assertTrue(spec.hourly)
+        self.assertFalse(spec.daily_guard)
+        self.assertEqual(spec.func_name, "job_drift_alarm")
+
+        self.s.apply_timezone(SAO_PAULO)
+        job = self.s.scheduler.get_job("drift_alarm")
+        self.assertIsNotNone(job, "drift_alarm was not registered")
+        self.assertEqual(str(job.trigger.timezone), SAO_PAULO)
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        self.assertEqual(fields["hour"], "*")
+        self.assertEqual(fields["minute"], str(spec.minute))
+
+        # it must survive a timezone switch like the rest of the registry
+        self.s.apply_timezone(config.HOME_TIMEZONE)
+        job = self.s.scheduler.get_job("drift_alarm")
+        self.assertEqual(str(job.trigger.timezone), config.HOME_TIMEZONE)
+        self.assertEqual(str(next(f for f in job.trigger.fields if f.name == "hour")), "*")
+
+    def test_only_a_repeating_job_may_skip_the_daily_guard(self):
+        for spec in self.s.cron_specs():
+            with self.subTest(job=spec.id):
+                if not spec.daily_guard:
+                    self.assertTrue(spec.hourly,
+                                    f"{spec.id} skips the daily guard but is not hourly")
 
     def test_no_weekend_twins_remain(self):
         """CYCLE-1 collapsed them: one job per function, timed by location."""

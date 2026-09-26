@@ -165,14 +165,28 @@ def known_location(key: str | None) -> bool:
 # Overrides (acos.cycle_day_overrides, migration 035)
 # ---------------------------------------------------------------------------
 
+class OverrideLookupError(RuntimeError):
+    """The override table could not be read. NOT "there is no override"."""
+
+
 def override_for(d: date) -> dict | None:
     """The live override covering `d`, newest first. None when there is none.
 
-    Read-only and fail-open: a DB problem means "no override", never an
-    exception into the scheduler.
+    FAIL-CLOSED (2026-09-26). This used to swallow every exception and return
+    None, so an unreachable or unreadable `acos.cycle_day_overrides` answered
+    "no override" — indistinguishable from the real answer, and the base pattern
+    then resolved cleanly and wrote cleanly. Eleven plan rows were rebuilt on
+    the strength of exactly that during the leave-week write: the read happened
+    on a second connection that could not see the still-uncommitted overrides.
+
+    `None` now means one thing only: the table was read and covers nothing.
+    A read that FAILS raises `OverrideLookupError`. A caller that genuinely
+    wants the base pattern says so with `use_overrides=False` — nothing gets it
+    by accident from a failed read.
     """
+    from knowledge.db import execute_one
+    from knowledge.dbguard import RealDbInTestError
     try:
-        from knowledge.db import execute_one
         return execute_one(
             "SELECT override_id, start_date, end_date, day_type, location, reason "
             "FROM acos.cycle_day_overrides "
@@ -180,9 +194,24 @@ def override_for(d: date) -> dict | None:
             "ORDER BY created_at DESC LIMIT 1",
             (d, d),
         )
-    except Exception:
-        logger.debug("cycle override lookup failed for %s — treating as none", d, exc_info=True)
+    except RealDbInTestError:
+        # The ONE swallow, and it is not a failed read: TEST-DB-GUARD raises this
+        # only when a test is running, and no test has an overrides table, so
+        # "nothing covers this day" is the honest answer rather than a guess.
+        # It cannot fire in production — the guard needs ARTEMIS_TEST_NO_DB or
+        # pytest imported. Every real failure mode (refused, auth, timeout,
+        # UndefinedTable, permission) still raises below.
+        #
+        # NARROW ON PURPOSE: this catches one exception type, raised by one guard
+        # whose entire job is to say "you are in a test". WIDENING IT — to
+        # Exception, to psycopg2.Error, to anything that can occur in production —
+        # RE-CREATES THE 2026-09-26 DEFECT, where a failed read answered "no
+        # override" and eleven plan rows were rebuilt against the base pattern and
+        # committed. See FAIL-CLOSED-RESOLVERS in CLAUDE.md.
         return None
+    except Exception as exc:
+        raise OverrideLookupError(
+            f"could not read acos.cycle_day_overrides for {d}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
