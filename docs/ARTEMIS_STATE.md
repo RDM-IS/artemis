@@ -381,6 +381,39 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). Next builds, in
   - What equipment is at the **MSP home**.
   - Brown Deer's inventory (it's a fitness center, so probably machines and cables, but nothing is recorded).
 
+**SCHEDULE-3 — move a lift, don't add one (Ryan, 2026-09-23). PROPOSED, STILL UNAPPLIED. Its LOCATION-1 precondition is now MET, but its numbers are STALE — recompute before acting (note added 2026-09-26).** Target pattern in **both** cycle weeks: **Mon A · Tue Z2 · Wed B · Thu rest · Fri C**, with week 1's Friday C at **Richfield** and week 2's Monday A at **Richfield**, on the travel morning before the 11:00 departure. It also removes the B/C back-to-back pair that SCHEDULE-2 accepted.
+
+  | pos | day | morning | where | evening |
+  |---|---|---|---|---|
+  | 0 | Sun | rest | home | flow |
+  | 1 | Mon | **Strength A** | office | — |
+  | 2 | Tue | **Zone 2** | office | flow |
+  | 3 | Wed | **Strength B** | office | — |
+  | 4 | Thu | **rest** *(was C)* | office | none — transit |
+  | 5 | Fri | **Strength C** *(was rest)* | **Richfield** | flow (Brown Deer) |
+  | 6 | Sat | rest | Brown Deer | flow |
+  | 7 | Sun | rest | Brown Deer | flow |
+  | 8 | Mon | **Strength A** *(was rest)* | **Richfield** | flow (home) |
+  | 9 | Tue | **Zone 2** *(was A)* | office | — |
+  | 10 | Wed | **Strength B** *(was Z2)* | office | flow |
+  | 11 | Thu | **rest** *(was B)* | office | — |
+  | 12 | Fri | Strength C | office | — |
+  | 13 | Sat | rest | home | flow |
+
+- **STALE, 2026-09-26 — recompute before acting.** This diff predates the leave-week overrides (`acos.cycle_day_overrides`, first rows written 2026-09-26), which move 9/26–10/04 to Richfield and Brown Deer, and it predates the seeder resolving locations WITH overrides. Two of its Richfield dates (9/25 C, 9/28 A) are in the past. A reseed of that window would also revert the eleven hand-rebuilt leave-week rows' held siblings — see the leave-week note. **Recompute the diff against current RDS before this is applied.**
+- **Reseed diff, computed read-only against RDS 2026-09-23** (window 9/24 → 10/31): **18 morning rows rewritten**, in six even groups of three — `strength_c→rest`, `rest→strength_c`, `rest→strength_a`, `strength_a→cardio_z2`, `cardio_z2→strength_b`, `strength_b→rest`. **Three lifts in every full program week** (weeks 3–7), unchanged. **Evenings untouched** — 4 a week, same dates, same locations. **Zero logged rows** in the window. Six sessions would land at Richfield: C on 9/25, 10/9, 10/23 and A on 9/28, 10/12, 10/26.
+- **BLOCKER — Richfield Strength A has no approved table.** Still true 2026-09-26. Strength C's is approved and built; A's is not, and the diff's own check flags those three dates `NO TABLE YET`.
+  - **Read the proposal below as of 2026-09-23, not as ready for approval (note added 2026-09-26).** Three of its names — band pulldown, ball hamstring curl, lying leg raise — are the ones Ryan rejected on 2026-09-25 for the C table, on the grounds that they existed only in code comments and were never approved. They are kept here because this is a **proposal for A** in the proper channel rather than a change to an approved session, but the A table is to be built from the **requirements list and the inventory Ryan walked the rooms with on 2026-09-26**, not from this list. The requirements list (pattern trained + equipment class required, per movement) is the input; this is a guess made before the inventory existed.
+  - Proposed 2026-09-23, from the then-known inventory (PowerBlocks to 80, curl bar, flat bench, TRX, bands, stability ball, 6.5 ft ceiling):
+  - Leg press → **DB split squat** *(not goblet squat: that is Strength B's native lift, and reusing it would put the same movement on two days of one week)*
+  - DB bench press → **unchanged** (flat bench, native)
+  - Lat pulldown → **band pulldown** *(a vertical pull; TRX row is the horizontal one C already uses)*
+  - Seated leg curl → **ball hamstring curl**
+  - Cable face pull (rope) → **band face pull**
+  - Captain's chair knee raise → **lying leg raise** *(there is no chair and no bar)*
+  - New names needing a class and a region entry: DB split squat (`dumbbell`), band pulldown and band face pull (`bands`), ball hamstring curl and lying leg raise (`bodyweight`).
+- **Apply order, as Ryan set it:** LOCATION-1 lands and is deployed FIRST (artemis #177 + gym-display #26), so a Richfield session resolves properly the moment it exists; the Strength A table is approved and built; only then does the reseed run. Applying it before that would seed office exercises onto a farm morning. **Step 1 is DONE — both merged and deployed 2026-09-25/26, and the seeder now resolves with overrides. Step 2 (the A table) is the remaining gate.**
+- **Not in this proposal:** the office program's total volume is unchanged — three lifts a week, one Z2, four evening flows. Only which day each lands on changes.
 **LOCATION-1 PLAN — read 2026-09-23. SUPERSEDED 2026-09-26 by the built LOCATION-1 entry above; kept as the record of what the read found and what was proposed from it.** Everything below describes the state on 2026-09-23 and is **no longer true**: the class now travels on all 301 exercise entries (EXERCISE-CLASS, 9/23), `blocks.load_config` ships per row with both consumers reading it, the client's inferred-class tables are deleted, `loadMode` gained a third state (`unknown`), the Richfield C table is approved and live, and warmup/cooldown resolve per location. Read the built entry for current behaviour; read this for why it was built that way. The day split is done, so this is the last structural piece. The motivating case: the **wi Friday at Richfield** is a day off work with a real home gym, and it is currently a rest morning.
 
 - **What travels on the plan row today: almost nothing.** Measured in RDS on 2026-09-23 — **7 of 301** exercise entries carry `equipment_class` (the `EQUIPMENT_CLASS` exception map, only "Seated back extension"), and **0 rows** carry any load config. Everything else is inferred client-side from the exercise NAME by keyword rules written for the office. Those rules misread Richfield's vocabulary — band and strap movements resolved to `machine` and got a 10 lb stack step, and a bodyweight movement resolved to `dumbbell`. **The specific exercise names originally listed here have been removed (Ryan, 2026-09-25): they were never part of the approved Richfield C table and existed only as examples in the read.** The measured version of this finding is in the built entry: of the nine home-gym exercises in RDS, the deleted name rules misread five. **So the row must carry `equipment_class` for EVERY exercise, not just the exceptions** — that is the first change, and it is independent of everything else.
