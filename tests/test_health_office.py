@@ -28,6 +28,23 @@ os.environ.setdefault("RDS_DB", "test-db")
 import artemis.health_office as office  # noqa: E402
 from artemis import health  # noqa: E402
 
+# FAIL-CLOSED-RESOLVERS (2026-09-26): the seeder resolves locations WITH
+# overrides now, so building or validating rows reaches
+# `acos.cycle_day_overrides` and a failed read RAISES instead of answering "no
+# override". This whole file is about the BASE program shape — which lift falls
+# on which day, the cardio, the rest days, the evening count — so it declares
+# "no overrides" once, here, for every test in it. It used to get the same
+# answer from a swallowed DB error, which is the bug this rule exists for.
+from artemis import cycle as _cycle_for_build  # noqa: E402
+
+_NO_OVERRIDES = patch.object(_cycle_for_build, "override_for", return_value=None)
+_NO_OVERRIDES.start()
+
+
+def tearDownModule():
+    _NO_OVERRIDES.stop()
+
+
 _ROWS = office.build_rows()
 # EVENING-1: two rows share a date now. Most of this file is about the MORNING
 # session — the lifts, the cardio and the rest days — so it keys off those.

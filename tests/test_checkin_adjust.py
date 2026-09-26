@@ -82,7 +82,10 @@ class FakeDB:
                 return r["plan_date"]
         return self.plan_dates.get(plan_id)
 
-    def cursor(self):
+    def cursor(self, cursor_factory=None):
+        # `cursor_factory` is accepted and ignored: this fake already yields dict
+        # rows, which is what RealDictCursor would give. knowledge.db.execute_one
+        # always passes it, and cycle.override_for() goes through execute_one.
         return FakeCursor(self)
 
 
@@ -95,6 +98,13 @@ class FakeCursor:
         self.description = None
         self._rows = []
         self.rowcount = 0
+
+    # knowledge.db.execute_query uses `with conn.cursor(...) as cur`.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
     def execute(self, sql, params=()):
         s = " ".join(sql.split())
@@ -228,6 +238,13 @@ class FakeCursor:
             self.db._savepoint = None
         elif s == "ROLLBACK TO SAVEPOINT pain_patterns":
             self.db.patterns = self.db._savepoint
+        elif "acos.cycle_day_overrides" in s:
+            # FAIL-CLOSED-RESOLVERS (2026-09-26): cycle.override_for() raises
+            # rather than answering "no override" when it cannot read. These
+            # tests are about the base program, so the fake SAYS the table is
+            # empty instead of getting that from a swallowed error.
+            self._rows = []
+            self.rowcount = 0
         else:
             raise AssertionError(f"unhandled SQL: {s[:90]}")
 
