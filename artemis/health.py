@@ -3379,6 +3379,10 @@ def propose_nutrition_target(message: str, channel_id: str) -> str:
     return format_target_proposal(target)
 
 
+class TargetBackdated(ValueError):
+    """The new target starts on or before the open target's start date."""
+
+
 def insert_nutrition_target_tx(target: NutritionTarget) -> int:
     """Close the prior open target and insert the new one (+ any meals) in ONE
     transaction, so the one_open_target index never sees two open rows."""
@@ -3401,6 +3405,40 @@ def insert_nutrition_target_tx(target: NutritionTarget) -> int:
                  target.fat_g, target.fiber_g, target.set_by, target.notes),
             )
             new_id = cur.fetchone()[0]
+            # NUTRITION-2: nutrition.target (040) is what logging and "what's
+            # left" read. The health.* write above stays only because the
+            # grocery-staples generator (life_ops) still reads it; both retire
+            # together in the coverage-checked health.* retirement. Same
+            # transaction, so the two can never disagree.
+            cur.execute("SELECT id, (effective_from = %s::date) FROM nutrition.target "
+                        "WHERE effective_to IS NULL AND effective_from >= %s::date",
+                        (eff_from, eff_from))
+            open_row = cur.fetchone()
+            if open_row and not open_row[1]:
+                # Closing it would give it an end before its start.
+                raise TargetBackdated(eff_from)
+            if open_row:
+                # Same start date: a correction of today's target, not a new one.
+                cur.execute(
+                    "UPDATE nutrition.target SET kcal = %s, protein_g = %s, carb_g = %s, "
+                    "fat_g = %s, fiber_g = %s, set_by = %s, notes = %s WHERE id = %s",
+                    (target.kcal, target.protein_g, target.carb_g, target.fat_g,
+                     target.fiber_g, target.set_by, target.notes, open_row[0]),
+                )
+            else:
+                cur.execute(
+                    "UPDATE nutrition.target "
+                    "SET effective_to = (%s::date - INTERVAL '1 day')::date "
+                    "WHERE effective_to IS NULL",
+                    (eff_from,),
+                )
+                cur.execute(
+                    "INSERT INTO nutrition.target "
+                    "(effective_from, kcal, protein_g, carb_g, fat_g, fiber_g, set_by, notes) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (eff_from, target.kcal, target.protein_g, target.carb_g,
+                     target.fat_g, target.fiber_g, target.set_by, target.notes),
+                )
             for m in target.meals:
                 cur.execute(
                     "INSERT INTO health.meal "
@@ -3426,6 +3464,10 @@ def commit_nutrition_target(channel_id: str) -> str:
         return "⚠️ Pending target was malformed — discarded. Re-send it."
     try:
         new_id = insert_nutrition_target_tx(target)
+    except TargetBackdated as e:
+        clear_nutrition_target_pending(channel_id)
+        return (f"⚠️ The current target already starts on or after {e.args[0]} — a new "
+                "target needs a later effective date. Nothing changed.")
     except Exception:
         logger.exception("Nutrition target commit failed")
         return "⚠️ Couldn't write the target — check DB. Nothing changed."
