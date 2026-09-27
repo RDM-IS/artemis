@@ -118,6 +118,20 @@ _AND_SPLIT = re.compile(r"\band\b|\bplus\b|&", re.I)
 _SCORE_RE = re.compile(rf"(?<![\d.]){_NUM}{_SCALE}(?![\d.])", re.I)
 _WORD_RE = re.compile(r"[a-z']+")
 
+# Body vocabulary, derived from the parser's own lists (CHECKIN-GATE).
+_BODY_ALT = "|".join(sorted(map(re.escape, set(SORE_WORDS)), key=len, reverse=True))
+_REGION_ALT = "|".join(sorted(map(re.escape, hr.ALIASES), key=len, reverse=True))
+_BODY_WORD_RE = re.compile(rf"\b(?:{_BODY_ALT})\b", re.I)
+_REGION_WORD_RE = re.compile(rf"\b(?:{_REGION_ALT})\b", re.I)
+# CHECKIN-GATE (2026-09-26): a score followed by a new body clause ends the
+# clause, commas or not. Dictated replies drop commas, and without this
+# "knee pain 3 back sore 1" carried the pain word across both regions and
+# stored back=pain 3 — enough to convert every back exercise to mobility.
+_CLAUSE_AFTER_SCORE_RE = re.compile(
+    rf"((?<![\d.]){_NUM}{_SCALE})(?![\d.])\s+"
+    rf"(?=(?:left|right|both|bilateral|my|the|{_REGION_ALT}|{_BODY_ALT})\b)",
+    re.I)
+
 # Words that sit next to "sore" but are not regions.
 _NOT_REGIONS = {
     "sore", "soreness", "is", "was", "a", "bit", "little", "very", "really", "kind", "of",
@@ -199,6 +213,22 @@ def normalize_score(value: float, scale: str | None) -> int:
 def _blank(text: str, span: tuple[int, int]) -> str:
     a, b = span
     return text[:a] + " " * (b - a) + text[b:]
+
+
+def _split_clauses_after_scores(text: str) -> str:
+    """Insert a clause break after a score that CLOSES a region clause.
+
+    Only when the text since the previous break already names a region: the
+    score-first form ("sore 1 right knee", "pain 5 knee") puts the number
+    before its region, and must stay one clause.
+    """
+    out, last = [], 0
+    for m in _CLAUSE_AFTER_SCORE_RE.finditer(text):
+        if _REGION_WORD_RE.search(text, last, m.start()):
+            out.append(text[last:m.end(1)] + ", ")
+            last = m.end()
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _find_regions(clause: str) -> tuple[list[str], list[str]]:
@@ -288,7 +318,8 @@ def parse_checkin(text: str) -> CheckIn:
             # Sentences (comma/semicolon/newline/period) are independent; inside
             # one, "and"-joined parts share the next score: "shoulder and neck
             # sore 3". A pain word marks only the regions in its own part.
-            for sentence in _SENTENCE_SPLIT.split(work):
+            split_work = _split_clauses_after_scores(work)
+            for sentence in _SENTENCE_SPLIT.split(split_work):
                 pending: list[tuple[str, bool]] = []
                 pending_unknown: list[str] = []
                 carried_sides: set = set()   # "left and right knee": "left" has no region
@@ -1178,7 +1209,7 @@ def process_checkin_full(cur, text: str, day: date, *, checkin_id: str,
         return RATINGS_ERROR, []
     if not ci.has_data:
         return ("I couldn't read a check-in there. Try: "
-                "`slept 7 energy 4 sore 0 weight 283`."), []
+                "`energy 4 sore 0` or `energy 3 knee pain 2`."), []
     store_checkin(cur, day, ci)
 
     notes = []
@@ -1340,8 +1371,21 @@ _DONE_RE = re.compile(
     re.I)
 _ORIGINAL_RE = re.compile(
     r"^\s*(?:original|original\s+plan|use\s+(?:the\s+)?original|as\s+written)\s*[.!]*\s*$", re.I)
+# CHECKIN-GATE (2026-09-26). The gate admitted `sore`/`soreness` as its only
+# body-state words, so "knee pain 3" and "back tight 2" parsed cleanly and were
+# dropped with no reply — PAIN-1 never received an input. The rest of the
+# parser's vocabulary (SORE_WORDS, which includes PAIN_WORDS) now opens the
+# gate too, but ONLY alongside a known body region: words like "pulled",
+# "sharp", "strain" and "tight" are ordinary English, and the channel is
+# always-listen, so "pulled the Q3 report, 3 pages" must not become soreness 3.
+# The vocabulary is derived from SORE_WORDS and hr.ALIASES, never hand-kept.
 _CHECKIN_SHAPE_RE = re.compile(
     r"\b(?:slept|sleep|energy|sore(?:ness)?|rhr|resting\s*hr)\b|\bweight\s*\d", re.I)
+
+
+def _checkin_shaped(text: str) -> bool:
+    return bool(_CHECKIN_SHAPE_RE.search(text)
+                or (_BODY_WORD_RE.search(text) and _REGION_WORD_RE.search(text)))
 
 
 def classify(text: str) -> str | None:
@@ -1350,7 +1394,7 @@ def classify(text: str) -> str | None:
         return None
     if _ORIGINAL_RE.match(t):
         return "original"
-    if _CHECKIN_SHAPE_RE.search(t):
+    if _checkin_shaped(t):
         ci = parse_checkin(t)
         if ci.has_data or ci.rating_error:
             return "checkin"

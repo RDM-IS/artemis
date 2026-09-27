@@ -1,9 +1,9 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-09-21T17:48:34Z_
+_Generated: 2026-09-26T20:05:06Z_
 
 ## Git
 - Branch: main
-- Head: 543cc5a Merge pull request #152 from RDM-IS/feat/diet1-recipe-sync
+- Head: 4c336a1 feat(cycle): the script owns the whole leave window — 9/29 was the last carve-out (#203)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
@@ -26,11 +26,11 @@ _Generated: 2026-09-21T17:48:34Z_
 - PB-011: Vault / Second Brain Ingest (v1)
 
 ## Migrations (latest 5)
-- 036_watch_ingest.sql
-- 037_watch_heart_rate.sql
-- 038_watch_device.sql
 - 039_drop_plan_status_debris.sql
 - 040_nutrition_diet1.sql
+- 041_watch_hourly.sql
+- 042_plan_slot.sql
+- 043_session_log_modality.sql
 
 ## artemis/ modules
 - __init__.py
@@ -39,6 +39,7 @@ _Generated: 2026-09-21T17:48:34Z_
 - briefs.py
 - calendar.py
 - calendar_cache.py
+- cardio_baseline.py
 - commitments.py
 - config.py
 - crm_client.py
@@ -48,6 +49,7 @@ _Generated: 2026-09-21T17:48:34Z_
 - cycle.py
 - demo_intake.py
 - dossier.py
+- drift.py
 - email_index.py
 - gmail.py
 - google_drive.py
@@ -139,7 +141,6 @@ _Generated: 2026-09-21T17:48:34Z_
 - schema_migrations
 - system_state
 - timezone_overrides
-- v_gold_contacts
 - velocity_ledger
 
 ### schema `health`
@@ -155,8 +156,15 @@ _Generated: 2026-09-21T17:48:34Z_
 - session_log
 - training_rules
 - watch_heart_rate
+- watch_hourly
 - watch_sample
 - watch_workout
+
+### schema `nutrition`
+- day
+- entry
+- food
+- target
 
 ### schema `public`
 - commitments
@@ -174,10 +182,15 @@ _Generated: 2026-09-21T17:48:34Z_
 - processed_billing
 - relationships
 - touch_events
-- v_budget_vs_actual
-- v_founder_loan_balance
+
+### schema `vault`
+- extraction_proposal
+- ingest_state
+- note_links
+- note_metadata
+- notes
 
 ### health.plan — next 3 days
-- 2026-09-21: strength_a
-- 2026-09-22: cardio_z2
-- 2026-09-23: strength_b
+- 2026-09-26: recovery_flow
+- 2026-09-26: rest
+- 2026-09-27: recovery_flow
