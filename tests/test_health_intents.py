@@ -503,8 +503,7 @@ class TestPromptBuilders(unittest.TestCase):
         # FRIDAY-1: one prompt, 0–5 ratings; no timed "calibrated plan in 15 min".
         from artemis.health import build_morning_survey_prompt
         out = build_morning_survey_prompt(self._PLAN_STRENGTH, "workout_am")
-        self.assertEqual(out, "Morning check-in.\n\nReply with: sleep hrs, energy 0–5, soreness by "
-                              "area 0–5 (0 = none), weight, RHR.\nExample: `slept 7 energy 4 sore 0 weight 283`")
+        self.assertEqual(out, "Morning check-in.\n\n" + "Reply with: energy 0–5, and any sore or pain by area 0–5 (0 = none).\nExample: `energy 4 sore 0` · `energy 3 knee pain 2`\n_Sleep, weight and RHR come from the watch — add them only to correct it._")
         self.assertNotIn("15 min", out)
 
     def test_morning_survey_logging_only_no_calibration_note(self):
