@@ -21,7 +21,9 @@ The rules that govern it:
   how complete it is (DIETITIAN-DATA: the 14-day window can't fill under the
   work-day-only pre-fill, and the report must still be honest about that).
 * **Detail levels.** `summary` is page 1; `full` adds page 2 (activity,
-  per-day table, recurring meals).
+  per-day table) and the **daily menu** — every recorded day item by item,
+  with patient-logged or changed items marked † (Ryan, 2026-09-27: the full
+  menu replaces the "planned, no correction received" status label).
 """
 
 from __future__ import annotations
@@ -41,13 +43,6 @@ BANNED_WORDS = (
     "should", "bad", "great", "excellent", "failed", "missed", "behind", "ahead",
     "too", "better", "worse", "improve", "improved", "goal",
 )
-
-STATUS_LABEL = {
-    "assumed": "planned, no correction received",
-    "locked_unconfirmed": "planned, no correction received",
-    "confirmed": "confirmed",
-    "corrected": "corrected",
-}
 
 UNRECORDED_REASON = {
     "not_work_day": "non-work day (not pre-filled)",
@@ -114,14 +109,6 @@ def collect(start: date, end: date) -> dict:
             "WHERE metric = 'active_energy' AND local_date BETWEEN %s AND %s "
             "GROUP BY local_date", (start, end)),
         "sessions": health_eval.load(start, end).get("counts") or {},
-        "default_day": q(
-            "SELECT e.description, e.slot, e.kcal, e.protein_g, e.source, "
-            "f.is_placeholder, f.source_detail, f.portion "
-            "FROM nutrition.entry e LEFT JOIN nutrition.food f ON f.id = e.food_id "
-            "WHERE e.day_date = (SELECT max(d.day_date) FROM nutrition.day d "
-            "  WHERE d.day_date <= %s AND d.prefill_outcome = 'planned' "
-            "  AND d.day_type = 'msp_work') "
-            "AND e.status = 'assumed' AND e.source = 'notion' ORDER BY e.id", (end,)),
         "generated": local_today(),
     }
 
@@ -130,12 +117,49 @@ def collect(start: date, end: date) -> dict:
 # Build (pure)
 # ============================================================================
 
+SLOT_ORDER = {"breakfast": 0, "lunch": 1, "dinner": 2, "snacks": 3}
+
+
+@dataclass
+class MenuItem:
+    """One food as eaten. `changed` = logged or changed by the patient (the
+    rest came from the meal plan) — shown with a mark, never as a status."""
+    slot: str
+    description: str
+    amount: str
+    kcal: float
+    protein_g: float
+    fiber_g: float | None
+    basis: str
+    changed: bool
+
+
+def _amount(e: dict) -> str:
+    q = _f(e.get("quantity")) or 1.0
+    if (e.get("source") or "") == "usda":           # USDA values are per 100 g
+        return f"{q * 100:,.0f} g"
+    portion = e.get("portion")
+    if portion:
+        return portion if abs(q - 1.0) < 1e-9 else f"{q:g} × {portion}"
+    return "1 portion" if abs(q - 1.0) < 1e-9 else f"{q:g} × portion"
+
+
+def _menu(es: list[dict]) -> list[MenuItem]:
+    items = [MenuItem(slot=e.get("slot") or "", description=e.get("description") or "",
+                      amount=_amount(e), kcal=_f(e.get("kcal")), protein_g=_f(e.get("protein_g")),
+                      fiber_g=(_f(e["fiber_g"]) if e.get("fiber_g") is not None else None),
+                      basis=macro_basis(e), changed=(e.get("status") == "corrected"))
+             for e in es]
+    return sorted(items, key=lambda m: SLOT_ORDER.get(m.slot, 9))
+
+
 @dataclass
 class DayRow:
     day: date
     day_type: str | None
     recorded: bool
-    status: str                 # a STATUS_LABEL value, or "not recorded — <reason>"
+    note: str                   # "" when recorded, else "not recorded — <reason>"
+    menu: list                  # MenuItem, in slot order (only when recorded)
     totals: dict                # macro -> float (only when recorded)
     est_share: float | None     # % of kcal from estimate/placeholder
     steps: float | None
@@ -157,14 +181,12 @@ class Report:
     unrecorded_by_reason: dict
     averages: dict              # macro -> {mean, min, max}
     target_diff: dict           # macro -> signed difference (kcal, protein only)
-    status_counts: dict
+    n_changed_days: int         # recorded days with at least one patient-logged item
     basis_kcal: dict
     basis_protein: dict
     weight: dict
     sessions: dict
     activity: dict
-    default_day: list[dict]
-    repeats: list[tuple]        # (description, count)
     notes: list[str] = field(default_factory=list)
 
 
@@ -272,14 +294,12 @@ def build(data: dict, *, name: str | None = None) -> Report:
 
     rows: list[DayRow] = []
     unrecorded: dict[str, int] = {}
-    status_counts = {"planned, no correction received": 0, "confirmed": 0, "corrected": 0}
     for d in days:
         es = by_day.get(d, [])
         nd = ndays.get(d)
         recorded = bool(es)
         if recorded:
-            status = STATUS_LABEL.get((nd or {}).get("status") or "corrected", "corrected")
-            status_counts[status] = status_counts.get(status, 0) + 1
+            note, menu = "", _menu(es)
             totals = {k: sum(_f(e.get(k)) for e in es) for k, _, _ in MACROS}
             kc = totals["kcal"]
             est = sum(_f(e.get("kcal")) for e in es
@@ -288,10 +308,10 @@ def build(data: dict, *, name: str | None = None) -> Report:
         else:
             reason = UNRECORDED_REASON.get((nd or {}).get("prefill_outcome"), "no record")
             unrecorded[reason] = unrecorded.get(reason, 0) + 1
-            status, totals, est_share = f"not recorded — {reason}", {}, None
+            note, menu, totals, est_share = f"not recorded — {reason}", [], {}, None
         rows.append(DayRow(
             day=d, day_type=data.get("day_types", {}).get(d) or (nd or {}).get("day_type"),
-            recorded=recorded, status=status, totals=totals, est_share=est_share,
+            recorded=recorded, note=note, menu=menu, totals=totals, est_share=est_share,
             steps=hourly.get(("step_count", d)), active_min=hourly.get(("apple_exercise_time", d)),
             active_kcal=energy.get(d), weight=w.get(d)))
 
@@ -317,21 +337,16 @@ def build(data: dict, *, name: str | None = None) -> Report:
         "active_min_total": sum(amin) if amin else None, "active_min_days": len(amin),
         "active_kcal_avg": mean(akcal) if akcal else None, "active_kcal_days": len(akcal),
     }
-    repeats: dict[str, int] = {}
-    for e in data.get("entries") or []:
-        if e.get("status") == "corrected":
-            repeats[e["description"]] = repeats.get(e["description"], 0) + 1
 
     return Report(
         start=start, end=end, generated=data["generated"],
         name=name if name is not None else os.environ.get("REPORT_PATIENT_NAME", ""),
         target_line=_target_line(t), target=t, days=rows, n_recorded=len(rec),
         unrecorded_by_reason=unrecorded, averages=averages, target_diff=diff,
-        status_counts=status_counts,
+        n_changed_days=sum(1 for r in rec if any(m.changed for m in r.menu)),
         basis_kcal=_shares(all_entries, "kcal"), basis_protein=_shares(all_entries, "protein_g"),
         weight=_weight_summary(w, end), sessions=data.get("sessions") or {},
-        activity=activity, default_day=list(data.get("default_day") or []),
-        repeats=sorted(((k, v) for k, v in repeats.items() if v >= 2), key=lambda x: (-x[1], x[0])),
+        activity=activity,
     )
 
 
@@ -415,6 +430,8 @@ td.n, th.n { text-align: right; }
 .charts { display: flex; gap: 12pt; margin-top: 6pt; }
 .note { color: #444; font-size: 7.5pt; margin-top: 2pt; }
 .pb { page-break-before: always; }
+table.menu { margin-bottom: 5pt; page-break-inside: avoid; table-layout: fixed; }
+tr.tot td { font-weight: bold; border-bottom: none; }
 footer, .foot { color: #444; font-size: 7pt; margin-top: 8pt; }
 """
 
@@ -451,13 +468,7 @@ def _page1(r: Report) -> str:
                        f"<td class='n'>{ref}</td><td class='n'>{dif}</td></tr>")
         out.append("</table>")
 
-    out.append("<h2>3. How days were recorded</h2><table>"
-               "<tr><th>Recording status</th><th class='n'>Days</th></tr>")
-    for label in ("planned, no correction received", "confirmed", "corrected"):
-        out.append(f"<tr><td>{label}</td><td class='n'>{r.status_counts.get(label, 0)}</td></tr>")
-    out.append("</table>")
-
-    out.append("<h2>4. Share of intake by macro basis</h2>")
+    out.append("<h2>3. Share of intake by macro basis</h2>")
     if not r.basis_kcal:
         out.append("<p>No intake recorded in this period.</p>")
     else:
@@ -469,7 +480,7 @@ def _page1(r: Report) -> str:
                            f"<td class='n'>{_n(r.basis_protein.get(b, 0.0), 1)}</td></tr>")
         out.append("</table>")
 
-    out.append("<h2>5. Weight</h2>")
+    out.append("<h2>4. Weight</h2>")
     w = r.weight
     if not w.get("n"):
         out.append("<p>No weigh-ins recorded in this period.</p>")
@@ -511,9 +522,9 @@ def _page2(r: Report) -> str:
     out.append('<p class="note">Intensity breakdown not yet available.</p>')
 
     out.append("<h2>Per day</h2><table class='small'><tr><th>Date</th><th>Day type</th>"
-               "<th>Recording status</th><th class='n'>kcal</th><th class='n'>Protein</th>"
+               "<th class='n'>kcal</th><th class='n'>Protein</th>"
                "<th class='n'>Carb</th><th class='n'>Fat</th><th class='n'>Fiber</th>"
-               "<th class='n'>Est./placeholder</th><th class='n'>Weight</th></tr>")
+               "<th class='n'>Est./placeholder</th><th class='n'>Weight</th><th>Note</th></tr>")
     for d in r.days:
         t = d.totals
         wt = f"{d.weight[0]:.1f} ({d.weight[1]})" if d.weight else "—"
@@ -521,33 +532,47 @@ def _page2(r: Report) -> str:
                   _n(t['fiber_g']), (_n(d.est_share) + "%") if d.est_share is not None else "—"]
                  if d.recorded else ["—"] * 6)
         out.append(f"<tr><td>{_d(d.day)}</td><td>{_e(DAY_TYPE_LABEL.get(d.day_type, d.day_type or '—'))}</td>"
-                   f"<td>{_e(d.status)}</td>"
                    + "".join(f"<td class='n'>{c}</td>" for c in cells)
-                   + f"<td class='n'>{_e(wt)}</td></tr>")
+                   + f"<td class='n'>{_e(wt)}</td><td>{_e(d.note)}</td></tr>")
     out.append("</table>")
 
-    out.append("<h2>Recurring meals</h2>")
-    if r.default_day:
-        out.append("<table class='small'><tr><th>Default work day</th><th>Slot</th><th>Portion</th>"
-                   "<th class='n'>kcal</th><th class='n'>Protein</th><th>Basis</th></tr>")
-        for m in r.default_day:
-            out.append(f"<tr><td>{_e(m['description'])}</td><td>{_e(m.get('slot') or '')}</td>"
-                       f"<td>{_e(m.get('portion') or '1 portion')}</td><td class='n'>{_n(_f(m.get('kcal')))}</td>"
-                       f"<td class='n'>{_n(_f(m.get('protein_g')))} g</td><td>{macro_basis(m)}</td></tr>")
-        out.append("</table>")
-    else:
-        out.append("<p>No default work day recorded.</p>")
-    if r.repeats:
-        out.append("<p class='note'>Foods logged 2 or more times as changes: "
-                   + ", ".join(f"{_e(k)} ({v})" for k, v in r.repeats) + ".</p>")
+    return "".join(out)
+
+
+def _menu_pages(r: Report) -> str:
+    """Every recorded day's menu, item by item (Ryan, 2026-09-27: the full
+    menu, with changes marked, replaces the recording-status label)."""
+    rec = [d for d in r.days if d.recorded]
+    if not rec:
+        return ""
+    out = ['<div class="pb"></div><h2>Daily menu</h2>',
+           f'<p class="note">{len(rec)} recorded days; {r.n_changed_days} include items '
+           'logged or changed by the patient (marked †). Unmarked items are from the meal plan.</p>']
+    for d in rec:
+        t = d.totals
+        out.append('<table class="small menu"><colgroup><col style="width:9%"><col style="width:37%">'
+                   '<col style="width:18%"><col style="width:9%"><col style="width:10%">'
+                   '<col style="width:8%"><col style="width:9%"></colgroup>')
+        out.append(f'<tr><th colspan="2">{_d(d.day)} · '
+                   f'{_e(DAY_TYPE_LABEL.get(d.day_type, d.day_type or "—"))}</th><th>Amount</th>'
+                   f'<th class="n">kcal</th><th class="n">Protein</th><th class="n">Fiber</th>'
+                   f'<th>Basis</th></tr>')
+        for m in d.menu:
+            mark = " †" if m.changed else ""
+            out.append(f"<tr><td>{_e(m.slot)}</td><td>{_e(m.description)}{mark}</td>"
+                       f"<td>{_e(m.amount)}</td><td class='n'>{_n(m.kcal)}</td>"
+                       f"<td class='n'>{_n(m.protein_g)} g</td>"
+                       f"<td class='n'>{(_n(m.fiber_g) + ' g') if m.fiber_g is not None else '—'}</td>"
+                       f"<td>{_e(m.basis)}</td></tr>")
+        out.append(f"<tr class='tot'><td></td><td>Day total</td><td></td>"
+                   f"<td class='n'>{_n(t['kcal'])}</td><td class='n'>{_n(t['protein_g'])} g</td>"
+                   f"<td class='n'>{_n(t['fiber_g'])} g</td><td></td></tr></table>")
     return "".join(out)
 
 
 def _footer() -> str:
-    return ('<div class="foot">Recording status: <b>planned, no correction received</b> — the day '
-            'was pre-filled from the meal plan and no change was reported; <b>confirmed</b> — '
-            'reported as eaten as planned; <b>corrected</b> — changed or logged by the patient. '
-            'Basis: <b>label</b> — nutrition label or recipe computed from labels; <b>USDA</b> — '
+    return ('<div class="foot"><b>†</b> — logged or changed by the patient; other items are '
+            'from the meal plan. Basis: <b>label</b> — nutrition label or recipe computed from labels; <b>USDA</b> — '
             'USDA FoodData Central; <b>Open Food Facts</b> — product database; <b>estimate</b> — '
             'estimated value; <b>placeholder</b> — provisional value pending a label; '
             '<b>unclassified</b> — source not recorded. Active minutes: Apple Watch exercise '
@@ -557,7 +582,8 @@ def _footer() -> str:
 def render_html(r: Report, detail: str = "full") -> str:
     if detail not in ("summary", "full"):
         raise ValueError("detail is 'summary' or 'full'")
-    body = _page1(r) + (_page2(r) if detail == "full" else "") + _footer()
+    body = (_page1(r) + (_page2(r) + _footer() + _menu_pages(r) if detail == "full"
+                         else _footer()))
     return (f"<!doctype html><html><head><meta charset='utf-8'><title>{TITLE}</title>"
             f"<style>{_CSS}</style></head><body>{body}</body></html>")
 
@@ -574,8 +600,18 @@ def banned_words_in(text: str) -> list[str]:
     return [w for w in BANNED_WORDS if re.search(rf"\b{re.escape(w)}\b", low)]
 
 
+class PdfEngineMissing(RuntimeError):
+    """WeasyPrint isn't installed for this Python — say how to fix it."""
+
+
 def _document(html_doc: str):
-    from weasyprint import HTML        # heavy import; the box renders in its own process
+    try:
+        from weasyprint import HTML    # heavy import; the box renders in its own process
+    except ImportError as exc:
+        raise PdfEngineMissing(
+            "WeasyPrint is not installed for this Python. On the box: "
+            "sudo /usr/bin/python3.11 -m pip install weasyprint "
+            "(or pass --html to write the HTML instead).") from exc
     return HTML(string=html_doc).render()
 
 
