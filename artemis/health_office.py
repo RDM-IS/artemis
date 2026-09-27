@@ -15,7 +15,7 @@ which artemis.health.resolve_equipment_and_location prefers over its static
 fallback map. The home gym still exists; the rower and outdoor bike are retired
 from the plan.
 
-Rows are written INSERT ... ON CONFLICT (plan_date) DO UPDATE in ONE transaction
+Rows are written INSERT ... ON CONFLICT (plan_date, slot) DO UPDATE in ONE transaction
 with an acos.audit_log row, so plan_ids are stable and a session logged against a
 date mid-run is never orphaned. generated_by='manual' (CHECK-legal); week_num is
 1-7 (CHECK 1..19).
