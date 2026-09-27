@@ -74,7 +74,8 @@ PLANS = [
                                              "duration_min": 60}, phase=3, week=14),
     plan(2, date(2026, 9, 12), "strength_a", circuit("Home A", ["Leg press"]), phase=3, week=14),
     plan(3, date(2026, 9, 13), "walk", {"type": "steady", "display_name": "Run-Walk"}, phase=3, week=15),
-    # current program week 1 (Wed 9/16 – Tue 9/22)
+    # current program: week 1 is the Wed 9/16 – Sat 9/19 stub; 9/20+ is week 2
+    # (SCHEDULE-2 Sun..Sat weeks — the fixture predates them).
     plan(10, date(2026, 9, 16), "strength_a", circuit("Office Strength A", A)),
     plan(11, date(2026, 9, 17), "rest_mobility", FLOW, est_duration_min=38),
     plan(12, TODAY, "strength_b", circuit("Office Strength B", B, adjustment={
@@ -137,6 +138,10 @@ class FakeSession:
             return _Result([r for r in rows if r["status"] == "open" and r["qualifies"]])
         if "FROM health.phase_config" in sql:
             return _Result([{"phase_name": "Foundation"}] if p["p"] == 1 else [{"phase_name": "Peak"}])
+        if sql.startswith("SELECT week_num FROM health.plan WHERE plan_date = :t AND slot"):
+            rows = [x for x in self.plans if x["plan_date"] == p["t"]
+                    and x.get("slot", "morning") == "morning"]
+            return _Result([{"week_num": rows[0]["week_num"]}] if rows else [])
         if sql.startswith("SELECT phase, week_num, plan_date FROM health.plan"):
             rows = sorted([x for x in self.plans if x["plan_date"] <= p["t"]], key=lambda x: x["plan_date"])
             return _Result(rows[-1:][::-1])
@@ -219,10 +224,13 @@ class TestProgram(Base):
         self.assertEqual(prog["source"], "derived")
         self.assertEqual((prog["name"], prog["phase"], prog["week"], prog["weeks_total"]),
                          ("Foundation", 1, 1, 1))
+        # The week is the Sun..Sat program week (SCHEDULE-2): week 1 is the
+        # Wed 9/16..Sat 9/19 stub, not a Wed..Tue block from the anchor.
         self.assertEqual((prog["anchor"], prog["week_start"], prog["week_end"]),
-                         ("2026-09-16", "2026-09-16", "2026-09-22"))
+                         ("2026-09-16", "2026-09-16", "2026-09-19"))
         # Sessions exclude rest days; the flow day counts (partial, not done).
-        self.assertEqual((prog["sessions_done"], prog["sessions_planned"]), (1, 6))
+        # 3 planned in the Wed..Sat stub (6 was the old Wed..Tue window).
+        self.assertEqual((prog["sessions_done"], prog["sessions_planned"]), (1, 3))
 
     def test_program_state_wins(self):
         state = {"name": "Foundation", "phase": 1, "anchor": "2026-09-16", "weeks_total": 7,
@@ -232,14 +240,15 @@ class TestProgram(Base):
                          ("state", 7, 7, 6))
         later = self.overview(FakeSession(program_state=state),
                               now=datetime(2026, 10, 30, 17, 0, tzinfo=timezone.utc))["program"]
+        # Week 7 is Sun 10/25..Sat 10/31 (SCHEDULE-2).
         self.assertEqual((later["week"], later["weeks_to_deload"], later["week_start"]),
-                         (7, 0, "2026-10-28"))
+                         (7, 0, "2026-10-25"))
 
     def test_scoping_excludes_the_old_program(self):
         body = self.overview()
         dates = [d["plan_date"] for d in body["week_days"]]
         self.assertEqual(dates[0], "2026-09-16")
-        self.assertEqual(len(dates), 7)
+        self.assertEqual(len(dates), 4)           # the Wed..Sat week-1 stub
         for f in body["flags"]:
             self.assertGreaterEqual(f["date"], "2026-09-16", f)
             self.assertNotIn("tweak", f["text"])
@@ -304,9 +313,10 @@ class TestToday(Base):
 class TestStrengthProgress(Base):
     def test_rows_last_previous_best_setting(self):
         rows = {r["exercise"]: r for r in self.overview()["strength_progress"]}
-        # Program week's exercises, as written, in plan order.
+        # Program week's exercises, as written, in plan order. Pec fly is
+        # Strength C on Mon 9/21 — week 2 under Sun..Sat weeks, so not listed.
         self.assertEqual(list(rows), ["Leg press", "DB bench press", "DB goblet squat",
-                                      "Incline DB press", "Pec fly"])
+                                      "Incline DB press"])
         lp = rows["Leg press"]
         # Top set by load × reps: 160 × 12 (1920) beats 170 × 10 (1700).
         self.assertEqual(lp["last"], {"date": "2026-09-16", "weight_lbs": 160.0, "reps": 12, "score": 1920.0})
@@ -315,8 +325,7 @@ class TestStrengthProgress(Base):
         self.assertEqual(lp["setting"], 4.0)
         self.assertEqual(lp["setup"], {"seat": 4.0})          # legacy setting=N → seat
         self.assertEqual(rows["Incline DB press"]["setting"], 2.0)
-        self.assertEqual(rows["Pec fly"]["sessions"], 0)
-        self.assertIsNone(rows["Pec fly"]["last"])
+        self.assertNotIn("Pec fly", rows)
 
     def test_trend_calculation(self):
         from api.app.routers.health import TopSet, strength_progress, trend_of
