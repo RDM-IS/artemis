@@ -42,4 +42,4 @@ def is_training(session_type: str | None) -> bool:
 #: What the Sessions tab offers every day, rest days included — low-impact
 #: work that sits on top of planned training without affecting it (Ryan,
 #: 2026-09-27). Core and standalone mobility join when they have definitions.
-EXTRA_TYPES: tuple[str, ...] = ("recovery_flow",)
+EXTRA_TYPES: tuple[str, ...] = ("recovery_flow", "core", "mobility")

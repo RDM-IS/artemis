@@ -122,3 +122,35 @@ class TestMakeupState(unittest.TestCase):
         from knowledge.session_types import is_training
         for st in sl.LIBRARY_TYPES:
             self.assertFalse(is_training(st), st)
+
+
+class TestExtras(unittest.TestCase):
+    """EXTRAS (draft, 2026-09-27): core and mobility, bodyweight + mat, anywhere."""
+
+    def test_every_room_offers_all_extras(self):
+        lib = _build()
+        for loc in lib["locations"]:
+            self.assertEqual([s["session_type"] for s in loc["sessions"]],
+                             ["recovery_flow", "core", "mobility"], loc["key"])
+
+    def test_core_is_light_and_says_when(self):
+        e = sl.entry_for("core", "office", D)
+        b = e["blocks"]
+        self.assertEqual(b["type"], "circuit")
+        self.assertTrue(b["extra"])
+        self.assertLessEqual(e["target_rpe"], 4)
+        self.assertLessEqual(e["est_duration_min"], 15)
+        self.assertTrue(any("after the day's lift" in n for n in b["setup_notes"]))
+        for ex in b["exercises"]:
+            self.assertEqual(ex["equipment_class"], "bodyweight", ex["name"])
+
+    def test_every_extra_exercise_has_regions_for_the_pain_ladder(self):
+        from artemis import health_regions
+        for st in ("core", "mobility"):
+            for ex in sl.entry_for(st, "office", D)["blocks"]["exercises"]:
+                self.assertIn(ex["name"], health_regions.EXERCISE_REGIONS, ex["name"])
+
+    def test_unknown_types_still_fall_through_only_for_what_was_there(self):
+        # SESSION-LABELS: extras have their own branch, not the rest fallthrough.
+        b, *_ = health_office._build_inner("core", 3, location="office gym")
+        self.assertNotEqual(b["type"], "mobility")
