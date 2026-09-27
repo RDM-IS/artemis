@@ -77,6 +77,18 @@ _reg("Seated DB shoulder press", {"shoulder"}, {"triceps", "arms"})
 _reg("Calf press", {"legs", "calves"})
 _reg("Ab machine crunch", {"core"})
 
+# ── EXTRAS (2026-09-27, draft): the pain ladder can reason about them too ──
+_reg("Dead bug", {"core"}, {"low back", "hip"})
+_reg("Bird dog", {"core", "low back"}, {"hip", "shoulder"})
+_reg("Side plank", {"core"}, {"shoulder", "hip"})
+_reg("Glute bridge", {"hip"}, {"hamstrings", "low back"})
+_reg("McGill curl-up", {"core"})
+_reg("Cat-cow", {"back", "low back"}, {"neck"})
+_reg("90/90 hip switch", {"hip"}, {"knee"})
+_reg("Half-kneeling hip flexor stretch", {"hip"}, {"quads", "knee"})
+_reg("Thread the needle", {"back", "shoulder"}, {"neck"})
+_reg("Ankle rocks", {"calves"}, {"knee"})
+_reg("Child's pose", {"low back"}, {"hip", "shoulder"})
 # ── LOCATION-1 (Richfield): each mirrors the office exercise it stands in for,
 # because the pain ladder reasons about REGIONS, not about equipment. A
 # shoulder that rules out Pec fly rules out DB fly for the same reason.

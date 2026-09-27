@@ -191,6 +191,15 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "TRX fallout": "trx",
     # the home-gym Pallof was a band; the office one is "Cable Pallof press"
     "Pallof press": "bands",
+    # EXTRAS (2026-09-27, DRAFT pending Ryan's approval): no equipment beyond a mat
+    "Glute bridge": "bodyweight",
+    "McGill curl-up": "bodyweight",
+    "Cat-cow": "bodyweight",
+    "90/90 hip switch": "bodyweight",
+    "Half-kneeling hip flexor stretch": "bodyweight",
+    "Thread the needle": "bodyweight",
+    "Ankle rocks": "bodyweight",
+    "Child's pose": "bodyweight",
     # a legacy interval block, not a lift: duration work with no load. `cardio`
     # is a no-numeric-load class like bands and trx.
     "Stepmill or upright bike": "cardio",
@@ -285,6 +294,8 @@ _DISPLAY = {
     "rest_mobility": "Rest / Mobility",
     "rest": "Rest",
     "recovery_flow": "Recovery Flow",
+    "core": "Core (easy)",
+    "mobility": "Mobility",
 }
 
 # ── CYCLE-1 ────────────────────────────────────────────────────────────────
@@ -866,8 +877,66 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False,
     return blocks, rpe, zone, est
 
 
+# ---------------------------------------------------------------------------
+# EXTRAS (Ryan, 2026-09-27): low-impact work on top of the plan, any day, rest
+# days included. Never planned rows — the Sessions tab builds them on demand.
+# Bodyweight and a mat only, so they run anywhere but on the road.
+# CONTENT IS A DRAFT pending Ryan's approval (2026-09-27).
+#
+# Core stays LIGHT and goes AFTER the day's lift, never before it: the trunk
+# braces squats and hinges, and pre-fatiguing it costs stability under the bar.
+# ---------------------------------------------------------------------------
+
+# (name, format, target, per_side, rest_after_sec)
+_CORE = (
+    ("Dead bug",       "reps",     8,  True,  30),
+    ("Bird dog",       "reps",     8,  True,  30),
+    ("Side plank",     "duration", 20, True,  30),
+    ("Glute bridge",   "reps",     12, False, 30),
+    ("McGill curl-up", "reps",     5,  False, 45),
+)
+_MOBILITY = (
+    ("Cat-cow",                          "reps",     10, False, 10),
+    ("90/90 hip switch",                 "reps",     6,  True,  10),
+    ("Half-kneeling hip flexor stretch", "duration", 40, True,  10),
+    ("Thread the needle",                "reps",     6,  True,  10),
+    ("Ankle rocks",                      "reps",     10, True,  10),
+    ("Child's pose",                     "duration", 45, False, 0),
+)
+
+
+def _extra_exercise(name, fmt, target, per_side, rest) -> dict:
+    ex = {"name": name, "format": fmt, "rest_after_sec": rest,
+          "equipment_class": class_for(name),
+          "notes": "each side" if per_side else ""}
+    if fmt == "duration":
+        ex["duration_sec"] = target
+    else:
+        ex["target_reps"] = target
+    return ex
+
+
+def _extra(session_type: str, location: str):
+    spec, rounds, rpe, notes = {
+        "core": (_CORE, 2, 4.0,
+                 ["Light by design — after the day's lift, never before squats or hinges.",
+                  "Slow and controlled; stop well short of fatigue."]),
+        "mobility": (_MOBILITY, 1, 2.0,
+                     ["Easy range, no forcing. Breathe through each hold."]),
+    }[session_type]
+    exercises = [_extra_exercise(*e) for e in spec]
+    blocks = {"type": "circuit", "display_name": _DISPLAY[session_type], "location": location,
+              "rounds": rounds, "rest_between_rounds_sec": 45, "equipment": ["mat"],
+              "exercises": exercises, "setup_notes": notes, "extra": True}
+    work = sum((e.get("duration_sec") or e.get("target_reps", 0) * 4)
+               * (2 if s[3] else 1) + s[4] for e, s in zip(exercises, spec))
+    return blocks, rpe, None, max(5, round(rounds * work / 60))
+
+
 def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
                  location: str | None = None, location_key: str = "office"):
+    if session_type in ("core", "mobility"):
+        return _extra(session_type, location or LOCATION)
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
     if session_type.startswith("strength"):
