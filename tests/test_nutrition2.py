@@ -148,13 +148,17 @@ class TestParseMealLog(unittest.TestCase):
 
 
 FOODS = {
-    "asiago bagel": {"id": 1, "name": "Test bagel", "kcal": 300, "protein_g": 11, "fiber_g": 2,
-                     "basis": "portion", "portion": None, "source": "saved", "confidence": "exact"},
-    "egg": {"id": 2, "name": "Test egg", "kcal": 70, "protein_g": 6, "fiber_g": 0,
-            "basis": "portion", "portion": "1 large egg", "source": "saved", "confidence": "exact"},
-    "strawberry": {"id": None, "name": "Strawberries, raw", "kcal": 32, "protein_g": 0.7, "fiber_g": 2,
-                   "basis": "100g", "portion": "100 g", "source": "usda", "source_id": "x",
-                   "confidence": "matched"},
+    "asiago bagel": {"id": 1, "kind": "recipe", "name": "Test bagel", "kcal": 300, "protein_g": 11,
+                     "fiber_g": 2, "basis": "portion", "portion": None, "source": "saved",
+                     "confidence": "exact"},
+    "egg": {"id": 2, "kind": "ingredient", "name": "Test egg", "kcal": 70, "protein_g": 6,
+            "fiber_g": 0, "basis": "portion", "portion": "1 large egg", "source": "saved",
+            "confidence": "exact"},
+}
+EXTERNAL = {
+    "strawberry": {"id": None, "name": "Strawberries, raw", "kcal": 32, "protein_g": 0.7,
+                   "fiber_g": 2, "basis": "100g", "portion": "100 g", "source": "usda",
+                   "source_id": "x", "confidence": "matched"},
     "green grapes": {"id": None, "name": "Grapes", "kcal": 69, "protein_g": 0.7, "fiber_g": 0.9,
                      "basis": "100g", "portion": "100 g", "source": "usda", "source_id": "y",
                      "confidence": "matched"},
@@ -164,14 +168,29 @@ FOODS = {
 }
 
 
-def fake_resolve(_cur, name):
+def fake_saved(_cur, name):
     return FOODS.get(name.lower())
+
+
+def fake_external(name):
+    return EXTERNAL.get((name or "").lower())
+
+
+class _Cur:
+    rowcount = 0
+
+    def execute(self, *_a, **_k):
+        pass
+
+    def fetchone(self):
+        return (0,)
 
 
 class TestLogMeal(unittest.TestCase):
     def setUp(self):
         self.patches = [
-            mock.patch.object(nutrition, "resolve_food", side_effect=fake_resolve),
+            mock.patch.object(nutrition, "saved_food", side_effect=fake_saved),
+            mock.patch.object(nutrition, "external_food", side_effect=fake_external),
             mock.patch.object(nutrition, "is_open", return_value=True),
             mock.patch.object(nutrition, "_insert_entry"),
             mock.patch.object(nutrition, "_mark_corrected"),
@@ -179,7 +198,7 @@ class TestLogMeal(unittest.TestCase):
             mock.patch.object(meal_log, "_ensure_day"),
         ]
         self.m = [p.start() for p in self.patches]
-        self.insert = self.m[2]
+        self.insert = self.m[3]
 
     def tearDown(self):
         for p in self.patches:
@@ -187,54 +206,149 @@ class TestLogMeal(unittest.TestCase):
 
     def test_resolves_what_it_can_and_asks_about_the_rest(self):
         ml = meal_log.parse_meal_log(EXAMPLE)
-        out = meal_log.log_meal(mock.Mock(), ml, D)
+        out = meal_log.log_meal(_Cur(), ml, D)
         logged = {lg.item.name: lg for lg in out.logged}
         self.assertEqual(set(logged), {"asiago bagel", "eggs", "strawberry", "green grapes"})
-        self.assertEqual(logged["eggs"].factor, 2)                     # plural -> saved "egg"
-        self.assertAlmostEqual(logged["strawberry"].factor, 0.850485, places=5)   # 3 oz / 100 g
+        self.assertEqual(logged["eggs"].factor, 2)                     # plural -> SAVED "egg"
+        self.assertEqual(logged["eggs"].food["source"], "saved")
+        self.assertAlmostEqual(logged["strawberry"].factor, 0.850485, places=5)
         self.assertEqual(logged["strawberry"].kcal, 27)
-        # a slice against per-100 g is a question; an unknown food is a question
-        self.assertEqual(len(out.questions), 2)
+        self.assertEqual(len(out.questions), 2)                        # sandwich; a slice of per-100 g
         self.assertTrue(any("turkey sandwich" in q for q in out.questions))
         self.assertTrue(any("Cheddar" in q for q in out.questions))
         self.assertEqual(self.insert.call_count, 4)
 
     def test_nothing_resolvable_writes_nothing(self):
         ml = meal_log.parse_meal_log("I had a test mystery dish for lunch")
-        out = meal_log.log_meal(mock.Mock(), ml, D)
+        out = meal_log.log_meal(_Cur(), ml, D)
         self.assertEqual(out.logged, [])
         self.insert.assert_not_called()
 
     def test_a_locked_day_is_refused(self):
         with mock.patch.object(nutrition, "is_open", return_value=False):
             ml = meal_log.parse_meal_log("for lunch yesterday I had 2 eggs")
-            out = meal_log.log_meal(mock.Mock(), ml, D)
+            out = meal_log.log_meal(_Cur(), ml, D)
         self.assertIsNotNone(out.refused)
         self.insert.assert_not_called()
 
+    def test_bare_form_stores_saved_foods_only(self):
+        ml = meal_log.parse_meal_log("I had 2 eggs and strawberry")
+        out = meal_log.log_meal(_Cur(), ml, D)
+        self.assertEqual([lg.item.name for lg in out.logged], ["eggs"])
+        self.assertTrue(any("saved foods" in q for q in out.questions))
+
+    def test_a_usda_outage_is_a_question_not_a_fallthrough(self):
+        with mock.patch.object(nutrition, "external_food",
+                               side_effect=nutrition.SourceUnavailable("USDA could not be reached")):
+            ml = meal_log.parse_meal_log("for lunch I had 3 oz strawberry")
+            out = meal_log.log_meal(_Cur(), ml, D)
+        self.assertEqual(out.logged, [])
+        self.assertIn("USDA could not be reached", out.questions[0])
+
+    def test_a_range_is_a_question(self):
+        ml = meal_log.parse_meal_log("for lunch I had 3-4 eggs")
+        out = meal_log.log_meal(_Cur(), ml, D)
+        self.assertEqual(out.logged, [])
+        self.assertIn("range", out.questions[0])
+
+    def test_a_named_slot_replaces_only_the_planned_rows(self):
+        cur = mock.Mock()
+        cur.rowcount = 3
+        ml = meal_log.parse_meal_log("for breakfast I had 2 eggs")
+        out = meal_log.log_meal(cur, ml, D)
+        deletes = [c for c in cur.execute.call_args_list if "DELETE FROM nutrition.entry" in str(c)]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("status = 'assumed'", deletes[0].args[0])
+        self.assertEqual(deletes[0].args[1], (D, "breakfast"))
+        self.assertEqual(out.replaced_planned, 3)
+
+    def test_a_bare_snack_replaces_nothing(self):
+        cur = mock.Mock()
+        ml = meal_log.parse_meal_log("snacked on eggs")
+        meal_log.log_meal(cur, ml, D)
+        self.assertFalse([c for c in cur.execute.call_args_list if "DELETE" in str(c)])
+
+
+class TestHandleHoldsNoConnectionDuringLookups(unittest.TestCase):
+    def test_external_lookups_run_with_no_connection_open(self):
+        state = {"open": 0, "during_external": []}
+
+        class Conn:
+            def cursor(self):
+                return _Cur()
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def get_connection():
+            state["open"] += 1
+            try:
+                yield Conn()
+            finally:
+                state["open"] -= 1
+
+        def ext(name):
+            state["during_external"].append(state["open"])
+            return fake_external(name)
+
+        with mock.patch.object(nutrition, "saved_food", side_effect=fake_saved), \
+             mock.patch.object(nutrition, "external_food", side_effect=ext), \
+             mock.patch.object(nutrition, "find_saved_food", return_value=None), \
+             mock.patch.object(nutrition, "is_open", return_value=True), \
+             mock.patch.object(nutrition, "_insert_entry"), \
+             mock.patch.object(nutrition, "_mark_corrected"), \
+             mock.patch.object(nutrition, "_audit"), \
+             mock.patch.object(nutrition, "day_totals", return_value={
+                 "kcal": 1, "protein_g": 1, "carb_g": 0, "fat_g": 0, "fiber_g": 0, "n_entries": 1}), \
+             mock.patch.object(meal_log, "open_target", return_value=None), \
+             mock.patch.object(meal_log, "suggest", return_value=[]), \
+             mock.patch.object(meal_log, "_ensure_day"):
+            reply = meal_log.handle(get_connection, "for lunch I had 3 oz strawberry", D)
+        self.assertTrue(state["during_external"])
+        self.assertEqual(set(state["during_external"]), {0})
+        self.assertIn("Logged lunch", reply)
+
+    def test_multi_line_logs_each_meal(self):
+        logs = meal_log.parse_meal_logs("breakfast: eggs\nlunch: salad")
+        self.assertEqual([(m.slot, [i.name for i in m.items]) for m in logs],
+                         [("breakfast", ["eggs"]), ("lunch", ["salad"])])
+
 
 class TestReply(unittest.TestCase):
-    def _reply(self, target):
-        ml = meal_log.parse_meal_log("for breakfast I had 2 eggs")
-        out = meal_log.Outcome(day=D, slot="breakfast", logged=[meal_log.Logged(
-            item=ml.items[0], food=FOODS["egg"], factor=2, kcal=140, protein_g=12, fiber_g=0)])
+    def _reply(self, target, assumed=0, making=False, replaced=0):
+        text = "making 2 eggs for breakfast" if making else "for breakfast I had 2 eggs"
+        ml = meal_log.parse_meal_log(text)
+        out = meal_log.Outcome(day=D, slot="breakfast", replaced_planned=replaced,
+                               logged=[meal_log.Logged(item=ml.items[0], food=FOODS["egg"],
+                                                       factor=2, kcal=140, protein_g=12, fiber_g=0)])
         totals = {"kcal": 140, "protein_g": 12, "carb_g": 0, "fat_g": 0, "fiber_g": 0, "n_entries": 1}
         with mock.patch.object(nutrition, "day_totals", return_value=totals), \
+             mock.patch.object(meal_log, "_assumed_count", return_value=assumed), \
              mock.patch.object(meal_log, "open_target", return_value=target), \
              mock.patch.object(meal_log, "suggest", return_value=[
-                 {"name": "Test bowl", "kcal": 500, "protein_g": 40, "fiber_g": 9}]):
+                 {"name": "Test bowl", "kcal": 500, "protein_g": 40, "fiber_g": 9,
+                  "is_placeholder": True}]):
             return meal_log.build_reply(mock.Mock(), ml, out, D)
 
     def test_with_a_target(self):
         r = self._reply({"kcal": 2000, "protein_g": 190, "fiber_g": 40})
         self.assertIn("Logged breakfast", r)
         self.assertIn("Left: 1,860 kcal · 178 g protein · 40 g fiber", r)
-        self.assertIn("For lunch, fits: Test bowl", r)
+        self.assertIn("Recipes that fit what's left: Test bowl", r)
+        self.assertIn("estimate", r)                    # placeholder recipes say so
 
     def test_without_a_target_says_so_and_invents_none(self):
         r = self._reply(None)
         self.assertIn("No target set", r)
         self.assertNotIn("Left:", r)
+
+    def test_planned_rows_in_totals_are_named(self):
+        self.assertIn("includes 4 planned items not yet logged", self._reply(None, assumed=4))
+
+    def test_making_is_counted_as_eaten_and_replacement_is_stated(self):
+        r = self._reply(None, making=True, replaced=2)
+        self.assertIn("counted as eaten", r)
+        self.assertIn("Replaces the planned breakfast (2 items)", r)
 
 
 class FakeCur:
@@ -303,3 +417,101 @@ class TestOffBasis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReviewFindings(unittest.TestCase):
+    """The 2026-09-26 independent review of #208, one test per finding."""
+
+    NOT_LOGS = (
+        "Lunch was great, thanks", "lunch was cancelled", "breakfast was late today",
+        "dinner was amazing last night", "lunch: pushed to 1pm", "breakfast - done",
+        "dinner: done", "lunch: skipped", "dinner: no", "for lunch I got stuck in traffic",
+        "for breakfast I was running late so skipped it",
+        "dinner tonight: reservations at 7 with partner", "having Dennis over for dinner",
+        "I'm making plans for dinner", "I had a great weekend", "i had the flu", "I had fun",
+        "I had nothing", "I had no breakfast", "I had knee pain 2 this morning",
+        "I had lunch with Jennifer", "I ate at chipotle", "I had breakfast",
+    )
+
+    def test_status_talk_is_not_a_meal_log(self):
+        for t in self.NOT_LOGS:
+            with self.subTest(text=t):
+                self.assertIsNone(meal_log.parse_meal_log(t))
+
+    def test_company_is_not_food(self):
+        ml = meal_log.parse_meal_log("for lunch I had tacos with Jennifer")
+        self.assertEqual([i.name for i in ml.items], ["tacos"])
+        self.assertEqual(ml.ignored, ["with Jennifer"])
+
+    def test_day_phrases(self):
+        for t, off, slot in (("I had pizza for dinner last night", -1, "dinner"),
+                             ("for dinner last night I had pizza", -1, "dinner"),
+                             ("I had 2 eggs this morning", 0, "snacks")):
+            with self.subTest(text=t):
+                ml = meal_log.parse_meal_log(t)
+                self.assertEqual((ml.day_offset, ml.slot), (off, slot))
+                self.assertNotIn("night", ml.items[0].name)
+                self.assertNotIn("morning", ml.items[0].name)
+
+    def test_quantities(self):
+        cases = {"½ bagel": (0.5, None, "bagel"), "1½ cups rice": (1.5, "cups", "rice"),
+                 "2x eggs": (2, None, "eggs"), "eggs x2": (2, None, "eggs"),
+                 "1/2 an avocado": (0.5, None, "avocado"), "a 12 oz steak": (12, "oz", "steak"),
+                 "a dozen eggs": (12, None, "eggs")}
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                it = parse_item(text)
+                self.assertEqual((it.qty, it.unit, it.name), want)
+        self.assertIsNone(parse_item("3-4 strawberries").qty)
+        self.assertTrue(parse_item("7 layer burrito").numeric_lead)
+
+    def test_count_against_weight_or_external_portions_asks(self):
+        ing = {"basis": "portion", "kind": "ingredient"}
+        self.assertIsNone(portion_factor(3, None, {**ing, "portion": "100 g"}))
+        self.assertEqual(portion_factor(1, "slice", {**ing, "portion": "2 slices (56 g)"}), 0.5)
+        self.assertIsNone(portion_factor(1, "slice", {**ing, "portion": "1 oz (28 g)"}))
+        self.assertIsNone(portion_factor(1, None, {"basis": "serving", "portion": "1 bar",
+                                                    "source": "off"}))
+        self.assertEqual(portion_factor(2, None, {"basis": "portion", "kind": "recipe",
+                                                  "portion": None}), 2)
+
+    def test_status_gate_answers_nutrition_only(self):
+        for t in ("what's left on my calendar today?", "what's left in my inbox",
+                  "how many emails are left", "how much budget is remaining for the Paris trip",
+                  "where am i at on the backlog"):
+            with self.subTest(text=t):
+                self.assertFalse(meal_log.is_status_request(t))
+
+
+class TestSavedFoodMatch(unittest.TestCase):
+    """An exact slug in ANY kind beats a prefix, and a prefix ends at a word."""
+
+    class Cur:
+        def __init__(self, rows):
+            self.rows, self.last = rows, None
+            self.description = [(c,) for c in ("id", "kind", "name", "slug")]
+
+        def execute(self, sql, params):
+            kind, pat = params
+            if "slug = %s" in sql:
+                self.last = [r for r in self.rows if r[1] == kind and r[3] == pat]
+            else:
+                pre = pat[:-1]
+                self.last = [r for r in self.rows if r[1] == kind and r[3].startswith(pre)][:2]
+
+        def fetchone(self):
+            return self.last[0] if self.last else None
+
+        def fetchall(self):
+            return self.last
+
+    ROWS = [(1, "recipe", "Cheesecake bites", "cheesecake bites"),
+            (2, "ingredient", "Cheese", "cheese"),
+            (3, "recipe", "Egg white bites", "egg white bites"),
+            (4, "recipe", "Protein bar peanut", "protein bar peanut")]
+
+    def test_exact_ingredient_beats_recipe_prefix(self):
+        with mock.patch.object(nutrition, "_as_dict", side_effect=lambda _c, r: {"id": r[0]}):
+            self.assertEqual(nutrition.find_saved_food(self.Cur(self.ROWS), "cheese")["id"], 2)
+            self.assertIsNone(nutrition.find_saved_food(self.Cur(self.ROWS), "egg"))
+            self.assertEqual(nutrition.find_saved_food(self.Cur(self.ROWS), "protein bar")["id"], 4)

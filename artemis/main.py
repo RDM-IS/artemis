@@ -4158,10 +4158,12 @@ def _handle_meal_log(post: dict, question: str) -> bool:
     root_id = post.get("root_id") or post["id"]
     today = local_today()
     try:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            reply = (meal_log.status_reply(cur, today) if status
-                     else meal_log.handle(cur, question, today))
+        if status:
+            with get_connection() as conn:
+                reply = meal_log.status_reply(conn.cursor(), today)
+        else:
+            # Opens its own connections and holds none during network lookups.
+            reply = meal_log.handle(get_connection, question, today)
     except Exception:
         # The text already passed the deterministic gate, so it IS a meal log:
         # claim it and say nothing was stored. Falling through would hand it to

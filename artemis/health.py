@@ -3373,6 +3373,10 @@ def propose_nutrition_target(message: str, channel_id: str) -> str:
     return format_target_proposal(target)
 
 
+class TargetBackdated(ValueError):
+    """The new target starts on or before the open target's start date."""
+
+
 def insert_nutrition_target_tx(target: NutritionTarget) -> int:
     """Close the prior open target and insert the new one (+ any meals) in ONE
     transaction, so the one_open_target index never sees two open rows."""
@@ -3400,6 +3404,12 @@ def insert_nutrition_target_tx(target: NutritionTarget) -> int:
             # grocery-staples generator (life_ops) still reads it; both retire
             # together in the coverage-checked health.* retirement. Same
             # transaction, so the two can never disagree.
+            cur.execute("SELECT effective_from FROM nutrition.target "
+                        "WHERE effective_to IS NULL AND effective_from >= %s::date",
+                        (eff_from,))
+            if cur.fetchone():
+                # Closing it would give it an end before its start.
+                raise TargetBackdated(eff_from)
             cur.execute(
                 "UPDATE nutrition.target "
                 "SET effective_to = (%s::date - INTERVAL '1 day')::date "
@@ -3438,6 +3448,10 @@ def commit_nutrition_target(channel_id: str) -> str:
         return "⚠️ Pending target was malformed — discarded. Re-send it."
     try:
         new_id = insert_nutrition_target_tx(target)
+    except TargetBackdated as e:
+        clear_nutrition_target_pending(channel_id)
+        return (f"⚠️ The current target already starts on or after {e.args[0]} — a new "
+                "target needs a later effective date. Nothing changed.")
     except Exception:
         logger.exception("Nutrition target commit failed")
         return "⚠️ Couldn't write the target — check DB. Nothing changed."

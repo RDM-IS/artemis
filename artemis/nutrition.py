@@ -363,10 +363,14 @@ _FOOD_COLS = ("id, kind, name, kcal, protein_g, carb_g, fat_g, fiber_g, portion,
 
 
 def find_saved_food(cur, text: str) -> dict | None:
-    """Tier 1 of the source order: recipes, then ingredients.
+    """Tier 1 of the source order.
 
-    Within each kind: exact slug first, then a unique prefix. An ambiguous
-    prefix in a kind stops the search for that kind rather than picking one.
+    An EXACT slug in any kind (recipes, then ingredients) wins before any
+    prefix is considered, and a prefix must end at a word boundary — so
+    "cheese" is the ingredient "cheese", never the recipe "cheesecake bites"
+    (NUTRITION-2 review, 2026-09-26). A single word is never extended to a
+    recipe by prefix. An ambiguous prefix in a kind stops the search for that
+    kind rather than picking one.
     """
     slug = slugify(text)
     if not slug:
@@ -378,10 +382,17 @@ def find_saved_food(cur, text: str) -> dict | None:
         row = cur.fetchone()
         if row:
             return _as_dict(cur, row)
+    one_word = len(slug.split()) < 2
+    for kind in SAVED_FOOD_KINDS:
+        if one_word and kind == "recipe":
+            # A recipe is a dish: one word must not extend to it ("egg" is not
+            # "egg white bites"). An ingredient is a food with descriptors, so
+            # "salmon" may still find "salmon atlantic fresh portion".
+            continue
         cur.execute(
             f"SELECT {_FOOD_COLS} FROM nutrition.food "
             "WHERE kind = %s AND slug LIKE %s AND active LIMIT 2",
-            (kind, slug + "%"))
+            (kind, slug.replace("%", "").replace("_", "") + " %"))
         rows = cur.fetchall()
         if len(rows) == 1:
             return _as_dict(cur, rows[0])
@@ -526,8 +537,13 @@ def apply_deviation(cur, d: date, dev: Deviation) -> str:
 
     # NUTRITION-2: "+ 120 g banana" is 120 grams, not 120 bananas.
     item = parse_item(dev.text) or Item(1.0, None, dev.text, dev.text)
+    if item.qty is None:
+        return range_question(item)
     qty = dev.quantity * item.qty
-    resolved = resolve_food(cur, item.name)
+    try:
+        resolved = resolve_food(cur, item.name)
+    except SourceUnavailable as exc:
+        return f"{exc} — nothing stored for “{item.raw}”. Try again shortly."
     if resolved is None:
         return _ask_about(item.name)
     factor = portion_factor(qty, item.unit, resolved)
@@ -567,13 +583,40 @@ def _ask_about(text: str) -> str:
             f"which brand? (I won't guess the numbers.)")
 
 
-def resolve_food(cur, text: str) -> dict | None:
-    """Source order: saved foods -> USDA -> Open Food Facts. Returns None when
-    nothing matches — the caller asks rather than inventing macros."""
+class SourceUnavailable(Exception):
+    """A lookup source could not be READ (timeout, HTTP error). Distinct from
+    "no match": falling through to the next tier on an outage turns an
+    infrastructure error into a plausible wrong food (FAIL-CLOSED-RESOLVERS)."""
+
+
+def saved_food(cur, text: str) -> dict | None:
+    """Tier 1 alone, shaped like a resolve_food result."""
     saved = find_saved_food(cur, text)
     if saved:
         return {**saved, "confidence": "exact", "source": "saved",
                 "source_id": saved.get("source_id"), "basis": "portion"}
+    return None
+
+
+def external_food(text: str) -> dict | None:
+    """Tiers 2–3 (network, no DB). Raises SourceUnavailable when USDA is
+    configured but can't be read — never falls through to Open Food Facts."""
+    hit = lookup_usda(text)
+    if hit:
+        return {**hit, "confidence": "matched"}
+    hit = lookup_off(text)
+    if hit:
+        return {**hit, "confidence": "matched"}
+    return None
+
+
+def resolve_food(cur, text: str) -> dict | None:
+    """Source order: saved foods -> USDA -> Open Food Facts. Returns None when
+    nothing matches — the caller asks rather than inventing macros. Raises
+    SourceUnavailable when a configured source can't be read."""
+    saved = saved_food(cur, text)
+    if saved:
+        return saved
 
     hit = lookup_usda(text)
     if hit:
@@ -599,14 +642,18 @@ def lookup_usda(text: str) -> dict | None:
             "https://api.nal.usda.gov/fdc/v1/foods/search",
             params={"query": text, "pageSize": 1, "api_key": key}, timeout=10)
         if r.status_code != 200:
-            return None
+            raise SourceUnavailable(f"USDA answered HTTP {r.status_code}")
         foods = (r.json() or {}).get("foods") or []
-    except Exception:
-        logger.debug("USDA lookup failed", exc_info=True)
-        return None
+    except SourceUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("USDA lookup failed: %s", exc)
+        raise SourceUnavailable("USDA could not be reached") from exc
     if not foods:
         return None
     f = foods[0]
+    if not f.get("fdcId"):
+        return None
     by_id = {n.get("nutrientNumber"): n.get("value") for n in f.get("foodNutrients") or []}
     kcal = by_id.get("208")
     protein = by_id.get("203")
@@ -632,14 +679,18 @@ def lookup_off(text: str) -> dict | None:
             headers={"User-Agent": "artemis-acos/1.0 (personal nutrition log)"},
             timeout=10)
         if r.status_code != 200:
-            return None
+            raise SourceUnavailable(f"Open Food Facts answered HTTP {r.status_code}")
         products = (r.json() or {}).get("products") or []
-    except Exception:
-        logger.debug("Open Food Facts lookup failed", exc_info=True)
-        return None
+    except SourceUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("Open Food Facts lookup failed: %s", exc)
+        raise SourceUnavailable("Open Food Facts could not be reached") from exc
     if not products:
         return None
     p = products[0]
+    if not p.get("code"):
+        return None
     n = p.get("nutriments") or {}
     # NUTRITION-2: one basis per product, never a mix. Per serving when the
     # product states serving values, else per 100 g — the caller scales.
@@ -700,57 +751,124 @@ def portion_grams(portion: str | None) -> float | None:
 
 _WORD_QTY = {"a": 1.0, "an": 1.0, "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0,
              "five": 5.0, "six": 6.0, "half": 0.5, "half a": 0.5, "half an": 0.5,
-             "a half": 0.5, "a couple": 2.0, "a couple of": 2.0}
+             "a half": 0.5, "a couple": 2.0, "a couple of": 2.0, "a dozen": 12.0,
+             "dozen": 12.0}
+_UNICODE_FRAC = {"½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 1 / 3, "⅔": 2 / 3, "⅛": 0.125}
 _COUNT_UNITS = ("slices", "slice", "pieces", "piece", "servings", "serving",
-                "scoops", "scoop", "cans", "can", "bottles", "bottle")
+                "scoops", "scoop", "cans", "can", "bottles", "bottle", "bars", "bar")
+_UNITS_ALT = "|".join(sorted(list(_WEIGHT_G) + list(_VOLUME) + list(_COUNT_UNITS) + ["ml", "l"],
+                             key=len, reverse=True))
+_QTY_ALT = (r"\d+\s*/\s*\d+|\d+(?:\.\d+)?|half\s+an?|a\s+half|a\s+couple(?:\s+of)?|a\s+dozen"
+            r"|dozen|an|a|one|two|three|four|five|six|half")
 _ITEM_RE = re.compile(
-    r"^\s*(?P<qty>\d+/\d+|\d+(?:\.\d+)?|half\s+an?|a\s+half|a\s+couple(?:\s+of)?"
-    r"|an|a|one|two|three|four|five|six|half)?\s*"
-    r"(?P<unit>" + "|".join(sorted(list(_WEIGHT_G) + list(_VOLUME) + list(_COUNT_UNITS),
-                                   key=len, reverse=True)) + r")?\.?\b\s*"
+    rf"^\s*(?P<qty>{_QTY_ALT})?\s*(?P<unit>{_UNITS_ALT})?\.?\b\s*"
     r"(?:of\s+)?(?P<name>.+?)\s*[.!]*\s*$", re.I)
+# "3-4 strawberries", "2 to 3 eggs" — a range is a question, never a midpoint.
+_RANGE_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*(?:-|–|to)\s*\d+(?:\.\d+)?\b", re.I)
+# "eggs x2" / "2x eggs"
+_TIMES_SUFFIX_RE = re.compile(r"^(?P<name>.+?)\s*[x×]\s*(?P<n>\d+(?:\.\d+)?)\s*$", re.I)
+_TIMES_PREFIX_RE = re.compile(r"^\s*(?P<n>\d+(?:\.\d+)?)\s*[x×]\s+(?P<name>.+)$", re.I)
+# "a 12 oz steak" — the article belongs to the steak, the weight to the amount.
+_ARTICLE_WEIGHT_RE = re.compile(rf"^\s*(?:a|an)\s+(?=\d)", re.I)
 
 
 @dataclass
 class Item:
-    qty: float
+    qty: float | None      # None = a range or otherwise unreadable amount (ask)
     unit: str | None       # a weight/volume/count unit, or None for a plain count
     name: str
     raw: str
+    #: the amount came from a leading number that might be part of the name
+    #: ("7 layer burrito", "2 egg omelette") — a saved food named with it wins.
+    numeric_lead: bool = False
+
+
+def _unicode_fracs(t: str) -> str:
+    """"1½" -> "1.5", "½" -> "0.5"."""
+    def sub(m):
+        whole = float(m.group(1)) if m.group(1) else 0.0
+        return f"{whole + _UNICODE_FRAC[m.group(2)]:g}"
+    return re.sub(r"(\d+)?\s*([½¼¾⅓⅔⅛])", sub, t)
 
 
 def parse_item(text: str) -> Item | None:
     """"3 oz of strawberry" -> (3, oz, strawberry); "2 eggs" -> (2, None,
-    eggs); "an asiago bagel" -> (1, None, asiago bagel)."""
+    eggs); "an asiago bagel" -> (1, None, asiago bagel). A range ("3-4
+    strawberries") parses with qty None so the caller asks."""
     raw = (text or "").strip()
-    m = _ITEM_RE.match(raw)
+    t = _unicode_fracs(raw)
+    t = _ARTICLE_WEIGHT_RE.sub("", t)
+    m = _RANGE_RE.match(t)
+    if m:
+        name = re.sub(r"^(?:of\s+)?", "", t[m.end():].strip(), flags=re.I)
+        return Item(qty=None, unit=None, name=name or raw, raw=raw) if name else None
+    mult = 1.0
+    for rx in (_TIMES_SUFFIX_RE, _TIMES_PREFIX_RE):
+        mm = rx.match(t)
+        if mm:
+            mult, t = float(mm.group("n")), mm.group("name")
+            break
+    m = _ITEM_RE.match(t)
     if not m or not m.group("name").strip():
         return None
-    q = (m.group("qty") or "").lower()
-    q = re.sub(r"\s+", " ", q)
+    q = re.sub(r"\s+", " ", (m.group("qty") or "").lower())
+    numeric = bool(re.match(r"^\d", q))
     if not q:
         qty = 1.0
     elif q in _WORD_QTY:
         qty = _WORD_QTY[q]
     else:
-        qty = _num(q)
+        qty = _num(q.replace(" ", ""))
     unit = (m.group("unit") or "").lower() or None
-    if unit in _COUNT_UNITS:
-        unit = None if unit.rstrip("s") in ("serving",) else unit
-    name = re.sub(r"^(?:the|some|my)\s+", "", m.group("name").strip(), flags=re.I)
-    return Item(qty=qty, unit=unit, name=name, raw=raw)
+    if unit in ("serving", "servings"):
+        unit = None
+    name = m.group("name").strip()
+    # "1/2 an avocado", "half of an apple"
+    name = re.sub(r"^(?:of\s+)?(?:an?|the|some|my)\s+", "", name, flags=re.I)
+    return Item(qty=qty * mult, unit=unit, name=name, raw=raw,
+                numeric_lead=numeric and unit is None and mult == 1.0)
+
+
+def range_question(item: "Item") -> str:
+    return (f"“{item.raw}” is a range — how many exactly? (I won't pick a middle.)")
+
+
+_PORTION_COUNT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?|\d+/\d+)?\s*([a-z]+)?", re.I)
+
+
+def _portion_count(portion: str | None) -> tuple[float, str | None] | None:
+    """(n, unit word) when a portion is a COUNT of things — "2 slices (56 g)"
+    -> (2, "slice"); "1 medium" / "1 bar (68 g)" / "1 large egg" -> (1, word).
+    None when it is a weight or volume ("100 g", "1 oz (28 g)", "1/2 cup")."""
+    if not portion:
+        return None
+    m = _PORTION_COUNT_RE.match(portion)
+    if not m or not m.group(1):
+        return None
+    word = (m.group(2) or "").lower()
+    if word in _WEIGHT_G or word in _VOLUME or word in ("ml", "l"):
+        return None
+    n = _num(m.group(1))
+    singular = word[:-1] if word.endswith("s") and word[:-1] in _COUNT_UNITS else word
+    return n, (singular or None)
 
 
 def portion_factor(qty: float, unit: str | None, food: dict) -> float | None:
     """How many of `food`'s macro bases `qty unit` is — or None when that
-    can't be known without guessing.
+    can't be known without guessing (the caller asks).
 
     `food["basis"]`: "portion" (a saved food: one recipe portion, or the
     ingredient's Notion `serving`), "serving" (a product's stated serving), or
     "100g" (USDA search values; Open Food Facts without serving data).
+
+    Review fixes (2026-09-26): a count is only ever compared to a portion that
+    is itself a count ("2 slices (56 g)": 1 slice = 0.5); a count against a
+    weight portion ("100 g") or against an EXTERNAL serving is a question —
+    only weights scale an external hit.
     """
     basis = food.get("basis") or "portion"
     portion = food.get("portion")
+    external = food.get("source") in ("usda", "off")
     u = (unit or "").lower() or None
     if is_weight_unit(u):
         grams = qty * _WEIGHT_G[u]
@@ -759,16 +877,28 @@ def portion_factor(qty: float, unit: str | None, food: dict) -> float | None:
         pg = portion_grams(portion)
         return grams / pg if pg else None
     if is_volume_unit(u):
-        if basis == "100g":
+        if basis == "100g" or external:
             return None
         m = _PORTION_VOL_RE.match(portion or "")
         if m and _VOLUME[m.group(2).lower()] == _VOLUME[u]:
             return qty / (_num(m.group(1)) if m.group(1) else 1.0)
         return None
-    # A count (no unit, or slice / piece / serving / scoop): one per portion.
-    if basis == "100g":
+    if u in ("ml", "l"):
         return None
-    return qty
+    # A count: no unit, or slice / piece / scoop / can / bar.
+    if basis == "100g" or external:
+        return None
+    if food.get("kind") == "recipe" and not portion:
+        return qty if u is None else None          # one recipe portion as eaten
+    pc = _portion_count(portion)
+    if pc is None:
+        return None                                # a weight/volume portion
+    n, word = pc
+    if u is not None:
+        want = u[:-1] if u.endswith("s") else u
+        if word != want:
+            return None                            # "1 slice" vs "1 oz" / "1 bar"
+    return qty / n
 
 
 def _insert_entry(cur, d: date, slot: str, food: dict, qty: float) -> None:
