@@ -69,14 +69,35 @@ class TestAverages(unittest.TestCase):
         self.assertNotIn("fiber_g", r.target_diff)          # no target -> "—"
         self.assertIn("−300 kcal", _text(r))
 
-    def test_status_counts(self):
+    def test_the_menu_marks_what_the_patient_changed(self):
         data = month_data(n=7)
-        data["nutrition_days"][1]["status"] = "locked_unconfirmed"
+        for e in data["entries"]:
+            if e["day_date"] == date(2027, 1, 1) and e["slot"] == "lunch":
+                e["status"] = "corrected"
+                e["description"] = "Test salad"
         r = dr.build(data)
-        self.assertEqual(r.status_counts["planned, no correction received"], 3)
-        self.assertEqual(r.status_counts["corrected"], 2)
-        self.assertEqual(r.status_counts["confirmed"], 0)
+        day1 = r.days[0]
+        self.assertEqual([m.slot for m in day1.menu], ["breakfast", "lunch", "dinner"])
+        self.assertEqual([m.changed for m in day1.menu], [False, True, False])
+        self.assertEqual(r.n_changed_days, 1)
+        t = _text(r)
+        self.assertIn("Daily menu", t)
+        self.assertIn("Test salad †", t)
+        self.assertIn("Day total", t)
 
+    def test_no_recording_status_label_anywhere(self):
+        t = _text(dr.build(month_data(n=7)))
+        self.assertNotIn("no correction received", t)
+        self.assertNotIn("Recording status", t)
+
+    def test_amounts(self):
+        self.assertEqual(dr._amount({"source": "usda", "quantity": 0.85}), "85 g")
+        self.assertEqual(dr._amount({"source": "saved", "quantity": 2, "portion": "1 large egg"}),
+                         "2 × 1 large egg")
+        self.assertEqual(dr._amount({"source": "notion", "quantity": 1, "portion": None}), "1 portion")
+
+    def test_summary_has_no_menu(self):
+        self.assertNotIn("Daily menu", _text(dr.build(month_data(n=7)), "summary"))
 
 class TestBasis(unittest.TestCase):
     def test_shares_sum_to_100(self):
@@ -166,14 +187,17 @@ class TestPeriods(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_WEASY, "WeasyPrint not installed")
 class TestPages(unittest.TestCase):
-    def test_a_31_day_month_is_two_pages(self):
-        self.assertEqual(dr.page_count(dr.render_html(dr.build(month_data()), "full")), 2)
+    def test_a_31_day_month_is_summary_detail_then_menu(self):
+        # Pages 1–2 as specced, then the menu: 23 recorded days of 3 items.
+        n = dr.page_count(dr.render_html(dr.build(month_data()), "full"))
+        self.assertGreaterEqual(n, 3)
+        self.assertLessEqual(n, 6)
 
     def test_summary_is_one_page(self):
         self.assertEqual(dr.page_count(dr.render_html(dr.build(month_data()), "summary")), 1)
 
-    def test_a_week_is_two_pages(self):
-        self.assertEqual(dr.page_count(dr.render_html(dr.build(month_data(n=7)), "full")), 2)
+    def test_a_week_is_three_pages(self):
+        self.assertEqual(dr.page_count(dr.render_html(dr.build(month_data(n=7)), "full")), 3)
 
 
 if __name__ == "__main__":

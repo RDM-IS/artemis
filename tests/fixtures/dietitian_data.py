@@ -37,8 +37,5 @@ def month_data(start=date(2027, 1, 1), n=31, *, entries=True, watch=True):
                       for i, d in enumerate(days)]) if watch else [],
         "active_energy": [{"local_date": d, "value": 500} for d in days] if watch else [],
         "sessions": {"planned": 20, "done": 12, "due": 16},
-        "default_day": [{"description": "Test oats", "slot": "breakfast", "kcal": 400,
-                         "protein_g": 40, "source": "notion", "is_placeholder": False,
-                         "source_detail": "label", "portion": None}],
         "generated": date(2027, 2, 1),
     }
