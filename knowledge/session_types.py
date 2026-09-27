@@ -30,3 +30,16 @@ def is_rest(session_type: str | None) -> bool:
 def needs_followup(session_type: str | None) -> bool:
     """True when a missing log on this session is worth saying something about."""
     return (session_type or "") not in NO_FOLLOWUP_TYPES
+
+
+#: Planned TRAINING — what can be missed, and so what can be made up
+#: (MAKEUP-2, Ryan 2026-09-27). Flows and rest are not training.
+def is_training(session_type: str | None) -> bool:
+    t = session_type or ""
+    return t.startswith("strength") or t == "cardio_z2"
+
+
+#: What the Sessions tab offers every day, rest days included — low-impact
+#: work that sits on top of planned training without affecting it (Ryan,
+#: 2026-09-27). Core and standalone mobility join when they have definitions.
+EXTRA_TYPES: tuple[str, ...] = ("recovery_flow",)
