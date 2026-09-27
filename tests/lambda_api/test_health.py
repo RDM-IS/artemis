@@ -43,6 +43,17 @@ VALID_KEY = "test-health-api-key-xyz"
 # Mock DB plumbing — minimal shim for SQLAlchemy execute().mappings().first()
 # ---------------------------------------------------------------------------
 
+
+def _endpoint_today():
+    """The date the endpoints call "today": Central, not the runner's clock.
+
+    `date.today()` is the process's local date — UTC on the CI runner — so
+    from 19:00 CT (00:00 UTC) until midnight CT these tests built fixtures
+    for tomorrow and six of them failed every evening (found 2026-09-26).
+    """
+    from api.app.routers.health import _today_ct
+    return _today_ct()
+
 class _MockMappingResult:
     def __init__(self, row: dict | None):
         self._row = row
@@ -391,7 +402,7 @@ class TestStatusEndpoint(unittest.TestCase):
         """EVENING-1 + 2026-09-25: the strip filtered to mornings and then keyed
         a dict on date, so a rest morning beside a COMPLETED evening flow read
         as a day on which nothing happened."""
-        today = date.today()
+        today = _endpoint_today()
         fixtures = {"plan_window": [
             {"plan_id": 1, "plan_date": today, "session_type": "rest",
              "is_skipped": False, "is_logged": False, "phase": 1, "week_num": 2,
@@ -410,7 +421,7 @@ class TestStatusEndpoint(unittest.TestCase):
     def test_today_summary_stays_the_morning_row(self):
         """The summary mirrors /today, which drives the workout screen, so it
         must not follow the evening row even when that is the day's session."""
-        today = date.today()
+        today = _endpoint_today()
         fixtures = {"plan_window": [
             {"plan_id": 1, "plan_date": today, "session_type": "rest",
              "is_skipped": False, "is_logged": False, "phase": 1, "week_num": 2,
@@ -425,7 +436,7 @@ class TestStatusEndpoint(unittest.TestCase):
         self.assertEqual(body["today_summary"]["session_type"], "rest")
 
     def test_with_today_plan_and_summary_populates_today_summary(self):
-        today = date.today()
+        today = _endpoint_today()
         fixtures = {
             "plan_window": [{
                 "plan_id": 42,
@@ -846,7 +857,7 @@ class TestSessionsEndpoint(unittest.TestCase):
 
     def test_planned_set_count_from_circuit_blocks(self):
         from datetime import date as date_cls
-        today = date_cls.today()
+        today = _endpoint_today()
         plan_rows = [{
             "plan_id": 42,
             "plan_date": today,
@@ -883,7 +894,7 @@ class TestSessionsEndpoint(unittest.TestCase):
 
     def test_aggregates_and_outliers(self):
         from datetime import date as date_cls, datetime as datetime_cls
-        today = date_cls.today()
+        today = _endpoint_today()
         plan_rows = [{
             "plan_id": 70,
             "plan_date": today,
@@ -945,7 +956,7 @@ class TestSessionsEndpoint(unittest.TestCase):
 
     def test_incomplete_when_logged_lt_planned(self):
         from datetime import date as date_cls, datetime as datetime_cls
-        today = date_cls.today()
+        today = _endpoint_today()
         plan_rows = [{
             "plan_id": 71, "plan_date": today, "phase": 1, "week_num": 1,
             "session_type": "strength_a", "target_rpe": 7.0, "target_hr_zone": 3,
