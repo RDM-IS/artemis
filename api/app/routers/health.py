@@ -763,6 +763,12 @@ def post_log(
                     "notes": body.notes,
                     "is_skipped": False,
                     "logged_via": LOGGED_VIA_GYM_DISPLAY,
+                    # A summary is not done ON anything. These binds were missing
+                    # since 043 (0b38f64, 2026-09-25): SQLAlchemy refuses a
+                    # statement with an unbound parameter, so every POST carrying
+                    # session_rpe — the Finish cardio card — 500ed and rolled back.
+                    "modality": None,
+                    "device": None,
                 },
             ).mappings().first()
             if row is not None:
