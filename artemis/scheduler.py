@@ -265,6 +265,9 @@ class ArtemisScheduler:
             # is inside quiet hours and posts nothing. tier stays "business"
             # only because it never posts; see job_nutrition_prefill.
             CronSpec("nutrition_prefill", "job_nutrition_prefill", 0, 15),
+            # 00:20 — SESSION-LIB: rebuild the on-demand session library for the
+            # new day (program week and location may have changed). SILENT.
+            CronSpec("session_library", "job_session_library", 0, 20),
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
             # DRIFT-ALARM: hourly, phase-gated to wake+open inside the job.
             # tier="health" is the POSTING phase gate (wake as well as open),
@@ -1843,6 +1846,21 @@ class ArtemisScheduler:
                 logger.info("Posted check-in nudge for %s", today)
         except Exception:
             logger.exception("Check-in nudge failed")
+
+    def job_session_library(self):
+        """00:20 local — rebuild the SESSION-LIB library into acos.system_state.
+
+        SILENT BY DESIGN: posts nothing. A failure leaves yesterday's library in
+        place; the Lambda marks it stale (its `generated_on` isn't today), so the
+        launcher says so rather than presenting last week's program as current.
+        """
+        try:
+            from artemis import session_library
+            lib = session_library.write()
+            logger.info("session library: %s",
+                        {l["key"]: len(l["sessions"]) for l in lib["locations"]})
+        except Exception:
+            logger.exception("session library rebuild failed — keeping the previous one")
 
     def job_nutrition_prefill(self):
         """00:15 local — pre-fill today from the Notion default day (DIET-1).

@@ -2163,6 +2163,153 @@ def _upsert_hourly(db: Session, buckets: dict, merge_minutes, summarise_minutes)
     return result
 
 
+# ---------------------------------------------------------------------------
+# /library — SESSION-LIB: sessions that can be started on demand
+# ---------------------------------------------------------------------------
+# Built on the box by artemis/session_library.py (the Lambda can't run the
+# plan builder: it reads the cycle through box-only code) and served from
+# acos.system_state. Fail closed: a missing or unreadable library is
+# `available: false` with the reason — never an empty list presented as
+# "nothing can be done here".
+
+SESSION_LIBRARY_KEY = "session_library"
+
+
+@router.get("/library")
+def get_library(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    row = db.execute(
+        text("SELECT value FROM acos.system_state WHERE key = :k"),
+        {"k": SESSION_LIBRARY_KEY},
+    ).mappings().first()
+    if not row or not row.get("value"):
+        return {"available": False,
+                "reason": "The session library hasn't been built yet "
+                          "(python3.11 -m artemis.session_library on the box)."}
+    try:
+        lib = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "The stored session library is unreadable."}
+    today = datetime.now(ZoneInfo(_active_timezone(db))).date().isoformat()
+    lib["available"] = True
+    # Built for another day: the program week or the location may have moved.
+    lib["stale"] = lib.get("generated_on") != today
+    lib["today"] = today
+    return lib
+
+
+# ---------------------------------------------------------------------------
+# /makeup — MAKEUP-2 (Ryan, 2026-09-27): the one session not done this program
+# week is made up on today's rest day. The missed row becomes rest ("made up
+# on <date>"); today's rest row becomes the session, as the box's seeder built
+# it for today's location. The offer comes from the library the box wrote —
+# never from the client — and every condition is re-checked here, in one
+# transaction, before anything changes. Each row keeps what it was
+# (`makeup_original`, not `original`: the check-in's undo owns that key).
+# ---------------------------------------------------------------------------
+
+class MakeupIn(BaseModel):
+    missed_plan_id: int
+    rest_plan_id: int
+
+
+def _conflict(reason: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_409_CONFLICT,
+                         detail={"error": "makeup_not_possible", "reason": reason})
+
+
+@router.post("/makeup")
+def post_makeup(
+    body: MakeupIn,
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    from knowledge.session_types import REST_TYPES, is_training
+
+    row = db.execute(text("SELECT value FROM acos.system_state WHERE key = :k"),
+                     {"k": SESSION_LIBRARY_KEY}).mappings().first()
+    try:
+        lib = json.loads(row["value"]) if row and row.get("value") else None
+    except (TypeError, ValueError):
+        lib = None
+    today = datetime.now(ZoneInfo(_active_timezone(db))).date()
+    if not lib or lib.get("generated_on") != today.isoformat():
+        raise _conflict("the session library isn't current for today — rebuild it on the box")
+    mk = lib.get("makeup") or {}
+    offer = mk.get("offer")
+    if (not offer or offer.get("missed_plan_id") != body.missed_plan_id
+            or offer.get("rest_plan_id") != body.rest_plan_id or not offer.get("entry")):
+        raise _conflict("that makeup isn't on offer today")
+
+    def plan_row(pid: int):
+        return db.execute(text("""
+            SELECT plan_id, plan_date, slot, session_type, blocks, is_skipped,
+                   EXISTS (SELECT 1 FROM health.session_log sl WHERE sl.plan_id = health.plan.plan_id
+                           AND sl.logged_via <> 'inferred') AS logged
+            FROM health.plan WHERE plan_id = :pid AND slot = 'morning'
+        """), {"pid": pid}).mappings().first()
+
+    rest, missed = plan_row(body.rest_plan_id), plan_row(body.missed_plan_id)
+    if not rest or rest["plan_date"] != today or rest["session_type"] not in REST_TYPES or rest["logged"]:
+        raise _conflict("today's morning is no longer an unlogged rest day")
+    week_start = date.fromisoformat(mk["week_start"])
+    if (not missed or not (week_start <= missed["plan_date"] < today)
+            or not is_training(missed["session_type"]) or missed["logged"]):
+        raise _conflict("that session is no longer a not-done session from this week")
+    not_done = db.execute(text("""
+        SELECT plan_id, session_type FROM health.plan
+        WHERE slot = 'morning' AND plan_date >= :ws AND plan_date < :today
+          AND NOT EXISTS (SELECT 1 FROM health.session_log sl WHERE sl.plan_id = health.plan.plan_id
+                          AND sl.logged_via <> 'inferred')
+    """), {"ws": week_start, "today": today}).mappings().all()
+    not_done = [r for r in not_done if is_training(r["session_type"])]
+    if len(not_done) != 1:
+        raise _conflict(f"{len(not_done)} sessions are not done this week — the week repeats instead")
+
+    entry = offer["entry"]
+    old_rest_blocks = rest["blocks"] if isinstance(rest["blocks"], dict) else json.loads(rest["blocks"] or "{}")
+    old_missed_blocks = (missed["blocks"] if isinstance(missed["blocks"], dict)
+                         else json.loads(missed["blocks"] or "{}"))
+    new_blocks = dict(entry["blocks"])
+    new_blocks["makeup_of"] = {"plan_id": missed["plan_id"], "plan_date": missed["plan_date"].isoformat()}
+    new_blocks["makeup_original"] = {"session_type": rest["session_type"], "blocks": old_rest_blocks}
+    rest_blocks = {"type": "rest", "display_name": f"Rest — made up on {today:%a %-m/%-d}",
+                   "equipment": [], "made_up_on": today.isoformat(),
+                   "makeup_original": {"session_type": missed["session_type"],
+                                       "blocks": old_missed_blocks,
+                                       "is_skipped": bool(missed["is_skipped"])}}
+    try:
+        db.execute(text("""
+            UPDATE health.plan SET session_type = :t, blocks = CAST(:b AS jsonb),
+                   target_rpe = :rpe, target_hr_zone = :zone, est_duration_min = :est
+            WHERE plan_id = :pid
+        """), {"t": entry["session_type"], "b": json.dumps(new_blocks, default=str),
+               "rpe": entry.get("target_rpe"), "zone": entry.get("target_hr_zone"),
+               "est": entry.get("est_duration_min"), "pid": rest["plan_id"]})
+        db.execute(text("""
+            UPDATE health.plan SET session_type = 'rest', blocks = CAST(:b AS jsonb),
+                   is_skipped = FALSE, target_rpe = NULL, target_hr_zone = NULL, est_duration_min = 0
+            WHERE plan_id = :pid
+        """), {"b": json.dumps(rest_blocks, default=str), "pid": missed["plan_id"]})
+        db.execute(text(
+            "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
+            "outcome, token_count, api_cost_usd, metadata) "
+            "VALUES ('gym_display', NULL, 'makeup_swap', 'health', NULL, 'executed', 0, 0, "
+            "CAST(:meta AS jsonb))"),
+            {"meta": json.dumps({"missed_plan_id": missed["plan_id"],
+                                 "missed_date": missed["plan_date"].isoformat(),
+                                 "rest_plan_id": rest["plan_id"], "on": today.isoformat(),
+                                 "session_type": entry["session_type"]})})
+        db.commit()
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail={"error": "makeup_failed", "message": str(e)})
+    return {"ok": True, "plan_id": rest["plan_id"], "session_type": entry["session_type"],
+            "made_up": missed["plan_date"].isoformat()}
+
+
 @router.post("/ingest", response_model=IngestResponse)
 def post_ingest(
     payload: dict,
