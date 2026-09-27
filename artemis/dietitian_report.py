@@ -574,8 +574,18 @@ def banned_words_in(text: str) -> list[str]:
     return [w for w in BANNED_WORDS if re.search(rf"\b{re.escape(w)}\b", low)]
 
 
+class PdfEngineMissing(RuntimeError):
+    """WeasyPrint isn't installed for this Python — say how to fix it."""
+
+
 def _document(html_doc: str):
-    from weasyprint import HTML        # heavy import; the box renders in its own process
+    try:
+        from weasyprint import HTML    # heavy import; the box renders in its own process
+    except ImportError as exc:
+        raise PdfEngineMissing(
+            "WeasyPrint is not installed for this Python. On the box: "
+            "sudo /usr/bin/python3.11 -m pip install weasyprint "
+            "(or pass --html to write the HTML instead).") from exc
     return HTML(string=html_doc).render()
 
 

@@ -83,7 +83,11 @@ def main() -> int:
         out.write_text(doc)
         pages = "n/a (html)"
     else:
-        out.write_bytes(dr.render_pdf(doc))
+        try:
+            out.write_bytes(dr.render_pdf(doc))
+        except dr.PdfEngineMissing as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 3
         pages = dr.page_count(doc)
     n = (end - start).days + 1
     print(f"{out}\n  period {start} → {end} ({n} days) · pages {pages}\n"

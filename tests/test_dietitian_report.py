@@ -178,3 +178,20 @@ class TestPages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMissingEngine(unittest.TestCase):
+    def test_a_missing_weasyprint_names_the_fix(self):
+        import builtins
+        from unittest import mock
+        real = builtins.__import__
+
+        def no_weasy(name, *a, **k):
+            if name == "weasyprint":
+                raise ImportError("No module named 'weasyprint'")
+            return real(name, *a, **k)
+        with mock.patch("builtins.__import__", side_effect=no_weasy):
+            with self.assertRaises(dr.PdfEngineMissing) as caught:
+                dr.render_pdf("<p>x</p>")
+        self.assertIn("pip install weasyprint", str(caught.exception))
+        self.assertIn("--html", str(caught.exception))
