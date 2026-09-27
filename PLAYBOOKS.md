@@ -315,8 +315,9 @@ The morning is **event-driven**; the fixed 04:45 calibration post and its
 
 Prompt text:
 
-> Reply with: sleep hrs, energy 0–5, soreness by area 0–5 (0 = none), weight, RHR.
-> Example: `slept 7 energy 4 sore 0 weight 283`
+> Reply with: energy 0–5, and any sore or pain by area 0–5 (0 = none).
+> Example: `energy 4 sore 0` · `energy 3 knee pain 2`
+> _Sleep, weight and RHR come from the watch — add them only to correct it._
 
 **Routing.** The `morning_flow` handler sits **ahead of `nutrition`** and the
 LLM. It claims check-in-shaped text, ack words (`nope`, `all good`), done words

@@ -933,8 +933,7 @@ class TestPlanExactRender(unittest.TestCase):
             self.assertIn(f"{i}. {n} — 2×", text)
         self.assertNotIn("Calibrated plan", text)
         self.assertNotIn("workout is later", text)
-        self.assertIn("Reply with: sleep hrs, energy 0–5, soreness by area 0–5 (0 = none), "
-                      "weight, RHR.\nExample: `slept 7 energy 4 sore 0 weight 283`", text)
+        self.assertIn("Reply with: energy 0–5, and any sore or pain by area 0–5 (0 = none).\nExample: `energy 4 sore 0` · `energy 3 knee pain 2`\n_Sleep, weight and RHR come from the watch — add them only to correct it._", text)
 
     def test_rest_day_prompt_has_no_workout_later(self):
         from artemis.health import build_morning_survey_prompt
