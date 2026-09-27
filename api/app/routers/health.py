@@ -621,6 +621,10 @@ class LogExerciseIn(BaseModel):
     sets: list[LogSetIn] = Field(default_factory=list)
     notes: Optional[str] = None
     session_rpe: Optional[float] = Field(default=None, ge=1, le=10)
+    #: ADHOC-LOG: send INSTEAD of plan_id for a session started outside the
+    #: schedule (SESSION-LIB). The server attaches the sets to today's
+    #: uncompleted row of this type if there is one, else stores them unattached.
+    adhoc_session_type: Optional[str] = None
 
 
 class LogRowOut(BaseModel):
@@ -644,8 +648,38 @@ class LogRowOut(BaseModel):
 
 class LogResponse(BaseModel):
     plan_id: Optional[int] = None
+    #: ADHOC-LOG: True when the sets were stored unattached (plan_id None).
+    #: Clients send the returned plan_id on later sets of the same session.
+    adhoc: bool = False
     inserted: int
     rows: list[LogRowOut]
+
+
+# ADHOC-LOG: a session type is a lowercase slug. Deliberately not a fixed list
+# (SESSION-LIB adds core / yoga / mobility types), so a new one is not an
+# ENUM-EXPAND for the Lambda.
+_ADHOC_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+
+
+def _open_row_of_type(db: Session, session_type: str) -> Optional[int]:
+    """Today's plan row of this type, in either slot, that has no real log yet
+    (the 21:50 inferred placeholder doesn't count) and isn't skipped. The
+    morning row wins when both are open. None when there isn't one — the sets
+    are then stored unattached. Today is the ACTIVE timezone's date."""
+    today = datetime.now(ZoneInfo(_active_timezone(db))).date()
+    row = db.execute(
+        text("""
+            SELECT plan_id FROM health.plan
+            WHERE plan_date = :d AND session_type = :t AND NOT is_skipped
+              AND NOT EXISTS (
+                  SELECT 1 FROM health.session_log sl
+                  WHERE sl.plan_id = health.plan.plan_id AND sl.logged_via <> 'inferred')
+            ORDER BY (slot = 'morning') DESC, plan_id
+            LIMIT 1
+        """),
+        {"d": today, "t": session_type},
+    ).mappings().first()
+    return int(row["plan_id"]) if row else None
 
 
 @router.post("/log", response_model=LogResponse)
@@ -688,12 +722,28 @@ def post_log(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "unknown_modality", "modality": body.modality,
                     "known": list(CARDIO_MODALITIES)})
-    if body.plan_id is None:
+    adhoc_type: Optional[str] = None
+    if body.plan_id is None and body.adhoc_session_type is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"error": "plan_id_required",
-                    "fix": "send the plan_id of the session these sets belong to"})
-    plan_id = body.plan_id
+                    "fix": "send the plan_id of the session these sets belong to, "
+                           "or adhoc_session_type for a session outside the plan"})
+    if body.plan_id is not None and body.adhoc_session_type is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "plan_id_and_adhoc",
+                    "fix": "send one of plan_id or adhoc_session_type, not both"})
+    if body.plan_id is not None:
+        plan_id: Optional[int] = body.plan_id
+    else:
+        t = (body.adhoc_session_type or "").strip().lower()
+        if not _ADHOC_TYPE_RE.match(t):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "bad_adhoc_session_type", "value": body.adhoc_session_type})
+        plan_id = _open_row_of_type(db, t)
+        adhoc_type = None if plan_id is not None else t
     inserted_rows: list[dict[str, Any]] = []
 
     insert_sql = text("""
@@ -703,14 +753,14 @@ def post_log(
             duration_sec, distance_m,
             hr_avg, hr_peak, rpe_actual,
             notes, is_skipped, logged_via,
-            modality, device
+            modality, device, adhoc_session_type
         ) VALUES (
             :plan_id, :log_type, :exercise,
             :set_num, :reps_done, :weight_lbs,
             :duration_sec, :distance_m,
             :hr_avg, :hr_peak, :rpe_actual,
             :notes, :is_skipped, :logged_via,
-            :modality, :device
+            :modality, :device, :adhoc_session_type
         )
         RETURNING log_id, plan_id, log_type, exercise,
                   set_num, reps_done, weight_lbs,
@@ -740,6 +790,7 @@ def post_log(
                     "logged_via": LOGGED_VIA_GYM_DISPLAY,
                     "modality": body.modality,
                     "device": body.device,
+                    "adhoc_session_type": adhoc_type,
                 },
             ).mappings().first()
             if row is not None:
@@ -769,6 +820,7 @@ def post_log(
                     # session_rpe — the Finish cardio card — 500ed and rolled back.
                     "modality": None,
                     "device": None,
+                    "adhoc_session_type": adhoc_type,
                 },
             ).mappings().first()
             if row is not None:
@@ -783,6 +835,7 @@ def post_log(
 
     return LogResponse(
         plan_id=plan_id,
+        adhoc=adhoc_type is not None,
         inserted=len(inserted_rows),
         rows=[
             LogRowOut(
@@ -927,14 +980,16 @@ def get_last_logged(
                 sl.exercise,
                 sl.weight_lbs, sl.reps_done, sl.rpe_actual,
                 sl.duration_sec, sl.distance_m, sl.hr_avg, sl.hr_peak,
-                sl.notes, p.plan_date
+                sl.notes,
+                COALESCE(p.plan_date, (sl.logged_at AT TIME ZONE :tz)::date) AS plan_date
             FROM health.session_log sl
-            JOIN health.plan p ON p.plan_id = sl.plan_id
+            -- LEFT: ad-hoc sets (plan_id NULL, ADHOC-LOG) are real and feed LAST.
+            LEFT JOIN health.plan p ON p.plan_id = sl.plan_id
             WHERE sl.exercise = ANY(:names)
               AND sl.log_type IN ('strength_set', 'cardio_block')
             ORDER BY sl.exercise, sl.logged_at DESC
         """),
-        {"names": names},
+        {"names": names, "tz": _active_timezone(db)},
     ).mappings().all()
 
     out: dict[str, LastLoggedEntry] = {}

@@ -506,6 +506,7 @@ class _LogCaptureSession:
                 "is_skipped": params["is_skipped"],
                 "logged_at": datetime(2026, 6, 8, 18, 30, 0),
                 "logged_via": params["logged_via"],
+                "adhoc_session_type": params.get("adhoc_session_type"),
             }
             self.inserted.append(row)
             return _MockExecuteResult(row)
@@ -662,6 +663,50 @@ class TestLogEndpoint(unittest.TestCase):
         self.assertEqual([r["log_type"] for r in sess.inserted], ["cardio_block", "session_summary"])
         self.assertTrue(sess.committed)
         self.assertFalse(sess.rolled_back)
+
+    # ── ADHOC-LOG ──────────────────────────────────────────────────────────
+    def _adhoc(self, fixtures=None, **extra):
+        client, self.app, sess = _build_log_client(fixtures=fixtures)
+        body = {"exercise": "Test press", "log_type": "strength_set",
+                "sets": [{"set_num": 1, "reps_done": 9, "weight_lbs": 11, "rpe_actual": 6}]}
+        body.update(extra)
+        return client.post("/api/health/log", headers={"X-API-Key": VALID_KEY}, json=body), sess
+
+    def test_adhoc_with_no_open_row_is_stored_unattached(self):
+        resp, sess = self._adhoc(adhoc_session_type="strength_a")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["adhoc"])
+        self.assertIsNone(body["plan_id"])
+        self.assertIsNone(sess.inserted[0]["plan_id"])
+        self.assertEqual(sess.inserted[0]["adhoc_session_type"], "strength_a")
+
+    def test_adhoc_completes_todays_open_row_of_that_type(self):
+        resp, sess = self._adhoc(fixtures={"today_plan": {"plan_id": 77}},
+                                 adhoc_session_type="Strength_A")
+        body = resp.json()
+        self.assertFalse(body["adhoc"])
+        self.assertEqual(body["plan_id"], 77)
+        self.assertEqual(sess.inserted[0]["plan_id"], 77)
+        self.assertIsNone(sess.inserted[0]["adhoc_session_type"])
+
+    def test_adhoc_summary_rides_along_unattached(self):
+        resp, sess = self._adhoc(adhoc_session_type="core", session_rpe=6)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([r["adhoc_session_type"] for r in sess.inserted], ["core", "core"])
+
+    def test_adhoc_and_plan_id_together_is_refused(self):
+        resp, sess = self._adhoc(plan_id=5, adhoc_session_type="core")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()["detail"]["error"], "plan_id_and_adhoc")
+        self.assertEqual(sess.inserted, [])
+
+    def test_a_bad_adhoc_type_is_refused(self):
+        for bad in ("", "x", "Strength A", "drop table", "a" * 41):
+            with self.subTest(value=bad):
+                resp, sess = self._adhoc(adhoc_session_type=bad)
+                self.assertEqual(resp.status_code, 400)
+                self.assertEqual(sess.inserted, [])
 
     def test_400_on_empty_sets(self):
         client, self.app, _ = _build_log_client()
