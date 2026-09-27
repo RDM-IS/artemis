@@ -670,7 +670,9 @@ def _open_row_of_type(db: Session, session_type: str) -> Optional[int]:
     row = db.execute(
         text("""
             SELECT plan_id FROM health.plan
-            WHERE plan_date = :d AND session_type = :t AND NOT is_skipped
+            -- EITHER slot, deliberately (SESSION-LIB's rule); morning wins below.
+            WHERE plan_date = :d AND slot IN ('morning', 'evening')
+              AND session_type = :t AND NOT is_skipped
               AND NOT EXISTS (
                   SELECT 1 FROM health.session_log sl
                   WHERE sl.plan_id = health.plan.plan_id AND sl.logged_via <> 'inferred')
