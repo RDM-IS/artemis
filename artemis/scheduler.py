@@ -1996,16 +1996,25 @@ class ArtemisScheduler:
         if not self._is_open():
             logger.info("Weekly eval: phase not open — skipping")
             return
+        from artemis import health_eval
+        today = _local_today()
+        # The week that ended yesterday (Sat), reported complete.
+        start, end = health_eval.week_of(today - timedelta(days=1))
         try:
-            from artemis import health_eval
-            today = _local_today()
-            # The week that ended yesterday (Sat), reported complete.
-            start, end = health_eval.week_of(today - timedelta(days=1))
             result = health_eval.load(start, end, today=today)
             lines = health_eval.render_lines(result)
             self.mm.post_message(config.CHANNEL_OPS, "\U0001f4ca " + "\n".join(lines))
         except Exception:
             logger.exception("Weekly eval failed")
+        # REPEAT-WEEK: more than one session not done last week → PROPOSE the
+        # repeat. Nothing changes until Ryan replies `repeat week`.
+        try:
+            from artemis import program_repeat
+            msg = program_repeat.propose(start)
+            if msg:
+                self.mm.post_message(config.CHANNEL_OPS, msg)
+        except Exception:
+            logger.exception("Repeat-week proposal failed")
 
     def job_health_evening_prompt(self):
         """Wed/Sat 16:30 CT — pre-workout prompt with location + equipment.

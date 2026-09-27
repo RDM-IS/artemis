@@ -4138,6 +4138,36 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
     return True
 
 
+_REPEAT_RE = re.compile(r"^\s*(repeat(?:\s+the)?\s+week|yes\s+repeat)\s*[.!]*\s*$", re.I)
+_NO_REPEAT_RE = re.compile(r"^\s*(no\s+repeat|don'?t\s+repeat(?:\s+the\s+week)?)\s*[.!]*\s*$", re.I)
+
+
+def _handle_repeat_week(post: dict, question: str) -> bool:
+    """REPEAT-WEEK — `repeat week` applies the pending proposal; `no repeat`
+    declines it. Qualified words only, so no bare yes/no is claimed
+    (CONFIRM-ARB)."""
+    yes, no = _REPEAT_RE.match(question), _NO_REPEAT_RE.match(question)
+    if not (yes or no):
+        return False
+    from artemis import program_repeat
+    from datetime import date as _date
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        if no:
+            reply = program_repeat.decline()
+        else:
+            p = program_repeat.pending()
+            reply = ("Nothing to repeat — no week is waiting on a decision." if not p
+                     else program_repeat.apply(_date.fromisoformat(p["repeat_start"])))
+    except Exception:
+        logger.exception("repeat week failed")
+        reply = "⚠️ Couldn't apply the repeat — nothing was changed. Check the logs."
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_meal_log(post: dict, question: str) -> bool:
     """NUTRITION-2 — free-text meal logging and "what's left", into nutrition.*.
 
@@ -4277,6 +4307,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         # morning_flow so a check-in still wins, and it never claims
         # `fix <exercise> rpe <n>` (the workout-set correction in health.py).
         ("nutrition_fix", _handle_nutrition_fix),
+        # REPEAT-WEEK: `repeat week` / `no repeat` answer the Sunday proposal.
+        ("repeat_week", _handle_repeat_week),
         # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
         # resolved). After morning_flow so a check-in in the thread is a check-in.
         ("pattern_thread", _handle_pattern_thread),

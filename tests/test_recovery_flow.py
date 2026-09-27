@@ -368,7 +368,7 @@ class TestProgramState(unittest.TestCase):
     def test_program_state_for_the_status_page(self):
         self.assertEqual(office.program_state(), {
             "name": "Foundation", "phase": 1, "anchor": "2026-09-16", "weeks_total": 7,
-            "deload_week": 7, "end": "2026-10-31"})
+            "deload_week": 7, "end": "2026-10-31", "repeated_weeks": []})
 
     def test_written_with_the_reseed(self):
         cur = MagicMock()

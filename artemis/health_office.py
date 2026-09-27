@@ -922,33 +922,77 @@ def _rest_day():
 # Schedule
 # ============================================================================
 
-def week_num_for(d: date) -> int:
+# ---------------------------------------------------------------------------
+# REPEAT-WEEK (Ryan, 2026-09-27): a program week with more than one session not
+# done is repeated, and the block's END MOVES OUT a week rather than losing its
+# last week. A repeat is recorded as the Sunday the repeat week begins; the
+# program week number for any date is the calendar count minus the repeats
+# that have begun by then. Applied only on Ryan's `repeat week` (propose-then-
+# confirm) — see artemis/program_repeat.py.
+# ---------------------------------------------------------------------------
+
+REPEATS_KEY = "program_repeats"
+
+
+def repeat_starts() -> list[date]:
+    """The recorded repeat weeks. FAIL-CLOSED: an unreadable or malformed value
+    raises — a silent [] would renumber every week and rebuild the plan wrong.
+    The one permitted swallow is RealDbInTestError ("no table here")."""
+    from knowledge.dbguard import RealDbInTestError
+    from artemis.quiet_hours import get_system_value
+    try:
+        raw = get_system_value(REPEATS_KEY)
+    except RealDbInTestError:
+        return []
+    if not raw:
+        return []
+    got = json.loads(raw)
+    if not isinstance(got, list):
+        raise ValueError(f"{REPEATS_KEY} is not a list: {raw[:80]!r}")
+    return sorted(date.fromisoformat(str(x)[:10]) for x in got)
+
+
+def program_end(repeats: list[date] | None = None) -> date:
+    """The block's last day: OFFICE_END plus one week per repeat."""
+    reps = repeat_starts() if repeats is None else repeats
+    return OFFICE_END + timedelta(days=7 * len(reps))
+
+
+def calendar_week_start(d: date) -> date:
+    return WEEK2_START + timedelta(days=7 * ((d - WEEK2_START).days // 7))
+
+
+def week_num_for(d: date, repeats: list[date] | None = None) -> int:
     """Program week. Week 1 is the 9/16..9/19 stub; weeks 2+ run Sun..Sat from
-    WEEK2_START, matching the CYCLE-1 pay period (SCHEDULE-2)."""
+    WEEK2_START, matching the CYCLE-1 pay period (SCHEDULE-2). Each repeat that
+    has begun by `d` holds the number back one (REPEAT-WEEK)."""
     if d < WEEK2_START:
         return 1
-    return 2 + (d - WEEK2_START).days // 7
+    reps = repeat_starts() if repeats is None else repeats
+    return 2 + (d - WEEK2_START).days // 7 - sum(1 for r in reps if r <= d)
 
 
-def build_schedule() -> list[dict]:
+def build_schedule(repeats: list[date] | None = None) -> list[dict]:
     """Ordered specs {plan_date, session_type, week_num, location, wk0} from
-    WEEK2_START to OFFICE_END.
+    WEEK2_START to program_end() — OFFICE_END plus a week per repeat.
 
     The 9/16..9/19 week-1 stub is NOT regenerated — it is logged history and
     stays as seeded. Weeks 2..7 are Sun..Sat and the session for each day comes
     from SCHEDULE-2's office-day rule over the CYCLE-1 day types.
     """
+    reps = repeat_starts() if repeats is None else repeats
+    end = program_end(reps)
     specs: list[dict] = []
     d = WEEK2_START
-    while d <= OFFICE_END:
+    while d <= end:
         specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
-                      "week_num": week_num_for(d), "location": day_location(d),
+                      "week_num": week_num_for(d, reps), "location": day_location(d),
                       "location_key": day_location_key(d), "day_type": day_type(d),
                       "wk0": False})
         # EVENING-1: four evenings a week, and never one in a transit segment.
         if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
             specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
-                          "week_num": week_num_for(d),
+                          "week_num": week_num_for(d, reps),
                           "location": day_location(d, "evening"),
                           "location_key": day_location_key(d, "evening"),
                           "day_type": day_type(d), "wk0": False})
@@ -992,8 +1036,8 @@ def build_row(spec: dict) -> dict:
     }
 
 
-def build_rows() -> list[dict]:
-    return [build_row(s) for s in build_schedule()]
+def build_rows(repeats: list[date] | None = None) -> list[dict]:
+    return [build_row(s) for s in build_schedule(repeats)]
 
 
 # ============================================================================
@@ -1065,15 +1109,20 @@ def forbidden_hits(blocks) -> list[str]:
     return [t for t in FORBIDDEN_TOKENS if t in blob]
 
 
-def validate_rows(rows: list[dict]) -> list[str]:
+def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     """Structural asserts so a bad edit fails loudly. Returns the TIME-CAP
     notes (45-59 min, and the CALIBRATION_PENDING 60+ rows); a 60+ row
-    outside CALIBRATION_PENDING fails the assert."""
+    outside CALIBRATION_PENDING fails the assert.
+
+    `end` is the block's last day — program_end() unless the caller is
+    validating a proposed repeat. Weekly counts are per CALENDAR week: a
+    repeated week has the same week_num twice (REPEAT-WEEK)."""
+    end = program_end() if end is None else end
     keys = [(r["plan_date"], r.get("slot", "morning")) for r in rows]
     assert len(keys) == len(set(keys)), "duplicate (plan_date, slot)"
     mornings = sorted(r["plan_date"] for r in rows if r.get("slot", "morning") == "morning")
-    expected = [WEEK2_START + timedelta(days=i) for i in range((OFFICE_END - WEEK2_START).days + 1)]
-    assert mornings == expected, "every day 9/20..10/31 needs a MORNING row"
+    expected = [WEEK2_START + timedelta(days=i) for i in range((end - WEEK2_START).days + 1)]
+    assert mornings == expected, f"every day {WEEK2_START}..{end} needs a MORNING row"
     for r in rows:
         b = r["blocks"]
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
@@ -1104,9 +1153,10 @@ def validate_rows(rows: list[dict]) -> list[str]:
     # SCHEDULE-2: exactly 3 lifts per program week, and every row's location is
     # the one CYCLE-1 derives for that date.
     from collections import Counter
-    lifts = Counter(r["week_num"] for r in rows if r["session_type"].startswith("strength"))
-    for wk in sorted({r["week_num"] for r in rows}):
-        assert lifts[wk] == 3, f"week {wk} has {lifts[wk]} lifts, expected 3"
+    lifts = Counter(calendar_week_start(r["plan_date"]) for r in rows
+                    if r["session_type"].startswith("strength"))
+    for wk in sorted({calendar_week_start(r["plan_date"]) for r in rows}):
+        assert lifts[wk] == 3, f"week of {wk} has {lifts[wk]} lifts, expected 3"
     # EVENING-1: evenings are yoga, four a week, and never on the road.
     evenings = [r for r in rows if r.get("slot") == "evening"]
     for r in evenings:
@@ -1116,11 +1166,12 @@ def validate_rows(rows: list[dict]) -> list[str]:
             f"{r['plan_date']}: an evening session cannot be placed in a transit segment"
         assert r["blocks"].get("location") == day_location(r["plan_date"], "evening"), \
             f"{r['plan_date']}: evening location {r['blocks'].get('location')!r}"
-    ev_per_week = Counter(r["week_num"] for r in evenings)
-    full_weeks = {r["week_num"] for r in rows
-                  if week_num_for(WEEK2_START) < r["week_num"] < week_num_for(OFFICE_END)}
+    ev_per_week = Counter(calendar_week_start(r["plan_date"]) for r in evenings)
+    first_wk, last_wk = calendar_week_start(WEEK2_START), calendar_week_start(end)
+    full_weeks = {calendar_week_start(r["plan_date"]) for r in rows
+                  if first_wk < calendar_week_start(r["plan_date"]) < last_wk}
     for wk in sorted(full_weeks):
-        assert ev_per_week[wk] == 4, f"week {wk} has {ev_per_week[wk]} evenings, expected 4"
+        assert ev_per_week[wk] == 4, f"week of {wk} has {ev_per_week[wk]} evenings, expected 4"
 
     for r in rows:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
@@ -1175,10 +1226,12 @@ def validate_rows(rows: list[dict]) -> list[str]:
 
 _UPSERT_SQL = """
 INSERT INTO health.plan
-    (plan_date, phase, week_num, session_type, blocks,
+    (plan_date, slot, phase, week_num, session_type, blocks,
      target_rpe, target_hr_zone, est_duration_min, generated_by, notes)
-VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
-ON CONFLICT (plan_date) DO UPDATE SET
+VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+-- (plan_date, slot) since migration 042. It was ON CONFLICT (plan_date), which
+-- matches no constraint after 042 — every full reseed would have raised.
+ON CONFLICT (plan_date, slot) DO UPDATE SET
     phase            = EXCLUDED.phase,
     week_num         = EXCLUDED.week_num,
     session_type     = EXCLUDED.session_type,
@@ -1200,17 +1253,20 @@ PROGRAM_STATE_KEY = "health_program"
 DELOAD_WEEK = 7
 
 
-def program_state() -> dict:
+def program_state(repeats: list[date] | None = None) -> dict:
+    reps = repeat_starts() if repeats is None else repeats
     weeks = max(RAMP)
     return {"name": "Foundation", "phase": PHASE, "anchor": WEEK1_START.isoformat(),
-            "weeks_total": weeks, "deload_week": DELOAD_WEEK, "end": OFFICE_END.isoformat()}
+            "weeks_total": weeks, "deload_week": DELOAD_WEEK,
+            "end": program_end(reps).isoformat(),
+            "repeated_weeks": [r.isoformat() for r in reps]}
 
 
-def write_program_state(cur) -> None:
+def write_program_state(cur, repeats: list[date] | None = None) -> None:
     cur.execute(
         "INSERT INTO acos.system_state (key, value, updated_at) VALUES (%s, %s, now()) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        (PROGRAM_STATE_KEY, json.dumps(program_state())))
+        (PROGRAM_STATE_KEY, json.dumps(program_state(repeats))))
 
 
 def write_rows(cur, rows: list[dict], validate: list[dict] | None = None) -> int:
@@ -1224,7 +1280,7 @@ def write_rows(cur, rows: list[dict], validate: list[dict] | None = None) -> int
     duration_notes = validate_rows(validate if validate is not None else rows)
     for r in rows:
         cur.execute(_UPSERT_SQL, (
-            r["plan_date"], r["phase"], r["week_num"], r["session_type"],
+            r["plan_date"], r.get("slot", "morning"), r["phase"], r["week_num"], r["session_type"],
             json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
             r["est_duration_min"], r["generated_by"], r["notes"],
         ))
@@ -1233,7 +1289,7 @@ def write_rows(cur, rows: list[dict], validate: list[dict] | None = None) -> int
         "outcome, token_count, api_cost_usd, metadata) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
         ("health_office", None, "office_plan_reseed", "health", None, "executed", 0, 0.0,
-         json.dumps({"from": OFFICE_START.isoformat(), "to": OFFICE_END.isoformat(),
+         json.dumps({"from": OFFICE_START.isoformat(), "to": program_end().isoformat(),
                      "rows": len(rows), "duration_notes": duration_notes})),
     )
     write_program_state(cur)

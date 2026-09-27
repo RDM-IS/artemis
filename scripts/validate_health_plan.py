@@ -134,14 +134,14 @@ def evaluate(live: dict[date, dict]) -> list[dict]:
     for d in sorted(live):
         hits = office.forbidden_hits(live[d]["blocks"])
         add(d, "NO_RETIRED", not hits, f"retired equipment referenced: {hits}" if hits else "")
-        if d > office.OFFICE_END:
-            add(d, "HARD_STOP", False, f"unexpected row after {office.OFFICE_END.isoformat()}")
+        if d > office.program_end():
+            add(d, "HARD_STOP", False, f"unexpected row after {office.program_end().isoformat()}")
     return results
 
 
 def report(results: list[dict]) -> int:
     print(f"Office plan validation — {office.OFFICE_START.isoformat()} .. "
-          f"{office.OFFICE_END.isoformat()}\n")
+          f"{office.program_end().isoformat()}\n")
     categories: list[str] = []
     for r in results:
         if r["category"] not in categories:
@@ -186,7 +186,7 @@ def selftest_live(fault: bool) -> dict[date, dict]:
         live[office_day]["blocks"]["equipment"].append("water rower")
         live[start + timedelta(days=1)]["session_type"] = "cardio_intervals"
         live.pop(start + timedelta(days=3))
-        live[office.OFFICE_END + timedelta(days=1)] = {
+        live[office.program_end() + timedelta(days=1)] = {
             "phase": 1, "week_num": 7, "session_type": "cardio_z2",
             "blocks": {"type": "steady", "equipment": ["bike on trainer"]}}
     return live

@@ -2579,9 +2579,21 @@ def get_overview(
     if prog:
         anchor = prog["anchor"]
         scope_start = anchor
-        week = max(1, min(prog["weeks_total"], (today - anchor).days // 7 + 1))
-        week_start = anchor + timedelta(days=7 * (week - 1))
-        week_end = week_start + timedelta(days=6)
+        # The program week is what TODAY'S ROW says (REPEAT-WEEK holds it back
+        # a week at a time), and "this week" is the Sun..Sat calendar week the
+        # program runs on (SCHEDULE-2). Counting 7-day blocks from the Wed 9/16
+        # anchor gave a Wed..Tue window and a week number one behind the plan.
+        today_row = db.execute(
+            text("SELECT week_num FROM health.plan WHERE plan_date = :t AND slot = 'morning'"),
+            {"t": today},
+        ).mappings().first()
+        if today_row and today_row.get("week_num") is not None:
+            week = int(today_row["week_num"])
+        else:
+            week = max(1, min(prog["weeks_total"], (today - anchor).days // 7 + 1))
+        sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+        week_start = max(anchor, sunday)
+        week_end = sunday + timedelta(days=6)
         history_days, logs_by_plan = _plan_days(db, anchor, max(today, week_end), today)
         week_days = [d for d in history_days if week_start <= d.plan_date <= week_end]
         sessions = [d for d in week_days if not _is_rest_day(d.session_type, d.blocks)]

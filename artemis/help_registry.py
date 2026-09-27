@@ -74,6 +74,8 @@ COMMANDS: list[Command] = [
     Command("health", "making <recipe> for <meal>", "Log a planned meal from your recipes", "making chicken bowl for dinner"),
     Command("health", "what's left", "Today's totals and remaining vs target", "what's left"),
     Command("health", "set target …", "Set a nutrition target (confirmed)", "new target 2000 cal, 190 protein, 40 fiber"),
+    Command("health", "repeat week / no repeat", "Answer the Sunday repeat-week proposal",
+            "repeat week"),
     Command("health", "build grocery list", "Propose the week's staples from the meal plan", "build grocery list"),
 
     # ── rules ── (handler: rule_command)

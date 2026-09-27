@@ -132,7 +132,7 @@ def _logged_in_window(cur) -> list[tuple]:
         "JOIN health.plan p ON p.plan_id = sl.plan_id "
         "WHERE p.plan_date BETWEEN %s AND %s AND sl.logged_via <> 'inferred' "
         "GROUP BY 1 ORDER BY 1",
-        (office.WEEK2_START, office.OFFICE_END))
+        (office.WEEK2_START, office.program_end()))
     return cur.fetchall()
 
 
@@ -145,7 +145,7 @@ def _read_tail(cur) -> list[tuple]:
         "       (SELECT count(*) FROM health.session_log sl "
         "        WHERE sl.plan_id = p.plan_id AND sl.logged_via <> 'inferred') "
         "FROM health.plan p WHERE p.plan_date > %s ORDER BY p.plan_date",
-        (office.OFFICE_END,))
+        (office.program_end(),))
     return cur.fetchall()
 
 
@@ -154,11 +154,11 @@ def _delete_tail(cur) -> int:
     tail = _read_tail(cur)
     logged = [(d, st, n) for d, st, n in tail if n]
     if logged:
-        raise SystemExit(f"[ABORT] rows after {office.OFFICE_END} carry real session_log "
+        raise SystemExit(f"[ABORT] rows after {office.program_end()} carry real session_log "
                          f"rows — refusing to delete: {logged}")
     if not tail:
         return 0
-    cur.execute("DELETE FROM health.plan WHERE plan_date > %s", (office.OFFICE_END,))
+    cur.execute("DELETE FROM health.plan WHERE plan_date > %s", (office.program_end(),))
     return cur.rowcount
 
 
@@ -166,7 +166,7 @@ def _read_existing(cur) -> dict:
     cur.execute(
         "SELECT plan_date, phase, week_num, session_type, blocks FROM health.plan "
         "WHERE plan_date BETWEEN %s AND %s ORDER BY plan_date",
-        (office.WEEK2_START, office.OFFICE_END))
+        (office.WEEK2_START, office.program_end()))
     out = {}
     for d, phase, wk, st, blocks in cur.fetchall():
         b = json.loads(blocks) if isinstance(blocks, str) else (blocks or {})
@@ -195,7 +195,7 @@ def print_diff(existing: dict, rows: list[dict]) -> None:
         print(f"{d.isoformat():<11}{d.strftime('%a'):<4}{old_s:<52}{_row_label(new)}")
     print("-" * 120)
     n_new = sum(1 for r in rows if r["plan_date"] not in existing)
-    print(f"{len(rows)} office rows {office.WEEK2_START}..{office.OFFICE_END}: "
+    print(f"{len(rows)} office rows {office.WEEK2_START}..{office.program_end()}: "
           f"{len(rows) - n_new} rewritten, {n_new} inserted.\n")
 
 
@@ -276,13 +276,13 @@ def reseed_office(dry_run: bool, only: str | None = None) -> int:
 
         tail = [] if only else _read_tail(cur)
         if tail:
-            print(f"ROWS PAST {office.OFFICE_END} (to DELETE — orphans of the old window):")
+            print(f"ROWS PAST {office.program_end()} (to DELETE — orphans of the old window):")
             for d, st, n in tail:
                 flag = f"  << {n} REAL session_log row(s)" if n else ""
                 print(f"  {d.isoformat()}  {d.strftime('%a')}  {st}{flag}")
             print(f"  ({len(tail)} row(s) to delete)\n")
         elif not only:
-            print(f"No rows past {office.OFFICE_END}.\n")
+            print(f"No rows past {office.program_end()}.\n")
 
         if dry_run:
             conn.rollback()
@@ -295,7 +295,7 @@ def reseed_office(dry_run: bool, only: str | None = None) -> int:
             office.write_rows(cur, rows, validate=all_rows)
             conn.commit()
             if n_deleted:
-                print(f"[OK] Deleted {n_deleted} row(s) past {office.OFFICE_END}.")
+                print(f"[OK] Deleted {n_deleted} row(s) past {office.program_end()}.")
         except Exception:
             conn.rollback()
             raise
@@ -306,7 +306,7 @@ def reseed_office(dry_run: bool, only: str | None = None) -> int:
 def flow_rows(start: date) -> list[dict]:
     """The Recovery Flow rows from `start` through the program end."""
     rows = [r for r in office.build_rows()
-            if r["session_type"] == "recovery_flow" and start <= r["plan_date"] <= office.OFFICE_END]
+            if r["session_type"] == "recovery_flow" and start <= r["plan_date"] <= office.program_end()]
     for r in rows:
         office.validate_flow(r["blocks"])
     return rows
@@ -445,7 +445,7 @@ def strength_diff_lines(live: dict, rows: list[dict]) -> list[str]:
 def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
     _load_dotenv()
     rows = [r for r in office.build_rows()
-            if r["session_type"].startswith("strength") and start <= r["plan_date"] <= office.OFFICE_END]
+            if r["session_type"].startswith("strength") and start <= r["plan_date"] <= office.program_end()]
     office.validate_rows(office.build_rows())
     with _connect() as conn:
         cur = conn.cursor()
