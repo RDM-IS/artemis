@@ -5,8 +5,10 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dietitian_fixture import month_data  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+# Kept out of tests/*.py: CI runs pytest on every file there, and a helper
+# with no tests exits 5 ("no tests ran") and fails the job.
+from dietitian_data import month_data  # noqa: E402
 
 from artemis import dietitian_report as dr  # noqa: E402
 
