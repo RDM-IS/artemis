@@ -515,3 +515,108 @@ class TestSavedFoodMatch(unittest.TestCase):
             self.assertEqual(nutrition.find_saved_food(self.Cur(self.ROWS), "cheese")["id"], 2)
             self.assertIsNone(nutrition.find_saved_food(self.Cur(self.ROWS), "egg"))
             self.assertEqual(nutrition.find_saved_food(self.Cur(self.ROWS), "protein bar")["id"], 4)
+
+
+class TestReReviewFindings(unittest.TestCase):
+    """The re-verification of #208 (2026-09-26)."""
+
+    def test_units_only_follow_an_amount(self):
+        self.assertEqual(parse_item("pound cake").name, "pound cake")
+        self.assertIsNone(parse_item("pound cake").unit)
+        self.assertEqual(parse_item("slice of pizza").name, "slice of pizza")
+        it = parse_item("2 lbs chicken")
+        self.assertEqual((it.qty, it.unit, it.name), (2, "lbs", "chicken"))
+
+    def test_real_meals_with_ordinary_words_still_log(self):
+        for t in ("for lunch I had leftover chili from the other day",
+                  "for dinner I had a day-old bagel", "for lunch I had a sandwich over rice",
+                  "for lunch I grabbed a burrito", "for dinner I made tacos"):
+            with self.subTest(text=t):
+                self.assertIsNotNone(meal_log.parse_meal_log(t))
+
+    def test_bare_chat_stays_unclaimed(self):
+        for t in ("I ate too much", "I had enough", "I had a chance to review the PR",
+                  "breakfast: same as yesterday"):
+            with self.subTest(text=t):
+                self.assertIsNone(meal_log.parse_meal_log(t))
+
+    def test_a_chatty_next_line_is_not_food(self):
+        ml = meal_log.parse_meal_log("for lunch I had a salad\ncan you check my inbox")
+        self.assertEqual([i.raw for i in ml.items], ["a salad"])
+        self.assertEqual(ml.not_read, ["can you check my inbox"])
+        ml = meal_log.parse_meal_log("for breakfast I had eggs\nthanks!")
+        self.assertEqual(ml.not_read, ["thanks!"])
+
+    def test_a_slot_header_takes_the_lines_below(self):
+        logs = meal_log.parse_meal_logs("breakfast:\n2 eggs\n1 slice toast")
+        self.assertEqual([(m.slot, [i.raw for i in m.items]) for m in logs],
+                         [("breakfast", ["2 eggs", "1 slice toast"])])
+        self.assertEqual(meal_log.parse_meal_logs("lunch:"), [])
+
+    def test_whole_phrase_match_displays_as_matched(self):
+        with mock.patch.object(nutrition, "saved_food",
+                               side_effect=lambda _c, t: ({"id": 9, "kind": "recipe", "name": "7 layer burrito",
+                                                           "kcal": 500, "protein_g": 20, "fiber_g": 9,
+                                                           "basis": "portion", "portion": None,
+                                                           "source": "saved", "confidence": "exact"}
+                                                          if t.lower() == "7 layer burrito" else None)), \
+             mock.patch.object(nutrition, "is_open", return_value=True), \
+             mock.patch.object(nutrition, "_insert_entry"), \
+             mock.patch.object(nutrition, "_mark_corrected"), \
+             mock.patch.object(nutrition, "_audit"), \
+             mock.patch.object(meal_log, "_ensure_day"):
+            out = meal_log.log_meal(_Cur(), meal_log.parse_meal_log("for lunch I had 7 layer burrito"), D)
+        self.assertEqual(out.logged[0].factor, 1)
+        self.assertEqual(out.logged[0].kcal, 500)
+        self.assertNotIn("7 ×", meal_log._line_for(out.logged[0]))
+
+    def test_legacy_log_path_never_estimates(self):
+        src = (_REPO_ROOT / "artemis" / "main.py").read_text()
+        body = src[src.index("def _handle_nutrition("):src.index("def _handle_mention(")]
+        self.assertNotIn("log_nutrition(", body)
+        self.assertIn("I didn't log anything", body)
+
+    def test_same_day_target_correction_updates_in_place(self):
+        from artemis import health
+
+        class Cur:
+            def __init__(self):
+                self.sql = []
+                self._next = None
+
+            def execute(self, sql, params=None):
+                self.sql.append(sql)
+                if "RETURNING id" in sql:
+                    self._next = (41,)
+                elif "FROM nutrition.target" in sql:
+                    self._next = (7, True)        # open row starts the same day
+                else:
+                    self._next = None
+
+            def fetchone(self):
+                return self._next
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        cur = Cur()
+
+        class Conn:
+            def cursor(self):
+                return cur
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def get_connection():
+            yield Conn()
+
+        t = health.NutritionTarget(kcal=1999, protein_g=199, effective_from="2027-02-06")
+        with mock.patch("knowledge.db.get_connection", get_connection):
+            health.insert_nutrition_target_tx(t)
+        joined = " | ".join(cur.sql)
+        self.assertIn("UPDATE nutrition.target SET kcal", joined)
+        self.assertNotIn("INSERT INTO nutrition.target", joined)

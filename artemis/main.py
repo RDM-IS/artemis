@@ -4187,7 +4187,6 @@ def _handle_nutrition(post: dict, question: str) -> bool:
         INTENT_NUTRITION_STATUS,
         INTENT_SET_NUTRITION_TARGET,
         detect_nutrition_intent,
-        log_nutrition,
         nutrition_status,
         propose_nutrition_target,
     )
@@ -4204,7 +4203,11 @@ def _handle_nutrition(post: dict, question: str) -> bool:
         elif intent == INTENT_NUTRITION_STATUS:
             reply = nutrition_status()
         else:
-            reply = log_nutrition(question)
+            # NUTRITION-2 retires the legacy log path: it LLM-estimated macros
+            # into health.nutrition_log. Anything meal_log didn't claim is
+            # answered honestly, never estimated (review of #208, 2026-09-26).
+            reply = ("I didn't log anything from that. To log a meal: "
+                     "`for lunch I had 2 eggs, 3 oz strawberries` or `breakfast: oatmeal`.")
     except Exception:
         logger.exception("Nutrition handler failed (%s)", intent)
         reply = "⚠️ Nutrition handler hit an error — check DB."

@@ -820,9 +820,14 @@ def parse_item(text: str) -> Item | None:
     else:
         qty = _num(q.replace(" ", ""))
     unit = (m.group("unit") or "").lower() or None
+    name = m.group("name").strip()
+    if unit and not q and mult == 1.0:
+        # A unit with no amount before it is part of the name: "pound cake",
+        # "slice of pizza" stays whole-named. Units only follow an amount.
+        name = t[m.start("unit"):].strip().rstrip(".!").strip()
+        unit = None
     if unit in ("serving", "servings"):
         unit = None
-    name = m.group("name").strip()
     # "1/2 an avocado", "half of an apple"
     name = re.sub(r"^(?:of\s+)?(?:an?|the|some|my)\s+", "", name, flags=re.I)
     return Item(qty=qty * mult, unit=unit, name=name, raw=raw,

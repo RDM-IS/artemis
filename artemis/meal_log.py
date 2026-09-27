@@ -54,7 +54,8 @@ _DAY = rf"(?:\s+({_DAY_ALT}))?"
 
 # "for breakfast [today] I had X" — an explicit eating verb.
 _SLOT_VERB_RE = re.compile(
-    rf"^\s*(?:for\s+)?{_SLOT}{_DAY}\s*,?\s*(?:i\s+)?(?:had|ate)\s+(?P<body>.+)$", re.I | re.S)
+    rf"^\s*(?:for\s+)?{_SLOT}{_DAY}\s*,?\s*(?:i\s+)?(?:had|ate|made|cooked|grabbed|got)\s+"
+    r"(?P<body>.+)$", re.I | re.S)
 # "breakfast: X" / "lunch - X" — a listing.
 _SLOT_LIST_RE = re.compile(rf"^\s*{_SLOT}{_DAY}\s*[:\-–]\s*(?P<body>.+)$", re.I | re.S)
 # "I had X for lunch [yesterday]" / "ate X for dinner last night"
@@ -73,6 +74,7 @@ _NON_FOOD_LEAD_RE = re.compile(
     r"^\s*(?:done|skipped|skip|no|none|nothing|n/?a|not|cancel+ed|late|pushed|moved|"
     r"great|good|fine|amazing|awesome|terrible|ok(?:ay)?|fun|plans?|reservations?|"
     r"running|stuck|trouble|a\s+(?:great|good|bad|rough|long|busy|nice)|the\s+(?:flu|day)|"
+    r"(?:the\s+)?same\b|(?:the\s+|my\s+)?usual\b|enough\b|too\s+much|a\s+chance|"
     r"to\b|at\b|with\b|over\b|out\b)", re.I)
 _NOT_A_LOG_RE = re.compile(
     r"\b(?:meeting|call|appointment|interview|dream|idea|question|thought|chat|talk|"
@@ -97,6 +99,7 @@ class MealLog:
     slot_named: bool = True        # False: bare "I had X" -> snacks, saved foods only
     making: bool = False
     ignored: list[str] = field(default_factory=list)   # "with Jennifer"
+    not_read: list[str] = field(default_factory=list)  # later lines that aren't food
 
 
 def _norm_slot(s: str) -> str:
@@ -160,8 +163,14 @@ def _parse_line(line: str, is_known) -> MealLog | None:
     tail = _TRAILING_DAY_RE.search(body)
     if tail and not day:
         day = tail.group(0).strip(" .!")
-    body = _TRAILING_DAY_RE.sub("", body)
-    if _NON_FOOD_LEAD_RE.match(body) or _NOT_A_LOG_RE.search(body):
+    stripped = _TRAILING_DAY_RE.sub("", body)
+    if stripped.strip() and not re.search(r"\b(?:as|from|than)\s*$", stripped, re.I):
+        body = stripped
+    elif tail:
+        day = None                     # "same as yesterday": the day word is content
+    if _NON_FOOD_LEAD_RE.match(body):
+        return None
+    if not named and _NOT_A_LOG_RE.search(body):
         return None
     phrases, ignored = split_items(body, is_known)
     items = [it for it in (parse_item(p) for p in phrases) if it]
@@ -174,6 +183,9 @@ def _parse_line(line: str, is_known) -> MealLog | None:
                    slot_named=named, making=making, ignored=ignored)
 
 
+_SLOT_HEADER_RE = re.compile(rf"^\s*{_SLOT}{_DAY}\s*[:\-–]\s*$", re.I)
+
+
 def parse_meal_logs(text: str, is_known=lambda _t: False) -> list[MealLog]:
     """Every meal log in a message. Each line that is itself a log starts a
     new one ("breakfast: eggs\\nlunch: salad" is two); a line that isn't
@@ -182,21 +194,57 @@ def parse_meal_logs(text: str, is_known=lambda _t: False) -> list[MealLog]:
     if not t or len(t) > 2000:
         return []
     logs: list[MealLog] = []
+    header: MealLog | None = None      # "breakfast:" alone, items on the next lines
     for line in t.splitlines():
         if not line.strip():
+            continue
+        hm = _SLOT_HEADER_RE.match(line)
+        if hm:
+            header = MealLog(slot=_norm_slot(hm.group(1)), items=[],
+                             day_offset=_day_offset(hm.group(2)))
+            logs.append(header)
             continue
         ml = _parse_line(line, is_known)
         if ml:
             logs.append(ml)
+            header = None
             continue
         if not logs:
             return []
-        if _NON_FOOD_LEAD_RE.match(line) or _NOT_A_LOG_RE.search(line):
-            return []
-        phrases, ignored = split_items(line, is_known)
-        logs[-1].items += [it for it in (parse_item(p) for p in phrases) if it]
-        logs[-1].ignored += ignored
+        extra = _continuation_items(line, is_known)
+        if extra is None:
+            # Not food-shaped ("can you check my inbox", "thanks!"): the meal
+            # above is still logged; the line is named in the reply, not eaten.
+            logs[-1].not_read.append(line.strip())
+            continue
+        logs[-1].items += extra
+    logs = [ml for ml in logs if ml.items]
     return logs
+
+
+_CHATTY_RE = re.compile(
+    r"\?\s*$|\b(?:can\s+you|could\s+you|please|thanks|thank\s+you|check|show|what|how|"
+    r"why|when|remind|schedule|email|inbox|calendar|meeting)\b", re.I)
+
+
+def _continuation_items(line: str, is_known) -> list[Item] | None:
+    """Items for a line that continues a meal list — each phrase must carry an
+    amount or be a saved food. None when the line isn't a food list."""
+    if _CHATTY_RE.search(line) or _NON_FOOD_LEAD_RE.match(line):
+        return None
+    phrases, _ignored = split_items(line, is_known)
+    items = []
+    for ph in phrases:
+        it = parse_item(ph)
+        if it is None:
+            return None
+        has_amount = it.unit is not None or it.numeric_lead or it.qty != 1.0 or \
+            re.match(r"^\s*(?:an?|one|two|three|four|five|six|half|a\s+couple|a\s+dozen)\b",
+                     ph, re.I) is not None
+        if not (has_amount or is_known(ph)):
+            return None
+        items.append(it)
+    return items or None
 
 
 def parse_meal_log(text: str, is_known=lambda _t: False) -> MealLog | None:
@@ -227,6 +275,7 @@ class Outcome:
     questions: list[str] = field(default_factory=list)
     refused: str | None = None
     replaced_planned: int = 0
+    already_logged: int = 0
 
 
 def _singular(name: str) -> str | None:
@@ -243,8 +292,8 @@ def _saved_candidates(item: Item) -> list[tuple[str, bool]]:
     """(text to look up, use-it-whole?) in order. The whole phrase first when
     a leading number may be part of the name ("7 layer burrito")."""
     out: list[tuple[str, bool]] = []
-    if item.numeric_lead or re.match(r"^\s*(?:half|a\s+half)\b", item.raw, re.I):
-        whole = re.sub(r"^\s*(?:an?|the)\s+", "", item.raw, flags=re.I)
+    whole = re.sub(r"^\s*(?:an?|the|some|my)\s+", "", item.raw, flags=re.I).strip()
+    if whole and whole.lower() != item.name.lower():
         out.append((whole, True))
     out.append((item.name, False))
     s = _singular(item.name)
@@ -313,7 +362,7 @@ def _scale(pending: list[_Pending], out: Outcome) -> None:
             continue
         f = p.food
         out.logged.append(Logged(
-            item=p.item, food=f, factor=factor,
+            item=item, food=f, factor=factor,
             kcal=int(round(float(f["kcal"]) * factor)),
             protein_g=float(f["protein_g"]) * factor,
             fiber_g=(float(f["fiber_g"]) * factor) if f.get("fiber_g") is not None else None))
@@ -334,8 +383,16 @@ def _write(cur, ml: MealLog, out: Outcome) -> None:
     d = out.day
     _ensure_day(cur, d)
     if ml.slot_named:
+        cur.execute("SELECT count(*) FROM nutrition.entry WHERE day_date = %s AND slot = %s "
+                    "AND status = 'corrected'", (d, ml.slot))
+        row = cur.fetchone()
+        try:
+            out.already_logged = int((row[0] if not isinstance(row, dict)
+                                      else list(row.values())[0]) or 0)
+        except (TypeError, IndexError):
+            out.already_logged = 0
         # The meal replaces the PLAN for this slot; earlier logs Ryan made for
-        # the same slot (status `corrected`) stay.
+        # the same slot (status `corrected`) stay — and the reply says so.
         cur.execute("DELETE FROM nutrition.entry WHERE day_date = %s AND slot = %s "
                     "AND status = 'assumed'", (d, ml.slot))
         out.replaced_planned = cur.rowcount if isinstance(cur.rowcount, int) else 0
@@ -478,8 +535,14 @@ def build_reply(cur, ml: MealLog, out: Outcome, today: date) -> str:
         if out.replaced_planned:
             n = out.replaced_planned
             lines.append(f"_Replaces the planned {out.slot} ({n} item{'s' if n != 1 else ''})._")
+        if out.already_logged:
+            n = out.already_logged
+            lines.append(f"_Added to {n} item{'s' if n != 1 else ''} already logged for "
+                         f"{out.slot} — to redo it, send `fix` tomorrow or log only what's new._")
     if ml.ignored:
         lines.append("_Not food, ignored: " + ", ".join(ml.ignored) + "._")
+    if ml.not_read:
+        lines.append("_Not read as food (send separately): " + " / ".join(ml.not_read) + "_")
     if out.questions:
         lines.append("Not logged yet:" if out.logged else "Nothing logged —")
         lines += [f"· {q}" for q in out.questions]

@@ -3404,25 +3404,35 @@ def insert_nutrition_target_tx(target: NutritionTarget) -> int:
             # grocery-staples generator (life_ops) still reads it; both retire
             # together in the coverage-checked health.* retirement. Same
             # transaction, so the two can never disagree.
-            cur.execute("SELECT effective_from FROM nutrition.target "
+            cur.execute("SELECT id, (effective_from = %s::date) FROM nutrition.target "
                         "WHERE effective_to IS NULL AND effective_from >= %s::date",
-                        (eff_from,))
-            if cur.fetchone():
+                        (eff_from, eff_from))
+            open_row = cur.fetchone()
+            if open_row and not open_row[1]:
                 # Closing it would give it an end before its start.
                 raise TargetBackdated(eff_from)
-            cur.execute(
-                "UPDATE nutrition.target "
-                "SET effective_to = (%s::date - INTERVAL '1 day')::date "
-                "WHERE effective_to IS NULL",
-                (eff_from,),
-            )
-            cur.execute(
-                "INSERT INTO nutrition.target "
-                "(effective_from, kcal, protein_g, carb_g, fat_g, fiber_g, set_by, notes) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (eff_from, target.kcal, target.protein_g, target.carb_g,
-                 target.fat_g, target.fiber_g, target.set_by, target.notes),
-            )
+            if open_row:
+                # Same start date: a correction of today's target, not a new one.
+                cur.execute(
+                    "UPDATE nutrition.target SET kcal = %s, protein_g = %s, carb_g = %s, "
+                    "fat_g = %s, fiber_g = %s, set_by = %s, notes = %s WHERE id = %s",
+                    (target.kcal, target.protein_g, target.carb_g, target.fat_g,
+                     target.fiber_g, target.set_by, target.notes, open_row[0]),
+                )
+            else:
+                cur.execute(
+                    "UPDATE nutrition.target "
+                    "SET effective_to = (%s::date - INTERVAL '1 day')::date "
+                    "WHERE effective_to IS NULL",
+                    (eff_from,),
+                )
+                cur.execute(
+                    "INSERT INTO nutrition.target "
+                    "(effective_from, kcal, protein_g, carb_g, fat_g, fiber_g, set_by, notes) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (eff_from, target.kcal, target.protein_g, target.carb_g,
+                     target.fat_g, target.fiber_g, target.set_by, target.notes),
+                )
             for m in target.meals:
                 cur.execute(
                     "INSERT INTO health.meal "
