@@ -479,6 +479,13 @@ class _LogCaptureSession:
 
     def execute(self, stmt, params=None):
         sql = str(stmt).strip().lower()
+        # Like SQLAlchemy: every :bind in the statement must be supplied. The
+        # fake used to accept anything, so a missing bind shipped (2026-09-25)
+        # and 500ed every POST carrying session_rpe in production.
+        import re as _re
+        binds = set(_re.findall(r"(?<![:\w]):([a-z_][a-z0-9_]*)", str(stmt), _re.I))
+        missing = binds - set((params or {}).keys())
+        assert not missing, f"unbound parameters {sorted(missing)} in {str(stmt)[:80]!r}"
         if sql.startswith("insert"):
             assert params is not None
             self._log_counter += 1
@@ -638,6 +645,23 @@ class TestLogEndpoint(unittest.TestCase):
         self.assertEqual(body["rows"][0]["hr_avg"], 132)
         # notes fall-through from body when set-level is null
         self.assertEqual(body["rows"][0]["notes"], "Felt easy")
+
+    def test_cardio_block_with_session_rpe_writes_block_and_summary(self):
+        """The Finish cardio card's one POST (CARDIO-REQUIRED). It 500ed from
+        2026-09-25 to 2026-09-27: the summary insert lacked the modality/device
+        binds that 043 added to the statement."""
+        client, self.app, sess = _build_log_client()
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": "Zone 2 Cardio", "log_type": "cardio_block",
+                  "modality": "row", "device": "water",
+                  "sets": [{"duration_sec": 1980, "rpe_actual": 6}], "session_rpe": 6},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual([r["log_type"] for r in sess.inserted], ["cardio_block", "session_summary"])
+        self.assertTrue(sess.committed)
+        self.assertFalse(sess.rolled_back)
 
     def test_400_on_empty_sets(self):
         client, self.app, _ = _build_log_client()
