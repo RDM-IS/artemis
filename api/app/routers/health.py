@@ -2163,6 +2163,43 @@ def _upsert_hourly(db: Session, buckets: dict, merge_minutes, summarise_minutes)
     return result
 
 
+# ---------------------------------------------------------------------------
+# /library — SESSION-LIB: sessions that can be started on demand
+# ---------------------------------------------------------------------------
+# Built on the box by artemis/session_library.py (the Lambda can't run the
+# plan builder: it reads the cycle through box-only code) and served from
+# acos.system_state. Fail closed: a missing or unreadable library is
+# `available: false` with the reason — never an empty list presented as
+# "nothing can be done here".
+
+SESSION_LIBRARY_KEY = "session_library"
+
+
+@router.get("/library")
+def get_library(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    row = db.execute(
+        text("SELECT value FROM acos.system_state WHERE key = :k"),
+        {"k": SESSION_LIBRARY_KEY},
+    ).mappings().first()
+    if not row or not row.get("value"):
+        return {"available": False,
+                "reason": "The session library hasn't been built yet "
+                          "(python3.11 -m artemis.session_library on the box)."}
+    try:
+        lib = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "The stored session library is unreadable."}
+    today = datetime.now(ZoneInfo(_active_timezone(db))).date().isoformat()
+    lib["available"] = True
+    # Built for another day: the program week or the location may have moved.
+    lib["stale"] = lib.get("generated_on") != today
+    lib["today"] = today
+    return lib
+
+
 @router.post("/ingest", response_model=IngestResponse)
 def post_ingest(
     payload: dict,
@@ -2412,43 +2449,6 @@ def post_ingest(
         ignored={"other": counts["ignored_metrics"]},
         note="; ".join(bits) or None,
     )
-
-
-# ---------------------------------------------------------------------------
-# /library — SESSION-LIB: sessions that can be started on demand
-# ---------------------------------------------------------------------------
-# Built on the box by artemis/session_library.py (the Lambda can't run the
-# plan builder: it reads the cycle through box-only code) and served from
-# acos.system_state. Fail closed: a missing or unreadable library is
-# `available: false` with the reason — never an empty list presented as
-# "nothing can be done here".
-
-SESSION_LIBRARY_KEY = "session_library"
-
-
-@router.get("/library")
-def get_library(
-    db: Session = Depends(get_db),
-    _api_key: str = Depends(verify_health_api_key),
-) -> dict[str, Any]:
-    row = db.execute(
-        text("SELECT value FROM acos.system_state WHERE key = :k"),
-        {"k": SESSION_LIBRARY_KEY},
-    ).mappings().first()
-    if not row or not row.get("value"):
-        return {"available": False,
-                "reason": "The session library hasn't been built yet "
-                          "(python3.11 -m artemis.session_library on the box)."}
-    try:
-        lib = json.loads(row["value"])
-    except (TypeError, ValueError):
-        return {"available": False, "reason": "The stored session library is unreadable."}
-    today = datetime.now(ZoneInfo(_active_timezone(db))).date().isoformat()
-    lib["available"] = True
-    # Built for another day: the program week or the location may have moved.
-    lib["stale"] = lib.get("generated_on") != today
-    lib["today"] = today
-    return lib
 
 
 @router.get("/overview", response_model=OverviewResponse)
