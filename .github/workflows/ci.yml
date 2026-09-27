@@ -54,7 +54,8 @@ jobs:
           for f in tests/*.py tests/lambda_api/test_*.py; do
             case " $EXCLUDE " in *" $f "*) echo "skip   $f"; continue;; esac
             echo "::group::$f"
-            python -m pytest -q "$f" || fail=1
+            python -m pytest -q -rfE "$f" > /tmp/out.txt 2>&1 || { fail=1; grep -E "^(FAILED|ERROR)|Error|assert" /tmp/out.txt | head -8 | while read -r l; do echo "::error title=$f::$l"; done; }
+            cat /tmp/out.txt | tail -3
             echo "::endgroup::"
           done
           exit $fail
