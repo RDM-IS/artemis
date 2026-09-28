@@ -8,6 +8,8 @@ name with no bpm and every guard passed. A signature narrower than the row is a
 reseed that cannot see its own work, which is the quiet version of the failure
 the md5 guard is loud about.
 """
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
+
 import importlib.util
 import pathlib
 import unittest
