@@ -699,7 +699,10 @@ class TestLocationThenPain(unittest.TestCase):
                                  "Stability-ball crunch"])
         # …and the row says where it is, what it can load, and what it swapped
         self.assertEqual(blocks["location_key"], "richfield")
-        self.assertEqual(blocks["load_config"]["dumbbell"]["max"], 80)
+        # PowerBlocks pair to 90, confirmed from a photo 2026-09-28; 80 was the
+        # guess this test pinned.
+        self.assertEqual(blocks["load_config"]["dumbbell"]["max"], 90)
+        self.assertEqual(blocks["load_config"]["dumbbell"]["step"], 10)
         self.assertEqual(blocks["load_config"]["bands"], {"mode": "none"})
         self.assertIn({"from": "Pec fly", "to": "DB fly"}, blocks["substitutions"])
 
@@ -1146,3 +1149,70 @@ class TestClaimGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRichfieldStrengthA(unittest.TestCase):
+    """PROGRAM-2 (Ryan, 2026-09-28): Richfield can hold Strength A."""
+
+    def _blocks(self):
+        a, b, c = _offline()
+        with a, b, c:
+            return office._build("strength_a", 3, location="Richfield",
+                                 location_key="richfield")[0]
+
+    def test_richfield_can_hold_strength_a(self):
+        self.assertTrue(office.can_hold("richfield", "strength_a"))
+
+    def test_the_six_movements_are_the_approved_ones(self):
+        self.assertEqual([e["name"] for e in self._blocks()["exercises"]],
+                         ["DB split squat", "DB bench press", "Band lat pulldown",
+                          "Stability-ball hamstring curl", "Band face pull",
+                          "Lying leg raise"])
+
+    def test_db_bench_press_is_not_substituted(self):
+        """The flat bench is native here, so a substitution row for it would be
+        a lie about the room."""
+        subs = office.subs_for("richfield", "strength_a")
+        self.assertNotIn("DB bench press", subs)
+        froms = [s["from"] for s in self._blocks()["substitutions"]]
+        self.assertNotIn("DB bench press", froms)
+
+    def test_the_split_squat_is_per_side(self):
+        """A leg press is not unilateral and a split squat is. `per_side` comes
+        from the TABLE; inherited from the office movement it would be False and
+        the prescription would be half the work."""
+        ex = next(e for e in self._blocks()["exercises"] if e["name"] == "DB split squat")
+        self.assertIn("each side", ex["notes"])
+
+    def test_nothing_needs_equipment_richfield_lacks(self):
+        from knowledge import load_config as lc
+        have = set(lc.classes_at("richfield"))
+        for e in self._blocks()["exercises"]:
+            with self.subTest(exercise=e["name"]):
+                self.assertIn(e["equipment_class"], have)
+
+    def test_every_substitute_is_classed_and_mapped(self):
+        from artemis import health_regions as hr
+        for _office_name, (name, _lbl, _top, _ps) in office.RICHFIELD_A_SUBS.items():
+            with self.subTest(exercise=name):
+                self.assertTrue(office.class_for(name))
+                self.assertTrue(hr.regions_for(name))
+
+    def test_the_powerblock_set_is_exactly_what_the_room_owns(self):
+        cfg = self._blocks()["load_config"]["dumbbell"]
+        self.assertEqual(list(range(cfg["min"], cfg["max"] + 1, cfg["step"])),
+                         [10, 20, 30, 40, 50, 60, 70, 80, 90])
+
+    def test_the_curl_bar_reaches_only_its_four_totals(self):
+        from knowledge import load_config as lc
+        bar = lc.RICHFIELD["barbell"]
+        sums = {0}
+        for pl in bar["plates"]:
+            sums |= {x + pl for x in sums}
+        self.assertEqual(sorted(bar["bar"] + 2 * x for x in sums), [0, 20, 50, 70])
+
+    def test_the_bar_weight_is_recorded_as_unmeasured_not_guessed(self):
+        from knowledge import load_config as lc
+        bar = lc.RICHFIELD["barbell"]
+        self.assertEqual(bar["bar"], 0)
+        self.assertIn("bar weight not yet measured", bar["note"])
