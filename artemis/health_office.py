@@ -320,11 +320,23 @@ def class_for(name: str) -> str:
             "EQUIPMENT_CLASS — guessing from the name is what LOCATION-1 removes."
         ) from None
 
+# NAMING (Ryan, 2026-09-28 17:17): a session name says WHAT, never WHERE. The
+# location is already its own field on the row and its own chip on the screen, so
+# baking it into the name both repeats it and lies whenever the two disagree —
+# which they did: "Office Strength A" was what the iPad showed for a session at
+# Richfield, and had since LOCATION-1 made the office one location among four.
+#
+# `display_name_for()` below is the ONE derivation. Nothing should build a
+# session name by hand, and gym-display reads the row rather than keeping a
+# second list that can drift from this one.
 _DISPLAY = {
-    "strength_a": "Office Strength A",
-    "strength_b": "Office Strength B",
-    "strength_c": "Office Strength C",
-    "cardio_z2": "Zone 2 Cardio",
+    "strength_a": "Strength A",
+    "strength_b": "Strength B",
+    "strength_c": "Strength C",
+    "cardio_z2": "Zone 2",
+    # Without a modality this is the honest generic; with one it becomes
+    # "Row intervals" etc. via display_name_for().
+    "cardio_intervals": "Intervals",
     "rest_mobility": "Rest / Mobility",
     "rest": "Rest",
     "recovery_flow": "Recovery Flow",
@@ -332,6 +344,30 @@ _DISPLAY = {
     "mobility": "Mobility",
     "yoga_strength": "Yoga — Strength & Balance",
 }
+
+#: Location display names, so a test can prove none of them reaches a session
+#: name. Sourced from the cycle registry rather than typed twice.
+def _location_words() -> tuple[str, ...]:
+    return tuple((v or {}).get("display", k) for k, v in _cycle.DEFAULT_LOCATIONS.items())
+
+
+def display_name_for(session_type: str, *, modality: str | None = None) -> str:
+    """The name of a session. WHAT it is, never where it is.
+
+    `modality` distinguishes the cardio sessions from each other, because "Zone 2"
+    on a rower and "Zone 2" on a treadmill are different sessions to do even
+    though they are the same session_type. It is the MODALITY, not the room: the
+    rower reads "Zone 2 – Row" wherever the rower happens to live that month.
+    """
+    base = _DISPLAY.get(session_type, session_type)
+    if session_type in ("cardio_z2", "cardio_intervals") and modality:
+        from knowledge import cardio as cardio_cfg
+        label = cardio_cfg.MODALITY_LABELS.get(modality, modality.title()) \
+            if hasattr(cardio_cfg, "MODALITY_LABELS") else modality.title()
+        if session_type == "cardio_z2":
+            return f"{base} – {label}"
+        return f"{label} intervals"
+    return base
 
 # ── CYCLE-1 ────────────────────────────────────────────────────────────────
 # The cycle lives in artemis.cycle — ONE definition, shared with the scheduler
@@ -555,7 +591,8 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
     resolved = cardio_cfg.resolve(location_key)
     blocks = {
         "type": "steady",
-        "display_name": _DISPLAY["cardio_z2"],
+        "display_name": display_name_for("cardio_z2",
+                                         modality=resolved.get("modality")),
         "location": location,
         "location_key": location_key,
         "duration_min": hi,

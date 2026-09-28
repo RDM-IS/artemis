@@ -941,7 +941,7 @@ class TestPlanExactRender(unittest.TestCase):
              patch.object(wake, "local_now", return_value=datetime(2026, 9, 18, 4, 30, tzinfo=CT)), \
              patch.object(wake, "local_today", return_value=FRI):
             text = wake.build_wake_message(calendar=None, held_health=[])
-        self.assertIn("Office Strength B", text)
+        self.assertIn("Strength B", text)
         for i, n in enumerate(B_NAMES, 1):
             self.assertIn(f"{i}. {n} — 2×", text)
         self.assertNotIn("Calibrated plan", text)

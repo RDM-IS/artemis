@@ -95,7 +95,7 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual(a["session_type"], "strength_a")
         self.assertEqual(a["week_num"], 2)
         self.assertEqual(a["phase"], 1)
-        self.assertEqual(a["blocks"]["display_name"], "Office Strength A")
+        self.assertEqual(a["blocks"]["display_name"], "Strength A")
         self.assertEqual(a["blocks"]["location"], "office gym")
         self.assertEqual(a["blocks"]["rounds"], 2)
         self.assertEqual(a["target_rpe"], 6.0)
@@ -362,7 +362,7 @@ class TestRenders(unittest.TestCase):
     def test_plan_detail_0916_office_a_no_bike_weather(self):
         row = dict(_BY_DATE[date(2026, 9, 21)])
         text = health._render_full_block(date(2026, 9, 21), row, date(2026, 9, 21))
-        self.assertIn("Office Strength A", text)
+        self.assertIn("Strength A", text)
         for name in _A_EXERCISES:
             self.assertIn(name, text)
         low = text.lower()
@@ -378,7 +378,7 @@ class TestRenders(unittest.TestCase):
         from artemis import wake
         row = dict(_BY_DATE[date(2026, 9, 21)])
         post = "\n".join(wake._workout_section(row))
-        self.assertIn("Today: **Office Strength A** —", post)
+        self.assertIn("Today: **Strength A** —", post)
         self.assertNotIn("Push/Legs", post)
         self.assertIn("Where: office gym", post)
         self.assertIn("1. Leg press — 2×10-12 · RPE ≤6", post)
@@ -425,3 +425,76 @@ class TestRetired(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNaming(unittest.TestCase):
+    """NAMING (Ryan, 2026-09-28 17:17): a session name says WHAT, never WHERE.
+
+    The location is already a field on the row and a chip on the screen, so a
+    name that repeats it also LIES the moment the two disagree — which they did:
+    the iPad showed "Strength A" for a session at Richfield.
+    """
+
+    PLACES = ("Office", "Richfield", "Brown Deer", "MSP")
+
+    def test_no_display_name_contains_a_location(self):
+        for st, name in office._DISPLAY.items():
+            for place in self.PLACES:
+                with self.subTest(session_type=st, place=place):
+                    self.assertNotIn(place, name)
+
+    def test_no_BUILT_row_names_a_location(self):
+        """The dict is one thing; what the builder actually emits is another."""
+        for key, loc in (("office", "office gym"), ("richfield", "Richfield"),
+                         ("brown_deer", "Brown Deer")):
+            for st in ("strength_a", "strength_c", "cardio_z2", "rest",
+                       "recovery_flow", "core", "mobility", "yoga_strength"):
+                if not office.can_hold(key, st) and st.startswith("strength"):
+                    continue
+                with self.subTest(location=key, session_type=st):
+                    blocks = office._build(st, 3, location=loc, location_key=key)[0]
+                    for place in self.PLACES:
+                        self.assertNotIn(place, blocks["display_name"])
+
+    def test_the_location_still_travels_on_the_row(self):
+        """Removing it from the NAME must not remove it from the row — it is the
+        field the screen's chip reads."""
+        blocks = office._build("strength_a", 3, location="Richfield",
+                               location_key="richfield")[0]
+        self.assertEqual(blocks["location_key"], "richfield")
+        self.assertEqual(blocks["location"], "Richfield")
+
+    def test_cardio_is_named_by_MODALITY_not_by_room(self):
+        self.assertEqual(office.display_name_for("cardio_z2", modality="row"),
+                         "Zone 2 – Row")
+        self.assertEqual(office.display_name_for("cardio_intervals", modality="row"),
+                         "Row intervals")
+        # the rower reads the same wherever it lives that month
+        self.assertEqual(office.display_name_for("cardio_z2", modality="row"),
+                         office.display_name_for("cardio_z2", modality="row"))
+
+    def test_an_unknown_modality_falls_back_rather_than_inventing(self):
+        self.assertEqual(office.display_name_for("cardio_z2"), "Zone 2")
+        self.assertEqual(office.display_name_for("cardio_intervals"), "Intervals")
+
+    def test_the_strength_names_are_the_approved_ones(self):
+        self.assertEqual(
+            [office.display_name_for(f"strength_{x}") for x in "abc"],
+            ["Strength A", "Strength B", "Strength C"])
+
+
+class TestNamingIsMappedForPain(unittest.TestCase):
+    """Every name the builder emits must resolve in the pain-region map.
+
+    That map is keyed by DISPLAY NAME, so a rename silently unhooks the pain
+    ladder: after NAMING, "legs pain 3" on a Z2 day stopped becoming a mobility
+    day because the lookup missed. Caught by test_pain_ladder, pinned here.
+    """
+
+    def test_every_cardio_name_resolves(self):
+        from artemis import health_regions as hr
+        for m in (None, "row", "bike", "treadmill", "elliptical"):
+            for st in ("cardio_z2", "cardio_intervals"):
+                name = office.display_name_for(st, modality=m)
+                with self.subTest(name=name):
+                    self.assertTrue(hr.regions_for(name), f"{name} is in no region map")
