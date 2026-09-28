@@ -95,7 +95,7 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual(a["session_type"], "strength_a")
         self.assertEqual(a["week_num"], 2)
         self.assertEqual(a["phase"], 1)
-        self.assertEqual(a["blocks"]["display_name"], "Office Strength A")
+        self.assertEqual(a["blocks"]["display_name"], "Strength A")
         self.assertEqual(a["blocks"]["location"], "office gym")
         self.assertEqual(a["blocks"]["rounds"], 2)
         self.assertEqual(a["target_rpe"], 6.0)
@@ -362,7 +362,7 @@ class TestRenders(unittest.TestCase):
     def test_plan_detail_0916_office_a_no_bike_weather(self):
         row = dict(_BY_DATE[date(2026, 9, 21)])
         text = health._render_full_block(date(2026, 9, 21), row, date(2026, 9, 21))
-        self.assertIn("Office Strength A", text)
+        self.assertIn("Strength A", text)
         for name in _A_EXERCISES:
             self.assertIn(name, text)
         low = text.lower()
@@ -378,7 +378,7 @@ class TestRenders(unittest.TestCase):
         from artemis import wake
         row = dict(_BY_DATE[date(2026, 9, 21)])
         post = "\n".join(wake._workout_section(row))
-        self.assertIn("Today: **Office Strength A** —", post)
+        self.assertIn("Today: **Strength A** —", post)
         self.assertNotIn("Push/Legs", post)
         self.assertIn("Where: office gym", post)
         self.assertIn("1. Leg press — 2×10-12 · RPE ≤6", post)
@@ -432,7 +432,7 @@ class TestNaming(unittest.TestCase):
 
     The location is already a field on the row and a chip on the screen, so a
     name that repeats it also LIES the moment the two disagree — which they did:
-    the iPad showed "Office Strength A" for a session at Richfield.
+    the iPad showed "Strength A" for a session at Richfield.
     """
 
     PLACES = ("Office", "Richfield", "Brown Deer", "MSP")
