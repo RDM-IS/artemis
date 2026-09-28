@@ -628,6 +628,58 @@ def page_count(html_doc: str) -> int:
 # Periods
 # ============================================================================
 
+class ReportRefused(RuntimeError):
+    """The language rule refused the text. Not a rendering failure — a content one."""
+
+
+@dataclass
+class Rendered:
+    """One produced report. `data` is bytes for a PDF, str for HTML."""
+    start: date
+    end: date
+    detail: str
+    kind: str                  # "pdf" | "html"
+    data: bytes | str
+    pages: int | None          # None for HTML
+    n_days: int
+    n_recorded: int
+    filename: str
+
+    @property
+    def summary_line(self) -> str:
+        pages = "n/a (html)" if self.pages is None else str(self.pages)
+        return (f"period {self.start} → {self.end} ({self.n_days} days) · pages {pages} · "
+                f"days with intake recorded: {self.n_recorded} of {self.n_days}")
+
+
+def produce(start: date, end: date, *, detail: str = "full", as_html: bool = False,
+            name: str | None = None) -> Rendered:
+    """REPORT-CMD: collect → build → render → refuse-check, in ONE place.
+
+    `scripts/dietitian_report.py` and the `dietitian report` chat handler both
+    call this, so there is one code path and the banned-words refusal cannot
+    apply to one and not the other.
+
+    Raises ReportRefused when the text contains judgment words (a content
+    failure, deliberately not a warning), and PdfEngineMissing when a PDF was
+    asked for and WeasyPrint is not installed. Neither leaves a partial file —
+    this returns bytes and writes nothing.
+    """
+    if end < start:
+        raise ValueError("the period ends before it starts")
+    report = build(collect(start, end), name=name)
+    doc = render_html(report, detail)
+    bad = banned_words_in(visible_text(doc))
+    if bad:
+        raise ReportRefused(f"the report text contains judgment words: {bad}")
+    n_days = (end - start).days + 1
+    if as_html:
+        return Rendered(start, end, detail, "html", doc, None, n_days,
+                        report.n_recorded, f"dietitian-{start}_{end}-{detail}.html")
+    return Rendered(start, end, detail, "pdf", render_pdf(doc), page_count(doc),
+                    n_days, report.n_recorded, f"dietitian-{start}_{end}-{detail}.pdf")
+
+
 def period(kind: str, anchor: date) -> tuple[date, date]:
     """day | week (the 7 days ending on `anchor`) | month (calendar month of
     `anchor`) | fortnight (the 14 days ending on `anchor`)."""

@@ -57,11 +57,41 @@ class MattermostClient:
         return self._team_id
 
     def _api(self, method: str, path: str, **kwargs) -> requests.Response:
+        # A multipart upload must NOT carry our JSON Content-Type: requests sets
+        # its own `multipart/form-data; boundary=…`, and overriding it makes the
+        # server reject the body. Found 2026-09-26: POST /files returned 400
+        # through this client while the same token succeeded without the header.
+        headers = dict(self.headers)
+        if "files" in kwargs:
+            headers.pop("Content-Type", None)
         resp = requests.request(
-            method, f"{self.url}/api/v4{path}", headers=self.headers, **kwargs
+            method, f"{self.url}/api/v4{path}", headers=headers, **kwargs
         )
         resp.raise_for_status()
         return resp
+
+    def upload_file(self, channel_id: str, filename: str, data: bytes,
+                    content_type: str = "application/octet-stream") -> str:
+        """Upload one file to a channel and return its file_id.
+
+        The file is NOT attached to anything yet — an unattached upload is
+        invisible and expires on its own, so post_with_files() is what makes it
+        appear. Split that way so a failed post cannot leave a visible partial.
+        """
+        import io
+        resp = self._api("POST", "/files",
+                         files={"files": (filename, io.BytesIO(data), content_type)},
+                         data={"channel_id": channel_id})
+        return resp.json()["file_infos"][0]["id"]
+
+    def post_with_files(self, channel_id: str, text: str, file_ids: list[str],
+                        root_id: str | None = None) -> bool:
+        """One post carrying already-uploaded files."""
+        payload = {"channel_id": channel_id, "message": text, "file_ids": file_ids}
+        if root_id:
+            payload["root_id"] = root_id
+        self._api("POST", "/posts", json=payload)
+        return True
 
     def get_bot_user_id(self) -> str:
         if not self._bot_user_id:

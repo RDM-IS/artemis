@@ -69,29 +69,27 @@ def main() -> int:
     if end < start:
         ap.error("the period ends before it starts")
 
-    report = dr.build(dr.collect(start, end))
-    doc = dr.render_html(report, args.detail)
-    bad = dr.banned_words_in(dr.visible_text(doc))
-    if bad:
+    # REPORT-CMD: one code path. dr.produce() is what the chat handler calls too,
+    # so the banned-words refusal and the PDF-engine check cannot diverge between
+    # the script and the command.
+    try:
+        r = dr.produce(start, end, detail=args.detail, as_html=args.html)
+    except dr.ReportRefused as exc:
         # The language rule is a build failure, not a warning.
-        print(f"REFUSED: the report text contains judgment words: {bad}", file=sys.stderr)
+        print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
+    except dr.PdfEngineMissing as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 3
 
-    suffix = "html" if args.html else "pdf"
-    out = args.out or Path(f"/tmp/dietitian-{start}_{end}-{args.detail}.{suffix}")
-    if args.html:
-        out.write_text(doc)
-        pages = "n/a (html)"
+    out = args.out or Path("/tmp") / r.filename
+    if r.kind == "html":
+        out.write_text(r.data)
     else:
-        try:
-            out.write_bytes(dr.render_pdf(doc))
-        except dr.PdfEngineMissing as exc:
-            print(f"REFUSED: {exc}", file=sys.stderr)
-            return 3
-        pages = dr.page_count(doc)
-    n = (end - start).days + 1
-    print(f"{out}\n  period {start} → {end} ({n} days) · pages {pages}\n"
-          f"  days with intake recorded: {report.n_recorded} of {n}")
+        out.write_bytes(r.data)
+    pages = "n/a (html)" if r.pages is None else r.pages
+    print(f"{out}\n  period {r.start} → {r.end} ({r.n_days} days) · pages {pages}\n"
+          f"  days with intake recorded: {r.n_recorded} of {r.n_days}")
     return 0
 
 
