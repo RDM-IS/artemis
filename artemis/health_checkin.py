@@ -1113,6 +1113,49 @@ def audit(cur, action: str, outcome: str, metadata: dict) -> None:
          json.dumps(metadata, default=str)))
 
 
+def adjust_assumptions(plan: dict, ci: "CheckIn", adj=None, rising: dict | None = None,
+                       *, considered: bool, reason: str) -> dict:
+    """What the check-in decision believed (COGNITION-1 bronze, site 1).
+
+    The decision is "what did today's check-in do to today's session", and
+    NO CHANGE is one of its answers — the ladder running and matching nothing is
+    a decision, not the absence of one. Without it the ledger would record only
+    the days something happened, which is the wrong half: a day Ryan felt bad and
+    the ladder did nothing is exactly the case worth reviewing later.
+
+    `considered` says whether the ladder ran at all. It is False when the session
+    was already logged or the day was already light — both are reasons no
+    adjustment was possible, and they are not the same as "ran and found
+    nothing".
+    """
+    written_type, _blocks = _written(plan)
+    return {
+        "rule": "the check-in ladder: rising pain > pain > soreness > energy",
+        "considered": considered,
+        "reason": reason,
+        "plan_id": plan.get("plan_id"),
+        "plan_date": plan.get("plan_date"),
+        "week_num": plan.get("week_num"),
+        "session_type_as_written": written_type,
+        "target_rpe_as_written": plan.get("target_rpe"),
+        "checkin": {"energy": ci.energy, "sleep_hrs": ci.sleep_hrs,
+                    "soreness": dict(ci.soreness), "pain": dict(ci.pain),
+                    "rating_error": ci.rating_error},
+        "rising_pain": rising if rising is None else {k: list(v) for k, v in rising.items()},
+        "rules_fired": list(adj.rules_fired) if adj is not None else None,
+        "target_rpe_after": adj.target_rpe if adj is not None else None,
+        "session_type_after": adj.session_type if adj is not None else None,
+    }
+
+
+def decide(cur, action: str, outcome: str, metadata: dict, assumptions: dict) -> None:
+    """An audit row plus what the choice rested on."""
+    from knowledge import cognition
+    cognition.log_decision(cur, agent="health_checkin", action=action, domain="health",
+                           outcome=outcome, metadata=metadata, assumptions=assumptions,
+                           manual_gap=False)
+
+
 # ============================================================================
 # Flows
 # ============================================================================
@@ -1257,19 +1300,37 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
     written_type, written_blocks = _written(plan)
     label = session_label(written_type, written_blocks)
     if logged_set_count(cur, plan["plan_id"]) > 0:
-        audit(cur, "checkin_logged", "no_adjust_sets_logged", {"plan_id": plan["plan_id"]})
+        decide(cur, "checkin_logged", "no_adjust_sets_logged",
+               {"plan_id": plan["plan_id"]},
+               adjust_assumptions(plan, ci, considered=False,
+                                  reason="the session was already logged, so there was "
+                                         "nothing left to adjust"))
         return "\n".join(["Logged."] + notes)
 
     if written_type in LIGHT_TYPES:
+        decide(cur, "checkin_adjust", "no_change_light_day",
+               {"plan_id": plan["plan_id"]},
+               adjust_assumptions(plan, ci, considered=False,
+                                  reason=f"the day was already {written_type}, which the "
+                                         f"ladder does not adjust"))
         return "\n".join(["Check-in logged — rest day as planned."] + notes)
 
-    adj = compute_adjustment(plan, ci, rising=rising_pain(cur, day, ci),
+    rising = rising_pain(cur, day, ci)
+    adj = compute_adjustment(plan, ci, rising=rising,
                              last_loads=last_loads(cur, _pain_primary_names(plan, ci), day))
     if not adj.changed or not adjust:
         if adj.changed and not adjust:
             logger.info("CHECKIN_ADJUST=0 — would have applied: %s", adj.reason)
-            audit(cur, "checkin_adjust_suppressed", "flag_off",
-                  {"plan_id": plan["plan_id"], "rules": adj.rules_fired})
+            decide(cur, "checkin_adjust_suppressed", "flag_off",
+                   {"plan_id": plan["plan_id"], "rules": adj.rules_fired},
+                   adjust_assumptions(plan, ci, adj, rising, considered=True,
+                                      reason="the ladder matched but CHECKIN_ADJUST is off"))
+        else:
+            # The ladder ran and matched nothing. That is a decision.
+            decide(cur, "checkin_adjust", "no_change",
+                   {"plan_id": plan["plan_id"]},
+                   adjust_assumptions(plan, ci, adj, rising, considered=True,
+                                      reason="the ladder ran and no rule matched"))
         what = (f"{label} as planned" if written_type == FLOW_TYPE
                 else f"run {label} as written")
         if "adjustment" in plan["blocks"] and adjust:
@@ -1286,9 +1347,11 @@ def _checkin_reply(cur, ci: CheckIn, day: date, checkin_id: str, now: datetime,
     evening_cleared = 0
     if adj.rules_fired and adj.rules_fired[0] in DAY_OFF_RULES:
         evening_cleared = clear_evening(cur, day, adj.rules_fired[0])
-    audit(cur, "checkin_adjust", ",".join(adj.rules_fired),
-          {"plan_id": plan["plan_id"], "checkin_id": checkin_id, "removed": adj.removed,
-           "added": adj.added, "eased": adj.eased, "evening_cleared": evening_cleared})
+    decide(cur, "checkin_adjust", ",".join(adj.rules_fired),
+           {"plan_id": plan["plan_id"], "checkin_id": checkin_id, "removed": adj.removed,
+            "added": adj.added, "eased": adj.eased, "evening_cleared": evening_cleared},
+           adjust_assumptions(plan, ci, adj, rising, considered=True,
+                              reason="the ladder matched and the plan row was rewritten"))
     # Plan-exact diff only — no advice, no health text.
     if adj.rules_fired[0] in DAY_OFF_RULES and not notes:
         return f"{adj.lines[0]} Reply `original` to undo."

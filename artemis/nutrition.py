@@ -1045,7 +1045,7 @@ def _prefill_assumptions(d, day_type: str, kind, *, dated_pick, default_row,
 
 def _decision(cur, action: str, outcome: str, metadata: dict, assumptions: dict) -> None:
     """A decision row: `_audit` plus what the choice rested on."""
-    from artemis import cognition
+    from knowledge import cognition
     cognition.log_decision(cur, agent="nutrition", action=action, domain="health",
                            outcome=outcome, metadata=metadata,
                            assumptions=assumptions, manual_gap=False)
