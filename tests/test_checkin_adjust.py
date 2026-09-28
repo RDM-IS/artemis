@@ -1214,3 +1214,77 @@ class TestRichfieldStrengthA(unittest.TestCase):
         bar = lc.RICHFIELD["barbell"]
         self.assertEqual(bar["bar"], 0)
         self.assertIn("bar weight not yet measured", bar["note"])
+
+
+class TestRichfieldStrengthB(unittest.TestCase):
+    """PROGRAM-2: Richfield Strength B, approved 2026-09-28 as drafted."""
+
+    def _blocks(self):
+        return office._build("strength_b", 3, location="Richfield",
+                             location_key="richfield")[0]
+
+    def test_richfield_can_hold_strength_b(self):
+        self.assertTrue(office.can_hold("richfield", "strength_b"))
+
+    def test_the_seven_movements_are_the_approved_ones(self):
+        self.assertEqual([e["name"] for e in self._blocks()["exercises"]],
+                         ["DB goblet squat", "Band seated row", "Band incline press",
+                          "Band leg extension", "Band rear delt fly", "Band Pallof press",
+                          "Stability-ball back extension"])
+
+    def test_the_goblet_squat_is_not_substituted(self):
+        self.assertNotIn("DB goblet squat", office.subs_for("richfield", "strength_b"))
+
+    def test_the_incline_press_keeps_the_incline(self):
+        """The argument for the band: either DB option repeats Strength A's flat
+        bench, and the week would carry two flat presses and no incline."""
+        names = [e["name"] for e in self._blocks()["exercises"]]
+        self.assertIn("Band incline press", names)
+        self.assertNotIn("DB floor press", names)
+        self.assertNotIn("DB bench press", names)
+
+    def test_the_pallof_press_stays_per_side(self):
+        ex = next(e for e in self._blocks()["exercises"] if e["name"] == "Band Pallof press")
+        self.assertIn("each side", ex["notes"])
+
+    def test_nothing_needs_equipment_richfield_lacks(self):
+        from knowledge import load_config as lc
+        have = set(lc.classes_at("richfield"))
+        for e in self._blocks()["exercises"]:
+            with self.subTest(exercise=e["name"]):
+                self.assertIn(e["equipment_class"], have)
+
+    def test_every_substitute_is_classed_and_mapped(self):
+        from artemis import health_regions as hr
+        for _o, (name, _l, _t, _ps) in office.RICHFIELD_B_SUBS.items():
+            with self.subTest(exercise=name):
+                self.assertTrue(office.class_for(name))
+                self.assertTrue(hr.regions_for(name))
+
+
+class TestRichfieldPrep(unittest.TestCase):
+    """The approved warmup and cooldown, and what they must NOT contain."""
+
+    def _blocks(self, st="strength_a"):
+        return office._build(st, 3, location="Richfield", location_key="richfield")[0]
+
+    def test_richfield_rows_no_longer_carry_prep_unknown(self):
+        for st in ("strength_a", "strength_b", "strength_c"):
+            with self.subTest(session_type=st):
+                b = self._blocks(st)
+                self.assertNotIn("prep_unknown", b)
+                self.assertTrue(b["warmup"])
+                self.assertTrue(b["cooldown"])
+
+    def test_no_office_equipment_appears_in_richfields_prep(self):
+        """The whole reason prep is per-location: the office lines name an
+        elliptical and a Stretch Trainer, neither of which is in this room."""
+        b = self._blocks()
+        for word in ("elliptical", "Stretch Trainer"):
+            self.assertNotIn(word.lower(), (b["warmup"] + b["cooldown"]).lower())
+
+    def test_the_prep_uses_only_what_the_room_has(self):
+        b = self._blocks()
+        text = (b["warmup"] + " " + b["cooldown"]).lower()
+        for word in ("bike", "band", "bodyweight"):
+            self.assertIn(word, text)
