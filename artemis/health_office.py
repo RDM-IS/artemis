@@ -652,6 +652,113 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
     return blocks, 4.0, 2, est
 
 
+# ── PROGRAM-2 intervals (Ryan, 2026-09-28) ──────────────────────────────────
+#
+# `cardio_intervals` existed as a session type but had NO BUILDER: it fell
+# through to `_rest`, which is why the 14 rows seeded with it rendered as
+# "Rest / Mobility". This is the builder.
+#
+# Weeks that are NOT in INTERVAL_WEEKS run the **Z2 variant** — the same row,
+# steady instead of intervals. That is one concept, not two: the early weeks run
+# it because the plan says so, and a gated week runs it because a condition
+# failed, and both produce a session he can actually do rather than an absent row.
+INTERVAL_WARMUP_MIN = 10
+INTERVAL_COOLDOWN_MIN = 5
+#: program week -> (reps, work seconds at Z4, easy seconds between)
+INTERVAL_WEEKS: dict[int, tuple[int, int, int]] = {
+    5: (6, 60, 120),
+    6: (5, 120, 120),
+}
+#: The Z2 variant's work minutes, by week. Week 7 is the deload.
+Z2_VARIANT_MIN: dict[int, int] = {7: 30}
+Z2_VARIANT_DEFAULT_MIN = 40
+
+
+def _cardio_common(location: str, location_key: str, on):
+    from knowledge import cardio as cardio_cfg
+    resolved = cardio_cfg.resolve(location_key, on)
+    return resolved, [cardio_cfg.label_for(d)
+                      for _, d in cardio_cfg.available(location_key, on)]
+
+
+def _intervals(week_num: int, location: str = LOCATION, location_key: str = "office",
+               on=None, gate: dict | None = None):
+    """A `cardio_intervals` session, or its Z2 variant when the week or the gate
+    says so.
+
+    `gate` is None when nobody asked, and otherwise the GATE's own answer; a
+    blocked gate names the condition that failed on the card, because "why is
+    this Z2 today" is the first thing he will ask.
+    """
+    from knowledge import cardio as cardio_cfg
+    from knowledge import zones
+
+    resolved, equipment = _cardio_common(location, location_key, on)
+    modality = resolved.get("modality")
+    spec = INTERVAL_WEEKS.get(week_num)
+    blocked = bool(gate and not gate.get("ok"))
+    reason = None
+    if blocked:
+        reason = gate.get("reason")
+    elif spec is None:
+        reason = (f"week {week_num} is the deload — easy Z2" if week_num == 7
+                  else f"week {week_num} runs Z2 by the plan; intervals start in week 5")
+
+    if spec is None or blocked:
+        work_min = Z2_VARIANT_MIN.get(week_num, Z2_VARIANT_DEFAULT_MIN)
+        blocks = {
+            "type": "steady",
+            "display_name": display_name_for("cardio_z2", modality=modality),
+            "location": location,
+            "location_key": location_key,
+            "duration_min": work_min,
+            "intensity": "Zone 2",
+            "zones": {"work": zones.zone_block("Z2")},
+            "cardio": resolved,
+            "equipment": equipment,
+            "ran_as": "z2_variant",
+            "z2_variant_reason": reason,
+            "setup_notes": [cardio_cfg.describe(resolved),
+                            f"{zones.describe('Z2')} — conversational pace",
+                            f"Intervals not today: {reason}." if reason else ""],
+        }
+        blocks["setup_notes"] = [n for n in blocks["setup_notes"] if n]
+        if not modality:
+            blocks["no_equipment"] = True
+        est = INTERVAL_WARMUP_MIN + work_min + INTERVAL_COOLDOWN_MIN
+        return blocks, None, "Zone 2", est
+
+    reps, work_sec, easy_sec = spec
+    blocks = {
+        "type": "intervals",
+        "display_name": display_name_for("cardio_intervals", modality=modality),
+        "location": location,
+        "location_key": location_key,
+        "intervals": {"reps": reps, "work_sec": work_sec, "easy_sec": easy_sec},
+        "warmup_min": INTERVAL_WARMUP_MIN,
+        "cooldown_min": INTERVAL_COOLDOWN_MIN,
+        "intensity": "Zone 4",
+        # Both ranges travel on the row: the work target and what "easy" means
+        # between reps, so the iPad never has to derive one from the other.
+        "zones": {"work": zones.zone_block("Z4"), "easy": zones.zone_block("Z2")},
+        "cardio": resolved,
+        "equipment": equipment,
+        "ran_as": "intervals",
+        "setup_notes": [
+            cardio_cfg.describe(resolved),
+            f"{INTERVAL_WARMUP_MIN} min easy warm-up, then "
+            f"{reps} × {work_sec // 60 if work_sec % 60 == 0 else work_sec / 60:g} min "
+            f"hard / {easy_sec // 60} min easy, then "
+            f"{INTERVAL_COOLDOWN_MIN} min easy cool-down.",
+            f"Hard = {zones.describe('Z4')}. Easy = {zones.describe('Z2')}.",
+        ],
+    }
+    if not modality:
+        blocks["no_equipment"] = True
+    est = INTERVAL_WARMUP_MIN + round(reps * (work_sec + easy_sec) / 60) + INTERVAL_COOLDOWN_MIN
+    return blocks, None, "Zone 4", est
+
+
 def _rest(week_num: int):
     blocks = {
         "type": "mobility",
@@ -1117,12 +1224,14 @@ def _recovery_flow(location: str = LOCATION):
 
 
 def _build(session_type: str, week_num: int, *, wk0: bool = False,
-           location: str | None = None, location_key: str = "office"):
+           location: str | None = None, location_key: str = "office",
+           on=None, gate: dict | None = None):
     """Every blocks dict carries its location_key: the pain ladder reads it to
     filter the substitution pool, and a row without one is an office row (which
     is what every row seeded before LOCATION-1 is)."""
     blocks, rpe, zone, est = _build_inner(session_type, week_num, wk0=wk0,
-                                          location=location, location_key=location_key)
+                                          location=location, location_key=location_key,
+                                          on=on, gate=gate)
     blocks["location_key"] = location_key
     cfg = _load_config.for_location(location_key)
     if cfg:
@@ -1189,7 +1298,8 @@ def _extra(session_type: str, location: str):
 
 
 def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
-                 location: str | None = None, location_key: str = "office"):
+                 location: str | None = None, location_key: str = "office",
+                 on=None, gate: dict | None = None):
     if session_type == "yoga_strength":
         return _yoga_strength(location or LOCATION)
     if session_type in ("core", "mobility"):
@@ -1201,6 +1311,9 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
                          location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
         return _z2(week_num, location or LOCATION, location_key=location_key)
+    if session_type == "cardio_intervals":
+        return _intervals(week_num, location or LOCATION, location_key=location_key,
+                          on=on, gate=gate)
     if session_type == "rest":
         return _rest_day()
     return _rest(week_num)
