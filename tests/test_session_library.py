@@ -231,12 +231,14 @@ class TestYoga6(unittest.TestCase):
         names = [s["name"] for s in b["flow"]]
         self.assertLess(names.index("Downward dog"), names.index("Warrior III"))
 
-    def test_the_draft_marker_is_present(self):
-        """It must be obvious in the source that Ryan has not approved this yet."""
+    def test_the_approval_is_on_the_record(self):
+        """Approved 2026-09-28. The marker stays in the source rather than only in
+        a PR, so the provenance of the content travels with it."""
         from pathlib import Path
-        src = Path(__file__).resolve().parents[1] / "artemis" / "health_office.py"
-        self.assertIn("CONTENT IS A DRAFT pending Ryan's approval (2026-09-28)",
-                      src.read_text())
+        src = (Path(__file__).resolve().parents[1] / "artemis"
+               / "health_office.py").read_text()
+        self.assertIn("CONTENT APPROVED by Ryan 2026-09-28", src)
+        self.assertNotIn("CONTENT IS A DRAFT pending", src)
 
     def test_it_adds_no_new_posture(self):
         """Adding one would need the same value in gym-display's POSTURES union in

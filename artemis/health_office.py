@@ -738,7 +738,7 @@ FLOW_SANSKRIT = {
     "Seated mountain":       ("Parvatasana", "par-vah-TAH-sah-nah"),
     "Easy pose":             ("Sukhasana", "soo-KAH-sah-nah"),
     "Savasana":              ("Shavasana", "shah-VAH-sah-nah"),
-    # YOGA-6 (2026-09-28) — CONTENT IS A DRAFT pending Ryan's approval.
+    # YOGA-6 — CONTENT APPROVED by Ryan 2026-09-28.
     "Chair":                 ("Utkatasana", "oot-kah-TAH-sah-nah"),
     "Plank":                 ("Phalakasana", "fah-lah-KAH-sah-nah"),
     "Warrior II":            ("Virabhadrasana II", "veer-ah-bah-DRAH-sah-nah two"),
@@ -872,7 +872,7 @@ def _flow_step(spec: dict, hold_sec: int = FLOW_HOLD_SEC) -> dict:
 # ---------------------------------------------------------------------------
 # YOGA-6 — Yoga, Strength & Balance. A higher-intensity flow for the Extras list.
 #
-# CONTENT IS A DRAFT pending Ryan's approval (2026-09-28).
+# CONTENT APPROVED by Ryan 2026-09-28.
 #
 # Still low-impact and still mat-only — Ryan's rule is that extras are
 # yoga/core/mobility — but standing strength and single-leg balance instead of
@@ -960,7 +960,7 @@ YOGA6_STEPS = [
 def _yoga_strength(location: str = LOCATION):
     """YOGA-6. Mat only, so it runs at every location a mat does.
 
-    CONTENT IS A DRAFT pending Ryan's approval (2026-09-28).
+    CONTENT APPROVED by Ryan 2026-09-28.
     """
     blocks = {
         "type": "recovery_flow",          # the RENDERER: gym-display's Flow screen
@@ -1036,7 +1036,9 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False,
 # EXTRAS (Ryan, 2026-09-27): low-impact work on top of the plan, any day, rest
 # days included. Never planned rows — the Sessions tab builds them on demand.
 # Bodyweight and a mat only, so they run anywhere but on the road.
-# CONTENT IS A DRAFT pending Ryan's approval (2026-09-27).
+# CONTENT APPROVED by Ryan 2026-09-27 (#217). The marker said DRAFT until
+# 2026-09-28: the content was approved and merged, and only the comment was
+# left behind — so the source claimed it was unapproved for a day.
 #
 # Core stays LIGHT and goes AFTER the day's lift, never before it: the trunk
 # braces squats and hinges, and pre-fatiguing it costs stability under the bar.
