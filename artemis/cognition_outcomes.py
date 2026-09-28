@@ -252,6 +252,7 @@ def run(cur, *, today: date | None = None, limit: int = 500) -> dict:
 
     Silent: writes only, posts nothing. Runs inside the caller's transaction.
     """
+    from artemis import manual_gap
     from knowledge import cognition
     if today is None:
         from artemis.quiet_hours import local_today
@@ -279,8 +280,14 @@ def run(cur, *, today: date | None = None, limit: int = 500) -> dict:
         if cur.fetchone() is not None:
             counts["raced"] += 1
             continue
+        # manual_gap rule 1, evaluated exactly where the correction is appended.
+        # There is no third setter: rule 2 is set at write time by the scripts.
+        gap = manual_gap.is_gap_by_email_correction(
+            cur, domain=row["domain"], correction=res.correction,
+            corrected_to_action=(res.correction or {}).get("corrected_to_action"))
         cognition.log_outcome(cur, decides=row["id"], action=row["action"],
                               domain=row["domain"] or "health", outcome=res.outcome,
-                              metadata=res.metadata, correction=res.correction)
+                              metadata=res.metadata, correction=res.correction,
+                              manual_gap=gap)
         counts["wrote"] += 1
     return counts

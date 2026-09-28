@@ -113,9 +113,9 @@ def main() -> int:
 
         cur.execute("""
             INSERT INTO acos.audit_log (agent, persona, action, domain, confidence,
-                                        outcome, token_count, api_cost_usd, metadata, source)
+                                        outcome, token_count, api_cost_usd, metadata, source, manual_gap)
             VALUES ('backfill', NULL, 'load_config_backfill', 'health', NULL, 'executed', 0, 0,
-                    CAST(%s AS jsonb), 'script')
+                    CAST(%s AS jsonb), 'script', TRUE)
         """, (json.dumps({
             "through": args.through,
             "written": len(targets),

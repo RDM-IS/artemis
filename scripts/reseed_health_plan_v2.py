@@ -374,8 +374,8 @@ def reseed_flow_days(start: date, dry_run: bool) -> int:
                     r["est_duration_min"], r["generated_by"], r["notes"]))
             cur.execute(
                 "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
-                "outcome, token_count, api_cost_usd, metadata, source) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'script')",
+                "outcome, token_count, api_cost_usd, metadata, source, manual_gap) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'script', TRUE)",
                 ("health_office", None, "recovery_flow_reseed", "health", None, "executed",
                  0, 0.0, json.dumps({"from": start.isoformat(), "dates": [d.isoformat() for d in dates]})))
             office.write_program_state(cur)
@@ -483,8 +483,8 @@ def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
                     r["est_duration_min"], r["generated_by"], r["notes"]))
             cur.execute(
                 "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
-                "outcome, token_count, api_cost_usd, metadata, source) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'script')",
+                "outcome, token_count, api_cost_usd, metadata, source, manual_gap) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'script', TRUE)",
                 ("health_office", None, "strength_days_reseed", "health", None, "executed",
                  0, 0.0, json.dumps({"from": start.isoformat(),
                                      "dates": [d.isoformat() for d in dates],

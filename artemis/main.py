@@ -4315,6 +4315,40 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
 # from — any pending confirm. Deterministic: it must not reach the LLM.
 _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
 
+# COGNITION-1: `gaps` / `gaps week` / `gaps month` — read-only, no confirm.
+_GAPS_RE = re.compile(r"^\s*gaps(?:\s+(?P<period>week|month))?\s*[.!?]*\s*$", re.I)
+
+
+def _handle_gaps_command(post: dict, question: str) -> bool:
+    """`gaps [week|month]` — the manual_gap list, grouped by action.
+
+    READ-ONLY and deterministic: it writes nothing, confirms nothing, and the reply
+    is generated text with no advice in it. A gap is the structural fact that Ryan
+    did something by hand that Artemis had no path to do; what to do about one is
+    his call, and an LLM never touches this column or this reply.
+    """
+    m = _GAPS_RE.match(question or "")
+    if not m:
+        return False
+    from artemis import manual_gap
+    from knowledge.db import get_connection
+    period = (m.group("period") or manual_gap.DEFAULT_PERIOD).lower()
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            rows = manual_gap.gaps(conn.cursor(), period)
+        reply = manual_gap.render(rows, period)
+    except Exception:
+        logger.exception("gaps: could not read the manual_gap rows")
+        # FAIL-CLOSED on the reply: "no gaps" and "I could not look" must never
+        # read the same, or a broken query looks like a clean week.
+        reply = ("I couldn't read the gap list, so I'm not telling you it's empty. "
+                 "The traceback is in the log.")
+    if _mm:
+        _mm.post_message(channel_id, reply, root_id=root_id)
+    return True
+
 
 def _handle_meal_nudge_toggle(post: dict, question: str) -> bool:
     """Human-gated activation for the standing evening nudge (MEAL-NUDGE)."""
@@ -4610,6 +4644,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         # the `morning`-prefixed check-in classifier.
         ("morning_brief_command", _handle_morning_brief_command),
         ("version_command", _handle_version_command),
+        # COGNITION-1 `gaps` — read-only, deterministic, ahead of the LLM.
+        ("gaps_command", _handle_gaps_command),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
