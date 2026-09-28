@@ -30,6 +30,17 @@ api/package/
 api/function.zip
 lambda.zip
 
+# Local scratch that must not reach a public repo. Explicit rather than broad:
+# nothing tracked matches any of these (checked 2026-09-28 — `git ls-files '*.log'`
+# is empty, and no tracked file is named ddl.py, introspect.py or sample.py), and
+# the three probes are ROOT-ANCHORED so a real module of the same name elsewhere in
+# the tree is still seen. commitments_backup_*.json carries client names.
+*.log
+commitments_backup_*.json
+/ddl.py
+/introspect.py
+/sample.py
+
 # OS and stray files.
 .DS_Store
 UQ3o
