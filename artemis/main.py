@@ -4513,6 +4513,40 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
 # from — any pending confirm. Deterministic: it must not reach the LLM.
 _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
 
+# WEEK-AHEAD: `week ahead` — read-only lookahead, no confirm.
+_WEEK_AHEAD_RE = re.compile(r"^\s*week\s+ahead\s*[.!?]*\s*$", re.I)
+
+
+def _handle_week_ahead(post: dict, question: str) -> bool:
+    """`week ahead` — the next 7 days, flags first.
+
+    READ-ONLY: it writes nothing and confirms nothing. Every flag is a fact read
+    from config or Notion, resolved by the same code the 00:15 pre-fill and the
+    session library use, so the lookahead cannot promise something they then fail
+    to deliver.
+    """
+    if not _WEEK_AHEAD_RE.match(question or ""):
+        return False
+    from artemis import week_ahead as wa
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            week = wa.week_ahead(conn.cursor(), local_today())
+        reply = wa.render(week)
+    except Exception:
+        logger.exception("week ahead: could not build the lookahead")
+        # FAIL-CLOSED on the reply: "no gaps" and "I could not look" must never
+        # read the same, or a broken query looks like a clear week.
+        reply = ("I couldn't build the week ahead, so I'm not telling you it's "
+                 "clear. The traceback is in the log.")
+    if _mm:
+        _mm.post_message(channel_id, reply, root_id=root_id)
+    return True
+
+
 # COGNITION-1: `gaps` / `gaps week` / `gaps month` — read-only, no confirm.
 _GAPS_RE = re.compile(r"^\s*gaps(?:\s+(?P<period>week|month))?\s*[.!?]*\s*$", re.I)
 
@@ -4848,6 +4882,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("version_command", _handle_version_command),
         # COGNITION-1 `gaps` — read-only, deterministic, ahead of the LLM.
         ("gaps_command", _handle_gaps_command),
+        # WEEK-AHEAD `week ahead` — read-only, deterministic, ahead of the LLM so
+        # a lookahead is never answered by a guess.
+        ("week_ahead", _handle_week_ahead),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),

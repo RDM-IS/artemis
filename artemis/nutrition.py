@@ -157,19 +157,88 @@ def _default_row_for(kind: str) -> str | None:
             KIND_TRAVEL: nmp.TRAVEL_DAY_NAME}.get(kind)
 
 
-def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
-    """Pre-fill `d` from Notion. Silent — the caller posts nothing. Idempotent:
-    a day that already has entries is left alone.
+@dataclass
+class MealSource:
+    """Which meal source wins for a day, and why — WITHOUT WRITING ANYTHING.
 
-    NUTRITION-2 source order:
+    Factored out of `prefill_day` 2026-09-28 so the week-ahead lookahead and the
+    00:15 pre-fill cannot disagree about what a day will get. A lookahead that
+    re-implemented the source order would drift from it, and the drift would show
+    up as Ryan being told a day was covered when the pre-fill then recorded
+    `no_plan` — which is exactly the 10/04 failure the lookahead exists to catch.
+    """
+    outcome: str                     # planned | no_plan | unavailable
+    day_type: str
+    kind: str
+    chosen: str | None = None        # picked | default | None
+    plan: object | None = None
+    foods: list | None = None
+    dated_pick: bool | None = None   # True / False / None = the lookup never ran
+    default_row: str | None = None
+    detail: str | None = None
+
+    @property
+    def has_source(self) -> bool:
+        return self.outcome == "planned"
+
+
+def resolve_meal_source(d: date) -> MealSource:
+    """NUTRITION-2's source order, resolved and nothing else.
+
       1. a `meal planning` row DATED `d` — the menu Ryan picked (any day kind);
       2. the kind's undated default row — work day, or travel day;
-      3. an off day has no default: it records `no_plan` and stays empty, and
-         logging fills it. Nothing is ever invented.
+      3. an off day has no default: `no_plan`, and logging fills it.
+
+    Reads Notion; touches no database and writes nothing. Every branch here
+    corresponds to exactly one `prefill_day` outcome, which is the point.
     """
     from artemis import cycle
     from artemis import notion_meal_plan as nmp
 
+    day_type = cycle.day_type(d)
+    kind = day_kind(day_type)
+    picked = None            # three-state: True / False / None = the lookup never ran
+    try:
+        plan = nmp.fetch_dated_day(d)
+        picked = plan is not None
+        if plan is None:
+            name = _default_row_for(kind)
+            if name is None:
+                return MealSource(
+                    "no_plan", day_type, kind, dated_pick=False, default_row=None,
+                    detail="off day: no dated pick and the kind has no default row")
+            plan = nmp.fetch_default_day(name)
+    except nmp.NotionUnavailable as exc:
+        return MealSource(
+            "unavailable", day_type, kind, dated_pick=None, default_row=None,
+            detail=f"Notion unavailable, so neither lookup ran: {str(exc)[:200]}")
+    except LookupError as exc:
+        return MealSource(
+            "no_plan", day_type, kind, dated_pick=picked,
+            default_row=_default_row_for(kind),
+            detail=f"the default row for this kind was not found: {str(exc)[:200]}")
+
+    foods = plan.all_foods()
+    chosen = "picked" if picked else "default"
+    if not foods:
+        return MealSource(
+            "no_plan", day_type, kind, chosen=chosen, plan=plan, foods=[],
+            dated_pick=picked, default_row=None if picked else _default_row_for(kind),
+            detail="the chosen day links no recipe with usable macros")
+    return MealSource(
+        "planned", day_type, kind, chosen=chosen, plan=plan, foods=foods,
+        dated_pick=picked, default_row=None if picked else _default_row_for(kind))
+
+
+def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
+    """Pre-fill `d` from Notion. Silent — the caller posts nothing. Idempotent:
+    a day that already has entries is left alone.
+
+    The SOURCE ORDER lives in `resolve_meal_source()`, not here. This function
+    decides what to WRITE for each of its outcomes; `week_ahead` reads the same
+    resolution to say what a day WOULD get. One code path, so a lookahead cannot
+    promise a source the pre-fill then fails to find.
+    """
     existing = get_day(cur, d)
     if existing and existing.get("prefilled"):
         return PrefillResult("already", 0, "day already pre-filled")
@@ -179,70 +248,41 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
     if (row[0] if not isinstance(row, dict) else list(row.values())[0]):
         return PrefillResult("already", 0, "day already has logged entries")
 
-    day_type = cycle.day_type(d)
-    kind = day_kind(day_type)
+    src = resolve_meal_source(d)
+    day_type, kind = src.day_type, src.kind
 
-    picked = None          # three-state: True / False / None = the lookup never ran
-    try:
-        plan = nmp.fetch_dated_day(d)
-        picked = plan is not None
-        if plan is None:
-            name = _default_row_for(kind)
-            if name is None:
-                _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                            prefilled=False, outcome="no_plan",
-                            note=(f"{day_type} — an off day: pick a menu for "
-                                  f"{d.isoformat()} in Notion, or log meals as you go"),
-                            plan_source_id=None)
-                _decision(cur, "nutrition_prefill", "no_plan",
-                          {"day": d.isoformat(), "entries": 0},
-                          _prefill_assumptions(
-                              d, day_type, kind, dated_pick=False, default_row=None,
-                              chosen=None,
-                              detail="off day: no dated pick and the kind has no default row"))
-                return PrefillResult("no_plan", 0, f"{d} is an off day with no picked menu")
-            plan = nmp.fetch_default_day(name)
-    except nmp.NotionUnavailable as exc:
+    def _assume(outcome: str, note: str, plan_source_id=None) -> None:
+        _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type, prefilled=False,
+                    outcome=outcome, note=note[:500], plan_source_id=plan_source_id)
+        _decision(cur, "nutrition_prefill", outcome,
+                  {"day": d.isoformat(), "entries": 0,
+                   **({"plan_page": src.plan.page_id} if src.plan is not None else {})},
+                  _prefill_assumptions(
+                      d, day_type, kind, dated_pick=src.dated_pick,
+                      default_row=src.default_row, chosen=src.chosen, plan=src.plan,
+                      detail=src.detail))
+
+    if src.outcome == "unavailable":
         # The specced degradation: nothing pre-filled, the day says so.
-        _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                    prefilled=False, outcome="unavailable",
-                    note=str(exc)[:500], plan_source_id=None)
-        _decision(cur, "nutrition_prefill", "unavailable",
-                  {"day": d.isoformat(), "entries": 0},
-                  _prefill_assumptions(
-                      d, day_type, kind, dated_pick=None, default_row=None, chosen=None,
-                      detail=f"Notion unavailable, so neither lookup ran: {str(exc)[:200]}"))
-        logger.warning("nutrition pre-fill %s: Notion unavailable — %s", d, exc)
-        return PrefillResult("unavailable", 0, str(exc))
-    except LookupError as exc:
-        _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                    prefilled=False, outcome="no_plan",
-                    note=str(exc)[:500], plan_source_id=None)
-        _decision(cur, "nutrition_prefill", "no_plan",
-                  {"day": d.isoformat(), "entries": 0},
-                  _prefill_assumptions(
-                      d, day_type, kind, dated_pick=picked,
-                      default_row=_default_row_for(kind), chosen=None,
-                      detail=f"the default row for this kind was not found: {str(exc)[:200]}"))
-        logger.warning("nutrition pre-fill %s: no plan row — %s", d, exc)
-        return PrefillResult("no_plan", 0, str(exc))
+        _assume("unavailable", src.detail or "Notion unavailable")
+        logger.warning("nutrition pre-fill %s: Notion unavailable — %s", d, src.detail)
+        return PrefillResult("unavailable", 0, src.detail)
 
-    foods = plan.all_foods()
-    if not foods:
-        _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
-                    prefilled=False, outcome="no_plan",
-                    note="default day links no usable recipes",
-                    plan_source_id=plan.page_id)
-        _decision(cur, "nutrition_prefill", "no_plan",
-                  {"day": d.isoformat(), "entries": 0, "plan_page": plan.page_id},
-                  _prefill_assumptions(
-                      d, day_type, kind, dated_pick=picked,
-                      default_row=None if picked else _default_row_for(kind),
-                      chosen="picked" if picked else "default", plan=plan,
-                      detail="the chosen day links no recipe with usable macros"))
+    if src.outcome == "no_plan":
+        if src.plan is None and src.dated_pick is False and src.default_row is None:
+            # An off day: the note tells him how to fill it.
+            _assume("no_plan", f"{day_type} — an off day: pick a menu for "
+                               f"{d.isoformat()} in Notion, or log meals as you go")
+            return PrefillResult("no_plan", 0, f"{d} is an off day with no picked menu")
+        if src.plan is None:
+            _assume("no_plan", src.detail or "no plan row")
+            logger.warning("nutrition pre-fill %s: no plan row — %s", d, src.detail)
+            return PrefillResult("no_plan", 0, src.detail)
+        _assume("no_plan", "default day links no usable recipes", src.plan.page_id)
         return PrefillResult("no_plan", 0, "default day links no usable recipes")
 
-    notes = [f"picked: {plan.name}" if picked else f"default: {plan.name}"]
+    plan, foods = src.plan, src.foods
+    notes = [f"picked: {plan.name}" if src.chosen == "picked" else f"default: {plan.name}"]
     if plan.skipped:
         notes.append("skipped (no macros): " + ", ".join(plan.skipped))
     _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
@@ -273,11 +313,11 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
               {"day": d.isoformat(), "entries": written,
                "plan_page": plan.page_id, "skipped": plan.skipped},
               _prefill_assumptions(
-                  d, day_type, kind, dated_pick=picked,
-                  default_row=None if picked else _default_row_for(kind),
-                  chosen="picked" if picked else "default", plan=plan,
+                  d, day_type, kind, dated_pick=src.dated_pick,
+                  default_row=src.default_row, chosen=src.chosen, plan=plan,
                   detail=None))
     return PrefillResult("planned", written)
+
 
 
 # ============================================================================
