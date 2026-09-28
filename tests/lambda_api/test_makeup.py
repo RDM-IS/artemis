@@ -2,6 +2,7 @@
 only when everything the box offered is still true. Synthetic data only."""
 import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
 import json
+import re
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -26,6 +27,9 @@ class _R:
     def all(self):
         return self._rows
 
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
 
 class _DB:
     def __init__(self, lib, plans, not_done):
@@ -34,6 +38,12 @@ class _DB:
 
     def execute(self, stmt, params=None):
         sql = " ".join(str(stmt).lower().split())
+        # Like SQLAlchemy: every :bind in the statement must be supplied. A fake
+        # that accepts anything is how 043's missing binds shipped and 500ed every
+        # Finish cardio (#213) -- and COGNITION-1 just widened this INSERT.
+        binds = set(re.findall(r"(?<![:\w]):([a-z_][a-z0-9_]*)", str(stmt), re.I))
+        missing = binds - set((params or {}).keys())
+        assert not missing, f"unbound parameters {sorted(missing)} in {str(stmt)[:80]!r}"
         if "from acos.system_state" in sql:
             return _R([{"value": json.dumps(self.lib)}] if self.lib else [])
         if sql.startswith("update health.plan"):
@@ -41,7 +51,7 @@ class _DB:
             return _R([])
         if "insert into acos.audit_log" in sql:
             self.audits.append(params)
-            return _R([])
+            return _R([{"id": "00000000-0000-0000-0000-000000000001"}])
         if "where plan_id = :pid" in sql:
             p = self.plans.get(params["pid"])
             return _R([p] if p else [])
@@ -126,6 +136,34 @@ class TestMakeup(unittest.TestCase):
         self.assertEqual(mb["made_up_on"], _today().isoformat())
         self.assertEqual(mb["makeup_original"]["session_type"], "strength_b")
         self.assertEqual(len(db.audits), 1)
+
+    def test_the_swap_records_what_it_rested_on(self):
+        """COGNITION-1 site 2: the swap is a decision, so it carries assumptions."""
+        db = _setup()
+        self.assertEqual(_post(db).status_code, 200)
+        row = db.audits[0]
+        self.assertIs(row["manual_gap"], False)
+        a = json.loads(row["assumptions"])
+        self.assertEqual(a["missed"]["plan_id"], 11)
+        self.assertEqual(a["missed"]["session_type"], "strength_b")
+        self.assertEqual(a["rest_day"]["plan_id"], 22)
+        self.assertEqual(a["rest_day"]["session_type_before"], "rest")
+        self.assertEqual(a["week_not_done_count"], 1)
+        self.assertEqual(a["location_key"], "office")
+        self.assertIn("rule", a)
+        # can_hold ran on the BOX, and the record says so rather than implying
+        # this route checked it.
+        self.assertIs(a["can_hold"]["result"], True)
+        self.assertIn("session_library", a["can_hold"]["evaluated_by"])
+        # metadata still carries what the swap DID; assumptions is not a copy.
+        self.assertEqual(json.loads(row["metadata"])["rest_plan_id"], 22)
+
+    def test_a_refused_swap_records_no_decision(self):
+        """Nothing happened, so there is nothing to have decided."""
+        db = _setup(plans={22: {"logged": True}})     # the rest day was already logged
+        self.assertNotEqual(_post(db).status_code, 200)
+        self.assertEqual(db.audits, [])
+        self.assertFalse(db.committed)
 
     def test_a_stale_library_is_refused(self):
         db = _setup(lib={"generated_on": "2027-01-01"})

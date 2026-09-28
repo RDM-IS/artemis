@@ -11,7 +11,7 @@ import unittest
 from datetime import date, timedelta
 from unittest import mock
 
-from artemis import cognition
+from knowledge import cognition
 
 D = date(2027, 3, 4)          # synthetic: no real plan row exists here
 
@@ -302,6 +302,219 @@ class TestPrefillDecision(unittest.TestCase):
         with mock.patch.object(nutrition, "get_day", return_value=None):
             self.assertEqual(nutrition.prefill_day(cur, D).outcome, "already")
         self.assertEqual(cur.captured, [])
+
+
+# ---------------------------------------------------------------------------
+# Two bind styles, one column list
+# ---------------------------------------------------------------------------
+
+class TestBothDialects(unittest.TestCase):
+    """The box writes through psycopg2, the Lambda through SQLAlchemy. If the two
+    statements ever disagree about columns, one of them writes the wrong thing
+    into the wrong column silently — so they are generated, and this proves it."""
+
+    @staticmethod
+    def _cols(sql):
+        return sql.split("(", 1)[1].split(")", 1)[0].replace(" ", "").split(",")
+
+    def test_the_two_statements_name_the_same_columns_in_the_same_order(self):
+        self.assertEqual(self._cols(cognition.SQL_PG), self._cols(cognition.SQL_SA))
+        self.assertEqual(self._cols(cognition.SQL_PG), list(cognition._COLUMNS))
+
+    def test_the_jsonb_columns_are_cast_in_both(self):
+        for c in ("metadata", "assumptions", "correction"):
+            with self.subTest(column=c):
+                self.assertIn(f"CAST(:{c} AS jsonb)", cognition.SQL_SA)
+        self.assertEqual(cognition.SQL_PG.count("%s::jsonb"), 3)
+
+    def test_both_return_the_id(self):
+        self.assertTrue(cognition.SQL_PG.rstrip().endswith("RETURNING id"))
+        self.assertTrue(cognition.SQL_SA.rstrip().endswith("RETURNING id"))
+
+
+class SaDb:
+    """A SQLAlchemy Session fake that ENFORCES NAMED BINDS, like #213's."""
+
+    def __init__(self, row_id="dead-beef"):
+        self.captured, self._id = [], row_id
+
+    def execute(self, stmt, params=None):
+        import re
+        binds = set(re.findall(r"(?<![:\w]):([a-z_][a-z0-9_]*)", str(stmt), re.I))
+        missing = binds - set((params or {}).keys())
+        assert not missing, f"unbound parameters {sorted(missing)}"
+        extra = set((params or {}).keys()) - binds
+        assert not extra, f"params with no bind in the statement: {sorted(extra)}"
+        self.captured.append(dict(params or {}))
+        outer = self
+
+        class R:
+            def fetchone(self_):
+                return {"id": outer._id}
+        return R()
+
+
+class TestSaDialect(unittest.TestCase):
+    def test_it_writes_the_same_row_through_sqlalchemy(self):
+        db = SaDb()
+        rid = cognition.log_decision_sa(
+            db, agent="gym_display", action="makeup_swap", domain="health",
+            outcome="executed", assumptions={"x": 1}, metadata={"y": 2})
+        self.assertEqual(rid, "dead-beef")
+        row = db.captured[0]
+        self.assertIs(row["manual_gap"], False)
+        self.assertEqual(json.loads(row["assumptions"]), {"x": 1})
+        self.assertIsNone(row["correction"])
+
+    def test_the_same_validation_applies(self):
+        with self.assertRaises(TypeError):
+            cognition.log_decision_sa(SaDb(), agent="a", action="b", domain="c",
+                                      outcome="d", assumptions="not a dict")
+
+
+# ---------------------------------------------------------------------------
+# Outcome rows
+# ---------------------------------------------------------------------------
+
+class TestOutcomeRow(unittest.TestCase):
+    def test_an_outcome_row_has_NO_assumptions(self):
+        """Load-bearing: the job finds work with `assumptions IS NOT NULL`, so an
+        outcome row carrying assumptions would be picked up as a decision needing
+        an outcome, and the job would feed on its own output every night."""
+        cur = Cur()
+        cognition.log_outcome(cur, decides="abc-123", action="checkin_adjust",
+                              domain="health", outcome="logged_as_adjusted")
+        row = cur.one
+        self.assertIsNone(row["assumptions"])
+        self.assertIsNone(row["manual_gap"])
+        self.assertEqual(row["action"], "checkin_adjust.outcome")
+        self.assertEqual(json.loads(row["metadata"])["decides"], "abc-123")
+        self.assertEqual(row["agent"], "cognition")
+
+    def test_the_action_spelling_lives_in_one_place(self):
+        self.assertEqual(cognition.outcome_action("repeat_week"), "repeat_week.outcome")
+
+    def test_a_correction_rides_on_the_outcome_row_not_the_decision(self):
+        cur = Cur()
+        cognition.log_outcome(cur, decides="abc", action="checkin_adjust", domain="health",
+                              outcome="restored_to_original",
+                              correction={"what": "ran the original session"})
+        self.assertEqual(json.loads(cur.one["correction"])["what"], "ran the original session")
+
+
+# ---------------------------------------------------------------------------
+# Site 1 — the check-in decision, including the days nothing happens
+# ---------------------------------------------------------------------------
+
+class TestCheckinAssumptions(unittest.TestCase):
+    PLAN = {"plan_id": 501, "plan_date": date(2027, 3, 4), "week_num": 2,
+            "session_type": "strength_a", "target_rpe": 7.0, "est_duration_min": 45,
+            "blocks": {"type": "circuit", "display_name": "Test A"}}
+
+    def _ci(self, **kw):
+        from artemis.health_checkin import CheckIn
+        return CheckIn(**kw)
+
+    def test_it_records_the_parsed_checkin_and_the_plan_row(self):
+        from artemis import health_checkin as hc
+        a = hc.adjust_assumptions(self.PLAN, self._ci(energy=2, sleep_hrs=5.5,
+                                                      soreness={"quad": 4}, pain={"knee": 2}),
+                                  considered=True, reason="test")
+        self.assertEqual(a["plan_id"], 501)
+        self.assertEqual(a["week_num"], 2)
+        self.assertEqual(a["session_type_as_written"], "strength_a")
+        self.assertEqual(a["target_rpe_as_written"], 7.0)
+        self.assertEqual(a["checkin"]["energy"], 2)
+        self.assertEqual(a["checkin"]["soreness"], {"quad": 4})
+        self.assertEqual(a["checkin"]["pain"], {"knee": 2})
+
+    def test_considered_separates_ran_and_found_nothing_from_never_ran(self):
+        from artemis import health_checkin as hc
+        never = hc.adjust_assumptions(self.PLAN, self._ci(), considered=False,
+                                      reason="already logged")
+        self.assertFalse(never["considered"])
+        self.assertIsNone(never["rules_fired"])          # the ladder did not run
+        ran = hc.adjust_assumptions(self.PLAN, self._ci(),
+                                    hc.Adjustment(changed=False, blocks={}, session_type="x",
+                                                  target_rpe=7.0, est_duration_min=45),
+                                    considered=True, reason="no rule matched")
+        self.assertTrue(ran["considered"])
+        self.assertEqual(ran["rules_fired"], [])         # ran, matched nothing
+        self.assertNotEqual(never["rules_fired"], ran["rules_fired"])
+
+    def test_the_payload_is_jsonb_serialisable(self):
+        from artemis import health_checkin as hc
+        json.dumps(hc.adjust_assumptions(self.PLAN, self._ci(energy=3),
+                                         considered=True, reason="t"), default=str)
+
+
+class TestCheckinWritesDecisions(unittest.TestCase):
+    """Drives the real check-in flow through the existing harness, so the two
+    paths that used to record NOTHING are proved to record something now."""
+
+    def _run(self, text_in, *, adjust=True, logged=False, session_type=None):
+        from datetime import datetime, timezone
+        from tests import test_checkin_adjust as tca
+        from artemis import health_checkin as hc
+        row = tca.office_row(tca.FRI)
+        if session_type is not None:
+            for r in row:
+                r["session_type"] = session_type
+        db = tca.FakeDB(row)
+        if logged:
+            pid = db.plan[tca.FRI]["plan_id"]
+            db.logs.append({"plan_id": pid, "logged_via": "manual",
+                            "log_type": "strength_set", "exercise": "Test",
+                            "weight_lbs": 100})
+        hc.process_checkin(db.cursor(), text_in, tca.FRI, checkin_id="post-1",
+                           now=datetime(2026, 9, 18, 10, 10, tzinfo=timezone.utc),
+                           adjust=adjust)
+        return [d for d in db.decisions if d["assumptions"] is not None]
+
+    def test_a_day_the_ladder_changes_nothing_is_still_recorded(self):
+        """The case that used to vanish: he checked in, nothing was wrong, and
+        the ledger held no trace that the ladder had even looked."""
+        rows = self._run("slept 8 energy 4 sore 0")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "checkin_adjust")
+        self.assertEqual(rows[0]["outcome"], "no_change")
+        a = json.loads(rows[0]["assumptions"])
+        self.assertTrue(a["considered"])
+        self.assertEqual(a["rules_fired"], [])
+        self.assertIs(rows[0]["manual_gap"], False)
+
+    def test_an_already_logged_session_says_the_ladder_never_ran(self):
+        rows = self._run("energy 2", logged=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "no_adjust_sets_logged")
+        a = json.loads(rows[0]["assumptions"])
+        self.assertFalse(a["considered"])
+        self.assertIsNone(a["rules_fired"])
+        self.assertIn("already logged", a["reason"])
+
+    def test_an_applied_adjustment_records_the_rule_that_fired(self):
+        rows = self._run("slept 5 energy 1 sore 0")
+        self.assertEqual(len(rows), 1)
+        a = json.loads(rows[0]["assumptions"])
+        self.assertTrue(a["considered"])
+        self.assertTrue(a["rules_fired"], "a low-energy check-in should fire a rule")
+        self.assertEqual(a["checkin"]["energy"], 1)
+        self.assertIsNotNone(a["session_type_after"])
+
+    def test_the_suppressed_path_records_what_it_would_have_done(self):
+        rows = self._run("slept 5 energy 1 sore 0", adjust=False)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], "checkin_adjust_suppressed")
+        self.assertTrue(json.loads(rows[0]["assumptions"])["rules_fired"])
+
+    def test_every_recorded_checkin_decision_is_jsonb_and_explicit(self):
+        for label, kw in {"no change": {}, "logged": {"logged": True},
+                          "adjusted": {}, "suppressed": {"adjust": False}}.items():
+            with self.subTest(case=label):
+                text_in = "slept 5 energy 1 sore 0" if label != "no change" else "energy 4 sore 0"
+                for row in self._run(text_in, **kw):
+                    json.loads(row["assumptions"])
+                    self.assertIs(row["manual_gap"], False)
 
 
 if __name__ == "__main__":

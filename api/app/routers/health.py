@@ -49,6 +49,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from knowledge import cognition
 from knowledge.machine_setup import parse_setup
 
 from ..database import get_db
@@ -2293,15 +2294,32 @@ def post_makeup(
                    is_skipped = FALSE, target_rpe = NULL, target_hr_zone = NULL, est_duration_min = 0
             WHERE plan_id = :pid
         """), {"b": json.dumps(rest_blocks, default=str), "pid": missed["plan_id"]})
-        db.execute(text(
-            "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
-            "outcome, token_count, api_cost_usd, metadata) "
-            "VALUES ('gym_display', NULL, 'makeup_swap', 'health', NULL, 'executed', 0, 0, "
-            "CAST(:meta AS jsonb))"),
-            {"meta": json.dumps({"missed_plan_id": missed["plan_id"],
-                                 "missed_date": missed["plan_date"].isoformat(),
-                                 "rest_plan_id": rest["plan_id"], "on": today.isoformat(),
-                                 "session_type": entry["session_type"]})})
+        # COGNITION-1 site 2: the swap is a decision, so it records what it
+        # rested on. `can_hold` is NOT evaluated here -- the box evaluates it
+        # when it builds the library, and an offer only exists when it passed
+        # (session_library._supported). Recording it as a check this route made
+        # would be a small lie about where the constraint was enforced.
+        cognition.log_decision_sa(
+            db, agent="gym_display", action="makeup_swap", domain="health",
+            outcome="executed", manual_gap=False,
+            metadata={"missed_plan_id": missed["plan_id"],
+                      "missed_date": missed["plan_date"].isoformat(),
+                      "rest_plan_id": rest["plan_id"], "on": today.isoformat(),
+                      "session_type": entry["session_type"]},
+            assumptions={
+                "rule": "one session not done this week is made up on an unlogged rest day",
+                "missed": {"plan_id": missed["plan_id"],
+                           "plan_date": missed["plan_date"].isoformat(),
+                           "session_type": missed["session_type"],
+                           "was_skipped": bool(missed["is_skipped"])},
+                "rest_day": {"plan_id": rest["plan_id"], "plan_date": rest["plan_date"].isoformat(),
+                             "session_type_before": rest["session_type"]},
+                "week_start": week_start.isoformat(),
+                "week_not_done_count": len(not_done),
+                "location_key": offer.get("location_key"),
+                "can_hold": {"result": True, "evaluated_by": "session_library on the box",
+                             "library_generated_on": lib.get("generated_on")},
+            })
         db.commit()
     except SQLAlchemyError as e:
         db.rollback()

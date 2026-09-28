@@ -71,6 +71,7 @@ class FakeDB:
         self.logs: list[dict] = []
         self.daily: dict[date, dict] = {}
         self.audit: list[tuple] = []
+        self.decisions: list[dict] = []      # COGNITION-1: parsed audit rows
         self.patterns: list[dict] = []          # health.pain_pattern
         self.reflections: list[dict] = []       # health.reflection
         self.plan_dates: dict[int, date] = {}   # plan_id -> date for history-only rows
@@ -158,7 +159,16 @@ class FakeCursor:
             row.update(blocks=json.loads(blocks), session_type=st, target_rpe=rpe,
                        est_duration_min=est)
         elif s.startswith("INSERT INTO acos.audit_log"):
+            # Enforce binds: %s count must match the params. COGNITION-1 widened
+            # this INSERT, and a fake that accepts anything is how a statement and
+            # its parameters drift apart unnoticed (#213).
+            want = s.replace("%%", "").count("%s")
+            assert want == len(params), \
+                f"{want} %s placeholders but {len(params)} params in {s[:70]!r}"
+            cols = s.split("(", 1)[1].split(")", 1)[0].replace(" ", "").split(",")
             self.db.audit.append(params)
+            self.db.decisions.append(dict(zip(cols, params)))
+            self._rows = [("00000000-0000-0000-0000-000000000001",)]   # RETURNING id
         elif s.startswith("SELECT exercise, log_type FROM health.session_log"):
             self._rows = [(l["exercise"], l["log_type"]) for l in self.db.logs
                           if l["plan_id"] == params[0] and l["logged_via"] != "inferred"]

@@ -175,7 +175,8 @@ def _assumptions(repeat_start: date, reps: list, new_reps: list, plan: dict,
 
 
 def apply(repeat_start: date) -> str:
-    from artemis import cognition, health_office as office
+    from artemis import health_office as office
+    from knowledge import cognition
     from artemis.quiet_hours import set_system_value
     from knowledge.db import get_connection
 
