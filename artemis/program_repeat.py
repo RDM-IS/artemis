@@ -125,8 +125,57 @@ def plan_rewrite(existing: list[dict], built: list[dict], repeat_start: date) ->
     return {"target": target, "kept_logged": sorted(logged)}
 
 
+def _assumptions(repeat_start: date, reps: list, new_reps: list, plan: dict,
+                 keys: list, md5_before: str, office) -> dict:
+    """What the repeat believed when it rewrote the plan (COGNITION-1 bronze).
+
+    Deliberately NOT a copy of `metadata`: metadata records what the write did,
+    assumptions records what it took to be true beforehand. The one that matters
+    is `not_done` — the rule fires on "more than one session not done", and
+    nothing in the audit row has ever said WHICH sessions those were, so a repeat
+    that turns out to have been wrong cannot currently be argued with.
+
+    The proposal is read for that, and an unreadable proposal is recorded as
+    UNKNOWN rather than as an empty list. Absence and silence are different
+    answers (FAIL-CLOSED-RESOLVERS); an empty `not_done` would claim the rule
+    fired on nothing. This never raises: a decision record must not be able to
+    break the decision it describes.
+    """
+    try:
+        p = pending()
+    except Exception as exc:                                        # noqa: BLE001
+        logger.warning("repeat assumptions: proposal unreadable — %s", exc)
+        p = None
+        trigger = {"not_done": None, "not_done_count": None,
+                   "source": "unreadable: the proposal could not be read"}
+    else:
+        if p is None:
+            trigger = {"not_done": None, "not_done_count": None,
+                       "source": "absent: applied with no live proposal"}
+        else:
+            nd = p.get("not_done") or []
+            trigger = {"not_done": [f"{m.get('plan_date')} {m.get('display_name')}"
+                                    + (" (skipped)" if m.get("skipped") else "") for m in nd],
+                       "not_done_count": len(nd),
+                       "source": "proposal",
+                       "proposed_at": p.get("proposed_at"),
+                       "proposal_week_num": p.get("week_num")}
+    return {
+        "rule": "a program week with more than one session not done repeats",
+        "trigger": trigger,
+        "week_num": office.week_num_for(repeat_start, new_reps),
+        "repeat_start": repeat_start.isoformat(),
+        "repeats_before": [d.isoformat() for d in reps],
+        "rows_to_rewrite": len(keys),
+        "rows_kept_because_logged": [f"{d} {s}" for d, s in plan["kept_logged"]],
+        "md5_untouched_before": md5_before,
+        "program_end_before": office.program_end(reps).isoformat(),
+        "program_end_after": office.program_end(new_reps).isoformat(),
+    }
+
+
 def apply(repeat_start: date) -> str:
-    from artemis import health_office as office
+    from artemis import cognition, health_office as office
     from artemis.quiet_hours import set_system_value
     from knowledge.db import get_connection
 
@@ -183,16 +232,17 @@ def apply(repeat_start: date) -> str:
             return ("⚠️ The repeat didn't verify, so nothing changed "
                     f"({'rows outside the rebuild moved; ' if after != before else ''}"
                     f"{len(wrong)} rebuilt row(s) didn't match). Check the logs.")
-        cur.execute(
-            "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
-            "outcome, token_count, api_cost_usd, metadata) "
-            "VALUES ('artemis', NULL, 'repeat_week', 'health', NULL, 'executed', 0, 0, %s::jsonb)",
-            (json.dumps({"repeat_start": repeat_start.isoformat(),
-                         "repeats": [d.isoformat() for d in new_reps],
-                         "rows_rebuilt": len(keys),
-                         "kept_logged": [f"{d} {s}" for d, s in plan["kept_logged"]],
-                         "new_end": office.program_end(new_reps).isoformat(),
-                         "md5_untouched": before, "time_cap_notes": len(notes)}),))
+        cognition.log_decision(
+            cur, agent="artemis", action="repeat_week", domain="health",
+            outcome="executed", manual_gap=False,
+            metadata={"repeat_start": repeat_start.isoformat(),
+                      "repeats": [d.isoformat() for d in new_reps],
+                      "rows_rebuilt": len(keys),
+                      "kept_logged": [f"{d} {s}" for d, s in plan["kept_logged"]],
+                      "new_end": office.program_end(new_reps).isoformat(),
+                      "md5_untouched": before, "time_cap_notes": len(notes)},
+            assumptions=_assumptions(repeat_start, reps, new_reps, plan, keys, before,
+                                     office))
     set_system_value(PENDING_KEY, "")
     wk = office.week_num_for(repeat_start, new_reps)
     kept = (f" {len(plan['kept_logged'])} already-logged row(s) were left as they were."

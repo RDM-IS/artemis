@@ -128,9 +128,16 @@ class _Cur:
         self.rows = {(r["plan_date"], r["slot"]): dict(r) for r in rows}
         self.logged, self._res, self.state = set(logged), [], {}
         self.corrupt = None                   # (date, slot) to write wrong — guard test
+        self.audit = []                       # captured acos.audit_log writes
 
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
+        # Like psycopg2: every %s in the statement must be supplied. The fake used
+        # to accept anything, which is how a statement and its params drifted apart
+        # unnoticed in the Lambda on 2026-09-25 (#213).
+        want = s.replace("%%", "").count("%s")
+        got = 0 if params is None else len(params)
+        assert want == got, f"{want} %s placeholders but {got} params in {s[:70]!r}"
         if s.startswith("SELECT p.plan_date, p.slot, EXISTS"):
             self._res = [(d, sl, (d, sl) in self.logged) for (d, sl) in self.rows if d >= params[0]]
         elif s.startswith("SELECT plan_date, slot, week_num, session_type, blocks FROM health.plan ORDER"):
@@ -148,6 +155,10 @@ class _Cur:
             self._res = [(r["week_num"], r["session_type"], r["blocks"])] if r else []
         elif "INTO acos.system_state" in s:
             self.state[params[0]] = params[1]
+        elif "INTO acos.audit_log" in s:
+            cols = s.split("(", 1)[1].split(")", 1)[0].replace(" ", "").split(",")
+            self.audit.append(dict(zip(cols, params)))
+            self._res = [(9001,)]                      # RETURNING id
         self.rolled_back = getattr(self, "rolled_back", False)
 
     def fetchall(self):

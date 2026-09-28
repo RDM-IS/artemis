@@ -182,6 +182,7 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
     day_type = cycle.day_type(d)
     kind = day_kind(day_type)
 
+    picked = None          # three-state: True / False / None = the lookup never ran
     try:
         plan = nmp.fetch_dated_day(d)
         picked = plan is not None
@@ -193,6 +194,12 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
                             note=(f"{day_type} — an off day: pick a menu for "
                                   f"{d.isoformat()} in Notion, or log meals as you go"),
                             plan_source_id=None)
+                _decision(cur, "nutrition_prefill", "no_plan",
+                          {"day": d.isoformat(), "entries": 0},
+                          _prefill_assumptions(
+                              d, day_type, kind, dated_pick=False, default_row=None,
+                              chosen=None,
+                              detail="off day: no dated pick and the kind has no default row"))
                 return PrefillResult("no_plan", 0, f"{d} is an off day with no picked menu")
             plan = nmp.fetch_default_day(name)
     except nmp.NotionUnavailable as exc:
@@ -200,12 +207,23 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
         _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
                     prefilled=False, outcome="unavailable",
                     note=str(exc)[:500], plan_source_id=None)
+        _decision(cur, "nutrition_prefill", "unavailable",
+                  {"day": d.isoformat(), "entries": 0},
+                  _prefill_assumptions(
+                      d, day_type, kind, dated_pick=None, default_row=None, chosen=None,
+                      detail=f"Notion unavailable, so neither lookup ran: {str(exc)[:200]}"))
         logger.warning("nutrition pre-fill %s: Notion unavailable — %s", d, exc)
         return PrefillResult("unavailable", 0, str(exc))
     except LookupError as exc:
         _upsert_day(cur, d, status=DAY_ASSUMED, day_type=day_type,
                     prefilled=False, outcome="no_plan",
                     note=str(exc)[:500], plan_source_id=None)
+        _decision(cur, "nutrition_prefill", "no_plan",
+                  {"day": d.isoformat(), "entries": 0},
+                  _prefill_assumptions(
+                      d, day_type, kind, dated_pick=picked,
+                      default_row=_default_row_for(kind), chosen=None,
+                      detail=f"the default row for this kind was not found: {str(exc)[:200]}"))
         logger.warning("nutrition pre-fill %s: no plan row — %s", d, exc)
         return PrefillResult("no_plan", 0, str(exc))
 
@@ -215,6 +233,13 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
                     prefilled=False, outcome="no_plan",
                     note="default day links no usable recipes",
                     plan_source_id=plan.page_id)
+        _decision(cur, "nutrition_prefill", "no_plan",
+                  {"day": d.isoformat(), "entries": 0, "plan_page": plan.page_id},
+                  _prefill_assumptions(
+                      d, day_type, kind, dated_pick=picked,
+                      default_row=None if picked else _default_row_for(kind),
+                      chosen="picked" if picked else "default", plan=plan,
+                      detail="the chosen day links no recipe with usable macros"))
         return PrefillResult("no_plan", 0, "default day links no usable recipes")
 
     notes = [f"picked: {plan.name}" if picked else f"default: {plan.name}"]
@@ -244,9 +269,14 @@ def prefill_day(cur, d: date, *, now: datetime | None = None) -> PrefillResult:
              food.carb_g, food.fat_g, food.fiber_g, food.page_id))
         written += 1
 
-    _audit(cur, "nutrition_prefill", "planned",
-           {"day": d.isoformat(), "entries": written,
-            "plan_page": plan.page_id, "skipped": plan.skipped})
+    _decision(cur, "nutrition_prefill", "planned",
+              {"day": d.isoformat(), "entries": written,
+               "plan_page": plan.page_id, "skipped": plan.skipped},
+              _prefill_assumptions(
+                  d, day_type, kind, dated_pick=picked,
+                  default_row=None if picked else _default_row_for(kind),
+                  chosen="picked" if picked else "default", plan=plan,
+                  detail=None))
     return PrefillResult("planned", written)
 
 
@@ -982,6 +1012,43 @@ def _set_system_value(cur, key: str, value: str) -> None:
         "VALUES (%s, %s, now()) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         (key, value))
+
+
+def _prefill_assumptions(d, day_type: str, kind, *, dated_pick, default_row,
+                         chosen, plan=None, detail: str | None = None) -> dict:
+    """What the pre-fill believed when it resolved a source (COGNITION-1 bronze).
+
+    The decision is "which meal source won" and its three answers are the dated
+    Notion pick, the kind's undated default, and NONE — so `chosen=None` is a
+    recorded decision, not a missing one. This is the column the dietitian
+    report's data gap needs: a day with no intake is either "Ryan didn't log" or
+    "nothing was ever planned for it", and today nothing distinguishes them.
+
+    `dated_pick` and `default_row` are three-state on purpose: True/False when
+    the lookup ran, None when it could not (Notion down). An unknown recorded as
+    False would read as "Ryan picked no menu" when in fact nobody asked.
+    """
+    return {
+        "rule": "dated pick wins; else the kind default; an off day has none",
+        "day": d.isoformat(),
+        "day_type": day_type,
+        "day_kind": kind,
+        "dated_pick_found": dated_pick,
+        "default_row_for_kind": default_row,
+        "chosen": chosen,
+        "plan_name": getattr(plan, "name", None),
+        "plan_page": getattr(plan, "page_id", None),
+        "recipes_skipped_no_macros": list(getattr(plan, "skipped", []) or []),
+        "detail": detail,
+    }
+
+
+def _decision(cur, action: str, outcome: str, metadata: dict, assumptions: dict) -> None:
+    """A decision row: `_audit` plus what the choice rested on."""
+    from artemis import cognition
+    cognition.log_decision(cur, agent="nutrition", action=action, domain="health",
+                           outcome=outcome, metadata=metadata,
+                           assumptions=assumptions, manual_gap=False)
 
 
 def _audit(cur, action: str, outcome: str, metadata: dict) -> None:
