@@ -1,9 +1,26 @@
+# Secrets and credentials — NEVER on disk (CLAUDE.md). Only non-secret config
+# lives in .env; .env.example* stays TRACKED as the documented shape.
+.env
+.env.bak*
+credentials.json
+token.json
+calendar_token.json
+
+# Private data that must never reach a public repo. artemis is public: the
+# dossiers under scripts/seed_data/ name real people, so the directory is
+# ignored and only its README is tracked (2026-09-28).
+scripts/seed_data/*
+!scripts/seed_data/README.md
+
+# Per-machine editor/agent state.
+.claude/settings.local.json
+
+# Retired store — SQLite is gone and tests guard against its return.
+artemis.db
+
+# Build and packaging artefacts.
 __pycache__/
 *.pyc
-.env
-token.json
-credentials.json
-artemis.db
 *.egg-info/
 dist/
 build/
@@ -11,15 +28,8 @@ build/
 venv/
 api/package/
 api/function.zip
-calendar_token.json
 lambda.zip
-credentials.json
-token.json
-calendar_token.json
-.env
-artemis.db
-lambda.zip
+
+# OS and stray files.
 .DS_Store
 UQ3o
-__pycache__/
-*.pyc
