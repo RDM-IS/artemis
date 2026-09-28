@@ -90,6 +90,15 @@ _reg("Thread the needle", {"back", "shoulder"}, {"neck"})
 _reg("Ankle rocks", {"calves"}, {"knee"})
 _reg("Child's pose", {"low back"}, {"hip", "shoulder"})
 
+# ── PROGRAM-2: Richfield Strength A substitutes (Ryan, 2026-09-28) ──
+# The pain ladder has to be able to reason about a substitute, or a knee flare
+# removes the leg press and leaves the split squat that replaced it.
+_reg("DB split squat", {"legs", "quads"}, {"knee", "hip", "glutes"})
+_reg("Band lat pulldown", {"back"}, {"shoulder", "biceps"})
+_reg("Stability-ball hamstring curl", {"hamstrings"}, {"knee", "low back"})
+_reg("Band face pull", {"shoulder", "back"}, {"neck"})
+_reg("Lying leg raise", {"core"}, {"low back", "hip"})
+
 # ── YOGA-6 (2026-09-28, DRAFT): so the pain ladder can reason about them too ──
 _reg("Chair", {"quads", "legs"}, {"knee", "shoulder"})
 _reg("Plank", {"core", "shoulder"}, {"low back", "wrist"})

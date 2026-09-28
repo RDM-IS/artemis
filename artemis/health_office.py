@@ -147,6 +147,12 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
 # build error, not a silent `dumbbell`.
 EQUIPMENT_CLASS: dict[str, str] = {
     # office — machines
+    # PROGRAM-2 Richfield Strength A (Ryan, 2026-09-28)
+    "DB split squat": "dumbbell",
+    "Band lat pulldown": "bands",
+    "Stability-ball hamstring curl": "bodyweight",
+    "Band face pull": "bands",
+    "Lying leg raise": "bodyweight",
     "Leg press": "machine",
     "Lat pulldown": "machine",
     "Seated leg curl": "machine",
@@ -230,22 +236,42 @@ EQUIPMENT_CLASS: dict[str, str] = {
 # Richfield Strength C, approved by Ryan 2026-09-23. Three of the six are
 # native there; these are the three that are not, plus the ab machine.
 # (name at the office) -> (name at Richfield, rep-range label, top reps)
-RICHFIELD_SUBS: dict[str, tuple[str, str, int]] = {
-    "Pec fly": ("DB fly", "10-12", 12),
-    "Single-arm cable row": ("1-arm DB row", "10-12", 12),
-    "Calf press": ("Standing DB calf raise", "12-15", 15),
-    "Ab machine crunch": ("Stability-ball crunch", "10-12", 12),
+# (name at the office) -> (name here, rep-range label, top reps, per_side)
+#
+# `per_side` joined the tuple on 2026-09-28: it used to be inherited from the
+# office movement, which is right for every substitution above but wrong for a
+# split squat — Leg press is not per-side, and prescribing "3×10-12" for a
+# unilateral lift asks for half the work.
+RICHFIELD_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Pec fly": ("DB fly", "10-12", 12, False),
+    "Single-arm cable row": ("1-arm DB row", "10-12", 12, False),
+    "Calf press": ("Standing DB calf raise", "12-15", 15, False),
+    "Ab machine crunch": ("Stability-ball crunch", "10-12", 12, False),
+}
+
+#: Richfield STRENGTH A — approved by Ryan 2026-09-28 as part of PROGRAM-2.
+#: DB bench press is deliberately ABSENT: the flat bench is native here, so that
+#: movement runs unchanged and a substitution row for it would be a lie.
+RICHFIELD_A_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Leg press": ("DB split squat", "10-12", 12, True),
+    "Lat pulldown": ("Band lat pulldown", "10-12", 12, False),
+    "Seated leg curl": ("Stability-ball hamstring curl", "10-12", 12, False),
+    "Cable face pull (rope)": ("Band face pull", "12-15", 15, False),
+    "Captain's chair knee raise": ("Lying leg raise", "8-12", 12, False),
 }
 
 #: What the gym is called on the row, per location. The office keeps its
 #: per-session equipment list; anywhere else names what the session uses.
 LOCATION_EQUIPMENT: dict[str, list[str]] = {
-    "richfield": ["PowerBlocks (to 80 lb)", "flat bench", "stability ball"],
+    # CONFIRMED by Ryan 2026-09-28 15:14. "to 80 lb" was wrong: they pair to 90.
+    "richfield": ["PowerBlocks (to 90 lb)", "flat bench", "stability ball",
+                  "resistance bands + wall anchors", "TRX", "curl bar",
+                  "bike on trainer", "yoga mat"],
 }
 
 #: Which office session each location can hold, and how.
-LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int]]]] = {
-    "richfield": {"strength_c": RICHFIELD_SUBS},
+LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int, bool]]]] = {
+    "richfield": {"strength_a": RICHFIELD_A_SUBS, "strength_c": RICHFIELD_SUBS},
 }
 
 
@@ -457,10 +483,12 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
     for spec in _EXERCISES[session_type]:
         name, label, top, per_side, machine = spec
         if name in subs:
-            sub_name, sub_label, sub_top = subs[name]
-            # a substitute is never a machine, and never per-side unless the
-            # table says so by name (1-arm DB row is logged as one load)
-            specs.append((sub_name, sub_label, sub_top, per_side, False))
+            sub_name, sub_label, sub_top, sub_per_side = subs[name]
+            # A substitute is never a machine. `per_side` now comes from the
+            # TABLE rather than from the office movement it replaces: a split
+            # squat is unilateral where a leg press is not, and inheriting False
+            # would have prescribed half the work.
+            specs.append((sub_name, sub_label, sub_top, sub_per_side, False))
         else:
             specs.append(spec)
     exercises = [_exercise(*e, sets, week_num, wk0=wk0) for e in specs]
