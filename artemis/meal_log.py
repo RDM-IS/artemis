@@ -568,7 +568,33 @@ def build_reply(cur, ml: MealLog, out: Outcome, today: date) -> str:
         picks = suggest(cur, out.day, left)
         if picks:
             lines.append(_suggest_line(picks))
+    walk = post_meal_walk_line(out.slot, out.day, today)
+    if walk:
+        lines.append(walk)
     return "\n".join(lines)
+
+
+#: PROGRAM-2 (Ryan, 2026-09-28). Prediabetes is one of the three goals, and a
+#: short easy walk after the two big meals blunts the post-meal glucose rise.
+WALK_LINE = "10-minute easy walk now helps blunt the glucose rise."
+
+#: Only the two meals big enough to matter. Breakfast and snacks are left alone:
+#: a line on every logged item would be nagging, and a nag is how a true line
+#: stops being read.
+WALK_SLOTS = ("lunch", "dinner")
+
+
+def post_meal_walk_line(slot: str | None, day: date, today: date) -> str | None:
+    """One line after a lunch or dinner logged FOR TODAY, else None.
+
+    Deliberately NOT a scheduled nudge (Ryan, 2026-09-28): it rides on the reply
+    he is already reading, so there is no new standing automation here and
+    nothing to gate. Back-logging yesterday's dinner gets no line — the advice is
+    about the next ten minutes, and a walk he cannot take now is noise.
+    """
+    if day != today:
+        return None
+    return WALK_LINE if (slot or "").lower() in WALK_SLOTS else None
 
 
 def is_known_food_fn(cur):
