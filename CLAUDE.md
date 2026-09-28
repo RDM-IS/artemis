@@ -64,6 +64,8 @@ Never delete a branch on ahead/behind counts — squash/rebase merges leave bran
 
 `feat/*` → PR → `main`. Never push to `main` except the generated snapshot. Branches auto-delete on merge. Two machines push (Mac + EC2) — always `git pull --ff-only` before pushing; never edit the same thing on both.
 
+**MERGE-SUBJECT — merge with an explicit subject and body, then read back what landed.** `gh pr merge <n> --squash --subject "<title> (#<n>)" --body "<summary>"`, and check `git log -1` on `main` afterwards. A squash takes the branch's FIRST commit subject, not the PR title, so a `wip` commit followed by any second commit — including a `git merge origin/main` — puts `wip …` on `main` permanently. **2026-09-28:** #229 and #230 landed as `wip-site5` and `wip-step23` with empty bodies, because the amend that was meant to fix the message hit the merge commit instead of the content commit. The reasoning survived in the PR descriptions, but `git log` did not. **Never rewrite `main` to repair a commit message** — force-pushing shared history costs more than the message is worth.
+
 ## Build loop
 
 Changes go through Claude Code: "read the entire codebase / these specific files before writing anything," then exact spec. For migrations/deletions: **coverage-check first** (map each capability to its new home; stop and surface any with no home rather than silently dropping). Return with results; deploy + verify on the box before merge.
