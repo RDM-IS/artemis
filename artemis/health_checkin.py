@@ -433,9 +433,14 @@ def _pool_exercise(name: str, sets: int, week_num: int) -> dict:
             return ex
     for table in office.LOCATION_SUBS.values():
         for subs in table.values():
-            for sub_name, label, top in subs.values():
+            # 4-wide since 2026-09-28: `per_side` lives in the table, and this
+            # rebuild used to hardcode False. A split squat rebuilt by the pain
+            # ladder would have lost "each side" -- and before that, the extra
+            # element raised ValueError here, which is how CI found it.
+            for sub_name, label, top, sub_per_side in subs.values():
                 if sub_name == name:
-                    ex = office._exercise(name, label, top, False, False, sets, week_num)
+                    ex = office._exercise(name, label, top, sub_per_side, False,
+                                          sets, week_num)
                     ex["notes"] = re.sub(r"^\d+×", f"{sets}×", ex["notes"])
                     return ex
     raise KeyError(f"{name} is in no session or substitution table")

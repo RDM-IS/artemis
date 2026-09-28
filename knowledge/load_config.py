@@ -39,21 +39,33 @@ OFFICE: dict[str, dict] = {
     "cardio": _NONE,
 }
 
-#: Richfield — the farm. PowerBlocks, a curl bar with 70 lb of plates, a flat
-#: bench, TRX, bands on a wall mount, a stability ball, a rower and a bike on a
-#: trainer. 6.5 ft ceiling: no STANDING overhead work.
+#: Richfield — the farm. INVENTORY CONFIRMED by Ryan 2026-09-28 15:14: a road
+#: bike on an indoor trainer, a yoga mat, TRX, 10–50 lb resistance bands with
+#: handles and connectors, wall anchors every 6" from 6" off the floor to the
+#: ceiling (two anchor boards side by side, one continuing across the joist, with
+#: a mirrored board on the opposite wall), a flat bench, a stability ball, a curl
+#: bar and PowerBlocks. 6.5 ft ceiling, so presses stay SEATED.
 #:
-#: TODO(richfield) — Ryan is there Friday 2026-09-25 and will confirm:
-#:   * the PowerBlock increment (5 lb assumed; they may go in 2.5s), and
-#:   * whether a SEATED overhead press clears the 6.5 ft ceiling.
-#: Until then the dumbbell step is the conservative 5 and the seated press
-#: stays in the session as written.
+#: PowerBlocks — CONFIRMED by Ryan 2026-09-28 17:02 from a photo. They are paired
+#: to 90 lb and he keeps BOTH adders in and will not take them out, so the only
+#: loads that exist here are 10, 20, 30, 40, 50, 60, 70, 80, 90. The old
+#: TODO(richfield) guessed a 5 lb step, which would have offered him 15s, 25s and
+#: 35s that the room cannot make; `lighter_load()` rounds DOWN inside this set.
 RICHFIELD: dict[str, dict] = {
-    "dumbbell": {"mode": "numeric", "step": 5, "min": 5, "max": 80,
-                 "note": "PowerBlocks — TODO(richfield) confirm the increment"},
-    "barbell": {"mode": "numeric", "step": 10, "min": 0, "max": 70, "bar": 0,
-                "plates": [10, 10, 5, 5, 2.5],
-                "note": "curl bar + 70 lb of plates — TODO(richfield) confirm the set"},
+    "dumbbell": {"mode": "numeric", "step": 10, "min": 10, "max": 90,
+                 "note": "PowerBlocks, paired to 90 lb with both adders in — "
+                         "10 lb steps, nothing between"},
+    # The curl bar carries 2×10 and 2×25, i.e. ONE 10 and ONE 25 per side, so the
+    # reachable plate totals are exactly 0, 20, 50, 70.
+    #
+    # TODO(richfield) — the BAR'S OWN WEIGHT is still unmeasured. It is recorded
+    # as 0 rather than guessed at 15 or 20, so every total here is PLATES ONLY and
+    # the note says so; the stepper labels it "+ bar". A guessed bar weight would
+    # be silently wrong on every set at this location, and wrong in the direction
+    # of under-loading.
+    "barbell": {"mode": "numeric", "step": 20, "min": 0, "max": 70, "bar": 0,
+                "plates": [25, 10],
+                "note": "curl bar: plates only, + bar (bar weight not yet measured)"},
     "bands": _NONE,
     "trx": _NONE,
     "bodyweight": _NONE,
@@ -96,8 +108,8 @@ CONSTRAINTS: dict[str, dict] = {
     "office": {"ceiling_ft": None, "standing_overhead": True,
                "note": "commercial gym; height never measured because it has never mattered"},
     "richfield": {"ceiling_ft": 6.5, "standing_overhead": False,
-                  "note": "no STANDING overhead work; whether a SEATED press clears "
-                          "6.5 ft is still unconfirmed"},
+                  "note": "no STANDING overhead work; a SEATED press clears 6.5 ft "
+                          "and presses stay seated here (Ryan, 2026-09-28)"},
     "brown_deer": {"ceiling_ft": 7.0, "standing_overhead": None,
                    "note": "confirmed 2026-09-26. Undetermined rather than assumed: "
                            "7 ft is marginal and depends on reach. Moot in practice — "
