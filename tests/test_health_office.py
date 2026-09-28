@@ -86,8 +86,9 @@ class TestSchedule(unittest.TestCase):
         r = _BY_DATE[date(2026, 9, 20)]
         self.assertEqual(date(2026, 9, 20).weekday(), 6, "9/20 must be a Sunday")
         self.assertEqual(office.CYCLE_ANCHOR, date(2026, 9, 20))
-        # EVENING-1: the Sunday's flow moved to the evening; its morning rests
-        self.assertEqual(r["session_type"], "rest")
+        # EVENING-1 moved the Sunday's flow to the evening; PROGRAM-2 then gave
+        # its morning the row intervals.
+        self.assertEqual(r["session_type"], "cardio_intervals")
         self.assertEqual(_EVENING_BY_DATE[date(2026, 9, 20)]["session_type"], "recovery_flow")
         self.assertEqual(r["week_num"], 2)
         # the first lift of the cycle is the Monday
@@ -162,8 +163,10 @@ class TestSchedule(unittest.TestCase):
 
     def test_a_rest_morning_is_a_real_row(self):
         """EVENING-1: "no plan" and "rest today" are different facts."""
+        # PROGRAM-2 turned four of the six rest positions into cardio, so two
+        # remain per cycle: Sat at Brown Deer and the travel Monday.
         rests = [r for r in _MORNINGS if r["session_type"] == "rest"]
-        self.assertEqual(len(rests), 18)
+        self.assertEqual(len(rests), 6)
         for r in rests:
             self.assertEqual(r["blocks"]["type"], "rest")
             self.assertEqual(r["est_duration_min"], 0)
@@ -187,10 +190,11 @@ class TestSchedule(unittest.TestCase):
     def test_weekly_pattern_and_weeks(self):
         # Sun..Sat. Odd cycle weeks lift Mon/Wed/Thu, even ones Tue/Thu/Fri.
         # EVENING-1: every flow moved to the evening; those mornings are rest.
-        odd = ["rest", "strength_a", "cardio_z2", "strength_b",
-               "strength_c", "rest", "rest"]
-        even = ["rest", "rest", "strength_a", "cardio_z2", "strength_b",
-                "strength_c", "rest"]
+        # PROGRAM-2 (2026-09-28): four positions moved from rest to cardio.
+        odd = ["cardio_intervals", "strength_a", "cardio_z2", "strength_b",
+               "strength_c", "cardio_z2", "rest"]
+        even = ["cardio_z2", "rest", "strength_a", "cardio_z2", "strength_b",
+                "strength_c", "cardio_intervals"]
         for wk in range(2, 8):
             pattern = odd if (wk % 2 == 0) else even
             for wd, st in enumerate(pattern):
@@ -212,7 +216,10 @@ class TestSchedule(unittest.TestCase):
             for r in lifts:
                 self.assertEqual(r["blocks"]["rounds"], sets)
                 self.assertEqual(r["target_rpe"], rpe)
-            z = next(r for r in wk_rows if r["session_type"] == "cardio_z2")
+            # The OFFICE Z2 specifically: PROGRAM-2 put Z2 at Richfield and Brown
+            # Deer too, and those carry their own cooldowns, not the office's.
+            z = next(r for r in wk_rows if r["session_type"] == "cardio_z2"
+                     and r["blocks"].get("location_key") == "office")
             # office Z2 carries the 5 min Stretch Trainer cooldown
             self.assertEqual(z["blocks"]["duration_min"], z2)
             self.assertEqual(z["est_duration_min"], z2 + office.COOLDOWN_MIN)
@@ -220,7 +227,9 @@ class TestSchedule(unittest.TestCase):
             self.assertIn(office.EQ_STRETCH, z["blocks"]["equipment"])
             self.assertEqual(z["target_hr_zone"], 2)
             self.assertIn("conversational pace", z["blocks"]["setup_notes"][0])
-        wk5_z2 = next(r for r in _ROWS if r["week_num"] == 5 and r["session_type"] == "cardio_z2")
+        wk5_z2 = next(r for r in _ROWS if r["week_num"] == 5
+                      and r["session_type"] == "cardio_z2"
+                      and r["blocks"].get("location_key") == "office")
         self.assertEqual(wk5_z2["blocks"]["target_range_min"], [35, 40])
 
     def test_strength_day_contract(self):
@@ -288,8 +297,10 @@ class TestTargetedReseed(unittest.TestCase):
 
     def test_write_rows_validates_the_whole_program_not_the_subset(self):
         from unittest.mock import MagicMock
+        # PROGRAM-2 doubled the Z2 rows (Richfield Friday and the Brown Deer
+        # Sunday joined the two office days).
         subset = [r for r in _ROWS if r["session_type"] == "cardio_z2"]
-        self.assertEqual(len(subset), 6)
+        self.assertEqual(len(subset), 12)
         # the subset alone can't satisfy full-window coverage
         with self.assertRaises(AssertionError):
             office.validate_rows(subset)

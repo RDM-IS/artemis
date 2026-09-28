@@ -93,6 +93,12 @@ BY_LOCATION: dict[str, dict] = {
     "brown_deer": BROWN_DEER,
     # msp_home has NO recorded inventory, so it gets no config and
     # for_location() returns None for it — "unknown", not "empty".
+    #
+    # PROGRAM-2 seeds cardio there from 2026-10-04 (the rower), and it was
+    # tempting to call that a confirmed empty. It is not: Ryan confirmed
+    # Richfield's inventory and has never confirmed this one, so "we know there
+    # is nothing to load here" would be a claim nobody has made. A cardio row
+    # carries no loaded exercise, so it costs nothing to leave this unknown.
 }
 
 #: Room constraints that are not loads, kept OUT of BY_LOCATION so `classes_at()`

@@ -477,16 +477,40 @@ LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
 # EVENING-1 (Ryan, 2026-09-23): the flows moved to the EVENING, so the days
 # that carried them are rest mornings now. Mornings are strength / cardio /
 # rest; evenings are yoga.
+# PROGRAM-2 (Ryan, approved 2026-09-28): four of these were `rest` and are now
+# cardio. The LIFT days are untouched -- A/B/C already land on office days 1, 3
+# and 4 in both weeks, which is what the approved table says.
 NON_LIFT = {
-    0: "rest",            # Sun, msp_home — flow moved to the evening
-    2: "cardio_z2",       # Tue, office — treadmill / elliptical
-    5: "rest",            # Fri, Richfield — flow moved to the evening
-    6: "rest",            # Sat, Brown Deer — flow moved to the evening
-    7: "rest",            # Sun, Brown Deer — flow moved to the evening
-    8: "rest",            # Mon, travel — flow moved to the evening
-    10: "cardio_z2",      # Wed, office — treadmill / elliptical
-    13: "rest",           # Sat, msp_home — flow moved to the evening
+    0: "cardio_intervals",   # Sun, msp_home — row (the rower arrives 10/04)
+    2: "cardio_z2",          # Tue, office
+    5: "cardio_z2",          # Fri, Richfield — bike on the trainer
+    6: "rest",               # Sat, Brown Deer — rest; Yoga S&B suggested
+    7: "cardio_z2",          # Sun, Brown Deer — treadmill incline walk
+    8: "rest",               # Mon, travel — rest; Mobility suggested
+    10: "cardio_z2",         # Wed, office
+    13: "cardio_intervals",  # Sat, msp_home — row
 }
+
+#: PROGRAM-2 SUGGESTED EXTRA — display only. Core stays an EXTRA and is NOT a
+#: planned row and NOT part of the lift: the office window is 05:00-06:00 and B
+#: is already 62 min. The row carries a NAME the card and the wake post show as
+#: one line, and tapping it opens that library entry. No new rows, and no change
+#: to what "extras" means.
+SUGGESTED_EXTRA_BY_TYPE: dict[str, str] = {
+    "strength_a": "core", "strength_b": "core", "strength_c": "core",
+}
+#: By cycle position, where the day rather than the session decides.
+SUGGESTED_EXTRA_BY_POS: dict[int, str] = {
+    6: "yoga_strength",   # Sat, Brown Deer — a mat is all it needs
+    8: "mobility",        # Mon, travel
+}
+
+
+def suggested_extra(session_type: str, pos: int | None = None) -> str | None:
+    """The extra offered alongside a session, or None. Display only."""
+    if pos is not None and pos in SUGGESTED_EXTRA_BY_POS:
+        return SUGGESTED_EXTRA_BY_POS[pos]
+    return SUGGESTED_EXTRA_BY_TYPE.get(session_type)
 
 # EVENING-1: FOUR evenings a week — the six days whose morning flow moved,
 # plus one training day in each program week (Tue of week 1, Wed of week 2).
@@ -608,7 +632,7 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
     return blocks, rpe, 3, minutes
 
 
-def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
+def _z2(week_num: int, location: str = LOCATION, location_key: str = "office", on=None):
     """CARDIO-LOC (2026-09-25): the modality comes from the LOCATION'S INVENTORY
     via `knowledge.cardio`, in the configured preference order.
 
@@ -621,7 +645,7 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
 
     lo, hi = RAMP[week_num][2]
     office = location == LOCATION
-    resolved = cardio_cfg.resolve(location_key)
+    resolved = cardio_cfg.resolve(location_key, on)
     blocks = {
         "type": "steady",
         "display_name": display_name_for("cardio_z2",
@@ -633,7 +657,7 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office"):
         # The resolved modality travels on the row, like load_config does, so
         # the iPad and the box read one answer instead of deciding separately.
         "cardio": resolved,
-        "equipment": [cardio_cfg.label_for(d) for _, d in cardio_cfg.available(location_key)],
+        "equipment": [cardio_cfg.label_for(d) for _, d in cardio_cfg.available(location_key, on)],
         "setup_notes": [Z2_NOTES if office else cardio_cfg.describe(resolved)],
     }
     if not resolved.get("modality"):
@@ -1310,7 +1334,7 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
         return _strength(session_type, week_num, wk0=wk0,
                          location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
-        return _z2(week_num, location or LOCATION, location_key=location_key)
+        return _z2(week_num, location or LOCATION, location_key=location_key, on=on)
     if session_type == "cardio_intervals":
         return _intervals(week_num, location or LOCATION, location_key=location_key,
                           on=on, gate=gate)
@@ -1427,7 +1451,7 @@ def build_schedule(repeats: list[date] | None = None) -> list[dict]:
         specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
                       "week_num": week_num_for(d, reps), "location": day_location(d),
                       "location_key": day_location_key(d), "day_type": day_type(d),
-                      "wk0": False})
+                      "pos": cycle_pos(d), "wk0": False})
         # EVENING-1: four evenings a week, and never one in a transit segment.
         if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
             specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
@@ -1444,9 +1468,18 @@ def build_row(spec: dict) -> dict:
     week_num = spec["week_num"]
     session_type = spec["session_type"]
     location = spec.get("location") or LOCATION
+    # PROGRAM-2: the row's OWN DATE reaches the builder, so a dated fact -- the
+    # rower moving on 10/04 -- resolves to where the equipment will be on that
+    # day rather than where it is while the seeder happens to run.
     blocks, rpe, zone, est = _build(session_type, week_num, wk0=wk0, location=location,
-                                    location_key=spec.get("location_key", "office"))
+                                    location_key=spec.get("location_key", "office"),
+                                    on=spec.get("plan_date"), gate=spec.get("gate"))
     blocks = copy.deepcopy(blocks)
+    extra = suggested_extra(session_type, spec.get("pos"))
+    if extra:
+        # Display only: a NAME the card and the wake post show as one line. It
+        # seeds no row and changes nothing about what "extras" means.
+        blocks["suggested_extra"] = extra
     # CYCLE-1: every row carries where it happens and the day type it came from.
     blocks["location"] = location
     # LOCATION-1: …and what a load means there. Two consumers must agree —
@@ -1567,7 +1600,10 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
         assert r["session_type"] in LEGAL_SESSION_TYPES, r["session_type"]
         assert 1 <= r["week_num"] <= 7, r["week_num"]
         assert b.get("display_name"), "blocks must carry a display_name"
-        assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow", "rest"), b["type"]
+        # PROGRAM-2 added "intervals". A block type the validator does not know
+        # is a hard failure on purpose, which is how this caught the new one.
+        assert b["type"] in ("circuit", "steady", "mobility", "recovery_flow", "rest",
+                             "intervals"), b["type"]
         assert not forbidden_hits(b), f"{r['plan_date']}: retired equipment {forbidden_hits(b)}"
         # SCHEDULE-2: a strength session only ever lands on an office day.
         #
