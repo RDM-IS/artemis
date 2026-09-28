@@ -281,25 +281,51 @@ def _disambiguation_reply(flows: list[str], unreadable: list[str]) -> str:
     return "\n".join(lines)
 
 
-#: The `deterministic_chain` entries that consume a BARE control word, in chain
-#: order, each with the flows it claims in the order it checks them. This is how
-#: "what first-match-wins WOULD have picked" is computed WITHOUT EXECUTING
-#: ANYTHING: every entry in the chain is a live handler with side effects, so the
-#: only safe way to answer the question is from the chain's static order.
+#: Every handler that CONSUMES a bare control word, in `deterministic_chain`
+#: order, with the flows each one claims. This is how "what first-match-wins
+#: WOULD have picked" is computed WITHOUT EXECUTING ANYTHING: every entry in the
+#: chain is a live handler with side effects, so the chain's static order is the
+#: only safe way to answer the question.
 #:
-#: It is exactly the set of handlers that call `_strip_qualifier` — a test asserts
-#: both that, and that these entries still appear in the chain in this order. A
-#: new arbitrated handler, or a reordered chain, fails the suite rather than
-#: silently making every recorded `would_have_picked` a lie.
-_BARE_WORD_CLAIMANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+#: **CORRECTED 2026-09-28.** The first version of this table was the set of
+#: handlers that call `_strip_qualifier`, which is NOT the same thing and left out
+#: four real consumers. `_handle_dossier_command` executes `dossier.apply_set()`
+#: on a bare `yes`; `_handle_duplicate_override` consumes confirm and cancel
+#: words; `_handle_convert_to_tasks` consumes them too. Two of those WRITE. The
+#: omission mattered twice over: `duplicate_override` is the FIRST entry in the
+#: chain, so a recorded `would_have_picked` was wrong whenever a duplicate pending
+#: was open, and treating those flows as harmless would have let a bare `yes`
+#: meant for one flow execute another — the exact bug CONFIRM-ARB exists to stop.
+_BARE_WORD_CONSUMERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("duplicate_override", ("duplicate",)),
     ("calendar_confirm", ("calendar",)),
     ("delete_confirm", ("delete",)),
     ("debrief_confirm", ("debrief",)),
     ("swap_confirm", ("swap",)),
     ("nutrition_confirm", ("target", "staples")),
+    ("dossier_command", ("dossier", "org")),
     ("rule_command", ("rule",)),
     ("disposition_command", ("disposition",)),
 )
+
+#: `_handle_convert_to_tasks` consumes a bare confirm word too, but it is called
+#: AFTER `deterministic_chain`, not from it — so it has no chain position and any
+#: chain consumer beats it. It still counts toward ambiguity.
+_POST_CHAIN_CONSUMERS: tuple[str, ...] = ("convert",)
+
+#: The one open pending that CANNOT consume a bare control word:
+#: `_handle_nutrition_fix` is gated on `fix`, `done` or a deviation-shaped line,
+#: and none of those is a control word. A `fix` correction being open must
+#: therefore not make a bare `yes` ambiguous — it could never have claimed it.
+_NON_CONSUMING_FLOWS: frozenset[str] = frozenset({"fix"})
+
+
+def consuming_flows() -> frozenset[str]:
+    """The flows a bare control word could actually go to — ONE list, derived from
+    the tables above, so the arbiter's counting and site 5's `would_have_picked`
+    cannot disagree about who the candidates are."""
+    return frozenset(f for _e, fl in _BARE_WORD_CONSUMERS for f in fl) | frozenset(
+        _POST_CHAIN_CONSUMERS)
 
 #: How long after a disambiguation a qualified reply still counts as its answer.
 _ARB_OUTCOME_WINDOW_MIN = 10
@@ -315,21 +341,25 @@ _QUALIFIED_FORM_RE = re.compile(
 
 def _would_have_picked(flows: list[str]) -> tuple[str | None, list[str]]:
     """(the flow first-match-wins would have given the bare word to, the open
-    flows that no chain handler would have claimed at all).
+    flows that could not have claimed it at all).
 
-    The second half matters more than it looks. `_open_pending_flows` counts every
-    open pending, but only seven handlers consume a bare control word — so
-    `dossier`, `org`, `duplicate`, `convert` and `fix` can make a bare `yes`
-    ambiguous without any of them ever having been able to claim it. Recording
-    that separately is what will show, from data, whether the arbiter refuses
-    bare words it did not need to.
+    Chain consumers first, in chain order, then the post-chain one — which is the
+    real precedence, since `_handle_convert_to_tasks` only runs when nothing in the
+    chain claimed the message.
+
+    The second element is now almost always empty, and the 2026-09-28 correction is
+    why: it was built on the belief that five open pendings could not claim a bare
+    word, and only `fix` actually cannot.
     """
-    claimed = {f for _entry, fl in _BARE_WORD_CLAIMANTS for f in fl}
-    for _entry, claims in _BARE_WORD_CLAIMANTS:
+    consuming = consuming_flows()
+    for _entry, claims in _BARE_WORD_CONSUMERS:
         for flow in claims:
             if flow in flows:
-                return flow, [f for f in flows if f not in claimed]
-    return None, [f for f in flows if f not in claimed]
+                return flow, [f for f in flows if f not in consuming]
+    for flow in _POST_CHAIN_CONSUMERS:
+        if flow in flows:
+            return flow, [f for f in flows if f not in consuming]
+    return None, [f for f in flows if f not in consuming]
 
 
 def _record_arbitration(channel_id: str, word: str, flows: list[str],
@@ -430,11 +460,26 @@ def _arbitrate_bare_control_word(channel_id: str, question: str) -> str | None:
     q = (question or "").lower().strip().rstrip(".!")
     if q not in _CONTROL_WORDS:
         return None
-    flows, unreadable = _open_pending_flows(channel_id)
+    all_flows, all_unreadable = _open_pending_flows(channel_id)
+    # Only flows that could ACTUALLY consume this word can make it ambiguous
+    # (Ryan, 2026-09-28). A `fix` correction being open is not a competing claim —
+    # `_handle_nutrition_fix` is gated on `fix`/`done`/deviation lines and could
+    # never have taken a bare `yes`. Every other open pending can, including the
+    # two that WRITE on one, so the narrowing is exactly one flow wide.
+    consuming = consuming_flows()
+    flows = [f for f in all_flows if f in consuming]
+    # FAIL-CLOSED is preserved where it matters: an unreadable store still counts,
+    # but only for a flow that could have consumed the word. "Might be open" is
+    # only dangerous for a flow that could act on it.
+    unreadable = [f for f in all_unreadable if f in consuming]
+    ignored = [f for f in all_flows + all_unreadable if f not in consuming]
     if len(flows) + len(unreadable) <= 1:
+        if ignored:
+            logger.info("CONFIRM-ARB: bare %r — %s open but cannot consume it, so "
+                        "first-match-wins stands", q, ignored)
         return None                      # unchanged first-match-wins behaviour
-    logger.info("CONFIRM-ARB: bare %r with open=%s unreadable=%s — disambiguating",
-                q, flows, unreadable)
+    logger.info("CONFIRM-ARB: bare %r with open=%s unreadable=%s ignored=%s — "
+                "disambiguating", q, flows, unreadable, ignored)
     _record_arbitration(channel_id, q, flows, unreadable)
     return _disambiguation_reply(flows, unreadable)
 
@@ -1638,6 +1683,9 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
     # confirm handlers already ran and ignore a non-matching pending type.
     pending = _pending_confirms.get(channel_id)
     if pending and pending.get("type") == "dossier_set":
+        # CONFIRM-ARB: accept `yes dossier`. Stripped into a LOCAL, not into `ql` —
+        # that drives the rest of this handler's parsing and must not change.
+        ql = _strip_qualifier(question, "dossier").lower().strip()
         if ql in _CONFIRM_WORDS:
             del _pending_confirms[channel_id]
             # apply_set renders the confirmation from the written rows.
@@ -1651,6 +1699,7 @@ def _handle_dossier_command(post: dict, question: str) -> bool:
 
     # Pending `org set` confirm (PB-010d org-profile authoring).
     if pending and pending.get("type") == "org_set":
+        ql = _strip_qualifier(question, "org").lower().strip()   # CONFIRM-ARB
         if ql in _CONFIRM_WORDS:
             del _pending_confirms[channel_id]
             say(dossier.apply_org_set(pending["org"], pending["column"], pending["value"]))
@@ -2393,7 +2442,12 @@ def _handle_duplicate_override(post: dict, question: str) -> bool:
         del _pending_confirms[channel_id]
         return False
 
-    q_lower = question.lower().strip()
+    # CONFIRM-ARB: accept `yes duplicate` / `no duplicate` — the arbiter offers
+    # that form, and this handler never stripped it, so the advice did not work.
+    # `override duplicate` is untouched: the qualified pattern needs a CONTROL
+    # WORD followed by the suffix, and "override" is not one, so the one phrase
+    # that may create past a duplicate block still cannot be reached by a confirm.
+    q_lower = _strip_qualifier(question, "duplicate").lower().strip()
 
     if q_lower == _DUP_OVERRIDE_PHRASE:
         data = pending["data"]
@@ -2622,7 +2676,10 @@ def _handle_convert_to_tasks(post: dict, question: str) -> bool:
             if time.time() - pending["timestamp"] > 600:
                 del _pending_confirms[channel_id]
                 return False
-            if q_lower in _CONFIRM_WORDS or q_lower == "execute":
+            # CONFIRM-ARB: accept `yes convert`. A LOCAL, because `q_lower` is not
+            # re-read after this leg but the pattern match below uses `question`.
+            qc = _strip_qualifier(question, "convert").lower().strip()
+            if qc in _CONFIRM_WORDS or qc == "execute":
                 events = pending["events"]
                 deleted = 0
                 added = 0
