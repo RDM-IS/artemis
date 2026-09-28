@@ -200,6 +200,14 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "Thread the needle": "bodyweight",
     "Ankle rocks": "bodyweight",
     "Child's pose": "bodyweight",
+    # YOGA-6 poses (2026-09-28, draft). Flow poses do not currently route through
+    # class_for, but class_for RAISES on an unknown name, so an entry here is what
+    # keeps a future consumer from being a build error.
+    "Chair": "bodyweight",
+    "Plank": "bodyweight",
+    "Warrior II": "bodyweight",
+    "Warrior III": "bodyweight",
+    "Low lunge twist": "bodyweight",
     # a legacy interval block, not a lift: duration work with no load. `cardio`
     # is a no-numeric-load class like bands and trx.
     "Stepmill or upright bike": "cardio",
@@ -296,6 +304,7 @@ _DISPLAY = {
     "recovery_flow": "Recovery Flow",
     "core": "Core (easy)",
     "mobility": "Mobility",
+    "yoga_strength": "Yoga — Strength & Balance",
 }
 
 # ── CYCLE-1 ────────────────────────────────────────────────────────────────
@@ -656,6 +665,13 @@ FLOW_POSTURE = {
     "Extended puppy": "kneeling", "Bridge": "supine", "Supine twist": "supine",
     "Wind release": "supine", "Seated side bend": "seated", "Seated twist": "seated",
     "Seated mountain": "seated", "Easy pose": "seated",
+    # YOGA-6 (draft). Every one is an EXISTING posture on purpose: adding a value
+    # to FLOW_POSTURES would need the same value added to gym-display's POSTURES
+    # union in the same change (ENUM-EXPAND), which is not a draft-content change.
+    # "Low lunge twist" is kneeling because the back knee is down; a plank is
+    # face-down and supported, which is what prone means.
+    "Chair": "standing", "Warrior II": "standing", "Warrior III": "standing",
+    "Plank": "prone", "Low lunge twist": "kneeling",
 }
 # YOGA-5 mid-hold cues (Ryan, 2026-09-20). ONE short line per pose, spoken
 # 12 s into the hold and then nothing, so the rest of the hold is silent.
@@ -681,6 +697,12 @@ FLOW_CUE_MID = {
     "Seated mountain":       "Relax your shoulders, sit tall",
     "Easy pose":             "Settle in, soften your jaw",
     # Savasana is deliberately absent — silence, not a line at the start.
+    # YOGA-6 (draft).
+    "Chair":           "Weight in your heels, chest up, sit back",
+    "Plank":           "One line from heels to head, ribs down",
+    "Warrior II":      "Front knee over the ankle, arms long and level",
+    "Warrior III":     "Reach the back heel away, hips level",
+    "Low lunge twist": "Lengthen first, then turn from the ribs",
 }
 # How long into a hold the mid cue is spoken. Never collides with the 7 s
 # lead-in: the shortest hold is 40 s, so the gap is 21 s.
@@ -716,6 +738,13 @@ FLOW_SANSKRIT = {
     "Seated mountain":       ("Parvatasana", "par-vah-TAH-sah-nah"),
     "Easy pose":             ("Sukhasana", "soo-KAH-sah-nah"),
     "Savasana":              ("Shavasana", "shah-VAH-sah-nah"),
+    # YOGA-6 — CONTENT APPROVED by Ryan 2026-09-28.
+    "Chair":                 ("Utkatasana", "oot-kah-TAH-sah-nah"),
+    "Plank":                 ("Phalakasana", "fah-lah-KAH-sah-nah"),
+    "Warrior II":            ("Virabhadrasana II", "veer-ah-bah-DRAH-sah-nah two"),
+    "Warrior III":           ("Virabhadrasana III", "veer-ah-bah-DRAH-sah-nah three"),
+    "Low lunge twist":       ("Parivrtta Anjaneyasana",
+                              "pah-ree-VRIT-tah ahn-jah-nay-AH-sah-nah"),
 }
 # YOGA-4: the lead-in moves to 7 s before the hold ends, and there is no chime
 # in front of it any more — the words start at 7 s exactly.
@@ -815,11 +844,17 @@ def validate_flow(blocks: dict) -> None:
                             f"add it to FLOW_CUE_MID, or set it to None on purpose")
 
 
-def _flow_step(spec: dict) -> dict:
-    """One FLOW_STEPS entry as the JSONB row gym-display reads."""
+def _flow_step(spec: dict, hold_sec: int = FLOW_HOLD_SEC) -> dict:
+    """One flow-step entry as the JSONB row gym-display reads.
+
+    `hold_sec` is a parameter because YOGA-6 holds for less time than the
+    Recovery Flow does; a step may also carry its own `duration_sec`. The
+    Recovery Flow's default is unchanged, so its rows are byte-identical.
+    """
     name = spec["name"]
     out = {"step": spec["step"], "name": name, "side": spec.get("side"),
-           "side_label": spec.get("side_label"), "duration_sec": FLOW_HOLD_SEC,
+           "side_label": spec.get("side_label"),
+           "duration_sec": spec.get("duration_sec", hold_sec),
            "transition_sec": spec["transition_sec"], "mirror_group": spec.get("mirror_group"),
            "cue": spec.get("cue"), "easier": spec.get("easier"),
            "posture": FLOW_POSTURE.get(name)}
@@ -832,6 +867,126 @@ def _flow_step(spec: dict) -> dict:
         out["sanskrit"], out["sanskrit_spoken"] = sans
     out["cue_mid"] = FLOW_CUE_MID.get(name)
     return out
+
+
+# ---------------------------------------------------------------------------
+# YOGA-6 — Yoga, Strength & Balance. A higher-intensity flow for the Extras list.
+#
+# CONTENT APPROVED by Ryan 2026-09-28.
+#
+# Still low-impact and still mat-only — Ryan's rule is that extras are
+# yoga/core/mobility — but standing strength and single-leg balance instead of
+# the Recovery Flow's restorative shape. Holds are 30 s rather than 40 s and
+# there are more of them, so the flow keeps moving.
+#
+# Order notes:
+#   * it opens with a short sun-salutation arc (forward bend → plank → cobra →
+#     downward dog) so nothing loaded happens cold;
+#   * the eight standing poses run R,R,R,R then L,L,L,L in MIRROR ORDER, so the
+#     side switch lands at the low lunge twist rather than between two different
+#     poses — the same reason the Recovery Flow runs its lunges R,R,L,L;
+#   * chair sits before the single-leg work, while the legs are fresh enough for
+#     warrior III to be balance rather than a fight;
+#   * bridge then child's pose close each round, which is where the trunk work
+#     lands after the standing block rather than before it.
+#
+# Every posture used here already exists in FLOW_POSTURES. Adding one would mean
+# adding the same value to gym-display's POSTURES union in the same change
+# (ENUM-EXPAND), and that is not a draft-content change — which is why there is
+# no side plank in this draft.
+# ---------------------------------------------------------------------------
+YOGA6_HOLD_SEC = 30
+YOGA6_ROUNDS = 2
+YOGA6_TARGET_RPE = 4.5
+YOGA6_OPEN = {"name": "Standing centering", "side": None, "duration_sec": 30,
+              "transition_sec": 5, "posture": "standing", "cue_mid": None,
+              "cue": "Stand tall, feet hip-width, three slow breaths."}
+YOGA6_CLOSE = {"name": "Savasana", "side": None, "duration_sec": 180,
+               "transition_sec": 5, "posture": "supine", "cue_mid": None,
+               "cue": "Lie on your back, arms by your sides, let everything go.",
+               "sanskrit": "Shavasana", "sanskrit_spoken": "shah-VAH-sah-nah"}
+
+YOGA6_STEPS = [
+    {"step": "1", "name": "Standing forward bend", "transition_sec": 5,
+     "cue": "Soft knees, fold from the hips, let your head hang."},
+    {"step": "2", "name": "Plank", "transition_sec": 4,
+     "cue": "One line from heels to head, hands under the shoulders.",
+     "easier": "Knees down"},
+    {"step": "3", "name": "Cobra", "transition_sec": 3,
+     "cue": "Hips stay down; press the palms and lift the chest gently."},
+    {"step": "4", "name": "Downward dog", "transition_sec": 3,
+     "cue": "Hips high, heels reaching down, long spine.",
+     "easier": "Dolphin — forearms down"},
+    {"step": "5", "name": "Chair", "transition_sec": 5,
+     "cue": "Feet together, sit back, weight in the heels, arms up.",
+     "easier": "Feet hip-width, sit back less"},
+    {"step": "6", "name": "High lunge", "side": "R", "mirror_group": "standing-unit",
+     "side_label": "Right leg forward", "transition_sec": 5,
+     "cue": "Front knee over ankle, back heel lifted, arms up.", "easier": "Knee down"},
+    {"step": "7", "name": "Warrior II", "side": "R", "mirror_group": "standing-unit",
+     "side_label": "Right leg forward", "transition_sec": 4,
+     "cue": "Open the hips, arms long and level, gaze over the front hand.",
+     "easier": "Shorten the stance"},
+    {"step": "8", "name": "Warrior III", "side": "R", "mirror_group": "standing-unit",
+     "side_label": "Standing on the right leg", "transition_sec": 4,
+     "cue": "Hinge forward, back leg straight behind, hips level.",
+     "easier": "Fingertips to a wall or the floor"},
+    {"step": "9", "name": "Low lunge twist", "side": "R", "mirror_group": "standing-unit",
+     "side_label": "Right leg forward", "transition_sec": 4,
+     "cue": "Back knee down, lengthen up, then turn toward the front leg.",
+     "easier": "Hand to the floor, turn less"},
+    {"step": "10", "name": "Low lunge twist", "side": "L", "mirror_group": "standing-unit",
+     "side_label": "Left leg forward", "transition_sec": 5,
+     "cue": "Back knee down, lengthen up, then turn toward the front leg.",
+     "easier": "Hand to the floor, turn less"},
+    {"step": "11", "name": "Warrior III", "side": "L", "mirror_group": "standing-unit",
+     "side_label": "Standing on the left leg", "transition_sec": 4,
+     "cue": "Hinge forward, back leg straight behind, hips level.",
+     "easier": "Fingertips to a wall or the floor"},
+    {"step": "12", "name": "Warrior II", "side": "L", "mirror_group": "standing-unit",
+     "side_label": "Left leg forward", "transition_sec": 4,
+     "cue": "Open the hips, arms long and level, gaze over the front hand.",
+     "easier": "Shorten the stance"},
+    {"step": "13", "name": "High lunge", "side": "L", "mirror_group": "standing-unit",
+     "side_label": "Left leg forward", "transition_sec": 4,
+     "cue": "Front knee over ankle, back heel lifted, arms up.", "easier": "Knee down"},
+    {"step": "14", "name": "Bridge", "transition_sec": 5,
+     "cue": "Feet hip-width, press through the heels, lift the hips."},
+    {"step": "15", "name": "Child's pose", "transition_sec": 4,
+     "cue": "Knees wide, hips back toward your heels, arms long."},
+]
+
+
+def _yoga_strength(location: str = LOCATION):
+    """YOGA-6. Mat only, so it runs at every location a mat does.
+
+    CONTENT APPROVED by Ryan 2026-09-28.
+    """
+    blocks = {
+        "type": "recovery_flow",          # the RENDERER: gym-display's Flow screen
+        "session_type": "yoga_strength",
+        "display_name": _DISPLAY["yoga_strength"],
+        "location": location,
+        "rounds": YOGA6_ROUNDS,
+        "hold_sec": YOGA6_HOLD_SEC,
+        "leadin_sec": FLOW_LEADIN_SEC,
+        "cue_mid_sec": FLOW_CUE_MID_SEC,
+        "start_posture": FLOW_START_POSTURE,
+        "pre": [dict(YOGA6_OPEN)],
+        "flow": [_flow_step(s, YOGA6_HOLD_SEC) for s in YOGA6_STEPS],
+        "close": dict(YOGA6_CLOSE),
+        "equipment": [EQ_MAT],
+        "extra": True,
+    }
+    total = flow_total_sec(blocks)
+    blocks["total_sec"] = total
+    n = len(flow_steps_for_round(blocks, 1))
+    blocks["notes"] = (f"{YOGA6_ROUNDS} rounds of {n} poses, every hold "
+                       f"{YOGA6_HOLD_SEC} s, 3 min savasana; 3–5 s to move between "
+                       f"poses. Standing strength and balance — harder than the "
+                       f"Recovery Flow, still mat-only.")
+    validate_flow(blocks)
+    return blocks, YOGA6_TARGET_RPE, None, -(-total // 60)
 
 
 def _recovery_flow(location: str = LOCATION):
@@ -881,7 +1036,9 @@ def _build(session_type: str, week_num: int, *, wk0: bool = False,
 # EXTRAS (Ryan, 2026-09-27): low-impact work on top of the plan, any day, rest
 # days included. Never planned rows — the Sessions tab builds them on demand.
 # Bodyweight and a mat only, so they run anywhere but on the road.
-# CONTENT IS A DRAFT pending Ryan's approval (2026-09-27).
+# CONTENT APPROVED by Ryan 2026-09-27 (#217). The marker said DRAFT until
+# 2026-09-28: the content was approved and merged, and only the comment was
+# left behind — so the source claimed it was unapproved for a day.
 #
 # Core stays LIGHT and goes AFTER the day's lift, never before it: the trunk
 # braces squats and hinges, and pre-fatiguing it costs stability under the bar.
@@ -935,6 +1092,8 @@ def _extra(session_type: str, location: str):
 
 def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
                  location: str | None = None, location_key: str = "office"):
+    if session_type == "yoga_strength":
+        return _yoga_strength(location or LOCATION)
     if session_type in ("core", "mobility"):
         return _extra(session_type, location or LOCATION)
     if session_type == "recovery_flow":

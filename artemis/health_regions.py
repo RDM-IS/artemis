@@ -89,6 +89,13 @@ _reg("Half-kneeling hip flexor stretch", {"hip"}, {"quads", "knee"})
 _reg("Thread the needle", {"back", "shoulder"}, {"neck"})
 _reg("Ankle rocks", {"calves"}, {"knee"})
 _reg("Child's pose", {"low back"}, {"hip", "shoulder"})
+
+# ── YOGA-6 (2026-09-28, DRAFT): so the pain ladder can reason about them too ──
+_reg("Chair", {"quads", "legs"}, {"knee", "shoulder"})
+_reg("Plank", {"core", "shoulder"}, {"low back", "wrist"})
+_reg("Warrior II", {"legs", "quads"}, {"knee", "hip", "shoulder"})
+_reg("Warrior III", {"hamstrings", "hip"}, {"low back", "knee"})
+_reg("Low lunge twist", {"hip", "back"}, {"quads", "knee"})
 # ── LOCATION-1 (Richfield): each mirrors the office exercise it stands in for,
 # because the pain ladder reasons about REGIONS, not about equipment. A
 # shoulder that rules out Pec fly rules out DB fly for the same reason.

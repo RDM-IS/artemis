@@ -308,8 +308,13 @@ class TestTransitions(unittest.TestCase):
         self.assertIn("no Sanskrit entry", str(cm.exception))
 
     def test_every_pose_name_in_the_table_is_used(self):
-        """A stale FLOW_SANSKRIT entry is dead weight; catch it here."""
-        used = {s["name"] for s in office.FLOW_STEPS} | {office.FLOW_CLOSE["name"]}
+        """A stale FLOW_SANSKRIT entry is dead weight; catch it here.
+
+        `used` spans EVERY flow, not just the Recovery Flow — YOGA-6 (2026-09-28)
+        added poses to the same shared table. Narrowing this to one flow would let
+        a genuinely dead entry hide behind the other."""
+        used = ({s["name"] for s in office.FLOW_STEPS} | {office.FLOW_CLOSE["name"]}
+                | {s["name"] for s in office.YOGA6_STEPS} | {office.YOGA6_CLOSE["name"]})
         self.assertEqual(set(office.FLOW_SANSKRIT) - used, set())
 
     def test_every_pose_resolves_to_a_mid_hold_cue_or_explicitly_none(self):
@@ -353,7 +358,9 @@ class TestTransitions(unittest.TestCase):
                 self.assertLess(at, st["duration_sec"] - b["leadin_sec"], st["name"])
 
     def test_every_cue_mid_entry_is_used(self):
-        used = {s["name"] for s in office.FLOW_STEPS}
+        """Every flow, for the same reason as the Sanskrit table above."""
+        used = ({s["name"] for s in office.FLOW_STEPS}
+                | {s["name"] for s in office.YOGA6_STEPS})
         self.assertEqual(set(office.FLOW_CUE_MID) - used, set())
 
     def test_a_pose_without_a_posture_fails_validation(self):
