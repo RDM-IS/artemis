@@ -579,13 +579,23 @@ def _footer() -> str:
             'minutes. Figures are recorded data only.</div>')
 
 
+def _wrap(body: str) -> str:
+    """The HTML shell. One definition, so the budget measure renders the specced
+    body through exactly the same CSS and @page rules the real report uses."""
+    return (f"<!doctype html><html><head><meta charset='utf-8'><title>{TITLE}</title>"
+            f"<style>{_CSS}</style></head><body>{body}</body></html>")
+
+
+def _specced_body(r: Report, detail: str) -> str:
+    """The specced report WITHOUT the Daily menu appendix."""
+    return _page1(r) + (_page2(r) + _footer() if detail == "full" else _footer())
+
+
 def render_html(r: Report, detail: str = "full") -> str:
     if detail not in ("summary", "full"):
         raise ValueError("detail is 'summary' or 'full'")
-    body = (_page1(r) + (_page2(r) + _footer() + _menu_pages(r) if detail == "full"
-                         else _footer()))
-    return (f"<!doctype html><html><head><meta charset='utf-8'><title>{TITLE}</title>"
-            f"<style>{_CSS}</style></head><body>{body}</body></html>")
+    body = _specced_body(r, detail) + (_menu_pages(r) if detail == "full" else "")
+    return _wrap(body)
 
 
 def visible_text(html_doc: str) -> str:
@@ -620,8 +630,28 @@ def render_pdf(html_doc: str) -> bytes:
 
 
 def page_count(html_doc: str) -> int:
-    """Pages the PDF will have — the spec's two-page limit is checked on this."""
+    """Total pages the PDF will have, appendix included.
+
+    **This is NOT the budget check.** The budget applies to the specced report —
+    `summary` is page 1 and `full` is pages 1–2 — and the Daily menu appended by
+    `_menu_pages()` is an APPENDIX of any length, one or more pages scaling with
+    the number of recorded days (Ryan, approved 2026-09-28). This docstring used
+    to claim "the spec's two-page limit is checked on this", which stopped being
+    true when the menu was added on 2026-09-27 and nothing checked it.
+
+    `specced_page_count()` is what the budget is measured on.
+    """
     return len(_document(html_doc).pages)
+
+
+def specced_page_count(r: "Report", detail: str = "full") -> int:
+    """Pages of the SPECCED report, excluding the Daily menu appendix.
+
+    The budget lives here: `summary` must be 1 page, `full` must be 2. A month
+    that cannot fit is a build-time failure to raise, never something to shrink
+    by dropping days or labels.
+    """
+    return len(_document(_wrap(_specced_body(r, detail))).pages)
 
 
 # ============================================================================
