@@ -131,7 +131,8 @@ class TestExtras(unittest.TestCase):
         lib = _build()
         for loc in lib["locations"]:
             self.assertEqual([s["session_type"] for s in loc["sessions"]],
-                             ["recovery_flow", "core", "mobility"], loc["key"])
+                             ["recovery_flow", "core", "mobility", "yoga_strength"],
+                             loc["key"])
 
     def test_core_is_light_and_says_when(self):
         e = sl.entry_for("core", "office", D)
@@ -154,3 +155,92 @@ class TestExtras(unittest.TestCase):
         # SESSION-LABELS: extras have their own branch, not the rest fallthrough.
         b, *_ = health_office._build_inner("core", 3, location="office gym")
         self.assertNotEqual(b["type"], "mobility")
+
+
+class TestYoga6(unittest.TestCase):
+    """YOGA-6 — Yoga, Strength & Balance. CONTENT IS A DRAFT pending approval."""
+
+    def test_it_is_offered_wherever_a_mat_is(self):
+        lib = _build()
+        for loc in lib["locations"]:
+            with self.subTest(location=loc["key"]):
+                self.assertIn("yoga_strength",
+                              [s["session_type"] for s in loc["sessions"]])
+
+    def test_it_sits_in_the_specced_window(self):
+        e = sl.entry_for("yoga_strength", "richfield", D)
+        self.assertEqual(e["blocks"]["display_name"], "Yoga — Strength & Balance")
+        self.assertGreaterEqual(e["est_duration_min"], 20)
+        self.assertLessEqual(e["est_duration_min"], 25)
+        self.assertGreaterEqual(e["target_rpe"], 4.0)
+        self.assertLessEqual(e["target_rpe"], 5.0)
+
+    def test_it_is_harder_than_the_recovery_flow_and_still_mat_only(self):
+        y6 = sl.entry_for("yoga_strength", "richfield", D)
+        rf = sl.entry_for("recovery_flow", "richfield", D)
+        self.assertGreater(y6["target_rpe"], rf["target_rpe"])
+        self.assertEqual(y6["blocks"]["equipment"], ["mat"])
+
+    def test_it_holds_for_less_time_than_the_recovery_flow(self):
+        from artemis import health_office as office
+        self.assertLess(office.YOGA6_HOLD_SEC, office.FLOW_HOLD_SEC)
+
+    def test_the_recovery_flow_is_unchanged_by_the_hold_parameter(self):
+        """`_flow_step` gained a hold argument; the Recovery Flow's own rows must
+        be byte-identical to what they were."""
+        from artemis import health_office as office
+        for spec in office.FLOW_STEPS:
+            with self.subTest(step=spec["step"]):
+                self.assertEqual(office._flow_step(spec)["duration_sec"],
+                                 office.FLOW_HOLD_SEC)
+
+    def test_every_pose_validates(self):
+        """validate_flow is called in the builder; this pins what it checks —
+        balanced sides, a known posture, Sanskrit, and a cue_mid key."""
+        from artemis import health_office as office
+        b = sl.entry_for("yoga_strength", "office", D)["blocks"]
+        office.validate_flow(b)                       # must not raise
+        for st in b["flow"]:
+            with self.subTest(pose=st["name"]):
+                self.assertIn(st["posture"], office.FLOW_POSTURES)
+                self.assertTrue(st["sanskrit"] and st["sanskrit_spoken"])
+                self.assertIn("cue_mid", st)
+
+    def test_the_standing_block_is_balanced_left_and_right(self):
+        from artemis import health_office as office
+        b = sl.entry_for("yoga_strength", "office", D)["blocks"]
+        sided = [s for s in b["flow"] if s["mirror_group"] == "standing-unit"]
+        self.assertEqual(sum(s["duration_sec"] for s in sided if s["side"] == "R"),
+                         sum(s["duration_sec"] for s in sided if s["side"] == "L"))
+        self.assertEqual(len(sided), 8)
+
+    def test_the_side_switch_lands_at_the_low_lunge_twist(self):
+        """R,R,R,R then L,L,L,L in mirror order, so the switch is not between two
+        different poses — the same reason the Recovery Flow runs its lunges R,R,L,L."""
+        from artemis import health_office as office
+        b = sl.entry_for("yoga_strength", "office", D)["blocks"]
+        sided = [s for s in b["flow"] if s["mirror_group"] == "standing-unit"]
+        self.assertEqual([s["side"] for s in sided], list("RRRRLLLL"))
+        switch = sided[3], sided[4]
+        self.assertEqual(switch[0]["name"], switch[1]["name"])
+
+    def test_nothing_loaded_happens_cold(self):
+        """The opening arc comes before the standing block."""
+        from artemis import health_office as office
+        b = sl.entry_for("yoga_strength", "office", D)["blocks"]
+        names = [s["name"] for s in b["flow"]]
+        self.assertLess(names.index("Downward dog"), names.index("Warrior III"))
+
+    def test_the_draft_marker_is_present(self):
+        """It must be obvious in the source that Ryan has not approved this yet."""
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "artemis" / "health_office.py"
+        self.assertIn("CONTENT IS A DRAFT pending Ryan's approval (2026-09-28)",
+                      src.read_text())
+
+    def test_it_adds_no_new_posture(self):
+        """Adding one would need the same value in gym-display's POSTURES union in
+        the same change (ENUM-EXPAND); a draft-content PR is not that change."""
+        from artemis import health_office as office
+        self.assertEqual(office.FLOW_POSTURES,
+                         ("standing", "kneeling", "quadruped", "prone", "supine", "seated"))

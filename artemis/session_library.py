@@ -50,7 +50,7 @@ def _supported(location_key: str, session_type: str) -> bool:
         return office.can_hold(location_key, session_type)
     if session_type == "cardio_z2":
         return bool(cardio_cfg.resolve(location_key).get("modality"))
-    if session_type in ("recovery_flow", "core", "mobility"):
+    if session_type in ("recovery_flow", "core", "mobility", "yoga_strength"):
         return True           # a mat travels; the library already excludes the road
     return False
 
