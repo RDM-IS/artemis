@@ -281,6 +281,146 @@ def _disambiguation_reply(flows: list[str], unreadable: list[str]) -> str:
     return "\n".join(lines)
 
 
+#: The `deterministic_chain` entries that consume a BARE control word, in chain
+#: order, each with the flows it claims in the order it checks them. This is how
+#: "what first-match-wins WOULD have picked" is computed WITHOUT EXECUTING
+#: ANYTHING: every entry in the chain is a live handler with side effects, so the
+#: only safe way to answer the question is from the chain's static order.
+#:
+#: It is exactly the set of handlers that call `_strip_qualifier` — a test asserts
+#: both that, and that these entries still appear in the chain in this order. A
+#: new arbitrated handler, or a reordered chain, fails the suite rather than
+#: silently making every recorded `would_have_picked` a lie.
+_BARE_WORD_CLAIMANTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("calendar_confirm", ("calendar",)),
+    ("delete_confirm", ("delete",)),
+    ("debrief_confirm", ("debrief",)),
+    ("swap_confirm", ("swap",)),
+    ("nutrition_confirm", ("target", "staples")),
+    ("rule_command", ("rule",)),
+    ("disposition_command", ("disposition",)),
+)
+
+#: How long after a disambiguation a qualified reply still counts as its answer.
+_ARB_OUTCOME_WINDOW_MIN = 10
+
+#: channel_id -> the arbitration awaiting its answer. In memory on purpose: it is
+#: a conversational follow-up, and losing it on restart costs one outcome row.
+_arb_decisions: dict[str, dict] = {}
+
+_QUALIFIED_FORM_RE = re.compile(
+    rf"^\s*(\S+)\s+({'|'.join(re.escape(s) for s in sorted(set(_QUALIFIED_SUFFIX.values())))})"
+    r"\s*$", re.I)
+
+
+def _would_have_picked(flows: list[str]) -> tuple[str | None, list[str]]:
+    """(the flow first-match-wins would have given the bare word to, the open
+    flows that no chain handler would have claimed at all).
+
+    The second half matters more than it looks. `_open_pending_flows` counts every
+    open pending, but only seven handlers consume a bare control word — so
+    `dossier`, `org`, `duplicate`, `convert` and `fix` can make a bare `yes`
+    ambiguous without any of them ever having been able to claim it. Recording
+    that separately is what will show, from data, whether the arbiter refuses
+    bare words it did not need to.
+    """
+    claimed = {f for _entry, fl in _BARE_WORD_CLAIMANTS for f in fl}
+    for _entry, claims in _BARE_WORD_CLAIMANTS:
+        for flow in claims:
+            if flow in flows:
+                return flow, [f for f in flows if f not in claimed]
+    return None, [f for f in flows if f not in claimed]
+
+
+def _record_arbitration(channel_id: str, word: str, flows: list[str],
+                        unreadable: list[str]) -> None:
+    """COGNITION-1 site 5: the arbiter chose to disambiguate rather than execute.
+
+    Deliberately FAIL-SOFT, which is the opposite coupling to `log_decision`'s
+    usual one. Everywhere else a decision that cannot be recorded should not
+    stand — but here the decision IS "execute nothing", the safe outcome, and the
+    user-facing reply that keeps every pending open must not depend on a
+    successful write. A missing row costs evidence; a raised exception here would
+    cost the safety behaviour.
+    """
+    picked, unclaimable = _would_have_picked(flows)
+    try:
+        from knowledge import cognition
+        from knowledge.db import get_connection
+        with get_connection() as conn:
+            cur = conn.cursor()
+            decision_id = cognition.log_decision(
+                cur, agent="artemis", action="confirm_arbitration", domain="ops",
+                outcome="disambiguated", manual_gap=False,
+                metadata={"channel_id": channel_id, "word": word},
+                assumptions={
+                    "rule": "more than one pending open + a bare control word "
+                            "=> execute nothing, name the qualified forms",
+                    "word": word,
+                    "open_flows": sorted(flows),
+                    "unreadable_flows": sorted(unreadable),
+                    "would_have_picked": picked,
+                    "would_have_picked_from": "the static order of deterministic_chain; "
+                                              "no handler was executed",
+                    "would_have_picked_note": (
+                        None if picked else
+                        "none of the open flows is claimed by a handler that consumes a "
+                        "bare control word, so first-match-wins would have executed "
+                        "nothing either"),
+                    "open_without_bare_claimant": sorted(unclaimable),
+                })
+        _arb_decisions[channel_id] = {
+            "id": decision_id, "at": datetime.now(timezone.utc),
+            "would_have_picked": picked, "word": word,
+        }
+    except Exception:
+        logger.warning("CONFIRM-ARB: could not record the arbitration decision",
+                       exc_info=True)
+
+
+def _record_arbitration_outcome(channel_id: str, question: str) -> None:
+    """The answer to a disambiguation: which qualified form he actually sent.
+
+    Recorded HERE, at handle time, rather than by the nightly outcome job —
+    Mattermost posts are not persisted anywhere (checked 2026-09-28: no table
+    holds them), so the reply cannot be recovered after the fact. `_arb_decisions`
+    is the only place that knows.
+
+    `confirm_arbitration` is therefore deliberately absent from the outcome job's
+    RESOLVERS. A disambiguation he simply ignores keeps NO outcome row, and that
+    is the honest record: it means he never answered.
+    """
+    pend = _arb_decisions.get(channel_id)
+    if not pend or not pend.get("id"):
+        return
+    m = _QUALIFIED_FORM_RE.match(question or "")
+    if not m or m.group(1).lower() not in _CONTROL_WORDS:
+        return
+    age_min = (datetime.now(timezone.utc) - pend["at"]).total_seconds() / 60
+    if age_min > _ARB_OUTCOME_WINDOW_MIN:
+        _arb_decisions.pop(channel_id, None)
+        return
+    picked = m.group(2).lower()
+    matched = picked == pend["would_have_picked"]
+    try:
+        from knowledge import cognition
+        from knowledge.db import get_connection
+        with get_connection() as conn:
+            cognition.log_outcome(
+                conn.cursor(), decides=pend["id"], action="confirm_arbitration",
+                domain="ops", outcome="answered",
+                metadata={"qualified_form": f"{m.group(1).lower()} {picked}",
+                          "chose": picked,
+                          "would_have_picked": pend["would_have_picked"],
+                          "matched_first_match_wins": matched,
+                          "minutes_after": round(age_min, 2)})
+    except Exception:
+        logger.warning("CONFIRM-ARB: could not record the arbitration outcome",
+                       exc_info=True)
+    finally:
+        _arb_decisions.pop(channel_id, None)
+
+
 def _arbitrate_bare_control_word(channel_id: str, question: str) -> str | None:
     """The reply to send INSTEAD of running a confirm handler, or None to proceed.
 
@@ -295,6 +435,7 @@ def _arbitrate_bare_control_word(channel_id: str, question: str) -> str | None:
         return None                      # unchanged first-match-wins behaviour
     logger.info("CONFIRM-ARB: bare %r with open=%s unreadable=%s — disambiguating",
                 q, flows, unreadable)
+    _record_arbitration(channel_id, q, flows, unreadable)
     return _disambiguation_reply(flows, unreadable)
 
 # Duplicate-block override. DELIBERATELY DISTINCT from the confirm words: a
@@ -4577,6 +4718,10 @@ def _handle_mention(post: dict, thread: list[dict]):
     # to sit earliest in the list — so instead nothing runs, every pending stays
     # open, and the reply names the qualified forms for exactly the open flows.
     # With 0 or 1 open this returns None and the chain behaves exactly as before.
+    # COGNITION-1 site 5: a qualified form answers the previous disambiguation.
+    # Recorded before the chain so it lands whichever handler then consumes it.
+    _record_arbitration_outcome(channel_id, question)
+
     _arb = _arbitrate_bare_control_word(channel_id, question)
     if _arb:
         if _mm:
