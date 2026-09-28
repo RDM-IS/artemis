@@ -642,6 +642,7 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office", o
     now, so the rower moving to MSP is one line in `knowledge/cardio.py`.
     """
     from knowledge import cardio as cardio_cfg
+    from knowledge import zones
 
     lo, hi = RAMP[week_num][2]
     office = location == LOCATION
@@ -654,16 +655,22 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office", o
         "location_key": location_key,
         "duration_min": hi,
         "intensity": "Zone 2",
+        # PROGRAM-2: the range travels on the row like the modality does. A Z2
+        # session that names a zone and not its bpm asks him to remember what Z2
+        # means, and the iPad would have to derive it from a second constant.
+        "zones": {"work": zones.zone_block("Z2")},
         # The resolved modality travels on the row, like load_config does, so
         # the iPad and the box read one answer instead of deciding separately.
         "cardio": resolved,
         "equipment": [cardio_cfg.label_for(d) for _, d in cardio_cfg.available(location_key, on)],
-        "setup_notes": [Z2_NOTES if office else cardio_cfg.describe(resolved)],
+        "setup_notes": [Z2_NOTES if office else cardio_cfg.describe(resolved),
+                        f"{zones.describe('Z2')} — conversational pace"],
     }
     if not resolved.get("modality"):
         # MSP home: an explicit state, never a silent fall-through to another
         # location's equipment. The session still exists and says why.
-        blocks["setup_notes"] = [cardio_cfg.describe(resolved)]
+        blocks["setup_notes"] = [cardio_cfg.describe(resolved),
+                                 f"{zones.describe('Z2')} — conversational pace"]
         blocks["no_equipment"] = True
     # Ryan, 2026-09-19: keeps the Stretch Trainer in the program now that the
     # flows travel. Same cooldown the strength days use — and, since 2026-09-26,

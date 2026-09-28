@@ -73,3 +73,49 @@ class TestTheRowColumnType(unittest.TestCase):
                     on=date(2026, 10, 11))
                 self.assertIsInstance(zone, int, f"{st} wk{wk} returned {zone!r}")
                 self.assertIn(zone, (2, 4))
+
+
+class TestEveryCardioRowCarriesItsRange(unittest.TestCase):
+    """The first readout of the seeded fortnight had ranges on the two interval
+    rows and none on the six Zone 2 rows -- `_z2` predates PROGRAM-2 and never
+    learned to emit `zones`. A Z2 session that names a zone but not its bpm asks
+    him to remember what Z2 means, which is the whole point of putting the
+    numbers on the row.
+    """
+
+    def _cardio_blocks(self):
+        from artemis import health_office as o
+        out = []
+        for lk, loc in (("office", "the office"), ("richfield", "Richfield"),
+                        ("brown_deer", "Brown Deer"), ("msp_home", "MSP home")):
+            for wk in (4, 5, 6, 7):
+                out.append((f"_z2 wk{wk} {lk}", o._z2(wk, location=loc, location_key=lk)[0]))
+                out.append((f"_intervals wk{wk} {lk}",
+                            o._intervals(wk, location=loc, location_key=lk)[0]))
+        return out
+
+    def test_every_cardio_block_names_a_work_range(self):
+        for label, blocks in self._cardio_blocks():
+            with self.subTest(label):
+                work = (blocks.get("zones") or {}).get("work")
+                self.assertIsNotNone(work, f"{label} carries no work zone")
+                self.assertIsInstance(work.get("low_bpm"), int)
+                self.assertIsInstance(work.get("high_bpm"), int)
+                self.assertLess(work["low_bpm"], work["high_bpm"])
+                # The estimate must say it is one, so nobody reads it as measured.
+                self.assertIn("estimate", work.get("source", ""))
+
+    def test_an_interval_session_also_says_what_easy_means(self):
+        from artemis import health_office as o
+        blocks = o._intervals(5, location="MSP home", location_key="msp_home")[0]
+        self.assertEqual(blocks["type"], "intervals")
+        easy = blocks["zones"]["easy"]
+        self.assertEqual((easy["low_bpm"], easy["high_bpm"]), zones.ZONES["Z2"])
+
+    def test_the_range_is_on_the_card_not_only_in_the_notes(self):
+        """setup_notes is prose. The screen reads `zones`, so the numbers have to
+        be there as numbers -- a note alone cannot be rendered as a target."""
+        from artemis import health_office as o
+        blocks = o._z2(5, location="the office", location_key="office")[0]
+        self.assertIn("105", " ".join(blocks["setup_notes"]))
+        self.assertEqual(blocks["zones"]["work"]["low_bpm"], 105)
