@@ -199,6 +199,44 @@ class TestPages(unittest.TestCase):
     def test_a_week_is_three_pages(self):
         self.assertEqual(dr.page_count(dr.render_html(dr.build(month_data(n=7)), "full")), 3)
 
+    # ── PAGE BUDGET (approved 2026-09-28) ──────────────────────────────────
+    # The budget is on the SPECCED report: summary = 1 page, full = 2. The Daily
+    # menu is an appendix of any length. `page_count` counts everything and is
+    # deliberately NOT the budget — it stopped being a limit check when the menu
+    # was added on 2026-09-27 and nothing noticed, which is what this restores.
+
+    def test_the_specced_full_report_is_always_two_pages(self):
+        for n in (1, 7, 14, 28, 31):
+            with self.subTest(days=n):
+                r = dr.build(month_data(n=n))
+                self.assertEqual(dr.specced_page_count(r, "full"), 2,
+                                 f"{n} days: the specced report must stay at two pages")
+
+    def test_the_specced_summary_is_always_one_page(self):
+        for n in (1, 7, 14, 31):
+            with self.subTest(days=n):
+                self.assertEqual(
+                    dr.specced_page_count(dr.build(month_data(n=n)), "summary"), 1)
+
+    def test_the_appendix_is_what_grows_and_the_budget_does_not(self):
+        """A month has more recorded days than a week, so more appendix pages —
+        and the same two specced pages."""
+        wk, mo = dr.build(month_data(n=7)), dr.build(month_data(n=31))
+        self.assertGreater(dr.page_count(dr.render_html(mo, "full")),
+                           dr.page_count(dr.render_html(wk, "full")))
+        self.assertEqual(dr.specced_page_count(wk, "full"),
+                         dr.specced_page_count(mo, "full"))
+
+    def test_the_budget_measure_excludes_the_menu(self):
+        r = dr.build(month_data(n=31))
+        self.assertLess(dr.specced_page_count(r, "full"),
+                        dr.page_count(dr.render_html(r, "full")))
+
+    def test_a_period_with_nothing_recorded_has_no_appendix(self):
+        r = dr.build(month_data(n=14, entries=False))
+        self.assertEqual(dr.page_count(dr.render_html(r, "full")),
+                         dr.specced_page_count(r, "full"))
+
 
 if __name__ == "__main__":
     unittest.main()
