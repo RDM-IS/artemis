@@ -224,6 +224,10 @@ class ArtemisScheduler:
     LOCATION_JOBS = {
         "wake": "wake", "checkin_nudge": "wake",
         "inbox_zero_morning": "open", "open": "open", "morning_brief": "open",
+        # MEAL-NUDGE: 60 min BEFORE the day's quiet start, so it follows the
+        # cycle like every other phase job — never a hard-coded clock time and
+        # never a hard-coded zone, and it moves with a `set timezone` override.
+        "meal_nudge": "quiet",
         "quiet_hours_start": "quiet",
     }
 
@@ -251,6 +255,9 @@ class ArtemisScheduler:
                 out[job_id] = _plus_minutes(t.hour, t.minute, config.CHECKIN_NUDGE_OFFSET_MIN)
             elif job_id == "inbox_zero_morning":
                 out[job_id] = _minus_minutes(t.hour, t.minute, 5)
+            elif job_id == "meal_nudge":
+                out[job_id] = _minus_minutes(t.hour, t.minute,
+                                             config.MEAL_NUDGE_LEAD_MIN)
             else:
                 out[job_id] = (t.hour, t.minute)
         return out
@@ -310,6 +317,9 @@ class ArtemisScheduler:
                          *t["inbox_zero_morning"]),
                 CronSpec("open", "job_open", *t["open"]),
                 CronSpec("morning_brief", "job_morning_brief", *t["open"]),
+                # MEAL-NUDGE: one line if nothing is logged, 60 min before quiet.
+                # daily_guard keeps it to once per LOCAL day.
+                CronSpec("meal_nudge", "job_meal_nudge", *t["meal_nudge"]),
                 # quiet: follows the DAY TYPE (work 17:00 · non-work 22:30).
                 CronSpec("quiet_hours_start", "job_quiet_hours_start",
                          *t["quiet_hours_start"]),
@@ -1916,6 +1926,44 @@ class ArtemisScheduler:
                 recipes["synced"] if recipes else "skipped", len(locked))
         except Exception:
             logger.exception("Nutrition pre-fill failed")
+
+    def job_meal_nudge(self):
+        """MEAL-NUDGE — one line, 60 min before quiet, only if nothing is logged.
+
+        STANDING AUTOMATION, so activation is HUMAN-GATED: the flag in
+        `acos.system_state` defaults OFF and only `meal nudge on` in the channel
+        turns it on. Nothing here decides to start nudging on its own.
+
+        FAIL-CLOSED the other way round from a resolver: if the nutrition row
+        cannot be READ, post NOTHING. A false nudge on a day Ryan already logged
+        is noise he has to correct; a missed nudge costs nothing. So an
+        unreadable store means silence, not a guess that the day is empty.
+
+        Once per LOCAL day via CronSpec's daily_guard, and it goes through the
+        phase gate like every other post, so it cannot land inside quiet hours.
+        """
+        try:
+            from artemis import meal_nudge
+            from artemis.quiet_hours import local_today
+            from knowledge.db import get_connection
+
+            if not meal_nudge.enabled():
+                logger.info("MEAL-NUDGE: flag off — nothing posted")
+                return
+            today = local_today()
+            with get_connection() as conn:
+                n = meal_nudge.entry_count(conn.cursor(), today)
+            if n is None:
+                logger.warning("MEAL-NUDGE: could not read the nutrition row for %s "
+                               "— posting nothing (fail-closed)", today)
+                return
+            if n > 0:
+                logger.info("MEAL-NUDGE: %s already has %d entries — silent", today, n)
+                return
+            self._post(config.CHANNEL_OPS, meal_nudge.TEXT)
+            logger.info("MEAL-NUDGE: posted for %s (0 entries)", today)
+        except Exception:
+            logger.exception("Meal nudge failed")
 
     def job_watch_workout_match(self):
         """Every 30 min — re-match the last three local days' watch workouts to

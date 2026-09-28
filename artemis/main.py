@@ -4309,6 +4309,42 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
     return True
 
 
+# ── MEAL-NUDGE toggle ──────────────────────────────────────────────────────
+# `meal nudge on` / `meal nudge off`. A qualified phrase, NOT a bare control
+# word, so it is invisible to CONFIRM-ARB and cannot be claimed by — or steal
+# from — any pending confirm. Deterministic: it must not reach the LLM.
+_MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
+
+
+def _handle_meal_nudge_toggle(post: dict, question: str) -> bool:
+    """Human-gated activation for the standing evening nudge (MEAL-NUDGE)."""
+    m = _MEAL_NUDGE_RE.match(question or "")
+    if not m:
+        return False
+    from artemis import meal_nudge
+    on = m.group("state").lower() == "on"
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        meal_nudge.set_enabled(on)
+    except Exception:
+        logger.exception("MEAL-NUDGE: could not set the flag")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't change that setting — it is "
+                                         "unchanged. The traceback is in the log.",
+                             root_id=root_id)
+        return True
+    if _mm:
+        _mm.post_message(
+            channel_id,
+            ("Meal nudge **on** — if nothing is logged by an hour before quiet hours, "
+             "I'll post one line. `meal nudge off` stops it.") if on else
+            "Meal nudge **off** — I won't post about logging again unless you turn it on.",
+            root_id=root_id)
+    logger.info("MEAL-NUDGE: flag set to %s by chat command", "on" if on else "off")
+    return True
+
+
 # ── REPORT-CMD ─────────────────────────────────────────────────────────────
 # `dietitian report [week|fortnight|month|day] [summary]`, or an explicit range.
 # Deterministic (HEALTH-1): a report request must never reach the LLM classifier.
@@ -4591,6 +4627,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # LLM. Ahead of meal_log / nutrition, whose patterns would otherwise claim
         # a sentence containing "dietitian".
         ("dietitian_report", _handle_dietitian_report),
+        # MEAL-NUDGE toggle — deterministic, ahead of the nutrition matchers so
+        # "meal nudge on" is never read as a meal log.
+        ("meal_nudge_toggle", _handle_meal_nudge_toggle),
         # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
         # resolved). After morning_flow so a check-in in the thread is a check-in.
         ("pattern_thread", _handle_pattern_thread),
