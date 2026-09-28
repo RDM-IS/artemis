@@ -155,7 +155,7 @@ def outcome_action(decision_action: str) -> str:
 
 def log_outcome(cur, *, decides, action: str, domain: str, outcome: str,
                 metadata: dict | None = None, correction: dict | None = None,
-                agent: str = "cognition"):
+                manual_gap: bool | None = None, agent: str = "cognition"):
     """Append the outcome of an earlier decision as its OWN row (decision (a),
     Ryan 2026-09-28) — a decision row is never UPDATEd.
 
@@ -167,8 +167,12 @@ def log_outcome(cur, *, decides, action: str, domain: str, outcome: str,
     """
     meta = dict(metadata or {})
     meta["decides"] = str(decides)
+    # `manual_gap` rides on the OUTCOME row, not the decision, because a decision
+    # row is never UPDATEd (decision (a)) and the gap is only knowable once the
+    # correction exists. The partial index is on audit_log, so either row is found.
     v = _values(agent=agent, action=outcome_action(action), domain=domain,
                 outcome=outcome, assumptions=None, metadata=meta,
-                correction=correction, manual_gap=None, persona=None, confidence=None)
+                correction=correction, manual_gap=manual_gap, persona=None,
+                confidence=None)
     cur.execute(SQL_PG, tuple(v[c] for c in _COLUMNS))
     return _id(cur.fetchone())
