@@ -834,6 +834,11 @@ class TestJobs(PatternDB):
         s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock())
         s.mm.post_message.side_effect = lambda ch, text: {"id": f"post-{len(self.posts)}",
                                                           "_": self.posts.append(text)}
+        # WEEK-AHEAD (2026-09-28): job_health_review also posts the coming week's
+        # flags. Stubbed out here because these tests are about PATTERN posting,
+        # and this fake cursor serves no health.plan reads — the lookahead has its
+        # own tests in tests/test_week_ahead.py.
+        s._post_week_ahead_flags = lambda: None
         return s
 
     def setUp(self):

@@ -2054,6 +2054,38 @@ class ArtemisScheduler:
                 logger.info("Health review posted %d pattern(s)", len(rows))
         except Exception:
             logger.exception("Health review failed")
+        self._post_week_ahead_flags()
+
+    def _post_week_ahead_flags(self) -> None:
+        """WEEK-AHEAD: the coming week's flags, on the Sunday review.
+
+        A SEPARATE post rather than lines appended to a pattern post, because the
+        review emits ONE POST PER PATTERN (zero when nothing is new) — there is no
+        single post to append to, and appending to each would repeat the week N
+        times. This way the flags arrive on Sunday whether or not a pattern did.
+
+        Flags ONLY, never the whole week: `week ahead` is there when he wants the
+        detail. Nothing is posted when there are no flags — a weekly "all clear"
+        trains you to skim past the week that isn't.
+
+        Isolated from the review above on purpose: a lookahead failure must not
+        cost him the pain-pattern post.
+        """
+        try:
+            from artemis import week_ahead as wa
+            from knowledge.db import get_connection
+            with get_connection() as conn:
+                week = wa.week_ahead(conn.cursor(), _local_today())
+            lines = wa.flag_lines(week)
+            if not lines:
+                logger.info("Week-ahead: no flags in the coming 7 days — posting nothing")
+                return
+            self._post(config.CHANNEL_OPS,
+                       "\n".join([f"**The week ahead needs {len(lines)} thing(s):**"]
+                                 + lines + ["", "`week ahead` for the full week."]),
+                       tier="health")
+        except Exception:
+            logger.exception("Week-ahead flags failed")
 
     def job_weekly_eval(self):
         """Sun 08:35 local — the EVAL-1 post for the week that just ENDED.
