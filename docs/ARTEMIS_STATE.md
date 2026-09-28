@@ -150,16 +150,16 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 
 | # | Item | Why | Size | Status |
 |---|---|---|---|---|
-| 1 | **CHECKIN-GATE** — pain/tightness reach the check-in; the prompt asks only what the watch can't measure | No subjective data ⇒ PAIN-1 and EVAL-1's subjective lines are empty | S | PR #205 |
-| 2 | **CARDIO-REQUIRED** — a cardio day can't be finished without duration + modality | 36 planned, 1 logged, 0 with modality (CARDIO-UNLOGGED) | S | |
-| 3 | **NUTRITION-2** — meal source by day kind (work default / off-day pick / travel prepped set), free-text meal logging, remaining-vs-target with suggestions from the recipe DB | The tracker Ryan described; replaces the old "defaults for every day type" + "same-day overrides" items | M–L | spec below |
-| 4 | **MENUS** — the content: off-day from-scratch recipes, the drive-friendly travel set, recipe tags. High protein and fiber, LDL/triglyceride-friendly fats, a planned peanut-butter-cup substitute, a satiating evening protein for sleep. **Ryan's inputs, reviewed with the dietitian.** HDL is moved mostly by weight loss and aerobic work (#2), not food | Pure content; the #3 plumbing runs without it | M | Ryan |
-| 5 | **DIETITIAN-REPORT** — REPORT-1 + DIET-1's report: daily / weekly / monthly × detailed / summary, PDF | REPORT-1's prerequisites are done; needs #3 and the window decision (DIETITIAN-DATA) | M–L | |
-| 6 | **ADHOC-LOG** — sets logged outside the plan | Blocks #7 | S–M | built 2026-09-27, not deployed |
-| 7 | **SESSION-LIB** — the on-demand launcher at gym.rdm.is (yoga, core, mobility) | Ryan's web-app goal | M | |
-| 8 | **New flows** — core, standalone mobility, YOGA-6 higher-intensity | Content for #7 | M each | |
-| 9 | **RICHFIELD-CAPTURE** (Monday inventory) + SCHEDULE-3 recompute | 3 wrong leave-week days | S | |
-| 10 | ZONE-1 → SLEEP-PERF | Need data first; not before mid-October | S | |
+| 1 | **CHECKIN-GATE** — pain/tightness reach the check-in; the prompt asks only what the watch can't measure | No subjective data ⇒ PAIN-1 and EVAL-1's subjective lines are empty | S | **live** — #205, box `fd845d4` |
+| 2 | **CARDIO-REQUIRED** — a cardio day can't be finished without duration + modality | 36 planned, 1 logged, 0 with modality (CARDIO-UNLOGGED) | S | **live** — #207 + gd#39; the Finish-cardio 500 fixed by #213 |
+| 3 | **NUTRITION-2** — meal source by day kind (work default / off-day pick / travel prepped set), free-text meal logging, remaining-vs-target with suggestions from the recipe DB | The tracker Ryan described; replaces the old "defaults for every day type" + "same-day overrides" items | M–L | **live** — #208 |
+| 4 | **MENUS** — the content: off-day from-scratch recipes, the drive-friendly travel set, recipe tags. High protein and fiber, LDL/triglyceride-friendly fats, a planned peanut-butter-cup substitute, a satiating evening protein for sleep. **Ryan's inputs, reviewed with the dietitian.** HDL is moved mostly by weight loss and aerobic work (#2), not food | Pure content; the #3 plumbing runs without it | M | **Ryan's** — not started |
+| 5 | **DIETITIAN-REPORT** — REPORT-1 + DIET-1's report: daily / weekly / monthly × detailed / summary, PDF | REPORT-1's prerequisites are done; needs #3 and the window decision (DIETITIAN-DATA) | M–L | **built, HTML live; PDF needs WeasyPrint** — #209 + #212 |
+| 6 | **ADHOC-LOG** — sets logged outside the plan | Blocks #7 | S–M | **live** — #214, migration 044 applied |
+| 7 | **SESSION-LIB** — the on-demand launcher at gym.rdm.is (yoga, core, mobility) | Ryan's web-app goal | M | **live** — #215 + gd#40 |
+| 8 | **New flows** — core, standalone mobility, YOGA-6 higher-intensity | Content for #7 | M each | **core + mobility live** — #217 (content approved 2026-09-27); **YOGA-6 open** |
+| 9 | **RICHFIELD-CAPTURE** (Monday inventory) + SCHEDULE-3 recompute | 3 wrong leave-week days | S | **blocked on Ryan's Monday inventory** — nothing to build until the room is measured |
+| 10 | ZONE-1 → SLEEP-PERF | Need data first; not before mid-October | S | **not before mid-October** — waiting on workout HR volume |
 
 **NUTRITION-2 — the tracker as Ryan described it (spec 2026-09-26; systems only, content later).**
 - **Day kind decides the meal source.** `cycle.day_type(d)` maps to three kinds: `msp_work` → **work**; `travel` → **travel**; everything else (`msp_home`, `wi`, and leave-week override days) → **off**. Leave days are off days (Ryan).
@@ -181,20 +181,38 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 
 **HEALTH-1 — morning check-in misroute + confabulation loop — CLOSED 2026-09-19.** Fixed by HEALTH-1 A1/A2 (`add_note` and the "I've learned…" correction re-route removed from live routing) and FRIDAY-1 (the deterministic `morning_flow` handler ahead of the LLM). Verified on a real message: the 9/19 08:12 check-in ("Sleep 9, energy 4, sore 1 right knee, …") was dispatched to `morning_flow` and stored in `health.daily_state` in ~75 ms, no classifier involved; the 08:15 nudge then correctly stayed silent. 9/18 has no check-in because none arrived (only the 05:15 nudge is logged), not a misroute. Follow-ups: CHECKIN-TEXT, CORRECTION-DEADCODE.
 
-**CONFIRM-ARB — confirm-handler arbitration / bare-`yes` disambiguation (medium).** Multiple flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its *own* pending-state, and those states are **independent** — several can be live at once. A bare control word is then resolved by fixed `deterministic_chain` order (first-match-wins), which is deterministic but **not** intent-aware: a `yes` meant for flow A can silently execute flow B.
+**CONFIRM-ARB — bare-`yes` disambiguation — BUILT 2026-09-27 (`feat/confirm-arb`).** Several flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its **own** pending store, and those stores are **independent** — more than one can be open at once. `deterministic_chain` resolved the tie by list order, first-match-wins: deterministic, but **not intent-aware**, so a `yes` meant for the swap could execute the rule.
 
-- **Pending stores (independent; nothing clears the others):**
-  | flow | store | expiry |
-  |---|---|---|
-  | calendar create / delete / dupe-override, `rule add`, dossier/org set | in-mem `_pending_confirms[channel]` (single value → these are mutually exclusive *with each other*) | 600s (calendar) / none (rule, dossier) |
-  | debrief capture | `acos.system_state` `debrief_pending:{ch}` | 600s |
-  | modality swap | `acos.system_state` `modality_swap_pending:{ch}` | 600s |
-  | nutrition target / grocery staples | `acos.system_state` keys | 900s / 1800s |
-  | inbox disposition batch | `_inbox_listing_state[ch]` | none |
-- **Chain trace (bare `yes`, two pendings live):** the first handler in `deterministic_chain` whose own store is pending wins; the others are never reached. The confirm backstop only re-runs the in-memory calendar handlers, so it doesn't help.
-- **Worst case (now smaller):** the never-expiring ramp pending is gone with RAMP-RETIRE (2026-09-19); the `rule add` / dossier pendings still never expire, so they can coexist for days with a shorter-lived one.
-- **Interim:** none left — the qualified `yes ramp` / `no ramp` route was deleted with the ramp engine. The general race (debrief↔swap↔nutrition↔rule↔disposition ordering) remains.
-- **Fix (this item):** a shared `_count_open_pendings(channel_id)` helper over all stores; when **>1** pending is open and a bare control word arrives, reply with a disambiguation prompt (e.g. `reply `yes swap` or `yes rule``) and consume the word safely instead of first-match-wins; teach each confirm handler to also accept its qualified form. Keep first-match-wins when exactly one pending is open.
+- **The rule now.** `_arbitrate_bare_control_word()` runs **before the chain**. With **more than one** pending open and a **bare** control word: **nothing is executed, every pending stays open**, and the reply names the qualified form for exactly the flows that are open. With **0 or 1** open it returns `None` and the chain behaves exactly as before — first-match-wins is untouched where it was never ambiguous.
+- **FAIL-CLOSED (FAIL-CLOSED-RESOLVERS).** `_open_pending_flows()` returns `(open, unreadable)`. A store that **raises** is reported unreadable and counted toward the total, so an unreadable store disambiguates rather than being assumed closed. A resolver answering "nothing is pending" because RDS was down is exactly how a bare `yes` runs the wrong flow.
+- **Qualified forms.** `_strip_qualifier(question, *flows)` turns `yes swap` into `yes` **for the handler that owns `swap` and no other**, so a handler accepts its own qualified form however many others are open — and `yes rule` can never be consumed by the swap handler. Wired into 7 handlers; the rest of each handler's logic still compares a bare word.
+
+- **The inventory, read from the code (2026-09-27), not from this entry:**
+
+  | flow | store | expiry | bare words consumed | qualified form |
+  |---|---|---|---|---|
+  | calendar create | `_pending_confirms[ch]` type `calendar_create_external` | 600 s | `_CONTROL_WORDS` | `yes calendar` |
+  | calendar delete | `_pending_confirms[ch]` type `calendar_delete` | 600 s | `_CONTROL_WORDS` | `yes delete` |
+  | duplicate override | `_pending_confirms[ch]` type `duplicate_override` | 600 s | **none — `override duplicate` only** | n/a (deliberate) |
+  | convert-to-tasks batch | `_pending_confirms[ch]` type `bulk_convert_to_tasks` | 600 s | `_CONTROL_WORDS` | `yes convert` |
+  | `rule add` | `_pending_confirms[ch]` type `playbook_rule` | **none** | `_CONFIRM_WORDS` | `yes rule` |
+  | dossier set | `_pending_confirms[ch]` type `dossier_set` | **none** | `_CONTROL_WORDS` | `yes dossier` |
+  | org set | `_pending_confirms[ch]` type `org_set` | **none** | `_CONTROL_WORDS` | `yes org` |
+  | debrief capture | `acos.system_state` `debrief_pending:{ch}` | 600 s | `_CONFIRM_WORDS` | `yes debrief` |
+  | modality swap | `acos.system_state` `modality_swap_pending:{ch}` | 600 s | `_SWAP_YES_RE` / `_SWAP_NO_RE` | `yes swap` |
+  | nutrition target | `acos.system_state` `nutrition_target_pending:{ch}` | 900 s | `_CONTROL_WORDS` | `yes target` |
+  | grocery staples | `acos.system_state` `grocery_staples_pending:{ch}` | 1800 s | `_CONTROL_WORDS` | `yes staples` |
+  | inbox disposition batch | `_inbox_listing_state[ch]["pending_dispositions"]` | **none** | `_CONFIRM_WORDS` | `yes disposition` |
+  | nutrition `fix` window | `acos.system_state` `nutrition_fix_pending:{ch}` | 48 h (the correction window) | bare `fix` opens it | `yes fix` |
+
+  **The seven `_pending_confirms` types share one dict value per channel, so they are mutually exclusive with each other** — at most one can contribute to the count.
+
+- **Three discrepancies between the old entry and the code, all found by reading the code:**
+  1. **`bulk_convert_to_tasks` was missing from the entry.** It is a `_pending_confirms` type consumed by `_handle_convert_to_tasks`, which is **not in `deterministic_chain`** — it is dispatched separately (two call sites in `_handle_mention`). It is now in the arbiter's map.
+  2. **`nutrition_fix_pending` was missing.** Bare `fix` opens a 48 h correction window; the old entry mentioned bare `fix` in prose but never listed its store.
+  3. **REPEAT-WEEK does NOT consume bare words**, contrary to the assumption that it "joined the bare-word crowd". `_REPEAT_RE` requires `repeat week` / `yes repeat` and `_NO_REPEAT_RE` requires `no repeat` / `don't repeat`. It is therefore **not** in the arbiter's flow map — a bare `yes` can never reach it — but its proposal (`repeat_week_pending`, live until the repeat week would have ended) is still a pending the user may be thinking of when they type `yes`. Recorded so the next reader does not "fix" it in.
+- **Worst case, now.** The three never-expiring stores (`rule add`, dossier/org, disposition batch) can still coexist for days with a shorter-lived one — but a bare word against them now disambiguates instead of guessing.
+- **Tests:** `tests/test_confirm_arb.py` — **25 tests, 49 subtests**, synthetic only. Seven pair classes each disambiguate and name both flows; one-open and none-open are unchanged; every `_CONTROL_WORDS` member and `yes.` / `YES` / whitespace forms are arbitrated; a qualified form is not arbitrated so it still reaches its owner; a non-owner never strips another flow's suffix; a store-read failure disambiguates; and after arbitration both pendings are still open.
 
 **RAMP-RETIRE — RETIRED 2026-09-19 (#111).** Deleted the dormant feat/health-ramp engine (`artemis/health_ramp.py`, the `yes ramp` / `no ramp` confirm route, the `--ramp` script flags, their tests). Reason: HARDEN-1's dry run showed it couldn't be re-pointed at the office program (Sun–Sat windows, Sunday-night evaluation, rest days counted as missed, a 5/5 threshold a 4-session week can't meet, a restart that re-seeds the home-gym plan), EVAL-1 now reports on weeks, and the plan is pre-seeded through 11/03. `health.ramp_state` dropped by migration 034 after an export to the box (`~/backups/ramp_state_2026-09-19.json`); `health.plan.status` / `original_date` from migration 030 are **kept** — the Lambda `/plan` and `/overview` read `plan.status`. There was no scheduled ramp job left to remove (HEALTH-2 had unregistered it). **Progression is manual:** the weekly evaluation reports, Ryan decides (PB-009). What the ramp did that nothing does now: slides of missed sessions to makeup slots (→ MAKEUP-1), week classification and repeat/restart proposals (→ manual via EVAL-1), the week-2 revisit prompt, travel-week templates (→ TRAVEL-1).
 
@@ -855,7 +873,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
       - **Weight source:** Apple Health samples (`health.watch_sample`, metric `weight`), falling back to the check-in value (`health.daily_state.weight_lbs`) on days with no sample. Each weigh-in is marked with its source in the per-day detail.
       - **Delivery:** Artemis renders the PDF (REPORT-1 pipeline, S3 `reports/`) and prepares a **Gmail draft** with it attached. Ryan reviews and sends it; **it is never sent automatically** (Brad Spaits rule). Upload to My HealtheVet stays manual.
     - **Tests:** a golden file; the banned-word scan; an empty period; a period with non-work days that weren't pre-filled; all four day statuses; the basis shares summing to 100 %; the weight fallback; fewer than 3 weigh-ins; no watch data; a day with no steps (an empty slot, not 0); the active-minutes chart unstacked with its note when ZONE-1 is absent, and stacked with a matching total when present; a 31-day period still two pages.
-- **DIETITIAN-REPORT — the renderer is BUILT, NOT DEPLOYED (2026-09-26; `feat/dietitian-report`; HEALTH-PRIORITY #5).** `artemis/dietitian_report.py` (collect → build → render_html → render_pdf) and `scripts/dietitian_report.py` (`--fortnight` / `--week` / `--month` / `--day` / `--from … --to`, `--detail full|summary`, `--html`). Read-only.
+- **DIETITIAN-REPORT — the renderer is LIVE ON THE BOX; the PDF path needs WeasyPrint (merged 2026-09-27 as #209, menu/guard fixes in #212; HEALTH-PRIORITY #5).** `render_html` works; `render_pdf` lazy-imports WeasyPrint and raises with install instructions until it is installed (#212). Nothing is sent, emailed or drafted — the script writes to `/tmp` on the box. `artemis/dietitian_report.py` (collect → build → render_html → render_pdf) and `scripts/dietitian_report.py` (`--fortnight` / `--week` / `--month` / `--day` / `--from … --to`, `--detail full|summary`, `--html`). Read-only.
   - **Built to the spec above:** header with the target line read from `nutrition.target`; page 1 sections 1–5 (completeness by reason, averages over recorded days with signed difference to target, recording status, share by basis, weight with watch-first / check-in fallback and the < 3 weigh-ins listing); page 2 activity table, the two grey bar charts as inline SVG (empty "no data" slots, y from 0, per-bar labels vertical past 14 days, active minutes unstacked with "Intensity breakdown not yet available"), the per-day table and recurring meals; footer definitions. **`summary` is page 1; `full` is both pages** — Ryan's "detailed or high level".
   - **The window question (DIETITIAN-DATA) doesn't block it:** any window renders, and completeness is reported ("days with intake recorded: X of N" plus reasons), never required.
   - **Deviations, each recorded rather than hidden:** `macro_basis` is **derived at render time** from `entry.source` + the food's `source_detail`/`is_placeholder`, and anything it can't classify shows as **`unclassified`** — the column and backfill in the decisions above still need their migration. `confirmed` is always 0 until its status migration. The language rule is enforced twice: a test scan, and the script refuses to write a PDF whose text contains a banned word.

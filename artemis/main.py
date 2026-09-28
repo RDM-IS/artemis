@@ -135,6 +135,168 @@ _CONFIRM_WORDS = frozenset({"confirm", "approved", "approve", "yes", "send", "se
 _CANCEL_WORDS = frozenset({"cancel", "no", "deny", "discard"})
 _CONTROL_WORDS = _CONFIRM_WORDS | _CANCEL_WORDS
 
+# ── CONFIRM-ARB ────────────────────────────────────────────────────────────
+# Several flows consume a bare control word, each gating on its OWN pending
+# store, and those stores are INDEPENDENT — more than one can be open at once. A
+# bare `yes` was then resolved by deterministic_chain order, first-match-wins:
+# deterministic, but not intent-aware, so a `yes` meant for the swap could
+# execute the rule.
+#
+# The rule now: >1 open pending + a BARE control word => execute nothing, name
+# the qualified forms for exactly the flows that are open, and LEAVE EVERY
+# PENDING OPEN. Exactly one open pending keeps the old behaviour untouched.
+#
+# Each entry is (flow key, qualified suffix, probe). The probe returns True when
+# that flow's own store is open for this channel. Keep this list beside the
+# stores it reads — a new pending store that is not here is invisible to the
+# arbiter, which is the bug this exists to prevent.
+_QUALIFIED_SUFFIX: dict[str, str] = {
+    "calendar": "calendar",
+    "delete": "delete",
+    "duplicate": "duplicate",
+    "convert": "convert",
+    "rule": "rule",
+    "dossier": "dossier",
+    "org": "org",
+    "debrief": "debrief",
+    "swap": "swap",
+    "target": "target",
+    "staples": "staples",
+    "disposition": "disposition",
+    "fix": "fix",
+}
+
+
+def _strip_qualifier(question: str, *flows: str) -> str:
+    """`yes swap` -> `yes` for the handler that owns `swap`; else unchanged.
+
+    CONFIRM-ARB step 4: a handler accepts its QUALIFIED form whenever its own
+    pending is open, however many others are. Each confirm handler calls this
+    once with the flow name(s) it owns, so the rest of its logic keeps comparing
+    a bare word and nothing else about it changes.
+
+    Only the owning handler strips its own suffix, so `yes rule` can never be
+    consumed by the swap handler — which is the whole point.
+    """
+    q = (question or "").strip().rstrip(".!")
+    for flow in flows:
+        suffix = _QUALIFIED_SUFFIX.get(flow, flow)
+        m = re.match(rf"^\s*(\S+)\s+{re.escape(suffix)}\s*$", q, re.I)
+        if m and m.group(1).lower() in _CONTROL_WORDS:
+            return m.group(1)
+    return question
+
+
+def _mem_pending_flow(channel_id: str) -> str | None:
+    """Which flow the single in-memory `_pending_confirms` slot holds, if any.
+
+    These are mutually exclusive WITH EACH OTHER (one dict value per channel),
+    so at most one can contribute. Expiry is the owning handler's business; this
+    only reports what is stored.
+    """
+    p = _pending_confirms.get(channel_id)
+    if not p:
+        return None
+    return {
+        "calendar_create_external": "calendar",
+        "calendar_delete": "delete",
+        "duplicate_override": "duplicate",
+        "bulk_convert_to_tasks": "convert",
+        "playbook_rule": "rule",
+        "dossier_set": "dossier",
+        "org_set": "org",
+    }.get(p.get("type"))
+
+
+def _open_pending_flows(channel_id: str) -> tuple[list[str], list[str]]:
+    """(flows open for this channel, flows whose store could not be READ).
+
+    FAIL-CLOSED (CONFIRM-ARB): a store that raises is reported as UNREADABLE,
+    and the caller treats unreadable as "might be open" — never as "not open".
+    A resolver that answers "nothing is pending" because the database was down
+    is how a bare `yes` executes the wrong flow; see FAIL-CLOSED-RESOLVERS.
+    """
+    open_flows: list[str] = []
+    unreadable: list[str] = []
+
+    def probe(flow: str, fn) -> None:
+        try:
+            if fn():
+                open_flows.append(flow)
+        except Exception:
+            logger.warning("CONFIRM-ARB: %s pending store unreadable — treating as open",
+                           flow, exc_info=True)
+            unreadable.append(flow)
+
+    # In-memory slot: one flow at most, and it cannot raise.
+    mem = _mem_pending_flow(channel_id)
+    if mem:
+        open_flows.append(mem)
+
+    def _debrief() -> bool:
+        from artemis.health import load_capture_pending
+        return load_capture_pending(channel_id) is not None
+
+    def _swap() -> bool:
+        from artemis.health import load_swap_pending
+        return load_swap_pending(channel_id) is not None
+
+    def _target() -> bool:
+        from artemis.health import load_nutrition_target_pending
+        return load_nutrition_target_pending(channel_id) is not None
+
+    def _staples() -> bool:
+        from artemis.life_ops import load_staples_pending
+        return load_staples_pending(channel_id) is not None
+
+    def _disposition() -> bool:
+        st = _inbox_listing_state.get(channel_id) or {}
+        return bool(st.get("pending_dispositions"))
+
+    def _fix() -> bool:
+        from artemis import nutrition
+        from knowledge.db import get_connection
+        with get_connection() as conn:
+            return nutrition.pending_correction(conn.cursor(), channel_id) is not None
+
+    probe("debrief", _debrief)
+    probe("swap", _swap)
+    probe("target", _target)
+    probe("staples", _staples)
+    probe("disposition", _disposition)
+    probe("fix", _fix)
+    return open_flows, unreadable
+
+
+def _disambiguation_reply(flows: list[str], unreadable: list[str]) -> str:
+    """Name the qualified form for exactly the flows that are open."""
+    shown = flows + [f for f in unreadable if f not in flows]
+    forms = ", ".join(f"`yes {_QUALIFIED_SUFFIX.get(f, f)}`" for f in sorted(set(shown)))
+    lines = [f"{len(shown)} things are waiting on a yes/no, so a bare one is ambiguous "
+             f"— nothing was done.",
+             f"Reply with one of: {forms} (or `no <the same word>` to cancel it)."]
+    if unreadable:
+        lines.append("_One or more pending stores could not be read, so they are "
+                     "listed as possibly open rather than assumed closed._")
+    return "\n".join(lines)
+
+
+def _arbitrate_bare_control_word(channel_id: str, question: str) -> str | None:
+    """The reply to send INSTEAD of running a confirm handler, or None to proceed.
+
+    None means "carry on as before": not a bare control word, or 0/1 pendings
+    open. A string means more than one flow could have claimed it.
+    """
+    q = (question or "").lower().strip().rstrip(".!")
+    if q not in _CONTROL_WORDS:
+        return None
+    flows, unreadable = _open_pending_flows(channel_id)
+    if len(flows) + len(unreadable) <= 1:
+        return None                      # unchanged first-match-wins behaviour
+    logger.info("CONFIRM-ARB: bare %r with open=%s unreadable=%s — disambiguating",
+                q, flows, unreadable)
+    return _disambiguation_reply(flows, unreadable)
+
 # Duplicate-block override. DELIBERATELY DISTINCT from the confirm words: a
 # confirm/approved/yes must NEVER bypass a duplicate block (Brad Spaits guard #2).
 # The only phrase that creates past a block is exactly this one.
@@ -984,6 +1146,7 @@ def _handle_rule_command(post: dict, question: str) -> bool:
     # 1) Pending rule-activation confirm (type-gated; coexists with other confirms).
     pending = _pending_confirms.get(channel_id)
     if pending and pending.get("type") == "playbook_rule":
+        ql = _strip_qualifier(question, "rule").lower().strip()   # CONFIRM-ARB
         if ql in _CONFIRM_WORDS:
             del _pending_confirms[channel_id]
             spec = pending["spec"]
@@ -1474,6 +1637,7 @@ def _handle_disposition_command(post: dict, question: str) -> bool:
     # _CANCEL_WORDS so the confirm vocabulary can't drift between subsystems.
     pending = state.get("pending_dispositions") if state else None
     if pending and channel_id not in _pending_confirms:
+        question = _strip_qualifier(question, "disposition")   # CONFIRM-ARB
         ans = _strip_parentheticals(question).strip().lower()
         if ans in _CONFIRM_WORDS:
             state.pop("pending_dispositions", None)
@@ -2124,6 +2288,7 @@ def _handle_duplicate_override(post: dict, question: str) -> bool:
 
 def _handle_calendar_confirm(post: dict, question: str) -> bool:
     """Handle confirmation replies for pending calendar actions. Returns True if handled."""
+    question = _strip_qualifier(question, "calendar")      # CONFIRM-ARB
     q_lower = question.lower().strip()
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
@@ -2245,6 +2410,7 @@ def _handle_delete_event(post: dict, question: str) -> bool:
 
 def _handle_delete_confirm(post: dict, question: str) -> bool:
     """Handle 'yes' confirmation for pending event deletions."""
+    question = _strip_qualifier(question, "delete")        # CONFIRM-ARB
     q_lower = question.lower().strip()
     channel_id = post.get("channel_id", "")
     root_id = post.get("root_id") or post["id"]
@@ -4008,6 +4174,7 @@ def _handle_debrief_confirm(post: dict, question: str) -> bool:
     if load_capture_pending(channel_id) is None:
         return False
 
+    question = _strip_qualifier(question, "debrief")   # CONFIRM-ARB
     q = question.lower().strip()
     if q in _CONFIRM_WORDS:
         reply = commit_capture(channel_id)
@@ -4050,6 +4217,9 @@ def _handle_swap_confirm(post: dict, question: str) -> bool:
     pending = load_swap_pending(channel_id)
     if pending is None:
         return False
+    # CONFIRM-ARB: strip the qualifier BEFORE _SWAP_YES_RE, which would otherwise
+    # capture "swap" as the swap REASON.
+    question = _strip_qualifier(question, "swap")
 
     m_yes = _SWAP_YES_RE.match(question)
     if m_yes:
@@ -4089,6 +4259,7 @@ def _handle_nutrition_confirm(post: dict, question: str) -> bool:
     )
 
     channel_id = post.get("channel_id", "")
+    question = _strip_qualifier(question, "target", "staples")   # CONFIRM-ARB
     q = question.lower().strip()
     if q not in _CONTROL_WORDS:
         return False
@@ -4270,6 +4441,18 @@ def _handle_mention(post: dict, thread: list[dict]):
     #   * PB-009 nutrition/health BEFORE inbox (so a bare "done" isn't shadowed)
     #     and BEFORE the LLM router (RDS health path wins over legacy life_ops).
     #   * rule/dossier BEFORE the inbox + LLM router (deterministic short-circuits).
+    # CONFIRM-ARB: arbitrate a BARE control word BEFORE the chain runs. With more
+    # than one pending open, first-match-wins would execute whichever flow happens
+    # to sit earliest in the list — so instead nothing runs, every pending stays
+    # open, and the reply names the qualified forms for exactly the open flows.
+    # With 0 or 1 open this returns None and the chain behaves exactly as before.
+    _arb = _arbitrate_bare_control_word(channel_id, question)
+    if _arb:
+        if _mm:
+            _mm.post_message(channel_id, _arb, root_id=root_id)
+        logger.info("dispatch: confirm_arb handled %r (nothing executed)", question[:40])
+        return
+
     deterministic_chain = [
         ("availability_command", _handle_availability_command),
         ("duplicate_override", _handle_duplicate_override),
