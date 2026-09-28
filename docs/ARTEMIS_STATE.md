@@ -181,6 +181,59 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 
 **HEALTH-1 — morning check-in misroute + confabulation loop — CLOSED 2026-09-19.** Fixed by HEALTH-1 A1/A2 (`add_note` and the "I've learned…" correction re-route removed from live routing) and FRIDAY-1 (the deterministic `morning_flow` handler ahead of the LLM). Verified on a real message: the 9/19 08:12 check-in ("Sleep 9, energy 4, sore 1 right knee, …") was dispatched to `morning_flow` and stored in `health.daily_state` in ~75 ms, no classifier involved; the 08:15 nudge then correctly stayed silent. 9/18 has no check-in because none arrived (only the 05:15 nudge is logged), not a misroute. Follow-ups: CHECKIN-TEXT, CORRECTION-DEADCODE.
 
+**COGNITION-1 — bronze: the decision ledger (PROPOSAL, 2026-09-28; nothing built, nothing approved).** North-star step 3 (§0, §2 "cognition medallion", §8). This entry answers the five questions that have to be settled before any code, and the first answer changes the §2 sketch.
+
+- **1. It should NOT be a new table. Bronze is `acos.audit_log` plus three columns — and §2's `acos.cognition_log` should be retired as a name.** Read from RDS 2026-09-28: `audit_log` holds **1,565 rows** and already carries **`confidence` (double)**, **`outcome` (varchar)**, **`metadata` (jsonb)** and **`verified` (boolean)** alongside `agent`, `action`, `domain`. Four of the six fields §2 asks for are already there, and the writers are already in the right places — `health_checkin`, `program_repeat`, `nutrition`, and two in the Lambda. A second table would mean two rows per decision, two writers per site, and the certainty that they drift; that is the two-store seam CRM-2 and COMMIT-1 already record as a mistake, and it is against one-system-of-record.
+  - **The exact difference in what a row means — and it is real.** An `audit_log` row today means **"this action was taken"**, written at the moment of action and never reopened: `inbox archive` ×448, `watch_ingest` ×189, `claude llm_call` ×705. A cognition row means **"this decision was made on these assumptions, and here is what became of it"** — it has a *lifecycle*: decided → outcome observed → corrected or not. **The difference is not the columns, it is that a cognition row is revisited later.** The `verified` and `outcome` columns are already vestigial evidence that someone wanted that.
+  - **So the change is narrow:** add `assumptions jsonb`, `correction jsonb`, `manual_gap boolean`, and one partial index over the rows that are decisions. Rows that are merely actions leave all three NULL and are unaffected — no backfill, and `action_class` already exists to tell the two apart.
+  - **PROPOSED DDL — NOT in `migrations/`** (PROPOSE-NOT-IN-MIGRATIONS; the deploy path runs `run_migrations.py`, so a file there ships whether or not it was approved):
+
+    ```sql
+    ALTER TABLE acos.audit_log
+        ADD COLUMN IF NOT EXISTS assumptions jsonb,
+        ADD COLUMN IF NOT EXISTS correction  jsonb,
+        ADD COLUMN IF NOT EXISTS manual_gap  boolean;
+    -- Only decisions carry assumptions, so the index covers only those.
+    CREATE INDEX IF NOT EXISTS idx_audit_log_decisions
+        ON acos.audit_log (domain, action, created_at DESC)
+        WHERE assumptions IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_audit_log_manual_gap
+        ON acos.audit_log (created_at DESC) WHERE manual_gap;
+    ```
+
+  - **Immutability, honestly.** §2 says bronze is "immutable, append-only", and attaching an outcome later contradicts that. Two options, and the second is preferred: (a) `UPDATE` the row's `outcome`/`correction`, which is simpler and breaks the append-only promise; **(b) append a second row that references the first** (`metadata.decides` → the original `id`), which keeps append-only and makes the correction itself a dated fact. (b) costs a join and is the honest one. **Ryan chooses.**
+
+- **2. The row shape.** `decision` is `action` (already there); `assumptions` is the new jsonb and is **the highest-value column** — it is what makes a wrong decision diagnosable rather than merely visible. Per site below. `confidence`, `outcome` exist. `correction` is what Ryan actually did instead. `manual_gap` is set by rule, never by an LLM — see 4.
+
+- **3. The first five sites to instrument**, all chosen because they make a consequential choice *today* and four of the five already write an audit row, so the work is adding fields rather than adding writers:
+
+  | # | site | the decision | `assumptions` would hold | how an outcome/correction attaches later |
+  |---|---|---|---|---|
+  | 1 | `artemis/health_checkin.py:compute_adjustment` (line ~525) | which rule fired and what it did to today's session (day off / mobility / −1 set / RPE cap) | the check-in's parsed pain + soreness + energy, the rule id that matched, the plan row's session_type and week, the cap it compared against | the session's own log: did he do the adjusted session, the original, or nothing? `session_log.plan_id` already ties them, so the outcome is derivable the next evening without asking him |
+  | 2 | makeup swap, `api/app/routers/health.py` (writes `audit_log` already) | which missed row is made up on which rest day | the missed row's date/type, the rest row's date, the week's not-done count, the location and whether it `can_hold` the session | whether the swapped-in session was logged on the rest day; if he skips it, that is the correction |
+  | 3 | `artemis/program_repeat.py:apply` (line ~128, writes `audit_log` already) | repeat the week and move the block's end | the not-done count and which sessions, the week number, the rows it will rewrite, the md5 it verified against | how the repeated week went — its own not-done count. A second repeat of the same week is the strongest possible correction signal |
+  | 4 | `artemis/nutrition.py:prefill_day` (line ~160, writes `audit_log` already) | which meal source won (dated Notion pick / kind default / none) | the day kind, the `day_type` it came from, which Notion rows existed, and why the chosen one won | the day's `status` at lock time: `confirmed` means the assumption held; a `fix` deviation names exactly what was wrong |
+  | 5 | `artemis/main.py:_arbitrate_bare_control_word` (line ~284) | disambiguate rather than execute | the open flow list, the unreadable list, the bare word | which qualified form he sent next. **If he then sends the form matching the flow that `deterministic_chain` would have picked anyway, the old first-match-wins was right for that pair** — which is how the arbiter earns or loses its keep on evidence |
+
+  Sites 1–4 need no new writer. Site 5 needs the first `audit_log` write in `main.py` — and it is the cheapest one to add.
+
+- **4. `manual_gap` is set by RULE, never by an LLM** (the statistics-vs-semantics wall, §3). It means **"Ryan did this by hand and Artemis had no path to do it"** — a structural fact, not a judgement about quality. Three deterministic setters, all mechanical:
+  - a decision whose `correction` is non-null **and** whose correction came from a chat command with no matching automation (`playbook_rules` has no rule for that action) ⇒ `manual_gap = true`;
+  - a script under `scripts/` writing an audit row for something no scheduled job does (the leave-week write is the live example: `cycle2 leave_week_overrides` ×8, all by hand, with no writer in the system) ⇒ true;
+  - everything else ⇒ false, explicitly, never NULL-as-maybe.
+  **No LLM reads or writes this column.** An LLM may later *summarise* the set of `manual_gap` rows for a human to read — that is description, not authorship — but the flag itself is only ever set by the three rules above. `manual_gap=true` entries self-generating the playbook roadmap (§2) is then a query, not a model.
+
+- **5. Explicitly OUT of scope for COGNITION-1, each with its gate:**
+  - **Silver (hard rules)** — deterministic rules Artemis executes. Gate: bronze has ≥ 8 weeks of rows across all five sites, and Ryan authors each rule; nothing is inferred into silver.
+  - **Gold (soft rules)** — observed tendencies. Gate: silver exists and is trusted first; gold **never auto-acts**, it only biases a default, per §2.
+  - **Actionable gold / self-proposed playbooks** — Gate: human approval per playbook, activation always gated (the Brad Spaits descendant).
+  - **Any auto-acting on a bronze row.** Bronze is *write and read*, full stop. Nothing in COGNITION-1 changes a decision because of a past decision.
+  - **`CORRECTION-DEADCODE`** — the unrouted `_handle_correction` stub stays unrouted. It is not the seed of this; deleting or wiring it is a separate call.
+
+- **Slices and size.** **S** — the three columns + two indexes, applied, nothing reading them. **S** — sites 3 and 4 (they already write; add `assumptions`). **M** — sites 1 and 2 plus the outcome-attachment path, which is where the real design is. **S** — site 5. **M** — the `manual_gap` rules and a `/gaps` read-only listing. **Total M**, and the first two slices are worth doing alone: assumptions on the repeat and the prefill would already have made this week's two doc errors self-evident.
+
+- **What this entry does NOT settle, for Ryan:** (a) `UPDATE` vs append-a-second-row for outcomes — I prefer append; (b) whether `acos.cognition_log` is dropped from §2 as a name or kept as a view over the decision rows; (c) whether site 5 is worth the first `main.py` audit writer, or waits.
+
 **CONFIRM-ARB — bare-`yes` disambiguation — BUILT 2026-09-27 (`feat/confirm-arb`).** Several flows consume a bare `yes`/`no`/`confirm`/`cancel` in `#artemis-ryan`, each gating on its **own** pending store, and those stores are **independent** — more than one can be open at once. `deterministic_chain` resolved the tie by list order, first-match-wins: deterministic, but **not intent-aware**, so a `yes` meant for the swap could execute the rule.
 
 - **The rule now.** `_arbitrate_bare_control_word()` runs **before the chain**. With **more than one** pending open and a **bare** control word: **nothing is executed, every pending stays open**, and the reply names the qualified form for exactly the flows that are open. With **0 or 1** open it returns `None` and the chain behaves exactly as before — first-match-wins is untouched where it was never ambiguous.
