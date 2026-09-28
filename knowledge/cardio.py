@@ -24,6 +24,8 @@ data can revisit that once there are a few weeks of both.
 
 from __future__ import annotations
 
+from datetime import date as _date
+
 MODALITIES = ("row", "bike", "treadmill", "elliptical")
 
 #: Preference order, most preferred first (Ryan, 2026-09-25). Rowing is primary:
@@ -79,26 +81,60 @@ def _device_rank(modality: str, device: str, inventory_index: int) -> tuple[int,
     return (order.index(device) if device in order else len(order), inventory_index)
 
 
-def available(location_key: str | None) -> tuple[tuple[str, str], ...]:
-    """Everything this location has, as (modality, device)."""
-    return INVENTORY.get(location_key or "", ())
+#: ROWER-MOVE (Ryan, 2026-09-28) — equipment that MOVES, with the date it moves.
+#: Dated rather than a flag-day edit to INVENTORY, because a plan is seeded ahead
+#: of itself: a row for 10/10 has to resolve to where the rower WILL be, while a
+#: row for 10/01 resolves to where it is now. One date to change if the move
+#: slips; nothing else moves with it.
+#:
+#: The rower goes Richfield -> MSP home on 2026-10-04 (planned; Ryan confirms
+#: when it is actually packed).
+MOVES: tuple[dict, ...] = (
+    {"on": _date(2026, 10, 4), "item": ("row", "water"),
+     "from": "richfield", "to": "msp_home",
+     "note": "ROWER-MOVE: planned 2026-10-04, Ryan confirms when packed"},
+)
 
 
-def modalities_at(location_key: str | None) -> tuple[str, ...]:
+def available(location_key: str | None, on: _date | None = None) -> tuple[tuple[str, str], ...]:
+    """Everything this location has on a given date, as (modality, device).
+
+    `on=None` means "the base inventory, before any dated move" rather than
+    "today". A caller that knows the date passes it; one that does not gets the
+    unmoved answer instead of a silently time-dependent one, because a resolver
+    whose answer changes with the wall clock is the hardest kind to reason about.
+    """
+    key = location_key or ""
+    have = list(INVENTORY.get(key, ()))
+    if on is None:
+        return tuple(have)
+    for mv in MOVES:
+        if on < mv["on"]:
+            continue
+        if key == mv["from"] and mv["item"] in have:
+            have.remove(mv["item"])
+        elif key == mv["to"] and mv["item"] not in have:
+            have.append(mv["item"])
+    return tuple(have)
+
+
+def modalities_at(location_key: str | None, on: _date | None = None) -> tuple[str, ...]:
     """The distinct modalities a location has, in preference order."""
-    have = {m for m, _ in available(location_key)}
+    have = {m for m, _ in available(location_key, on)}
     return tuple(m for m in MODALITY_ORDER if m in have)
 
 
-def device_for(location_key: str | None, modality: str) -> str | None:
+def device_for(location_key: str | None, modality: str,
+               on: _date | None = None) -> str | None:
     """The preferred device for a modality at a location, or None."""
-    candidates = [(d, i) for i, (m, d) in enumerate(available(location_key)) if m == modality]
+    candidates = [(d, i) for i, (m, d) in enumerate(available(location_key, on))
+                  if m == modality]
     if not candidates:
         return None
     return min(candidates, key=lambda c: _device_rank(modality, c[0], c[1]))[0]
 
 
-def resolve(location_key: str | None) -> dict:
+def resolve(location_key: str | None, on: _date | None = None) -> dict:
     """What a cardio session runs on here.
 
     Returns either::
@@ -116,21 +152,21 @@ def resolve(location_key: str | None) -> dict:
     a substitute runs the same session target but never advances the rowing
     baseline (see artemis/cardio_baseline.py).
     """
-    have = modalities_at(location_key)
-    all_here = [{"modality": m, "device": d} for m, d in available(location_key)]
+    have = modalities_at(location_key, on)
+    all_here = [{"modality": m, "device": d} for m, d in available(location_key, on)]
     if not have:
         return {
             "modality": None,
             "device": None,
             "available": all_here,
             "reason": "no cardio equipment at this location",
-            "elsewhere": list(modalities_at(REFERENCE_LOCATION)),
+            "elsewhere": list(modalities_at(REFERENCE_LOCATION, on)),
             "elsewhere_location": REFERENCE_LOCATION,
         }
     modality = have[0]
     return {
         "modality": modality,
-        "device": device_for(location_key, modality),
+        "device": device_for(location_key, modality, on),
         "available": all_here,
         "is_substitute": modality != "row",
     }
