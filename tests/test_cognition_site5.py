@@ -61,20 +61,49 @@ def _patched(cur):
 # computed without executing a live handler.
 # ---------------------------------------------------------------------------
 
-class TestClaimantTable(unittest.TestCase):
+class TestConsumerTable(unittest.TestCase):
+    """The table is load-bearing twice over: it is how `would_have_picked` is
+    computed without executing a handler, AND (since 2026-09-28) how the arbiter
+    decides which open pendings can make a bare word ambiguous at all.
+
+    Its first version was the set of handlers calling `_strip_qualifier`, which is
+    NOT the same set — it missed four real consumers, two of which WRITE on a bare
+    `yes`. These tests encode the correct invariant so that mistake cannot recur.
+    """
+
     @staticmethod
     def _chain_order():
         """The chain entry names, read from the dispatch function's SOURCE. The
-        list is a local inside the handler, and every entry is a live handler, so
+        list is a local inside the handler and every entry is a live handler, so
         reading the source is the only way to check the order without running it."""
         src = inspect.getsource(m)
         block = src[src.index("deterministic_chain = ["):]
         block = block[:block.index("\n    ]")]
         return re.findall(r'\(\s*"([a-z_]+)"\s*,', block)
 
-    def test_every_claimant_is_in_the_chain(self):
+    @staticmethod
+    def _bare_word_handlers():
+        """Every `_handle_*` that could consume a bare control word, by either
+        signal: it accepts a qualified form (`_strip_qualifier`), or it compares
+        against a control-word set. Both are needed — `swap_confirm` uses its own
+        `_SWAP_YES_RE`/`_SWAP_NO_RE` and matches no word set, while
+        `duplicate_override` matches a word set and never called `_strip_qualifier`
+        until this round."""
+        src = inspect.getsource(m)
+        bounds = [(x.start(), x.group(1)) for x in re.finditer(r"\ndef (_handle_[a-z_]+)\(", src)]
+        bounds.append((len(src), "<eof>"))
+        out = set()
+        for (a, name), (b, _n) in zip(bounds, bounds[1:]):
+            body = src[a:b]
+            if re.search(r"_strip_qualifier\(|_CONFIRM_WORDS|_CANCEL_WORDS|_CONTROL_WORDS",
+                         body):
+                out.add(name)
+        out.discard("_handle_mention")        # the dispatcher, not a flow handler
+        return out
+
+    def test_every_table_entry_is_in_the_chain(self):
         order = self._chain_order()
-        for entry, _flows in m._BARE_WORD_CLAIMANTS:
+        for entry, _flows in m._BARE_WORD_CONSUMERS:
             with self.subTest(entry=entry):
                 self.assertIn(entry, order)
 
@@ -82,40 +111,138 @@ class TestClaimantTable(unittest.TestCase):
         """A reordered chain must fail here rather than make every recorded
         `would_have_picked` a quiet lie."""
         order = self._chain_order()
-        positions = [order.index(e) for e, _ in m._BARE_WORD_CLAIMANTS]
+        positions = [order.index(e) for e, _ in m._BARE_WORD_CONSUMERS]
         self.assertEqual(positions, sorted(positions),
-                         f"_BARE_WORD_CLAIMANTS is out of chain order: {positions}")
+                         f"_BARE_WORD_CONSUMERS is out of chain order: {positions}")
 
-    def test_the_table_is_exactly_the_handlers_that_consume_a_bare_word(self):
-        """`_strip_qualifier` is called by precisely the arbitrated handlers. A new
-        one that forgets this table would otherwise be invisible to it."""
-        src = inspect.getsource(m)
-        callers = set()
-        for match in re.finditer(r"_strip_qualifier\(", src):
-            head = src[:match.start()]
-            fn = re.findall(r"\ndef (_handle_[a-z_]+)\(", head)
-            if fn:
-                callers.add(fn[-1])
-        callers.discard("_handle_strip_qualifier")
-        expected = {f"_handle_{e}" for e, _ in m._BARE_WORD_CLAIMANTS}
-        self.assertEqual(callers, expected,
-                         "the handlers calling _strip_qualifier and "
-                         "_BARE_WORD_CLAIMANTS have diverged")
+    def test_duplicate_override_is_first_because_the_chain_puts_it_first(self):
+        """The omission that mattered most: it is chain entry 1, so leaving it out
+        made `would_have_picked` wrong whenever a duplicate pending was open."""
+        order = self._chain_order()
+        self.assertEqual(m._BARE_WORD_CONSUMERS[0][0], "duplicate_override")
+        self.assertLess(order.index("duplicate_override"), order.index("swap_confirm"))
+
+    def test_no_in_chain_bare_word_consumer_is_missing_from_the_table(self):
+        """THE invariant the first version got wrong. A handler that can take a
+        bare control word and is not in this table is invisible to both the
+        arbiter and site 5 — which is how a bare `yes` executes the wrong flow."""
+        table = {e for e, _ in m._BARE_WORD_CONSUMERS}
+        chain = set(self._chain_order())
+        missing = {h for h in self._bare_word_handlers()
+                   if h[len("_handle_"):] in chain and h[len("_handle_"):] not in table}
+        self.assertEqual(missing, set(),
+                         f"in-chain bare-word consumers missing from the table: {missing}")
+
+    def test_the_post_chain_consumer_is_accounted_for(self):
+        """`convert` consumes a bare confirm word but is called after the chain, so
+        it has no chain position and must be listed separately rather than dropped."""
+        self.assertIn("_handle_convert_to_tasks", self._bare_word_handlers())
+        self.assertNotIn("convert_to_tasks", self._chain_order())
+        self.assertIn("convert", m._POST_CHAIN_CONSUMERS)
+        self.assertIn("convert", m.consuming_flows())
+
+    def test_fix_is_the_only_flow_that_cannot_consume_a_bare_word(self):
+        self.assertEqual(m._NON_CONSUMING_FLOWS, frozenset({"fix"}))
+        self.assertNotIn("fix", m.consuming_flows())
+        self.assertNotIn("_handle_nutrition_fix", self._bare_word_handlers())
+
+    def test_every_probed_flow_is_either_consuming_or_named_non_consuming(self):
+        """`_open_pending_flows` can return 13 flow names. Each must be classified,
+        or the arbiter would silently ignore one it should have counted."""
+        probed = set(m._QUALIFIED_SUFFIX)
+        unclassified = probed - m.consuming_flows() - m._NON_CONSUMING_FLOWS
+        self.assertEqual(unclassified, set(),
+                         f"flows that are neither consuming nor declared non-consuming: "
+                         f"{unclassified}")
 
     def test_first_match_wins_is_computed_from_the_table(self):
         self.assertEqual(m._would_have_picked(["swap", "calendar"])[0], "calendar")
         self.assertEqual(m._would_have_picked(["disposition", "swap"])[0], "swap")
         self.assertEqual(m._would_have_picked(["staples", "target"])[0], "target")
+        # the corrections: duplicate beats everything, dossier beats rule
+        self.assertEqual(m._would_have_picked(["swap", "duplicate"])[0], "duplicate")
+        self.assertEqual(m._would_have_picked(["rule", "dossier"])[0], "dossier")
+        self.assertEqual(m._would_have_picked(["org", "disposition"])[0], "org")
 
-    def test_open_flows_no_handler_would_have_claimed_are_reported_apart(self):
-        """dossier/org/duplicate/convert/fix make a bare word ambiguous without
-        any handler ever having been able to claim it."""
-        picked, unclaimable = m._would_have_picked(["dossier", "fix"])
-        self.assertIsNone(picked)
-        self.assertEqual(unclaimable, ["dossier", "fix"])
-        picked, unclaimable = m._would_have_picked(["swap", "dossier"])
+    def test_the_post_chain_consumer_loses_to_every_chain_one(self):
+        self.assertEqual(m._would_have_picked(["convert", "disposition"])[0], "disposition")
+        self.assertEqual(m._would_have_picked(["convert"])[0], "convert")
+
+    def test_only_a_non_consuming_flow_is_reported_as_unclaimable(self):
+        picked, unclaimable = m._would_have_picked(["swap", "fix"])
         self.assertEqual(picked, "swap")
-        self.assertEqual(unclaimable, ["dossier"])
+        self.assertEqual(unclaimable, ["fix"])
+        picked, unclaimable = m._would_have_picked(["dossier", "fix"])
+        self.assertEqual(picked, "dossier")      # NOT None — dossier writes on a yes
+        self.assertEqual(unclaimable, ["fix"])
+
+
+class TestArbiterCountsOnlyConsumers(unittest.TestCase):
+    """Ryan's call, 2026-09-28: a flow that could not have claimed the bare word
+    must not make it ambiguous."""
+
+    def setUp(self):
+        m._arb_decisions.clear()
+
+    def _arbitrate(self, flows, unreadable=()):
+        cur = Cur()
+        with _patched(cur), \
+             mock.patch.object(m, "_open_pending_flows",
+                               return_value=(list(flows), list(unreadable))):
+            reply = m._arbitrate_bare_control_word(CH, "yes")
+        return reply, cur
+
+    def test_a_consuming_and_a_non_consuming_pending_is_not_ambiguous(self):
+        """The whole point: `fix` open alongside `swap` used to refuse a bare yes
+        that only `swap` could ever have taken."""
+        reply, cur = self._arbitrate(["swap", "fix"])
+        self.assertIsNone(reply)
+        self.assertEqual(cur.written, [])          # nothing to decide, nothing recorded
+
+    def test_two_consuming_pendings_still_disambiguate(self):
+        reply, cur = self._arbitrate(["swap", "calendar"])
+        self.assertIsNotNone(reply)
+        self.assertEqual(len(cur.written), 1)
+
+    def test_an_unreadable_consumer_still_disambiguates(self):
+        """FAIL-CLOSED where it matters: 'might be open' is dangerous for a flow
+        that could act on the word."""
+        reply, _cur = self._arbitrate(["swap"], ["calendar"])
+        self.assertIsNotNone(reply)
+
+    def test_an_unreadable_NON_consumer_does_not(self):
+        """`fix` unreadable is not a competing claim, because even open it could
+        not have taken the word."""
+        reply, _cur = self._arbitrate(["swap"], ["fix"])
+        self.assertIsNone(reply)
+
+    def test_the_four_corrected_flows_still_count(self):
+        """dossier/org/duplicate/convert DO consume a bare yes — two of them write
+        — so excluding them would have reintroduced the CONFIRM-ARB bug."""
+        for other in ("dossier", "org", "duplicate", "convert"):
+            with self.subTest(flow=other):
+                m._arb_decisions.clear()
+                reply, _cur = self._arbitrate(["swap", other])
+                self.assertIsNotNone(reply, f"{other} must still cause disambiguation")
+
+    def test_only_non_consuming_flows_are_left_out_of_the_reply(self):
+        reply, _cur = self._arbitrate(["swap", "calendar", "fix"])
+        self.assertIn("swap", reply)
+        self.assertIn("calendar", reply)
+        self.assertNotIn("fix", reply)      # offering `yes fix` would be broken advice
+
+
+class TestQualifiedFormsAllWork(unittest.TestCase):
+    """Every flow the arbiter offers a qualified form for must have a handler that
+    strips it — otherwise the disambiguation reply is advice that does nothing."""
+
+    def test_each_consuming_flow_has_a_handler_that_strips_its_suffix(self):
+        src = inspect.getsource(m)
+        for flow in sorted(m.consuming_flows()):
+            with self.subTest(flow=flow):
+                self.assertIn(f'_strip_qualifier(question, "{flow}"', src.replace(
+                    '_strip_qualifier(question, "target", "staples")',
+                    '_strip_qualifier(question, "target") _strip_qualifier(question, "staples")'))
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +276,21 @@ class TestArbitrationDecision(unittest.TestCase):
         self.assertIsNone(a["would_have_picked_note"])
 
     def test_unreadable_stores_are_recorded_as_such(self):
-        _reply, cur = self._arbitrate(["swap"], ["fix"])
+        """The unreadable store has to be a CONSUMING one to count at all — this
+        test used `fix`, which stopped counting on 2026-09-28 and is why it is now
+        `calendar`."""
+        _reply, cur = self._arbitrate(["swap"], ["calendar"])
         a = json.loads(cur.written[0]["assumptions"])
-        self.assertEqual(a["unreadable_flows"], ["fix"])
+        self.assertEqual(a["unreadable_flows"], ["calendar"])
 
-    def test_when_nothing_could_have_claimed_it_the_row_says_why(self):
+    def test_dossier_and_org_are_recorded_as_real_claimants(self):
+        """This test asserted the opposite before 2026-09-28, on the belief that
+        neither could claim a bare `yes`. Both execute a write on one."""
         _reply, cur = self._arbitrate(["dossier", "org"])
         a = json.loads(cur.written[0]["assumptions"])
-        self.assertIsNone(a["would_have_picked"])
-        self.assertIn("would have executed nothing", a["would_have_picked_note"])
-        self.assertEqual(a["open_without_bare_claimant"], ["dossier", "org"])
+        self.assertEqual(a["would_have_picked"], "dossier")     # chain order
+        self.assertIsNone(a["would_have_picked_note"])
+        self.assertEqual(a["open_without_bare_claimant"], [])
 
     def test_one_pending_records_nothing_and_changes_nothing(self):
         reply, cur = self._arbitrate(["swap"])
