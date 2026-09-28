@@ -42,8 +42,13 @@ class TestEverySeededRow(unittest.TestCase):
     def test_every_row_carries_a_load_config(self):
         for r in self.rows:
             b = r["blocks"]
-            if b.get("type") in ("rest", "recovery_flow"):
-                continue                      # nothing to load
+            if b.get("type") in ("rest", "recovery_flow", "steady", "intervals"):
+                # Nothing to load. A cardio row has no loaded exercise, so a
+                # location whose load inventory is still UNKNOWN (msp_home) can
+                # carry one without the stepper losing anything — and calling
+                # that inventory "confirmed empty" to satisfy this test would be
+                # a claim nobody has made.
+                continue
             with self.subTest(date=r["plan_date"], slot=r.get("slot")):
                 self.assertIn("load_config", b,
                               "a row with no load_config leaves the stepper with nothing")

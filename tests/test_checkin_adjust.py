@@ -646,10 +646,10 @@ class TestFlows(unittest.TestCase):
     def test_nudge_text(self):
         self.assertEqual(hc.nudge_text(office_row(FRI)), "No check-in yet — run Session B as written.")
         self.assertIsNone(hc.nudge_text(rest_row(date(2026, 9, 17))))     # rest day
-        # EVENING-1: 9/25's flow moved to the evening, so its MORNING is a rest
-        # and the nudge — a morning thing — stays silent. The evening is
-        # unprompted by design.
-        self.assertIsNone(hc.nudge_text(office_row(date(2026, 9, 25))))
+        # EVENING-1 moved 9/25's flow to the evening; PROGRAM-2 then made that
+        # Friday a Richfield cardio morning, so the nudge DOES fire now — and it
+        # names the session, which is the point of the nudge.
+        self.assertIn("Zone 2", hc.nudge_text(office_row(date(2026, 9, 25))) or "")
         self.assertIsNone(hc.nudge_text(None))
 
     def test_a_pain_day_off_clears_the_evening_too(self):

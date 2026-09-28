@@ -4513,6 +4513,45 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
 # from — any pending confirm. Deterministic: it must not reach the LLM.
 _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
 
+# PROGRAM-2: `intervals cleared` / `intervals not cleared`. HUMAN-GATED —
+# Artemis never sets this, under any circumstances. It is the Brad Spaits rule
+# applied to his body rather than his mailbox: the flag says a VA provider has
+# cleared him for vigorous exercise, and only he can say that.
+_INTERVALS_CLEARED_RE = re.compile(
+    r"^\s*intervals\s+(?P<neg>not\s+)?cleared\s*[.!]*\s*$", re.I)
+
+
+def _handle_intervals_cleared(post: dict, question: str) -> bool:
+    """`intervals cleared` / `intervals not cleared` — the gate's condition (a)."""
+    m = _INTERVALS_CLEARED_RE.match(question or "")
+    if not m:
+        return False
+    from artemis.interval_gate import CLEARED_KEY
+    from artemis.quiet_hours import set_system_value
+    on = not m.group("neg")
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        set_system_value(CLEARED_KEY, "true" if on else "")
+    except Exception:
+        logger.exception("intervals cleared: could not store the flag")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't store that — it is unchanged. "
+                                         "The traceback is in the log.", root_id=root_id)
+        return True
+    if _mm:
+        _mm.post_message(
+            channel_id,
+            ("Recorded — cleared for intervals. Zone 4 work starts in program week 5, "
+             "and each session still checks that recent cardio is logged and nothing "
+             "hurts.") if on else
+            ("Recorded — NOT cleared. Interval days will run as Zone 2 until you send "
+             "`intervals cleared` again."),
+            root_id=root_id)
+    logger.info("PROGRAM-2: intervals_cleared set to %s by chat command", on)
+    return True
+
+
 # WEEK-AHEAD: `week ahead` — read-only lookahead, no confirm.
 _WEEK_AHEAD_RE = re.compile(r"^\s*week\s+ahead\s*[.!?]*\s*$", re.I)
 
@@ -4885,6 +4924,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         # WEEK-AHEAD `week ahead` — read-only, deterministic, ahead of the LLM so
         # a lookahead is never answered by a guess.
         ("week_ahead", _handle_week_ahead),
+        # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
+        ("intervals_cleared", _handle_intervals_cleared),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
