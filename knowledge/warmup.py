@@ -45,9 +45,23 @@ BROWN_DEER: dict = {
     "cooldown_equipment": "mat",
 }
 
+#: Richfield — APPROVED by Ryan 2026-09-28. Built from the confirmed inventory:
+#: the bike on its trainer, the bands on the wall anchors, and bodyweight. No
+#: elliptical and no Stretch Trainer, so neither office line can appear here.
+RICHFIELD: dict = {
+    "warmup": "3 min easy spin on the bike trainer, 15 band pull-aparts, "
+              "10 bodyweight hip hinges, 10 bodyweight squats",
+    "cooldown": "3 min easy spin, half-kneeling hip flexor stretch 40 s each side, "
+                "band-assisted chest stretch 40 s each side",
+    "cooldown_min": 5,
+    # No `cooldown_equipment`: the bike and the bands are already on the row's
+    # equipment list, and repeating one there would read as a second item.
+}
+
 #: EDIT THIS when an inventory lands, not the code.
 #:
-#: TODO(inventory) — richfield and msp_home still have NO entry, deliberately.
+#: TODO(inventory) — msp_home still has NO entry, deliberately. Richfield left
+#: this list on 2026-09-28, approved from its confirmed inventory.
 #: Until a warmup and a cooldown are confirmed for each, their rows carry the
 #: explicit unknown state. DO NOT invent one: "5 min easy on the rower" is a
 #: guess about both what is in the room and how much of it he wants before a
@@ -55,6 +69,7 @@ BROWN_DEER: dict = {
 BY_LOCATION: dict[str, dict] = {
     "office": OFFICE,
     "brown_deer": BROWN_DEER,
+    "richfield": RICHFIELD,
 }
 
 

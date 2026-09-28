@@ -94,6 +94,12 @@ _reg("Child's pose", {"low back"}, {"hip", "shoulder"})
 # The pain ladder has to be able to reason about a substitute, or a knee flare
 # removes the leg press and leaves the split squat that replaced it.
 _reg("DB split squat", {"legs", "quads"}, {"knee", "hip", "glutes"})
+_reg("Band seated row", {"back"}, {"shoulder", "biceps"})
+_reg("Band incline press", {"chest", "shoulder"}, {"triceps"})
+_reg("Band leg extension", {"quads"}, {"knee"})
+_reg("Band rear delt fly", {"shoulder"}, {"back", "neck"})
+_reg("Band Pallof press", {"core"}, {"shoulder", "low back"})
+_reg("Stability-ball back extension", {"low back"}, {"hamstrings", "hip"})
 _reg("Band lat pulldown", {"back"}, {"shoulder", "biceps"})
 _reg("Stability-ball hamstring curl", {"hamstrings"}, {"knee", "low back"})
 _reg("Band face pull", {"shoulder", "back"}, {"neck"})
