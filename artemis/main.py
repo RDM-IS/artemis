@@ -7,7 +7,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
@@ -4309,6 +4309,101 @@ def _handle_grocery_staples(post: dict, question: str) -> bool:
     return True
 
 
+# ── REPORT-CMD ─────────────────────────────────────────────────────────────
+# `dietitian report [week|fortnight|month|day] [summary]`, or an explicit range.
+# Deterministic (HEALTH-1): a report request must never reach the LLM classifier.
+# Anchored at both ends so "report" alone, or "dietitian" inside a sentence, is
+# NOT a match and still falls through.
+_REPORT_CMD_RE = re.compile(
+    r"^\s*(?:the\s+)?dietitian\s+report"
+    r"(?:\s+(?P<kind>day|week|fortnight|month))?"
+    r"(?:\s+for\s+(?P<start>\d{4}-\d{2}-\d{2})\s+to\s+(?P<end>\d{4}-\d{2}-\d{2}))?"
+    r"(?:\s+(?P<detail>summary|full))?"
+    r"\s*[.!]*\s*$", re.I)
+
+
+def _report_cmd_period(m) -> tuple:
+    """(start, end, detail) from a matched command. Default: fortnight, full."""
+    from artemis import dietitian_report as dr
+    from artemis.quiet_hours import local_today
+    detail = (m.group("detail") or "full").lower()
+    if m.group("start"):
+        start = date.fromisoformat(m.group("start"))
+        end = date.fromisoformat(m.group("end"))
+        return start, end, detail
+    kind = (m.group("kind") or "fortnight").lower()
+    start, end = dr.period(kind, local_today())
+    return start, end, detail
+
+
+def _handle_dietitian_report(post: dict, question: str) -> bool:
+    """REPORT-CMD — build the dietitian report on demand and attach the PDF.
+
+    Ryan's own channel, on his own request: this is not external comms. It
+    NEVER emails, drafts, or posts anywhere but the channel the request came
+    from, and it is on demand only — nothing here is scheduled.
+    """
+    m = _REPORT_CMD_RE.match(question or "")
+    if not m:
+        return False
+    from artemis import dietitian_report as dr
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+
+    try:
+        start, end, detail = _report_cmd_period(m)
+    except ValueError as exc:
+        if _mm:
+            _mm.post_message(channel_id, f"I couldn't read that period: {exc}", root_id=root_id)
+        return True
+
+    if end < start:
+        # A user error, not a build failure — say which.
+        if _mm:
+            _mm.post_message(channel_id,
+                             f"That period ends before it starts ({start} → {end}).",
+                             root_id=root_id)
+        return True
+
+    try:
+        r = dr.produce(start, end, detail=detail)
+    except dr.ReportRefused as exc:
+        if _mm:
+            _mm.post_message(channel_id, f"Not sent — {exc}. Nothing was written.",
+                             root_id=root_id)
+        return True
+    except dr.PdfEngineMissing as exc:
+        if _mm:
+            _mm.post_message(
+                channel_id,
+                f"I can't render a PDF here: {exc}\n"
+                f"The HTML renders fine — ask for `dietitian report {detail} --html` "
+                f"or run `scripts/dietitian_report.py --html` on the box.",
+                root_id=root_id)
+        return True
+    except Exception:
+        logger.exception("REPORT-CMD failed")
+        if _mm:
+            _mm.post_message(channel_id, "The report failed to build — nothing was "
+                                         "produced. The traceback is in the log.",
+                             root_id=root_id)
+        return True
+
+    if _mm:
+        try:
+            fid = _mm.upload_file(channel_id, r.filename, r.data, "application/pdf")
+            _mm.post_with_files(channel_id, r.summary_line, [fid], root_id=root_id)
+        except Exception:
+            logger.exception("REPORT-CMD: upload failed")
+            _mm.post_message(channel_id,
+                             f"Built it ({r.summary_line}) but the upload failed — "
+                             f"nothing is attached. The traceback is in the log.",
+                             root_id=root_id)
+    logger.info("dispatch: dietitian_report %s→%s %s (%s pages)",
+                r.start, r.end, r.detail, r.pages)
+    return True
+
+
 _REPEAT_RE = re.compile(r"^\s*(repeat(?:\s+the)?\s+week|yes\s+repeat)\s*[.!]*\s*$", re.I)
 _NO_REPEAT_RE = re.compile(r"^\s*(no\s+repeat|don'?t\s+repeat(?:\s+the\s+week)?)\s*[.!]*\s*$", re.I)
 
@@ -4492,6 +4587,10 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("nutrition_fix", _handle_nutrition_fix),
         # REPEAT-WEEK: `repeat week` / `no repeat` answer the Sunday proposal.
         ("repeat_week", _handle_repeat_week),
+        # REPORT-CMD: `dietitian report …` is deterministic and must not reach the
+        # LLM. Ahead of meal_log / nutrition, whose patterns would otherwise claim
+        # a sentence containing "dietitian".
+        ("dietitian_report", _handle_dietitian_report),
         # PAIN-1: replies in a pain-pattern thread (reflection / dismiss /
         # resolved). After morning_flow so a check-in in the thread is a check-in.
         ("pattern_thread", _handle_pattern_thread),
