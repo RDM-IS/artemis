@@ -750,7 +750,8 @@ def _intervals(week_num: int, location: str = LOCATION, location_key: str = "off
         if not modality:
             blocks["no_equipment"] = True
         est = INTERVAL_WARMUP_MIN + work_min + INTERVAL_COOLDOWN_MIN
-        return blocks, None, "Zone 2", est
+        # target_hr_zone is an INTEGER column -- `_z2` returns 2, not "Zone 2".
+        return blocks, None, 2, est
 
     reps, work_sec, easy_sec = spec
     blocks = {
@@ -780,7 +781,7 @@ def _intervals(week_num: int, location: str = LOCATION, location_key: str = "off
     if not modality:
         blocks["no_equipment"] = True
     est = INTERVAL_WARMUP_MIN + round(reps * (work_sec + easy_sec) / 60) + INTERVAL_COOLDOWN_MIN
-    return blocks, None, "Zone 4", est
+    return blocks, None, 4, est
 
 
 def _rest(week_num: int):

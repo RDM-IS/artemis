@@ -55,3 +55,21 @@ class TestZones(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheRowColumnType(unittest.TestCase):
+    """`health.plan.target_hr_zone` is an INTEGER. The intervals builder first
+    returned "Zone 4" and Postgres refused the whole reseed — which is the column
+    doing its job, but the builder should not have needed telling."""
+
+    def test_every_cardio_builder_returns_an_int_zone(self):
+        from datetime import date
+        from artemis import health_office as office
+        for st, wk in (("cardio_z2", 3), ("cardio_intervals", 3),
+                       ("cardio_intervals", 5), ("cardio_intervals", 7)):
+            with self.subTest(session_type=st, week=wk):
+                _b, _rpe, zone, _est = office._build(
+                    st, wk, location="Richfield", location_key="richfield",
+                    on=date(2026, 10, 11))
+                self.assertIsInstance(zone, int, f"{st} wk{wk} returned {zone!r}")
+                self.assertIn(zone, (2, 4))
