@@ -297,6 +297,12 @@ class ArtemisScheduler:
             # 22:00 — CYCLE-1: re-point the location jobs at tomorrow. Quiet
             # hours, posts nothing.
             CronSpec("location_recompute", "job_location_recompute", 22, 0),
+            # 22:05 — COGNITION-1: close yesterday's decisions by appending an
+            # outcome row to each. After the 21:55 recompute and 22:00 relocate,
+            # well before the 00:15 pre-fill. SILENT: writes only, posts nothing.
+            # It only ever looks at days that have ENDED, so running before
+            # midnight is correct — today's decisions are not yet knowable.
+            CronSpec("cognition_outcomes", "job_cognition_outcomes", 22, 5),
             # Sunday 08:30 / 08:35 — FIXED hours, independent of open time and
             # location (Ryan, 2026-09-19): the weekly health review, then the
             # EVAL-1 post for the week that just ended.
@@ -1152,6 +1158,23 @@ class ArtemisScheduler:
                     logger.debug("last_morning_brief_at write failed", exc_info=True)
         except Exception:
             logger.exception("Morning brief generation failed")
+
+    def job_cognition_outcomes(self):
+        """COGNITION-1 — append an outcome row to every decision that can now be
+        closed. Silent: writes only, posts nothing.
+
+        A decision made today is not yet knowable, which is not an error — those
+        rows are simply left for tomorrow. Nothing here ever UPDATEs a decision
+        row (Ryan's decision (a)).
+        """
+        from artemis import cognition_outcomes
+        from knowledge.db import get_connection
+        try:
+            with get_connection() as conn:
+                counts = cognition_outcomes.run(conn.cursor())
+            logger.info("COGNITION outcomes: %s", counts)
+        except Exception:
+            logger.exception("Cognition outcome job failed")
 
     def job_drift_alarm(self):
         """DRIFT-ALARM — hourly in the wake and open phases: is what is running
