@@ -402,9 +402,9 @@ def main() -> int:
 
         cur.execute("""
             INSERT INTO acos.audit_log (agent, persona, action, domain, confidence,
-                                        outcome, token_count, api_cost_usd, metadata)
+                                        outcome, token_count, api_cost_usd, metadata, source)
             VALUES ('cycle2', NULL, 'leave_week_overrides', 'health', NULL, 'executed',
-                    0, 0, CAST(%s AS jsonb))
+                    0, 0, CAST(%s AS jsonb), 'script')
         """, (json.dumps({
             "window": [str(start), str(end)],
             "requested": {str(d): list(v) for d, v in WANT.items()},
