@@ -1155,10 +1155,8 @@ class TestRichfieldStrengthA(unittest.TestCase):
     """PROGRAM-2 (Ryan, 2026-09-28): Richfield can hold Strength A."""
 
     def _blocks(self):
-        a, b, c = _offline()
-        with a, b, c:
-            return office._build("strength_a", 3, location="Richfield",
-                                 location_key="richfield")[0]
+        return office._build("strength_a", 3, location="Richfield",
+                             location_key="richfield")[0]
 
     def test_richfield_can_hold_strength_a(self):
         self.assertTrue(office.can_hold("richfield", "strength_a"))
