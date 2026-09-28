@@ -147,6 +147,13 @@ _EXERCISES: dict[str, list[tuple[str, str, int, bool, bool]]] = {
 # build error, not a silent `dumbbell`.
 EQUIPMENT_CLASS: dict[str, str] = {
     # office — machines
+    # PROGRAM-2 Richfield Strength B (Ryan, 2026-09-28)
+    "Band seated row": "bands",
+    "Band incline press": "bands",
+    "Band leg extension": "bands",
+    "Band rear delt fly": "bands",
+    "Band Pallof press": "bands",
+    "Stability-ball back extension": "bodyweight",
     # PROGRAM-2 Richfield Strength A (Ryan, 2026-09-28)
     "DB split squat": "dumbbell",
     "Band lat pulldown": "bands",
@@ -249,6 +256,31 @@ RICHFIELD_SUBS: dict[str, tuple[str, str, int, bool]] = {
     "Ab machine crunch": ("Stability-ball crunch", "10-12", 12, False),
 }
 
+#: Richfield STRENGTH B — APPROVED by Ryan 2026-09-28, exactly as drafted.
+#: DB goblet squat is deliberately ABSENT: PowerBlocks are native here.
+#:
+#: The incline press is the one that needed an argument. There is no incline
+#: bench, and the three honest options were a band incline press from a low
+#: anchor, a DB floor press and a DB flat press. The band keeps the INCLINE
+#: ANGLE, which is the upper-chest bias the movement exists for; either DB option
+#: just repeats Strength A's flat bench press and the week would carry two flat
+#: presses and no incline. The tension curve is the trade -- a band is hardest at
+#: lockout where a dumbbell is hardest at the stretch -- so the RPE does not map
+#: across from the office version, and that is a known cost, not an oversight.
+#:
+#: Four of these need an anchor at a SPECIFIC HEIGHT, which the wall boards give
+#: (every 6" from 6" off the floor to the ceiling). CLASS-ATTRIBUTES: `bands` says
+#: what the implement is, not that the room can anchor it where the movement
+#: needs -- so the height is named in each case rather than assumed.
+RICHFIELD_B_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Seated cable row": ("Band seated row", "10-12", 12, False),
+    "Incline DB press": ("Band incline press", "8-12", 12, False),
+    "Leg extension": ("Band leg extension", "10-12", 12, False),
+    "Rear delt fly": ("Band rear delt fly", "12-15", 15, False),
+    "Cable Pallof press": ("Band Pallof press", "10", 10, True),
+    "Seated back extension": ("Stability-ball back extension", "10-12", 12, False),
+}
+
 #: Richfield STRENGTH A — approved by Ryan 2026-09-28 as part of PROGRAM-2.
 #: DB bench press is deliberately ABSENT: the flat bench is native here, so that
 #: movement runs unchanged and a substitution row for it would be a lie.
@@ -271,7 +303,8 @@ LOCATION_EQUIPMENT: dict[str, list[str]] = {
 
 #: Which office session each location can hold, and how.
 LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int, bool]]]] = {
-    "richfield": {"strength_a": RICHFIELD_A_SUBS, "strength_c": RICHFIELD_SUBS},
+    "richfield": {"strength_a": RICHFIELD_A_SUBS, "strength_b": RICHFIELD_B_SUBS,
+                  "strength_c": RICHFIELD_SUBS},
 }
 
 

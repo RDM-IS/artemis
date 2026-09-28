@@ -30,8 +30,8 @@ class TestConfigIsTheSourceOfTruth(unittest.TestCase):
 
     def test_only_measured_rooms_have_an_entry(self):
         """A room with no confirmed inventory must NOT have an invented entry."""
-        self.assertEqual(set(prep.BY_LOCATION), {"office", "brown_deer"})
-        for key in ("richfield", "msp_home", "outside", "hotel"):
+        self.assertEqual(set(prep.BY_LOCATION), {"office", "brown_deer", "richfield"})
+        for key in ("msp_home", "outside", "hotel"):
             with self.subTest(location=key):
                 self.assertFalse(prep.is_known(key))
                 self.assertIsNone(prep.warmup_for(key))
@@ -58,17 +58,18 @@ class TestConfigIsTheSourceOfTruth(unittest.TestCase):
         self.assertNotIn("Stretch Trainer", b["equipment"])
 
     def test_adding_a_location_needs_no_code_change(self):
-        added = dict(prep.BY_LOCATION, richfield={"warmup": "3 min easy row",
+        added = dict(prep.BY_LOCATION, hotel={"warmup": "3 min easy row",
                                                   "cooldown": "2 min stretch",
                                                   "cooldown_min": 2})
         with patch.object(prep, "BY_LOCATION", added):
-            b, *_ = office._build("strength_c", 3, location="Richfield",
-                                  location_key="richfield")
+            b, *_ = office._build("strength_c", 3, location="Hotel gym",
+                                  location_key="hotel")
         self.assertEqual(b["warmup"], "3 min easy row")
         self.assertEqual(b["cooldown"], "2 min stretch")
         self.assertNotIn("prep_unknown", b)
         # and it is gone again once the patch lifts
-        self.assertFalse(prep.is_known("richfield"))
+        # richfield joined BY_LOCATION on 2026-09-28 (approved); msp_home has not.
+        self.assertFalse(prep.is_known("msp_home"))
 
 
 class TestTheUnknownStateIsExplicit(unittest.TestCase):
@@ -76,7 +77,7 @@ class TestTheUnknownStateIsExplicit(unittest.TestCase):
 
     def setUp(self):
         self.b, *_ = office._build("strength_c", 3, location="Richfield",
-                                   location_key="richfield")
+                                   location_key="msp_home")
 
     def test_no_office_warmup_or_cooldown_reaches_a_non_office_row(self):
         self.assertNotIn("warmup", self.b)
@@ -99,7 +100,7 @@ class TestTheUnknownStateIsExplicit(unittest.TestCase):
 
     def test_cardio_at_an_unconfigured_location_is_the_same(self):
         b, *_ = office._build("cardio_z2", 3, location="Richfield",
-                              location_key="richfield")
+                              location_key="msp_home")
         self.assertTrue(b["prep_unknown"])
         self.assertNotIn("cooldown", b)
 
@@ -126,7 +127,7 @@ class TestTheOfficeIsUnchanged(unittest.TestCase):
 
     def test_an_unconfigured_location_gets_no_cooldown_minutes(self):
         _, _, _, est = office._build("cardio_z2", 3, location="Richfield",
-                                     location_key="richfield")
+                                     location_key="msp_home")
         self.assertEqual(est, 30)
 
 
@@ -134,7 +135,7 @@ class TestTheValidatorReportsIt(unittest.TestCase):
     def test_an_unconfigured_row_is_named_in_the_findings(self):
         rows = [{"plan_date": __import__("datetime").date(2026, 10, 2), "slot": "morning",
                  "session_type": "strength_c", "week_num": 3,
-                 "blocks": {"location_key": "richfield", "prep_unknown": True},
+                 "blocks": {"location_key": "msp_home", "prep_unknown": True},
                  "est_duration_min": 55}]
         notes = []
         # exercise only the LOCATION-1 findings loop, not the whole validator
@@ -144,7 +145,7 @@ class TestTheValidatorReportsIt(unittest.TestCase):
                 notes.append(f"{r['plan_date']}: {r['session_type']} at {key} has NO "
                              "configured warmup or cooldown")
         self.assertEqual(len(notes), 1)
-        self.assertIn("richfield", notes[0])
+        self.assertIn("msp_home", notes[0])
 
 
 if __name__ == "__main__":
