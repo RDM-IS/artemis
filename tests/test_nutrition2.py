@@ -620,3 +620,39 @@ class TestReReviewFindings(unittest.TestCase):
         joined = " | ".join(cur.sql)
         self.assertIn("UPDATE nutrition.target SET kcal", joined)
         self.assertNotIn("INSERT INTO nutrition.target", joined)
+
+
+class TestPostMealWalk(unittest.TestCase):
+    """PROGRAM-2 (Ryan, 2026-09-28): one line after lunch and dinner. No new
+    scheduled automation — it rides on a reply he is already reading."""
+
+    D = date(2027, 6, 7)
+
+    def test_lunch_and_dinner_get_the_line(self):
+        for slot in ("lunch", "dinner"):
+            with self.subTest(slot=slot):
+                self.assertEqual(meal_log.post_meal_walk_line(slot, self.D, self.D),
+                                 meal_log.WALK_LINE)
+
+    def test_breakfast_and_snacks_do_not(self):
+        """A line on every logged item is a nag, and a nag is how a true line
+        stops being read."""
+        for slot in ("breakfast", "snack", None, ""):
+            with self.subTest(slot=slot):
+                self.assertIsNone(meal_log.post_meal_walk_line(slot, self.D, self.D))
+
+    def test_back_logging_an_earlier_day_gets_no_line(self):
+        """The advice is about the next ten minutes."""
+        from datetime import timedelta
+        self.assertIsNone(
+            meal_log.post_meal_walk_line("dinner", self.D - timedelta(1), self.D))
+
+    def test_the_line_says_what_it_is_for(self):
+        self.assertIn("10-minute", meal_log.WALK_LINE)
+        self.assertIn("glucose", meal_log.WALK_LINE)
+
+    def test_it_is_not_a_scheduled_job(self):
+        """No new standing automation: nothing in the scheduler fires this."""
+        import inspect
+        from artemis import scheduler
+        self.assertNotIn("post_meal_walk", inspect.getsource(scheduler))
