@@ -30,7 +30,7 @@ class TestConfigIsTheSourceOfTruth(unittest.TestCase):
 
     def test_only_measured_rooms_have_an_entry(self):
         """A room with no confirmed inventory must NOT have an invented entry."""
-        self.assertEqual(set(prep.BY_LOCATION), {"office", "brown_deer"})
+        self.assertEqual(set(prep.BY_LOCATION), {"office", "brown_deer", "richfield"})
         for key in ("msp_home", "outside", "hotel"):
             with self.subTest(location=key):
                 self.assertFalse(prep.is_known(key))
@@ -62,8 +62,8 @@ class TestConfigIsTheSourceOfTruth(unittest.TestCase):
                                                   "cooldown": "2 min stretch",
                                                   "cooldown_min": 2})
         with patch.object(prep, "BY_LOCATION", added):
-            b, *_ = office._build("strength_c", 3, location="Richfield",
-                                  location_key="msp_home")
+            b, *_ = office._build("strength_c", 3, location="Hotel gym",
+                                  location_key="hotel")
         self.assertEqual(b["warmup"], "3 min easy row")
         self.assertEqual(b["cooldown"], "2 min stretch")
         self.assertNotIn("prep_unknown", b)
