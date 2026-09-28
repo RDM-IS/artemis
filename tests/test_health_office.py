@@ -481,3 +481,20 @@ class TestNaming(unittest.TestCase):
         self.assertEqual(
             [office.display_name_for(f"strength_{x}") for x in "abc"],
             ["Strength A", "Strength B", "Strength C"])
+
+
+class TestNamingIsMappedForPain(unittest.TestCase):
+    """Every name the builder emits must resolve in the pain-region map.
+
+    That map is keyed by DISPLAY NAME, so a rename silently unhooks the pain
+    ladder: after NAMING, "legs pain 3" on a Z2 day stopped becoming a mobility
+    day because the lookup missed. Caught by test_pain_ladder, pinned here.
+    """
+
+    def test_every_cardio_name_resolves(self):
+        from artemis import health_regions as hr
+        for m in (None, "row", "bike", "treadmill", "elliptical"):
+            for st in ("cardio_z2", "cardio_intervals"):
+                name = office.display_name_for(st, modality=m)
+                with self.subTest(name=name):
+                    self.assertTrue(hr.regions_for(name), f"{name} is in no region map")

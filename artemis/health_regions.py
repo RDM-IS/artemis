@@ -115,7 +115,22 @@ _reg("Stability-ball crunch", {"core"})                       # ← Ab machine c
 # ── Weeks 5-6 finisher ──
 _reg("Stepmill or upright bike", {"legs"}, {"knee", "hip"})
 # ── Cardio (steady blocks; rules 2-4 never touch these, listed for coverage) ──
+# The pain ladder looks this map up by the session's DISPLAY NAME, so every name
+# the builder can emit has to be here. NAMING (2026-09-28) made cardio names
+# carry the modality, and until these were added "legs pain 3" on a Z2 day
+# stopped turning it into a mobility day -- the rule did not fire because the
+# lookup missed. "Zone 2 Cardio" stays for rows seeded before the rename.
 _reg("Zone 2 Cardio", {"legs"}, {"knee", "hip"})
+_reg("Zone 2", {"legs"}, {"knee", "hip"})
+_reg("Zone 2 – Row", {"legs"}, {"knee", "hip", "low back"})
+_reg("Zone 2 – Bike", {"legs"}, {"knee", "hip"})
+_reg("Zone 2 – Treadmill", {"legs"}, {"knee", "hip"})
+_reg("Zone 2 – Elliptical", {"legs"}, {"knee", "hip"})
+_reg("Intervals", {"legs"}, {"knee", "hip"})
+_reg("Row intervals", {"legs"}, {"knee", "hip", "low back"})
+_reg("Bike intervals", {"legs"}, {"knee", "hip"})
+_reg("Treadmill intervals", {"legs"}, {"knee", "hip"})
+_reg("Elliptical intervals", {"legs"}, {"knee", "hip"})
 _reg("Recovery Z2 + Mobility", {"legs"}, {"knee", "hip"})
 _reg("Treadmill incline walk", {"legs"}, {"calves", "knee", "hip"})
 _reg("Elliptical", {"legs"}, {"knee", "hip"})
