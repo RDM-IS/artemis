@@ -472,6 +472,10 @@ class _LogCaptureSession:
 
     def __init__(self, fixtures: dict | None = None):
         self.inserted: list[dict] = []
+        #: ZONE-0: what was written to health.session_hr_zones, and the watch
+        #: samples the endpoint is allowed to see.
+        self.zone_writes: list = []
+        self.hr_samples: list = []
         self.committed = False
         self.rolled_back = False
         self._fixtures = fixtures or {}
@@ -482,10 +486,30 @@ class _LogCaptureSession:
         # Like SQLAlchemy: every :bind in the statement must be supplied. The
         # fake used to accept anything, so a missing bind shipped (2026-09-25)
         # and 500ed every POST carrying session_rpe in production.
+        class _Empty:
+            def mappings(self): return self
+            def all(self): return []
+            def first(self): return None
+
+        class _Rows:
+            def __init__(self, rows): self.rows = rows
+            def mappings(self): return self
+            def all(self): return self.rows
+            def first(self): return self.rows[0] if self.rows else None
+
         import re as _re
         binds = set(_re.findall(r"(?<![:\w]):([a-z_][a-z0-9_]*)", str(stmt), _re.I))
         missing = binds - set((params or {}).keys())
         assert not missing, f"unbound parameters {sorted(missing)} in {str(stmt)[:80]!r}"
+        if sql.startswith("insert") and "session_hr_zones" in sql:
+            # ZONE-0 writes a second table from this endpoint. Without this
+            # branch the fake treated it as a session_log insert and died on
+            # params["log_type"], which made a working feature look like a
+            # rolled-back transaction.
+            self.zone_writes.append(params)
+            return _Empty()
+        if sql.startswith("select") and "watch_heart_rate" in sql:
+            return _Rows(self.hr_samples)
         if sql.startswith("insert"):
             assert params is not None
             self._log_counter += 1
@@ -663,6 +687,84 @@ class TestLogEndpoint(unittest.TestCase):
         self.assertEqual([r["log_type"] for r in sess.inserted], ["cardio_block", "session_summary"])
         self.assertTrue(sess.committed)
         self.assertFalse(sess.rolled_back)
+
+    # ── ZONE-0: the Finish-cardio card's zone line ─────────────────────────
+    def _cardio_post(self, samples):
+        from datetime import timedelta as _td
+        client, self.app, sess = _build_log_client()
+        # The endpoint's window is [logged_at - duration, logged_at]; the fake
+        # stamps logged_at at 2026-06-08 18:30. Synthetic bpm only.
+        end = datetime(2026, 6, 8, 18, 30, 0)
+        sess.hr_samples = [{"measured_at": end - _td(seconds=1980) + _td(seconds=s_i),
+                            "bpm": bpm} for s_i, bpm in samples]
+        resp = client.post(
+            "/api/health/log",
+            headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": "Zone 2 Cardio", "log_type": "cardio_block",
+                  "modality": "row", "device": "water",
+                  "sets": [{"duration_sec": 1980, "rpe_actual": 6}], "session_rpe": 6},
+        )
+        return resp, sess
+
+    def test_a_cardio_log_comes_back_with_its_zone_line(self):
+        dense = [(i * 30, 110 if i < 44 else 145) for i in range(66)]
+        resp, sess = self._cardio_post(dense)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        hz = resp.json()["hr_zones"]
+        self.assertEqual(hz["status"], "ok")
+        self.assertIn("Z2", hz["line"])
+        self.assertIn("min", hz["line"])
+        self.assertEqual(len(sess.zone_writes), 1)
+        self.assertEqual(sess.zone_writes[0]["status"], "ok")
+
+    def test_sparse_samples_say_so_instead_of_showing_zeros(self):
+        resp, sess = self._cardio_post([(0, 110), (900, 112)])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        hz = resp.json()["hr_zones"]
+        self.assertEqual(hz["status"], "insufficient_hr_data")
+        self.assertIn("not enough", hz["line"])
+        # The minutes must be absent, not zero: a 0 reads as "no time in Z4".
+        self.assertIsNone(hz["z2_min"])
+        self.assertIsNone(hz["z4_min"])
+        # And it is still RECORDED, so the next reader sees why.
+        self.assertEqual(sess.zone_writes[0]["status"], "insufficient_hr_data")
+
+    def test_no_samples_at_all(self):
+        resp, _sess = self._cardio_post([])
+        hz = resp.json()["hr_zones"]
+        self.assertEqual(hz["status"], "no_samples")
+        self.assertIsNone(hz["z2_min"])
+
+    def test_a_strength_log_gets_no_zone_block_at_all(self):
+        """None means "not a cardio block", never "no time in any zone"."""
+        client, self.app, sess = _build_log_client()
+        resp = client.post(
+            "/api/health/log", headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": "Leg press", "log_type": "strength_set",
+                  "sets": [{"set_num": 1, "reps_done": 10, "weight_lbs": 100}]})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["hr_zones"])
+        self.assertEqual(sess.zone_writes, [])
+
+    def test_a_failure_computing_zones_never_costs_the_log(self):
+        """The session is already committed when ZONE-0 runs. A heart-rate read
+        that explodes must lose a nice-to-have line, not a logged workout."""
+        client, self.app, sess = _build_log_client()
+        orig = sess.execute
+
+        def boom(stmt, params=None):
+            if "watch_heart_rate" in str(stmt).lower():
+                raise RuntimeError("down")
+            return orig(stmt, params)
+        sess.execute = boom
+        resp = client.post(
+            "/api/health/log", headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": "Zone 2 Cardio", "log_type": "cardio_block",
+                  "modality": "row", "device": "water",
+                  "sets": [{"duration_sec": 1980, "rpe_actual": 6}]})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["hr_zones"])
+        self.assertEqual([r["log_type"] for r in sess.inserted], ["cardio_block"])
 
     # ── ADHOC-LOG ──────────────────────────────────────────────────────────
     def _adhoc(self, fixtures=None, **extra):

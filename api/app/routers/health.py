@@ -601,6 +601,90 @@ class LogSetIn(BaseModel):
     notes: Optional[str] = None
 
 
+class HrZonesOut(BaseModel):
+    """ZONE-0: what the watch says about a session just logged."""
+    status: str                       # ok | insufficient_hr_data | no_samples | bad_window
+    line: str                         # "Z2 31 min · Z4 6 min", or why not
+    z1_min: Optional[int] = None
+    z2_min: Optional[int] = None
+    z3_min: Optional[int] = None
+    z4_min: Optional[int] = None
+    z5_min: Optional[int] = None
+    sample_count: int = 0
+
+
+def _zone_line(status: str, z: Optional[dict]) -> str:
+    """The one line a card shows. Says WHY rather than showing zeros when the
+    samples do not support a number — a 0 here would read as "you spent no time
+    in Z4", which is a training fact, not a data gap."""
+    if status != "ok" or not z:
+        return {"insufficient_hr_data": "not enough heart-rate data",
+                "no_samples": "no heart-rate data for this session",
+                "bad_window": "couldn't tell when this session ran"}.get(
+                    status, "no heart-rate data")
+    parts = [f"{name} {z[name]} min" for name in ("Z1", "Z2", "Z3", "Z4", "Z5")
+             if z.get(name)]
+    return " · ".join(parts) if parts else "below Z1 throughout"
+
+
+def _store_zone_minutes(db: Session, plan_id: Optional[int],
+                        inserted_rows: list) -> Optional["HrZonesOut"]:
+    """Compute and store ZONE-0 minutes for a just-logged cardio block.
+
+    Returns None when this was not a cardio block with a duration -- there is
+    nothing to say, and an empty breakdown would imply there was.
+    """
+    if not plan_id:
+        return None
+    durations = [r for r in inserted_rows
+                 if r.get("log_type") == "cardio_block" and r.get("duration_sec")]
+    if not durations:
+        return None
+    from knowledge import zones as _zones
+    try:
+        best = max(durations, key=lambda r: int(r["duration_sec"]))
+        end = best["logged_at"]
+        start = end - timedelta(seconds=int(best["duration_sec"]))
+        samples = [(r["measured_at"], r["bpm"]) for r in db.execute(text(
+            "SELECT measured_at, bpm FROM health.watch_heart_rate "
+            "WHERE measured_at BETWEEN :a AND :b AND bpm IS NOT NULL "
+            "ORDER BY measured_at"), {"a": start, "b": end}).mappings().all()]
+        out = _zones.minutes_by_zone(samples, start, end)
+        z = out.get("zones") or {}
+        db.execute(text(
+            "INSERT INTO health.session_hr_zones (plan_id, window_start, window_end, "
+            "  window_source, status, sample_count, counted_sec, unaccounted_sec, "
+            "  z1_min, z2_min, z3_min, z4_min, z5_min, hr_max_used, zones_source) "
+            "VALUES (:plan_id, :ws, :we, 'cardio_block duration', :status, :n, :c, :u, "
+            "  :z1, :z2, :z3, :z4, :z5, :hrmax, :src) "
+            "ON CONFLICT (plan_id) DO UPDATE SET window_start = EXCLUDED.window_start, "
+            "  window_end = EXCLUDED.window_end, window_source = EXCLUDED.window_source, "
+            "  status = EXCLUDED.status, sample_count = EXCLUDED.sample_count, "
+            "  counted_sec = EXCLUDED.counted_sec, unaccounted_sec = EXCLUDED.unaccounted_sec, "
+            "  z1_min = EXCLUDED.z1_min, z2_min = EXCLUDED.z2_min, z3_min = EXCLUDED.z3_min, "
+            "  z4_min = EXCLUDED.z4_min, z5_min = EXCLUDED.z5_min, "
+            "  hr_max_used = EXCLUDED.hr_max_used, zones_source = EXCLUDED.zones_source, "
+            "  computed_at = now()"),
+            {"plan_id": plan_id, "ws": start, "we": end, "status": out["status"],
+             "n": out.get("sample_count", 0), "c": out.get("counted_sec", 0),
+             "u": out.get("unaccounted_sec", 0),
+             "z1": z.get("Z1"), "z2": z.get("Z2"), "z3": z.get("Z3"),
+             "z4": z.get("Z4"), "z5": z.get("Z5"),
+             "hrmax": _zones.HR_MAX, "src": _zones.SOURCE})
+        db.commit()
+        return HrZonesOut(status=out["status"], line=_zone_line(out["status"], z),
+                          z1_min=z.get("Z1"), z2_min=z.get("Z2"), z3_min=z.get("Z3"),
+                          z4_min=z.get("Z4"), z5_min=z.get("Z5"),
+                          sample_count=out.get("sample_count", 0))
+    except Exception:                                           # noqa: BLE001
+        # The session IS logged. A failure here costs a nice-to-have line, and
+        # must not cost the log or turn a successful POST into a 500.
+        db.rollback()
+        logger.warning("ZONE-0: could not compute zone minutes for plan %s",
+                       plan_id, exc_info=True)
+        return None
+
+
 class LogExerciseIn(BaseModel):
     """Payload posted by gym-display for one exercise's sets.
 
@@ -658,6 +742,9 @@ class LogResponse(BaseModel):
     adhoc: bool = False
     inserted: int
     rows: list[LogRowOut]
+    #: ZONE-0: present only when a cardio block with a duration was logged.
+    #: None means "not a cardio block", never "no time in any zone".
+    hr_zones: Optional["HrZonesOut"] = None
 
 
 # ADHOC-LOG: a session type is a lowercase slug. Deliberately not a fixed list
@@ -840,8 +927,15 @@ def post_log(
             detail={"error": "insert_failed", "message": str(e)},
         )
 
+    # ZONE-0: compute the zone breakdown once the cardio block is committed, so
+    # the Finish-cardio card can show "Z2 31 min · Z4 6 min" straight away. It
+    # runs AFTER the commit and in its own try: a heart-rate read must never be
+    # able to lose a logged session.
+    hr_zones_out = _store_zone_minutes(db, plan_id, inserted_rows)
+
     return LogResponse(
         plan_id=plan_id,
+        hr_zones=hr_zones_out,
         adhoc=adhoc_type is not None,
         inserted=len(inserted_rows),
         rows=[
@@ -1762,6 +1856,16 @@ class CardioGoal(BaseModel):
     z2_minutes: Optional[int] = None
     z4_minutes: Optional[int] = None
     has_zone_data: bool = False
+    #: ZONE-0: "watch" when the minutes came from heart-rate samples,
+    #: "logged" when they are session durations with no HR behind them. The card
+    #: must say which, because "48 min in Z2" and "48 min of cardio" are
+    #: different claims and only one of them is about intensity.
+    zone_source: Optional[str] = None
+    #: How many of this week's cardio sessions have a usable zone breakdown, and
+    #: how many were looked at. A tile showing zones from one of four sessions
+    #: should not imply it covered the week.
+    zone_sessions: int = 0
+    zone_sessions_total: int = 0
     #: From the next cardio_intervals ROW, which is where the wake job writes the
     #: gate's answer. The Lambda deliberately does not evaluate the gate: that
     #: would be a second evaluation against a different read at a different
@@ -2767,13 +2871,39 @@ def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, Car
 
     this_week = [r for r in rows if r["plan_date"] >= week_start]
     minutes = int(round(sum((r["duration_sec"] or 0) for r in this_week) / 60.0))
-    with_hr = [r for r in this_week if r["hr_avg"]]
+
+    # ZONE-0 first: minutes measured from the watch's samples beat minutes
+    # inferred from a session's average, which beat nothing. `hr_avg` is a
+    # single number for a whole session, so bucketing it puts every minute of an
+    # interval session into one zone -- which is the opposite of what an
+    # interval session is. The stored breakdown is per-sample.
     z2 = z4 = None
-    if with_hr:
+    zone_source = None
+    zone_n = 0
+    week_plan_ids = {r["plan_id"] for r in this_week}
+    if week_plan_ids:
+        try:
+            zrows = db.execute(text(
+                "SELECT plan_id, z2_min, z4_min FROM health.session_hr_zones "
+                "WHERE status = 'ok' AND plan_id = ANY(:ids)"),
+                {"ids": list(week_plan_ids)}).mappings().all()
+        except Exception:                                       # noqa: BLE001
+            # The table is ZONE-0-new; an older database simply has no zones.
+            logger.warning("STATUS-2: could not read session_hr_zones", exc_info=True)
+            zrows = []
+        if zrows:
+            z2 = sum(int(r["z2_min"] or 0) for r in zrows)
+            z4 = sum(int(r["z4_min"] or 0) for r in zrows)
+            zone_source = "watch"
+            zone_n = len(zrows)
+
+    with_hr = [r for r in this_week if r["hr_avg"]]
+    if zone_source is None and with_hr:
         z2 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
                            if 105 <= int(r["hr_avg"]) <= 122) / 60.0))
         z4 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
                            if 139 <= int(r["hr_avg"]) <= 157) / 60.0))
+        zone_source = "session_average"
 
     gate = gate_reason = gate_date = None
     try:
@@ -2802,8 +2932,10 @@ def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, Car
         acc["plans"].add(r["plan_id"])
 
     goal = CardioGoal(minutes_this_week=minutes, z2_minutes=z2, z4_minutes=z4,
-                      has_zone_data=bool(with_hr), interval_gate=gate,
-                      interval_gate_reason=gate_reason, interval_gate_date=gate_date)
+                      has_zone_data=zone_source is not None, zone_source=zone_source,
+                      zone_sessions=zone_n, zone_sessions_total=len(week_plan_ids),
+                      interval_gate=gate, interval_gate_reason=gate_reason,
+                      interval_gate_date=gate_date)
     detail = CardioDetail(
         weeks=[CardioWeek(week_start=wk, minutes=int(round(a["secs"] / 60.0)),
                           sessions=len(a["plans"]))
