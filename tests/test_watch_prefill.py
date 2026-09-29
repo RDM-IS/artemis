@@ -129,15 +129,15 @@ class TestNothingCarriedForward(unittest.TestCase):
 
     def rows(self):
         return stored(REAL_NIGHT) + [
-            sample("resting_heart_rate", 64, at(9, 24, DAY - timedelta(days=1))),
-            sample("weight", 282.0, at(3, 47)),
+            sample("resting_heart_rate", 94, at(9, 24, DAY - timedelta(days=1))),
+            sample("weight", 342.0, at(3, 47)),
         ]
 
     def test_yesterdays_resting_hr_is_not_todays(self):
         got = wp.read_values(FakeCursor(self.rows()), DAY, CT)
         self.assertIsNone(got["resting_hr"])
         self.assertEqual(got["missing"], ["resting HR"])
-        self.assertEqual(got["weight_lbs"], 282.0)
+        self.assertEqual(got["weight_lbs"], 342.0)
 
     def test_the_next_morning_gets_nothing_from_this_one(self):
         got = wp.read_values(FakeCursor(self.rows()), DAY + timedelta(days=1), CT)
@@ -146,13 +146,13 @@ class TestNothingCarriedForward(unittest.TestCase):
         self.assertEqual(got["missing"], ["sleep", "resting HR", "weight"])
 
     def test_todays_resting_hr_is_used_once_it_syncs(self):
-        rows = self.rows() + [sample("resting_heart_rate", 65, at(0, 1))]
-        self.assertEqual(wp.read_values(FakeCursor(rows), DAY, CT)["resting_hr"], 65)
+        rows = self.rows() + [sample("resting_heart_rate", 95, at(0, 1))]
+        self.assertEqual(wp.read_values(FakeCursor(rows), DAY, CT)["resting_hr"], 95)
 
     def test_the_watch_wins_over_the_phone_for_resting_hr(self):
-        phone = dict(sample("resting_heart_rate", 70, at(7, 0)), device="iphone")
-        rows = [phone, sample("resting_heart_rate", 58, at(0, 1))]
-        self.assertEqual(wp.read_values(FakeCursor(rows), DAY, CT)["resting_hr"], 58)
+        phone = dict(sample("resting_heart_rate", 100, at(7, 0)), device="iphone")
+        rows = [phone, sample("resting_heart_rate", 88, at(0, 1))]
+        self.assertEqual(wp.read_values(FakeCursor(rows), DAY, CT)["resting_hr"], 88)
 
     def test_there_is_no_lookback_window_left(self):
         src = (ROOT / "knowledge" / "watch_prefill.py").read_text()
@@ -231,10 +231,10 @@ class TestManualWins(unittest.TestCase):
 
 class TestWording(unittest.TestCase):
     def test_the_wake_line_names_values_span_and_what_is_missing(self):
-        got = wp.read_values(FakeCursor(stored(REAL_NIGHT) + [sample("weight", 282.0, at(3, 47))]),
+        got = wp.read_values(FakeCursor(stored(REAL_NIGHT) + [sample("weight", 342.0, at(3, 47))]),
                              DAY, CT)
         self.assertEqual(wp.describe(got, CT),
-                         "From the watch: sleep 5.7h (20:57–03:19), weight 282. "
+                         "From the watch: sleep 5.7h (20:57–03:19), weight 342. "
                          "Not synced: resting HR.")
 
     def test_nothing_synced_says_so_plainly(self):
@@ -243,7 +243,7 @@ class TestWording(unittest.TestCase):
                          "No watch data yet — sleep, resting HR, weight not synced.")
 
     def test_the_line_makes_no_claim_about_quality(self):
-        line = wp.describe({"sleep_hrs": 4.1, "resting_hr": 72, "weight_lbs": 283.0,
+        line = wp.describe({"sleep_hrs": 4.1, "resting_hr": 102, "weight_lbs": 343.0,
                             "missing": []})
         self.assertNotRegex(line.lower(), r"\b(low|high|poor|good|short|below|above|only)\b")
 
@@ -299,8 +299,8 @@ class TestWakeSection(unittest.TestCase):
             yield MagicMock()
 
         with patch("knowledge.db.get_connection", conn), \
-             patch("artemis.watch_prefill.today_line", return_value="From the watch: weight 282."):
-            self.assertEqual(wake._watch_section(), ["", "From the watch: weight 282."])
+             patch("artemis.watch_prefill.today_line", return_value="From the watch: weight 342."):
+            self.assertEqual(wake._watch_section(), ["", "From the watch: weight 342."])
         with patch("knowledge.db.get_connection", side_effect=RuntimeError("db down")), \
              self.assertLogs("artemis.wake", "ERROR"):
             self.assertEqual(wake._watch_section(), [])

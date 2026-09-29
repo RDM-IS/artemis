@@ -29,7 +29,7 @@ SAMPLE = {
             {"name": "heart_rate_variability", "units": "ms",
              "data": [{"date": "2026-09-25 06:12:00 -0500", "qty": 42.5}]},
             {"name": "weight_body_mass", "units": "lb",
-             "data": [{"date": "2026-09-25 06:20:00 -0500", "qty": 281.4}]},
+             "data": [{"date": "2026-09-25 06:20:00 -0500", "qty": 341.4}]},
             {"name": "sleep_analysis", "units": "hr",
              "data": [{"date": "2026-09-25 06:00:00 -0500",
                        "asleep": 7.2, "deep": 1.1, "rem": 1.6, "core": 4.5,

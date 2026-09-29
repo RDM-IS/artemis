@@ -577,7 +577,8 @@ def get_status(
 #
 # Schema notes (see migrations/013_health_schema.sql):
 #   - log_type     IN ('strength_set', 'cardio_block', 'session_summary')
-#   - logged_via   IN ('mattermost', 'voice', 'manual', 'inferred')
+#   - logged_via   IN ('mattermost', 'voice', 'manual', 'inferred',
+#                     'watch_confirmed')   -- CARDIO-DETECT, migration 048
 #
 # `gym-display` writes use logged_via='manual'. The CHECK constraint does NOT
 # accept 'gym_display' today; widening it is a future migration if a separate
@@ -631,13 +632,24 @@ def _store_zone_minutes(db: Session, plan_id: Optional[int],
                         inserted_rows: list) -> Optional["HrZonesOut"]:
     """Compute and store ZONE-0 minutes for a just-logged cardio block.
 
-    Returns None when this was not a cardio block with a duration -- there is
-    nothing to say, and an empty breakdown would imply there was.
+    Returns None when nothing here finished a session -- there is nothing to
+    say, and an empty breakdown would imply there was.
+
+    Widened beyond cardio 2026-09-29: the computation cares about a WINDOW and
+    some samples, not about what the session was. A recovery flow's heart rate
+    is as real as a row's, and the flows are what actually have logs today.
+
+    A `strength_set` is deliberately NOT a trigger even though it carries a
+    duration -- that 20 s is one exercise, not a session, and a 20-second window
+    would produce a breakdown of nothing. The session-finishing logs are a
+    `cardio_block` (Finish cardio) and a `session_summary` with a duration
+    (Finish workout).
     """
     if not plan_id:
         return None
+    FINISHERS = ("cardio_block", "session_summary")
     durations = [r for r in inserted_rows
-                 if r.get("log_type") == "cardio_block" and r.get("duration_sec")]
+                 if r.get("log_type") in FINISHERS and r.get("duration_sec")]
     if not durations:
         return None
     from knowledge import zones as _zones
@@ -655,7 +667,7 @@ def _store_zone_minutes(db: Session, plan_id: Optional[int],
             "INSERT INTO health.session_hr_zones (plan_id, window_start, window_end, "
             "  window_source, status, sample_count, counted_sec, unaccounted_sec, "
             "  z1_min, z2_min, z3_min, z4_min, z5_min, hr_max_used, zones_source) "
-            "VALUES (:plan_id, :ws, :we, 'cardio_block duration', :status, :n, :c, :u, "
+            "VALUES (:plan_id, :ws, :we, :wsrc, :status, :n, :c, :u, "
             "  :z1, :z2, :z3, :z4, :z5, :hrmax, :src) "
             "ON CONFLICT (plan_id) DO UPDATE SET window_start = EXCLUDED.window_start, "
             "  window_end = EXCLUDED.window_end, window_source = EXCLUDED.window_source, "
@@ -665,7 +677,8 @@ def _store_zone_minutes(db: Session, plan_id: Optional[int],
             "  z4_min = EXCLUDED.z4_min, z5_min = EXCLUDED.z5_min, "
             "  hr_max_used = EXCLUDED.hr_max_used, zones_source = EXCLUDED.zones_source, "
             "  computed_at = now()"),
-            {"plan_id": plan_id, "ws": start, "we": end, "status": out["status"],
+            {"plan_id": plan_id, "ws": start, "we": end,
+             "wsrc": f"{best['log_type']} duration", "status": out["status"],
              "n": out.get("sample_count", 0), "c": out.get("counted_sec", 0),
              "u": out.get("unaccounted_sec", 0),
              "z1": z.get("Z1"), "z2": z.get("Z2"), "z3": z.get("Z3"),

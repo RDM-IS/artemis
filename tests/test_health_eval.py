@@ -213,19 +213,19 @@ class TestRecoveryLine(unittest.TestCase):
 
     def checkins(self):
         d = lambda i: WED + timedelta(days=i)  # noqa: E731
-        return [{"state_date": d(0), "sleep_hrs": 7.5, "resting_hr": 54},
-                {"state_date": d(1), "sleep_hrs": 6.5, "resting_hr": 56},
-                {"state_date": d(2), "sleep_hrs": None, "resting_hr": 55},
+        return [{"state_date": d(0), "sleep_hrs": 7.5, "resting_hr": 99},
+                {"state_date": d(1), "sleep_hrs": 6.5, "resting_hr": 101},
+                {"state_date": d(2), "sleep_hrs": None, "resting_hr": 100},
                 {"state_date": d(30), "sleep_hrs": 9.0, "resting_hr": 40}]   # outside the week
 
     def test_averages_only_the_week_and_only_what_exists(self):
         r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE,
                         today=TUE + timedelta(days=1), checkins=self.checkins())
         self.assertEqual(r["recovery"], {"avg_sleep_hrs": 7.0, "sleep_nights": 2,
-                                         "avg_resting_hr": 55, "resting_hr_days": 3})
+                                         "avg_resting_hr": 100, "resting_hr_days": 3})
         line = next(l for l in ev.render_lines(r) if l.startswith("Recovery:"))
         self.assertEqual(line, "Recovery: sleep 7.0h avg over 2 night(s) · "
-                               "resting HR 55 avg over 3 day(s)")
+                               "resting HR 100 avg over 3 day(s)")
 
     def test_no_data_says_so_rather_than_zero(self):
         r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE, today=TUE)

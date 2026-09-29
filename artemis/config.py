@@ -182,6 +182,13 @@ CHECKIN_NUDGE_OFFSET_MIN = int(os.environ.get("CHECKIN_NUDGE_OFFSET_MIN", "45"))
 # this is a lead time and never a clock time — it moves with the day type and
 # with a `set timezone` override.
 MEAL_NUDGE_LEAD_MIN = int(os.environ.get("MEAL_NUDGE_LEAD_MIN", "60"))
+
+#: CARDIO-DETECT: how long BEFORE the day's quiet start to look at the watch.
+#: Like MEAL-NUDGE this hangs off the cycle rather than a clock constant, so it
+#: follows a `set timezone` override and a changed quiet time instead of drifting
+#: away from them. 30 min leaves the proposal visible before the channel goes
+#: quiet, and late enough that an evening session is already in the samples.
+CARDIO_DETECT_LEAD_MIN = int(os.environ.get("CARDIO_DETECT_LEAD_MIN", "30"))
 DEPARTURE_CHECKLIST = _list(
     os.environ.get("DEPARTURE_CHECKLIST", "gym bag, badge, lunch, iPad")
 )

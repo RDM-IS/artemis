@@ -28,32 +28,45 @@ def main() -> int:
 
     with get_connection() as conn:
         cur = conn.cursor()
+        # ZONE-0 was cardio-only at first. Widened 2026-09-29: the computation
+        # cares about a WINDOW and some samples, not about what the session was
+        # -- a recovery flow's heart rate is as real as a row's, and it is the
+        # flows that actually have logs right now. Every slot too: an evening
+        # recovery_flow is a session with a heart rate like any other.
         cur.execute(
-            "SELECT DISTINCT p.plan_id, p.plan_date, p.session_type "
+            "SELECT DISTINCT p.plan_id, p.plan_date, p.slot, p.session_type "
             "FROM health.plan p JOIN health.session_log sl ON sl.plan_id = p.plan_id "
-            # EVENING-1: cardio is a morning session; say so rather than rely on it.
-            "WHERE p.slot = 'morning' AND p.session_type IN %s "
-            "  AND sl.logged_via <> 'inferred' "
-            "ORDER BY p.plan_date", (hr_zones.CARDIO_TYPES,))
+            "WHERE sl.logged_via <> 'inferred' "
+            "ORDER BY p.plan_date, p.slot")
         sessions = cur.fetchall()
 
-        print(f"cardio sessions with at least one real log: {len(sessions)}\n")
+        print(f"sessions with at least one real log: {len(sessions)}\n")
         counts: Counter = Counter()
         rows = []
         for s in sessions:
+            # Positional fallbacks must match the SELECT's column order, which
+            # gained `slot` when this was widened past cardio -- the first run
+            # after that printed every session's type as "morning".
             plan_id = s["plan_id"] if isinstance(s, dict) else s[0]
             plan_date = s["plan_date"] if isinstance(s, dict) else s[1]
-            stype = s["session_type"] if isinstance(s, dict) else s[2]
+            slot = s["slot"] if isinstance(s, dict) else s[2]
+            stype = s["session_type"] if isinstance(s, dict) else s[3]
             row = hr_zones.compute_for_plan(cur, plan_id)
             counts[row["status"]] += 1
             rows.append((plan_date, stype, row))
             line = hr_zones.describe(row)
-            print(f"  {plan_date} {stype:17s} {row['status']:21s} "
+            print(f"  {plan_date} {slot:7s} {stype:15s} {row['status']:21s} "
                   f"samples={row.get('sample_count', 0):5d}  {line}")
 
         print("\nby status:", dict(counts))
         usable = counts.get("ok", 0)
         print(f"sufficient HR data: {usable} of {len(sessions)}")
+        by_type: Counter = Counter()
+        for _d, stype, row in rows:
+            by_type[(stype, row["status"])] += 1
+        print("\nby session type and status:")
+        for (stype, status), n in sorted(by_type.items()):
+            print(f"  {stype:17s} {status:21s} {n}")
 
         if not args.commit:
             print("\nDRY RUN — nothing written.")
