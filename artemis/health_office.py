@@ -26,6 +26,7 @@ import json
 import logging
 from datetime import date, time, timedelta
 
+from knowledge import lift_recomp as _recomp
 from knowledge import warmup as _prep
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,121 @@ EQUIPMENT_CLASS: dict[str, str] = {
 # office movement, which is right for every substitution above but wrong for a
 # split squat — Leg press is not per-side, and prescribing "3×10-12" for a
 # unilateral lift asks for half the work.
+# ── LIFT-RECOMP: the class, pattern and station of every strength movement ──
+#
+# Three facts per exercise, on the row, for the same reason EXERCISE-CLASS put
+# the equipment class there: inference from the name was measured wrong five
+# times in nine. `lift_profile` RAISES on an unknown name, so a new exercise
+# without a profile is a build error rather than a silent "accessory, push, no
+# station".
+#
+#   class    compound | accessory -> which rep range (12-20 vs 15-25)
+#   pattern  push | pull | lower | core -> what may be supersetted with what
+#   station  the thing there is exactly ONE of, which must stay occupied for the
+#            whole set. None means the movement contends for nothing.
+#
+# THE STATION IS THE LOAD-BEARING ONE, AND IT IS EASY TO GET WRONG:
+#   * "Lat pulldown" and "Seated cable row" are the SAME machine here (the
+#     EQUIPMENT_CLASS comment above says so), so they can never be supersetted
+#     together even though one is a pulldown and one is a row.
+#   * every cable movement contends for the single functional trainer.
+#   * "Incline DB press" and "Seated DB shoulder press" both need the one
+#     adjustable bench.
+#   * ASSUMPTION, FLAGGED FOR RYAN: Richfield's band movements are treated as
+#     sharing ONE anchor point. If there are two, density there improves and
+#     these estimates are pessimistic. Over-estimating a session's length is the
+#     safe direction — the reverse runs him out of the office window.
+#: The first week of THIS BLOCK that LIFT-RECOMP governs.
+#:
+#: Block 1 starts it at week 5 (2026-10-11), because weeks 1-4 are already logged
+#: or already in front of him. BLOCK 2 NUMBERS ITS WEEKS 1-6 ALL OVER AGAIN, so a
+#: bare `week_num >= 5` would have given block 2's first four weeks the OLD
+#: strength-biased prescription and only its last two the new one — silently, and
+#: in a block that does not exist yet so nothing would have contradicted it.
+#: `block2._build_one` lowers this to 1 inside the same swap it already does for
+#: RAMP and INTERVAL_WEEKS, which is where block-2-specific tables belong.
+RECOMP_FROM_WEEK = _recomp.FIRST_WEEK
+
+
+def recomp_applies(week_num) -> bool:
+    """True for a week this block applies LIFT-RECOMP to. Fail-closed on junk:
+    an unreadable week keeps the prescription it already has."""
+    try:
+        return int(week_num) >= RECOMP_FROM_WEEK
+    except (TypeError, ValueError):
+        return False
+
+
+_LC, _LP = _recomp.COMPOUND, _recomp.ACCESSORY
+_PUSH, _PULL, _LOWER, _CORE = (_recomp.PUSH, _recomp.PULL, _recomp.LOWER,
+                               _recomp.CORE)
+
+LIFT_PROFILE: dict[str, tuple[str, str, str | None]] = {
+    # office — machines, each its own station except the pulldown/row pair
+    "Leg press":                     (_LC, _LOWER, "leg press"),
+    "Lat pulldown":                  (_LC, _PULL,  "pulldown/row"),
+    "Seated cable row":              (_LC, _PULL,  "pulldown/row"),
+    "Seated leg curl":               (_LP, _LOWER, "leg curl"),
+    "Leg extension":                 (_LP, _LOWER, "leg extension"),
+    "Pec fly":                       (_LP, _PUSH,  "pec fly"),
+    "Rear delt fly":                 (_LP, _PULL,  "rear delt fly"),
+    "Calf press":                    (_LP, _LOWER, "calf press"),
+    "Ab machine crunch":             (_LP, _CORE,  "ab machine"),
+    "Seated back extension":         (_LP, _CORE,  "back extension"),
+    # office — the single functional trainer
+    "Cable face pull (rope)":        (_LP, _PULL,  "functional trainer"),
+    "Cable Pallof press":            (_LP, _CORE,  "functional trainer"),
+    "Single-arm cable row":          (_LP, _PULL,  "functional trainer"),
+    # office — dumbbells; the BENCH is the station, the rack is not
+    "DB bench press":                (_LC, _PUSH,  "flat bench"),
+    "Incline DB press":              (_LC, _PUSH,  "adjustable bench"),
+    "Seated DB shoulder press":      (_LC, _PUSH,  "adjustable bench"),
+    "DB fly":                        (_LP, _PUSH,  "flat bench"),
+    "1-arm DB row":                  (_LC, _PULL,  "flat bench"),
+    "DB goblet squat":               (_LC, _LOWER, None),
+    "DB Romanian deadlift":          (_LC, _LOWER, None),
+    "DB split squat":                (_LC, _LOWER, None),
+    "Standing DB calf raise":        (_LP, _LOWER, None),
+    # bodyweight
+    "Captain's chair knee raise":    (_LP, _CORE,  "captain's chair"),
+    "Lying leg raise":               (_LP, _CORE,  None),
+    "Stability-ball back extension": (_LP, _CORE,  "stability ball"),
+    "Stability-ball crunch":         (_LP, _CORE,  "stability ball"),
+    "Stability-ball hamstring curl": (_LP, _LOWER, "stability ball"),
+    # Richfield — bands. One anchor assumed; "Band leg extension" is seated with
+    # the band under the foot and needs none.
+    "Band seated row":               (_LC, _PULL,  "band anchor"),
+    "Band lat pulldown":             (_LC, _PULL,  "band anchor"),
+    "Band incline press":            (_LC, _PUSH,  "band anchor"),
+    "Band face pull":                (_LP, _PULL,  "band anchor"),
+    "Band rear delt fly":            (_LP, _PULL,  "band anchor"),
+    "Band Pallof press":             (_LP, _CORE,  "band anchor"),
+    "Band leg extension":            (_LP, _LOWER, None),
+}
+
+
+def lift_profile(name: str) -> tuple[str, str, str | None]:
+    """(class, pattern, station). Raises on an unknown movement — see above."""
+    try:
+        return LIFT_PROFILE[name]
+    except KeyError:
+        raise KeyError(
+            f"no LIFT_PROFILE for {name!r} — add its class, pattern and station "
+            f"in artemis/health_office.py before it can be programmed") from None
+
+
+def lift_class_for(name: str) -> str:
+    return lift_profile(name)[0]
+
+
+def pattern_for(name: str) -> str:
+    return lift_profile(name)[1]
+
+
+def station_for(name: str) -> str | None:
+    return lift_profile(name)[2]
+
+
 RICHFIELD_SUBS: dict[str, tuple[str, str, int, bool]] = {
     "Pec fly": ("DB fly", "10-12", 12, False),
     "Single-arm cable row": ("1-arm DB row", "10-12", 12, False),
@@ -556,6 +672,15 @@ RAMP = {
 # ============================================================================
 
 def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -> dict:
+    # LIFT-RECOMP (from week 5, 2026-10-11): the rep range comes from the lift's
+    # CLASS, not from the table. The table's ranges are the old strength-biased
+    # ones and they stay in force for weeks 1-4 — that is deliberately how the
+    # reseed leaves everything before 10/11 untouched, rather than by filtering
+    # dates afterwards and hoping.
+    if recomp_applies(week_num):
+        lift_class = lift_class_for(name)
+        rng = _recomp.rep_label(lift_class)
+        top = _recomp.top_reps(lift_class)
     notes = [f"{sets}×{rng}" + (" each side" if per_side else "")]
     if machine and (week_num == 1 or wk0):
         notes.append(MACHINE_NOTE)
@@ -566,6 +691,33 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
     if week_num <= 2:
         ex["target_load_lbs"] = None  # finding weights
     return ex
+
+
+def _apply_supersets(exercises: list, pairs: list) -> None:
+    """Mark the paired exercises, in place, and set the rests that enact the pair.
+
+    THE RESTS ARE WHAT MAKE THIS WORK ON THE EXISTING iPAD. gym-display renders
+    `rest_after_sec` as its rest timer and knows nothing about supersets, so the
+    first half of a pair gets the short transition (walk to the partner) and the
+    second gets the real rest. Following the timers therefore performs the
+    superset correctly with no frontend change at all — and the note names the
+    partner so the screen reads as instructions rather than as odd rest values.
+    """
+    by_name = {e["name"]: e for e in exercises}
+    for idx, (a, b) in enumerate(pairs, start=1):
+        ea, eb = by_name[a], by_name[b]
+        for e, partner, rest in ((ea, b, _recomp.INTRA_PAIR_SEC),
+                                 (eb, a, _recomp.REST_BETWEEN_PAIRS_SEC)):
+            e["superset"] = idx
+            e["superset_partner"] = partner
+            e["rest_after_sec"] = rest
+        ea["notes"] = f"{ea['notes']}; superset {idx} — straight into {b}"
+        eb["notes"] = (f"{eb['notes']}; superset {idx} with {a} — "
+                       f"rest {_recomp.REST_BETWEEN_PAIRS_SEC}s, then repeat")
+    for e in exercises:
+        if "superset" not in e:
+            # Unpaired: it has not become denser, so it keeps the old interval.
+            e["rest_after_sec"] = _recomp.REST_BETWEEN_SETS_SEC
 
 
 def _strength(session_type: str, week_num: int, *, wk0: bool = False,
@@ -590,6 +742,13 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
         setup.append("Weeks 1-2: finding weights — stop 3-4 reps shy of failure.")
     elif week_num == 7:
         setup.append("Week 7 deload — 2 sets, easy.")
+    elif recomp_applies(week_num):
+        # LIFT-RECOMP: reps first, then one load step. The trigger is unchanged
+        # in kind (every set at the top of the range) and changed in number,
+        # because the range itself moved.
+        setup.append(_recomp.progression_note(_recomp.COMPOUND)
+                     .replace("Add reps first:", "Progression — reps first:"))
+        setup.append(_recomp.DENSITY_NOTE)
     else:
         setup.append("Progression: +1 rep or next pin once all sets hit the top of the range.")
     blocks = {
@@ -610,11 +769,32 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
     if subs:
         blocks["substituted_from"] = "office"
         blocks["substitutions"] = [{"from": k, "to": v[0]} for k, v in subs.items()]
+    # ── duration ─────────────────────────────────────────────────────────
+    #
     # The leading 10 is ALREADY the warmup + cooldown allowance for a strength
     # session, so cooldown_min is deliberately NOT added here — doing so pushed
     # every office lift from ~55 to ~60 and tripped the TIME-CAP reject. Only the
     # Z2 estimate adds it, because that one counts work minutes alone.
-    minutes = 10 + round(sets * len(exercises) * 2.5)
+    #
+    # LIFT-RECOMP: from week 5 the session is PAIRED, so the estimate comes from
+    # knowledge/lift_recomp.py's named components rather than one flat 2.5
+    # min/set. The old constant could not express the change at all: it bundled
+    # work, rest, setup and logging together, so halving the number of rests
+    # moved the answer by zero. Weeks 1-4 keep the old formula.
+    finisher_min = 12 if (session_type == "strength_c" and week_num in (5, 6)) else 0
+    if recomp_applies(week_num):
+        pairs, singles = _recomp.pair_for_density(
+            [e["name"] for e in exercises],
+            station_of=station_for, pattern_of=pattern_for)
+        _apply_supersets(exercises, pairs)
+        blocks["supersets"] = [list(pair) for pair in pairs]
+        blocks["unpaired"] = list(singles)
+        blocks["rest_between_rounds_sec"] = _recomp.REST_BETWEEN_PAIRS_SEC
+        blocks["density_note"] = _recomp.DENSITY_NOTE
+        minutes = _recomp.session_minutes(n_pairs=len(pairs), n_singles=len(singles),
+                                          sets=sets, finisher_min=finisher_min)
+    else:
+        minutes = 10 + round(sets * len(exercises) * 2.5) + finisher_min
     if session_type == "strength_c" and week_num in (5, 6):
         blocks["finisher"] = {
             "type": "intervals",
@@ -628,7 +808,7 @@ def _strength(session_type: str, week_num: int, *, wk0: bool = False,
                            "equipment_class": class_for("Stepmill or upright bike"),
                            "notes": "30s hard / 90s easy"}],
         }
-        minutes += 12
+        # minutes already includes finisher_min — adding it here would double it.
     return blocks, rpe, 3, minutes
 
 
@@ -1540,14 +1720,22 @@ def build_rows(repeats: list[date] | None = None) -> list[dict]:
 
 # ── TIME-CAP (Ryan, 2026-09-19): 45 min is a target, not a limit ────────────
 # 45-59 min is fine and gets a note (reseed diff + log); never auto-cut. 60+
-# is rejected — except the program slots in CALIBRATION_PENDING, whose
-# estimate (10 + sets x exercises x 2.5 min) is 60+ while weeks 3-6 stay as
-# planned. They warn until ~2 weeks of logged sessions recalibrate the
-# per-set estimate (the reports show planned vs logged span); empty the set
-# then and the hard reject applies to them too.
+# is rejected — except the program slots in CALIBRATION_PENDING, whose old
+# estimate (10 + sets x exercises x 2.5 min) is 60+ while those weeks stay as
+# planned.
+#
+# LIFT-RECOMP (2026-09-29) EMPTIED MOST OF THIS SET RATHER THAN RAISING THE CAP.
+# Supersets are what brought Strength B from 62 to 50 and Strength C from 67 to
+# 54, so weeks 5 and 6 now fit the office window on their own and the exemption
+# they needed is gone — the hard reject applies to them again. What remains is
+# weeks 3 and 4, which deliberately keep the OLD prescription (they are already
+# in front of him) and so keep the old 62-minute estimate.
+#
+# An exemption that outlives its cause is a cap that has quietly stopped
+# applying, so these come out as soon as the rows they cover do.
 TARGET_MIN = 45
 HARD_MAX_MIN = 60
-CALIBRATION_PENDING = {("strength_b", w) for w in (3, 4, 5, 6)} | {("strength_c", 5), ("strength_c", 6)}
+CALIBRATION_PENDING = {("strength_b", 3), ("strength_b", 4)}
 
 
 def duration_verdict(session_type: str, week_num, est) -> tuple[str, str]:
