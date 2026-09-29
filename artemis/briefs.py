@@ -1,7 +1,6 @@
 """Pre-meeting brief generator using Claude API."""
 
 import hashlib
-import json
 import logging
 import re
 
@@ -24,12 +23,16 @@ logger = logging.getLogger(__name__)
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences that LLMs sometimes wrap around JSON."""
-    text = text.strip()
-    text = re.sub(r'^```json\s*', '', text)
-    text = re.sub(r'^```\s*', '', text)
-    text = re.sub(r'\s*```$', '', text)
-    return text.strip()
+    """Kept as a thin alias: `artemis.llm_json` owns fence stripping now, and
+    this spelling existed in four modules with four chances to drift."""
+    from artemis.llm_json import strip_fences
+    return strip_fences(text)
+
+
+#: The stop_reason of the most recent _call_claude, so a caller that only gets
+#: the text back can still tell "cut off" from "malformed". A one-element list
+#: rather than a return-shape change, because four callers read that text.
+_LAST_STOP_REASON: list[str | None] = [None]
 
 
 def _call_claude(
@@ -54,31 +57,49 @@ def _call_claude(
         )
         text = response.content[0].text
         log_claude_call(model, prompt_hash, len(text))
+        from artemis.llm_json import stop_reason_of
+        stop = stop_reason_of(response)
+        if stop == "max_tokens":
+            # Say it HERE, where the number to change is in scope. Twenty triages
+            # were lost to this being reported downstream as a parse failure.
+            logger.warning("Claude response hit max_tokens=%s (%s chars) — the "
+                           "answer is cut off, not malformed", max_tokens, len(text))
+        _LAST_STOP_REASON[0] = stop
         return text
     except Exception:
         logger.exception("Claude API call failed (model=%s)", model)
+        _LAST_STOP_REASON[0] = None
         return ""
 
 
 def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
     """Classify emails by urgency and sender type, with playbook matching."""
     system = TRIAGE_SYSTEM.replace("{playbooks}", playbook_text or "")
+    # max_tokens was 1000, and that -- not fencing -- is what broke 20 triages in
+    # five days: the failures had a median response of 2820 chars against 511 for
+    # the ones that parsed, i.e. they were the long ones, cut off mid-value. The
+    # fence strip had been correct the whole time. 4000 leaves headroom over the
+    # 2909-char longest response actually observed.
     result = _call_claude(
         system,
         TRIAGE_USER.format(emails=emails_text),
-        max_tokens=1000,
+        max_tokens=4000,
     )
     if not result:
         return []
+    from artemis.llm_json import LlmJsonError, parse as parse_llm_json
     try:
-        data = json.loads(_strip_fences(result))
-        # Claude may return a bare array or a wrapped object like {"items": [...]}
-        if isinstance(data, list):
-            return data
-        return data.get("items", [data])
-    except json.JSONDecodeError:
-        logger.error("Failed to parse triage response: %s", result[:200])
+        data = parse_llm_json(result, stop_reason=_LAST_STOP_REASON[0],
+                              what="triage response")
+    except LlmJsonError as exc:
+        # The message distinguishes truncated from malformed. "Failed to parse"
+        # for a truncated response is what made this look like a fencing bug.
+        logger.error("Triage unusable — %s | starts: %s", exc, result[:120])
         return []
+    # Claude may return a bare array or a wrapped object like {"items": [...]}
+    if isinstance(data, list):
+        return data
+    return data.get("items", [data])
 
 
 def generate_meeting_brief(

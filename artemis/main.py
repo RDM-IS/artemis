@@ -3729,11 +3729,9 @@ def classify_correction(
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        text = resp.content[0].text.strip()
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"^```\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        data = json.loads(text.strip())
+        from artemis.llm_json import parse as parse_llm_json, stop_reason_of
+        data = parse_llm_json(resp.content[0].text, stop_reason=stop_reason_of(resp),
+                              what="correction parse")
 
         return CorrectionResult(
             original_intent=data.get("original_intent", ""),

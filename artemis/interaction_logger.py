@@ -3,7 +3,6 @@
 import hashlib
 import json
 import logging
-import re
 
 import anthropic
 
@@ -220,13 +219,8 @@ def _extract_interaction(message: str) -> dict | None:
         raw = response.content[0].text.strip()
         log_claude_call("claude-haiku-4-5-20251001", prompt_hash, len(raw))
 
-        # Strip markdown fences
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"^```\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        raw = raw.strip()
-
-        return json.loads(raw)
+        from artemis.llm_json import parse as parse_llm_json
+        return parse_llm_json(raw, what="interaction log summary")
     except Exception:
         logger.exception("Interaction extraction failed")
         return None
