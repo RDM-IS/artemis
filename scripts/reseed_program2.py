@@ -132,11 +132,8 @@ def main() -> int:
             return 0
 
         for (d, slot), row, _what in changes:
-            cur.execute(office._UPSERT_SQL, (
-                d, slot, row["phase"], row["week_num"], row["session_type"],
-                json.dumps(row["blocks"], default=str), row["target_rpe"],
-                row["target_hr_zone"], row["est_duration_min"], row["generated_by"],
-                row["notes"]))
+            cur.execute(office._UPSERT_SQL, office.upsert_params({**row, "plan_date": d,
+                                                                   "slot": slot}))
 
         after = _md5_outside(cur, keys)
         wrong = []

@@ -13,9 +13,12 @@ TODAY = date(2027, 7, 15)
 class Cur:
     """Serves the gate's three reads; any of them can be made to raise."""
 
-    def __init__(self, *, cleared="true", cardio=(), pain=(), raises=()):
+    def __init__(self, *, cleared="true", cardio=(), pain=(), raises=(),
+                 resolved=None, logged=False, row_exists=True):
         self.cleared, self.cardio, self.pain = cleared, list(cardio), list(pain)
         self.raises, self._res, self.written = set(raises), [], []
+        self.resolved, self.logged, self.row_exists = resolved, logged, row_exists
+        self.marked, self.upserted = [], []
 
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
@@ -24,10 +27,31 @@ class Cur:
         assert want == got, f"{want} placeholders but {got} params"
         self._res = []
         if "acos.system_state" in s and "SELECT" in s:
-            if "state" in self.raises:
-                raise RuntimeError("down")
-            self._res = [(self.cleared,)] if self.cleared is not None else []
-        elif "health.plan" in s:
+            # Two different reads hit this table: the cleared FLAG and the
+            # "this day is already resolved" MARKER. Keyed by the param, because
+            # answering the marker with the flag's value would make every resolve
+            # look already-done.
+            key = (params or (None,))[0]
+            if str(key).startswith(ig.RESOLVED_PREFIX):
+                if "marker" in self.raises:
+                    raise RuntimeError("down")
+                self._res = [(self.resolved,)] if self.resolved is not None else []
+            else:
+                if "state" in self.raises:
+                    raise RuntimeError("down")
+                self._res = [(self.cleared,)] if self.cleared is not None else []
+        elif "INSERT INTO acos.system_state" in s:
+            self.marked.append(params)
+        elif s.startswith("SELECT 1 FROM health.session_log"):
+            # Anchored at the START: the recent-cardio query also mentions
+            # health.session_log, in an EXISTS subquery, so a substring match
+            # here swallowed it and every gate saw "0 of the last 0".
+            self._res = [(1,)] if self.logged else []
+        elif s.startswith("SELECT plan_id FROM health.plan"):
+            self._res = [(41,)] if self.row_exists else []
+        elif "INSERT INTO health.plan" in s:
+            self.upserted.append(params)
+        elif "health.plan" in s and "session_type IN" in s:   # recent cardio
             if "cardio" in self.raises:
                 raise RuntimeError("down")
             self._res = list(self.cardio)
@@ -168,3 +192,189 @@ class TestArtemisNeverSetsIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Where the gate is APPLIED ───────────────────────────────────────────────
+# The gate was correct and unwired for a round: `build_row` passed `gate=None`
+# and `_intervals` read an absent gate as a pass, so 10/17 and 10/18 built as
+# intervals whatever the gate would have said. These tests are about the wiring,
+# not the conditions.
+
+INTERVAL_DAY = date(2026, 10, 17)
+
+
+def _spec(day=INTERVAL_DAY, slot="morning"):
+    return {"plan_date": day, "slot": slot, "session_type": "cardio_intervals",
+            "week_num": 5, "location": "MSP home", "location_key": "msp_home",
+            "day_type": "msp_home", "pos": 13, "wk0": False}
+
+
+class TestAnAbsentGateIsAFail(unittest.TestCase):
+    """The defect itself: no gate answer must never build intervals."""
+
+    def _blocks(self, gate):
+        from artemis import health_office as office
+        return office._intervals(5, location="MSP home", location_key="msp_home", gate=gate)
+
+    def test_no_gate_builds_the_z2_variant(self):
+        blocks, _rpe, zone, _est = self._blocks(None)
+        self.assertEqual(blocks["type"], "steady")
+        self.assertEqual(blocks["ran_as"], "z2_variant")
+        self.assertEqual(zone, 2)
+        self.assertIn("not been evaluated", blocks["z2_variant_reason"])
+
+    def test_a_blocked_gate_builds_the_z2_variant_and_names_the_condition(self):
+        blocks, _rpe, zone, _est = self._blocks({"ok": False, "reason": "you haven't sent x"})
+        self.assertEqual(blocks["ran_as"], "z2_variant")
+        self.assertEqual(zone, 2)
+        self.assertEqual(blocks["z2_variant_reason"], "you haven't sent x")
+
+    def test_only_a_passing_gate_builds_intervals(self):
+        blocks, _rpe, zone, _est = self._blocks({"ok": True})
+        self.assertEqual(blocks["type"], "intervals")
+        self.assertEqual(blocks["ran_as"], "intervals")
+        self.assertEqual(zone, 4)
+
+    def test_a_seeded_row_with_no_gate_is_zone_two(self):
+        """build_row passes no gate, so every seeded interval row is Z2 until
+        the morning resolves it. Fail-closed by construction, not by luck."""
+        from artemis import health_office as office
+        row = office.build_row(_spec())
+        self.assertEqual(row["session_type"], "cardio_intervals")
+        self.assertEqual(row["blocks"]["type"], "steady")
+        self.assertEqual(row["target_hr_zone"], 2)
+
+
+class TestResolveDay(unittest.TestCase):
+    def _cur(self, **kw):
+        kw.setdefault("cardio", _cardio())
+        kw.setdefault("pain", _pain(1))
+        return Cur(**kw)
+
+    def _resolve(self, cur, day=INTERVAL_DAY):
+        with mock.patch("artemis.health_office.build_schedule", return_value=[_spec(day)]):
+            return ig.resolve_day(cur, day)
+
+    def test_a_passing_gate_writes_the_interval_row(self):
+        cur = self._cur()
+        out = self._resolve(cur)
+        self.assertTrue(out["resolved"])
+        self.assertEqual(out["outcome"], "intervals")
+        self.assertEqual(len(cur.upserted), 1)
+        blocks = json.loads(cur.upserted[0][5])
+        self.assertEqual(blocks["type"], "intervals")
+        self.assertEqual(cur.upserted[0][7], 4)          # target_hr_zone
+
+    def test_a_blocked_gate_writes_the_z2_row_with_the_reason(self):
+        cur = self._cur(cleared="")
+        out = self._resolve(cur)
+        self.assertEqual(out["outcome"], "z2_variant")
+        self.assertIn("intervals cleared", out["reason"])
+        blocks = json.loads(cur.upserted[0][5])
+        self.assertEqual(blocks["type"], "steady")
+        self.assertIn("intervals cleared", blocks["z2_variant_reason"])
+        self.assertEqual(cur.upserted[0][7], 2)
+
+    def test_an_unreadable_condition_writes_the_z2_row(self):
+        cur = self._cur(raises=("state",))
+        out = self._resolve(cur)
+        self.assertEqual(out["outcome"], "z2_variant")
+        self.assertIn("couldn't check", out["reason"])
+        self.assertEqual(json.loads(cur.upserted[0][5])["type"], "steady")
+
+    def test_one_decision_row_per_day_and_the_day_is_marked(self):
+        cur = self._cur()
+        self._resolve(cur)
+        gate_rows = [w for w in cur.written if w.get("action") == "interval_gate"]
+        self.assertEqual(len(gate_rows), 1)
+        self.assertEqual(len(cur.marked), 1)
+        self.assertEqual(cur.marked[0][0], f"{ig.RESOLVED_PREFIX}{INTERVAL_DAY.isoformat()}")
+
+    def test_a_second_call_on_the_same_day_does_nothing(self):
+        """Not per fetch, per evaluation day. A wake that runs twice must not
+        write a second decision row or re-evaluate against a changed read."""
+        cur = self._cur(resolved="intervals")
+        out = self._resolve(cur)
+        self.assertFalse(out["resolved"])
+        self.assertEqual(cur.upserted, [])
+        self.assertEqual([w for w in cur.written if w.get("action") == "interval_gate"], [])
+
+    def test_a_day_with_no_interval_row_is_left_alone(self):
+        cur = self._cur()
+        with mock.patch("artemis.health_office.build_schedule",
+                        return_value=[{**_spec(), "session_type": "strength_a"}]):
+            out = ig.resolve_day(cur, INTERVAL_DAY)
+        self.assertFalse(out["resolved"])
+        self.assertEqual(cur.upserted, [])
+
+    def test_a_logged_session_is_never_rewritten(self):
+        """He already trained it. Rewriting would replace what he did with what
+        the gate now thinks."""
+        cur = self._cur(logged=True)
+        out = self._resolve(cur)
+        self.assertTrue(out["resolved"])
+        self.assertEqual(cur.upserted, [])
+        self.assertEqual(out["skipped"], [f"{INTERVAL_DAY} morning (already logged)"])
+
+    def test_an_unreadable_marker_raises_rather_than_double_evaluating(self):
+        cur = self._cur(raises=("marker",))
+        with self.assertRaises(RuntimeError):
+            self._resolve(cur)
+        self.assertEqual(cur.upserted, [])
+
+
+class TestTheCardAndThePostAgree(unittest.TestCase):
+    """Both read the row the gate wrote. There is no second evaluation to
+    disagree with -- which is the reason the gate resolves the ROW rather than
+    being consulted at card fetch."""
+
+    def _resolved_blocks(self, **kw):
+        kw.setdefault("cardio", _cardio())
+        kw.setdefault("pain", _pain(1))
+        cur = Cur(**kw)
+        with mock.patch("artemis.health_office.build_schedule", return_value=[_spec()]):
+            ig.resolve_day(cur, INTERVAL_DAY)
+        return json.loads(cur.upserted[0][5])
+
+    def test_the_post_names_the_same_reason_the_card_carries(self):
+        from artemis import wake
+        blocks = self._resolved_blocks(cleared="")
+        plan = {"session_type": "cardio_intervals", "blocks": blocks,
+                "est_duration_min": 55, "plan_date": INTERVAL_DAY}
+        lines = wake._workout_section(plan)
+        text = "\n".join(lines)
+        self.assertIn("Not intervals today:", text)
+        # The card reads blocks["z2_variant_reason"]; the post must quote it, not
+        # compose its own version of why.
+        self.assertIn(blocks["z2_variant_reason"], text)
+
+    def test_a_passing_gate_adds_no_such_line(self):
+        from artemis import wake
+        blocks = self._resolved_blocks()
+        self.assertEqual(blocks["ran_as"], "intervals")
+        lines = wake._workout_section({"session_type": "cardio_intervals", "blocks": blocks,
+                                       "est_duration_min": 33, "plan_date": INTERVAL_DAY})
+        self.assertNotIn("Not intervals today:", "\n".join(lines))
+
+
+class TestEveryBlockIsPlainJson(unittest.TestCase):
+    """`upsert_params` calls json.dumps WITHOUT default=str, so a non-serialisable
+    value raises instead of silently becoming a string in a card field."""
+
+    def test_every_built_row_serialises_without_a_default(self):
+        from artemis import health_office as office
+        for row in office.build_rows():
+            with self.subTest(str(row["plan_date"])):
+                json.dumps(row["blocks"])
+
+    def test_upsert_params_is_in_the_sql_column_order(self):
+        from artemis import health_office as office
+        row = office.build_row(_spec())
+        params = office.upsert_params(row)
+        cols = (office._UPSERT_SQL.split("(", 1)[1].split(")", 1)[0]
+                .replace("\n", " ").replace(" ", "").split(","))
+        self.assertEqual(len(params), len(cols))
+        self.assertEqual(cols[1], "slot")
+        self.assertEqual(params[1], "morning")
+        self.assertEqual(cols[0], "plan_date")
+        self.assertEqual(params[0], INTERVAL_DAY)

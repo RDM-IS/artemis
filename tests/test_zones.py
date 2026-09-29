@@ -90,8 +90,11 @@ class TestEveryCardioRowCarriesItsRange(unittest.TestCase):
                         ("brown_deer", "Brown Deer"), ("msp_home", "MSP home")):
             for wk in (4, 5, 6, 7):
                 out.append((f"_z2 wk{wk} {lk}", o._z2(wk, location=loc, location_key=lk)[0]))
-                out.append((f"_intervals wk{wk} {lk}",
+                out.append((f"_intervals(blocked) wk{wk} {lk}",
                             o._intervals(wk, location=loc, location_key=lk)[0]))
+                out.append((f"_intervals(passed) wk{wk} {lk}",
+                            o._intervals(wk, location=loc, location_key=lk,
+                                         gate={"ok": True})[0]))
         return out
 
     def test_every_cardio_block_names_a_work_range(self):
@@ -107,7 +110,11 @@ class TestEveryCardioRowCarriesItsRange(unittest.TestCase):
 
     def test_an_interval_session_also_says_what_easy_means(self):
         from artemis import health_office as o
-        blocks = o._intervals(5, location="MSP home", location_key="msp_home")[0]
+        # The gate has to be PASSED for this to be an interval session at all --
+        # an absent gate is a fail and builds the Z2 variant. This test is about
+        # the zones an interval session carries, so it asks for one.
+        blocks = o._intervals(5, location="MSP home", location_key="msp_home",
+                              gate={"ok": True})[0]
         self.assertEqual(blocks["type"], "intervals")
         easy = blocks["zones"]["easy"]
         self.assertEqual((easy["low_bpm"], easy["high_bpm"]), zones.ZONES["Z2"])

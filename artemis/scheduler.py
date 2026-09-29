@@ -541,6 +541,21 @@ class ArtemisScheduler:
         from artemis.quiet_hours import exit_quiet, set_system_value
 
         exit_quiet()
+        # PROGRAM-2: resolve today's interval gate BEFORE the post is composed.
+        # This is the one evaluation point: it rewrites the row, and the post and
+        # the card then both read that row, so they cannot disagree. A failure
+        # here leaves the row unresolved, which IS the Z2 variant -- so the wake
+        # post still goes out, and it goes out fail-closed.
+        try:
+            from artemis import interval_gate
+            from knowledge.db import get_connection
+            with get_connection() as conn:
+                # The upsert, the cognition row and the resolved marker are one
+                # transaction: a half-resolved day would be a row that says
+                # intervals with no decision recorded, or the reverse.
+                interval_gate.resolve_day(conn.cursor(), _local_today())
+        except Exception:
+            logger.exception("Interval gate resolve failed — the day stays Zone 2")
         held = take_holds("health")
         # Ryan can check in before the wake post. Then the post doesn't ask
         # again and the check-in key is left as it is.

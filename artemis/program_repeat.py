@@ -204,10 +204,7 @@ def apply(repeat_start: date) -> str:
         before = _md5(untouched())
 
         for r in plan["target"]:
-            cur.execute(office._UPSERT_SQL, (
-                r["plan_date"], r.get("slot", "morning"), r["phase"], r["week_num"],
-                r["session_type"], json.dumps(r["blocks"]), r["target_rpe"],
-                r["target_hr_zone"], r["est_duration_min"], r["generated_by"], r["notes"]))
+            cur.execute(office._UPSERT_SQL, office.upsert_params(r))
         cur.execute(
             "INSERT INTO acos.system_state (key, value, updated_at) VALUES (%s, %s, now()) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",

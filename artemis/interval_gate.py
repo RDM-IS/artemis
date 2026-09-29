@@ -162,3 +162,96 @@ def record(cur, result: GateResult, day: date, location_key: str) -> None:
             "reason": result.reason,
             **result.detail,
         })
+
+
+# ── Where the gate is actually applied ──────────────────────────────────────
+#
+# ONE evaluation point: the wake job, once per local day, which REWRITES that
+# day's row. Everything else -- the wake post, the card, the week view -- reads
+# the row. That is the whole reason it is done here and not at card fetch:
+#
+#   * A row is seeded weeks ahead, so the gate cannot be evaluated when the row
+#     is built. Something has to resolve it on the day.
+#   * If the card evaluated the gate itself, the box and the Lambda would each
+#     run their own evaluation against their own read at their own moment, and
+#     the post and the card could disagree about the same session. Persisting the
+#     answer makes them agree by construction, because there is only one answer.
+#   * A cognition row per fetch would be noise. Per evaluation day is the unit
+#     the decision is actually made in.
+#
+# The card needs no gate logic at all, which is also why this change ships no
+# Lambda code.
+
+#: acos.system_state key prefix for "this day has been resolved".
+RESOLVED_PREFIX = "intervals_resolved:"
+
+
+def _resolved_key(day: date) -> str:
+    return f"{RESOLVED_PREFIX}{day.isoformat()}"
+
+
+def _already_resolved(cur, day: date) -> bool:
+    """Raises rather than swallowing. An unreadable marker must not silently
+    become a second evaluation and a second cognition row."""
+    cur.execute("SELECT value FROM acos.system_state WHERE key = %s", (_resolved_key(day),))
+    return cur.fetchone() is not None
+
+
+def _mark_resolved(cur, day: date, result: GateResult) -> None:
+    cur.execute(
+        "INSERT INTO acos.system_state (key, value, updated_at) VALUES (%s, %s, now()) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        (_resolved_key(day), "intervals" if result.ok else "z2_variant"))
+
+
+def _has_real_log(cur, plan_id: int) -> bool:
+    cur.execute("SELECT 1 FROM health.session_log WHERE plan_id = %s "
+                "AND logged_via <> 'inferred' LIMIT 1", (plan_id,))
+    return cur.fetchone() is not None
+
+
+def resolve_day(cur, day: date) -> dict:
+    """Resolve `day`'s `cardio_intervals` rows against the gate. Idempotent.
+
+    Returns {"resolved": bool, "outcome": str|None, "reason": str|None,
+             "rows": [plan_date…], "skipped": [...]}. `resolved` is False when
+    there was nothing to do -- no interval row, or already done today.
+
+    Called from the wake job. It does NOT swallow database errors: a failure
+    leaves the row as it was, and a row that has not been resolved is the Z2
+    variant, so failing loudly here still fails closed for Ryan.
+    """
+    from artemis import health_office as office
+
+    specs = [s for s in office.build_schedule()
+             if s["plan_date"] == day and s["session_type"] == "cardio_intervals"]
+    if not specs:
+        return {"resolved": False, "outcome": None, "reason": None, "rows": [], "skipped": []}
+    if _already_resolved(cur, day):
+        logger.info("interval gate: %s already resolved — not re-evaluating", day)
+        return {"resolved": False, "outcome": None, "reason": None, "rows": [], "skipped": []}
+
+    result = evaluate(cur, day)
+    written, skipped = [], []
+    for spec in specs:
+        slot = spec.get("slot", "morning")
+        cur.execute("SELECT plan_id FROM health.plan WHERE plan_date = %s AND slot = %s",
+                    (day, slot))
+        existing = cur.fetchone()
+        if existing is not None:
+            plan_id = existing["plan_id"] if isinstance(existing, dict) else existing[0]
+            if _has_real_log(cur, plan_id):
+                # He already trained it. Rewriting a session that happened would
+                # replace what he did with what the gate now thinks.
+                skipped.append(f"{day} {slot} (already logged)")
+                continue
+        row = office.build_row({**spec, "gate": {"ok": result.ok, "reason": result.reason}})
+        cur.execute(office._UPSERT_SQL, office.upsert_params(row))
+        written.append(f"{day} {slot}")
+
+    record(cur, result, day, specs[0].get("location_key", "office"))
+    _mark_resolved(cur, day, result)
+    logger.info("interval gate %s: %s (%s)", day,
+                "intervals" if result.ok else "z2_variant", result.reason or "all conditions pass")
+    return {"resolved": True, "outcome": "intervals" if result.ok else "z2_variant",
+            "reason": result.reason, "rows": written, "skipped": skipped}
