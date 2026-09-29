@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from knowledge import prep_store
@@ -506,6 +506,10 @@ def post_session(body: SessionIn, db: Session = Depends(get_db),
              json.dumps(body.shortcuts), body.planned_min, body.hands_on_min))
         session_id = res.scalar()
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail={
+            "error": "no_stay", "message": f"no stay {body.stay_id}"})
     except SQLAlchemyError:
         db.rollback()
         logger.exception("prep session write failed")
@@ -574,6 +578,13 @@ def post_event(body: EventIn, db: Session = Depends(get_db),
             (body.session_id, body.task_key, body.task_name, body.resource,
              body.kind, body.planned_min, body.actual_min, delta))
         db.commit()
+    except IntegrityError:
+        # A session id that does not exist is a KNOWN condition, not a server
+        # fault: the foreign key is doing its job. A 500 here would send the
+        # caller looking for a broken endpoint instead of a stale session id.
+        db.rollback()
+        raise HTTPException(status_code=404, detail={
+            "error": "no_session", "message": f"no session {body.session_id}"})
     except SQLAlchemyError:
         db.rollback()
         logger.exception("prep event write failed")
