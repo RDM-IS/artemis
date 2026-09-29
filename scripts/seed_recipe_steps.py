@@ -35,55 +35,63 @@ HANDS, OVEN, STOVE, AIR, COUNTER, FRIDGE = (
     "hands", "oven", "stove", "air_fryer", "counter", "fridge")
 ACTIVE, PASSIVE, UNATT = "active", "passive", "unattended"
 
-#: (name, resource, mode, base_min, per_serving_min, temp_f, batch_key, shortcut)
+#: (name, resource, mode, base_min, per_serving_min, temp_f, batch_key, shortcut,
+#:  chain_key)
+#:
+#: CHAIN KEYS MATTER MORE THAN THEY LOOK. Steps sharing a key are sequential;
+#: different keys run in PARALLEL; NULL is a barrier that waits for all of them.
+#: Without them the Lentil tofu bowl's eleven steps were one queue and the board
+#: said 125 minutes with a 25-minute idle gap — the lentils, the veg and the tofu
+#: were being cooked one after another. The source spec lists those three as
+#: separate rows for exactly this reason.
 ROAST_VEG = [
-    ("Wash veg", HANDS, ACTIVE, 5, 0, None, "roast:veg", "precut_veg"),
-    ("Cut veg", HANDS, ACTIVE, 12, 0, None, "roast:veg", "precut_veg"),
-    ("Roast veg", OVEN, PASSIVE, 25, 0, 425, "roast:veg", None),
+    ("Wash veg", HANDS, ACTIVE, 5, 0, None, "roast:veg", "precut_veg", "veg"),
+    ("Cut veg", HANDS, ACTIVE, 12, 0, None, "roast:veg", "precut_veg", "veg"),
+    ("Roast veg", OVEN, PASSIVE, 25, 0, 425, "roast:veg", None, "veg"),
 ]
 
 LENTIL_BASE = [
-    ("Rinse lentils", HANDS, ACTIVE, 3, 0, None, None, "precooked_lentils"),
-    ("Simmer lentils", STOVE, PASSIVE, 20, 0, None, None, "precooked_lentils"),
-    ("Drain and cool", COUNTER, PASSIVE, 10, 0, None, None, "precooked_lentils"),
+    ("Rinse lentils", HANDS, ACTIVE, 3, 0, None, None, "precooked_lentils", "lentil"),
+    ("Simmer lentils", STOVE, PASSIVE, 20, 0, None, None, "precooked_lentils", "lentil"),
+    ("Drain and cool", COUNTER, PASSIVE, 10, 0, None, None, "precooked_lentils", "lentil"),
 ]
 
 STEPS: dict[str, list] = {
     "lentil egg white bowl": LENTIL_BASE + [
-        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None),
+        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None, None),
     ],
     "lentil tofu bowl plant based": LENTIL_BASE + ROAST_VEG + [
-        ("Press tofu", HANDS, ACTIVE, 2, 0, None, None, None),
-        ("Pressing", COUNTER, PASSIVE, 15, 0, None, None, None),
-        ("Cube and season tofu", HANDS, ACTIVE, 4, 0, None, None, None),
-        ("Bake tofu", OVEN, PASSIVE, 25, 0, 425, None, None),
-        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None),
+        ("Press tofu", HANDS, ACTIVE, 2, 0, None, None, None, "tofu"),
+        ("Pressing", COUNTER, PASSIVE, 15, 0, None, None, None, "tofu"),
+        ("Cube and season tofu", HANDS, ACTIVE, 4, 0, None, None, None, "tofu"),
+        ("Bake tofu", OVEN, PASSIVE, 25, 0, 425, None, None, "tofu"),
+        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None, None),
     ],
     "tempeh black bean bowl plant based": ROAST_VEG + [
-        ("Crumble and sear tempeh", STOVE, ACTIVE, 10, 0, None, None, None),
-        ("Portion with beans and veg", HANDS, ACTIVE, 0, 1.5, None, None, None),
+        ("Crumble and sear tempeh", STOVE, ACTIVE, 10, 0, None, None, None, "tempeh"),
+        ("Portion with beans and veg", HANDS, ACTIVE, 0, 1.5, None, None, None, None),
     ],
     "chicken thigh bowl": [
-        ("Season chicken", HANDS, ACTIVE, 4, 0, None, None, None),
-        ("Air-fry chicken", AIR, PASSIVE, 22, 0, None, None, None),
-        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None),
+        ("Season chicken", HANDS, ACTIVE, 4, 0, None, None, None, "chicken"),
+        ("Air-fry chicken", AIR, PASSIVE, 22, 0, None, None, None, "chicken"),
+        ("Portion", HANDS, ACTIVE, 0, 2, None, None, None, None),
     ],
     "overnight oats jar": [
-        ("Mix jars", HANDS, ACTIVE, 0, 2, None, None, None),
-        ("Chill overnight", FRIDGE, UNATT, 0, 0, None, None, None),
+        ("Mix jars", HANDS, ACTIVE, 0, 2, None, None, None, None),
+        ("Chill overnight", FRIDGE, UNATT, 0, 0, None, None, None, None),
     ],
     "cottage cheese chocolate pb mousse": [
-        ("Blend", HANDS, ACTIVE, 0, 1.5, None, None, None),
-        ("Chill", FRIDGE, UNATT, 0, 0, None, None, None),
+        ("Blend", HANDS, ACTIVE, 0, 1.5, None, None, None, None),
+        ("Chill", FRIDGE, UNATT, 0, 0, None, None, None, None),
     ],
     "cottage cheese cinnamon cheesecake": [
-        ("Blend", HANDS, ACTIVE, 0, 1.5, None, None, None),
-        ("Chill", FRIDGE, UNATT, 0, 0, None, None, None),
+        ("Blend", HANDS, ACTIVE, 0, 1.5, None, None, None, None),
+        ("Chill", FRIDGE, UNATT, 0, 0, None, None, None, None),
     ],
     "travel egg white bites string cheese": ROAST_VEG + [
-        ("Whisk and fill", HANDS, ACTIVE, 4, 0, None, None, None),
-        ("Bake bites", OVEN, PASSIVE, 18, 0, 350, None, None),
-        ("Cool uncovered", COUNTER, PASSIVE, 5, 0, None, None, None),
+        ("Whisk and fill", HANDS, ACTIVE, 4, 0, None, None, None, "bites"),
+        ("Bake bites", OVEN, PASSIVE, 18, 0, 350, None, None, "bites"),
+        ("Cool uncovered", COUNTER, PASSIVE, 5, 0, None, None, None, "bites"),
     ],
 }
 
@@ -99,8 +107,8 @@ PLAN_INELIGIBLE = ("protein pb cup dish",)
 _INSERT = """
 INSERT INTO nutrition.recipe_step
   (recipe_notion_id, step_no, name, resource, mode, base_min, per_serving_min,
-   temp_f, batch_key, shortcut_key)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+   temp_f, batch_key, shortcut_key, chain_key)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -140,10 +148,10 @@ def main() -> int:
                 if have:
                     cur.execute("DELETE FROM nutrition.recipe_step "
                                 "WHERE recipe_notion_id = %s", (notion_id,))
-                for i, (sname, resource, mode, base, per, temp, batch, short) in \
-                        enumerate(steps, start=1):
+                for i, (sname, resource, mode, base, per, temp, batch, short,
+                        chain) in enumerate(steps, start=1):
                     cur.execute(_INSERT, (notion_id, i, sname, resource, mode,
-                                          base, per, temp, batch, short))
+                                          base, per, temp, batch, short, chain))
                 print(f"  seed  {slug!r}: {len(steps)} step(s)")
                 wrote += 1
 
