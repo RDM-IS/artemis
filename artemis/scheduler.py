@@ -2074,6 +2074,11 @@ class ArtemisScheduler:
             synced = stay = menu = None
             with get_connection() as conn:
                 cur = conn.cursor()
+                # One run at a time. The lock is advisory and released when this
+                # connection closes, so a killed run cannot wedge the job.
+                if not prep.try_lock(cur):
+                    logger.warning("Prep refresh skipped — another run holds the lock")
+                    return
                 cur.execute("SAVEPOINT prep_sync")
                 try:
                     from artemis import prep_notion

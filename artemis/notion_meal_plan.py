@@ -52,6 +52,22 @@ class NotionUnavailable(Exception):
     """
 
 
+class NotionAccessDenied(NotionUnavailable):
+    """The database exists but this integration cannot see it: 404 or 403.
+
+    A SUBCLASS, so every existing `except NotionUnavailable` still catches it and
+    nothing changes for callers that do not care. What it adds is the distinction
+    that matters to a human reading the sync state: **this will not fix itself.**
+    A timeout is worth retrying in an hour; "not shared with the integration" is a
+    person clicking something in Notion, and a retry loop against it is time spent
+    learning nothing.
+
+    Notion answers 404 (not 403) for a database the integration has no access to,
+    because it will not confirm that an object it cannot see exists at all — so
+    404 here means "no access", not "wrong id", and the message says so.
+    """
+
+
 @dataclass
 class PlannedFood:
     """One recipe row, one portion as eaten."""
@@ -114,13 +130,20 @@ def _token() -> str:
     return token
 
 
-def _post(path: str, token: str, payload: dict) -> dict:
+def _post(path: str, token: str, payload: dict, timeout: float | None = None) -> dict:
+    """POST to Notion. `timeout` overrides the default so a caller with a time
+    budget can cap a single request at whatever it has left."""
     import requests
     try:
         r = requests.post(f"{NOTION_API}{path}", headers=_headers(token),
-                          json=payload, timeout=_TIMEOUT)
+                          json=payload, timeout=timeout or _TIMEOUT)
     except requests.RequestException as exc:
         raise NotionUnavailable(f"Notion request failed: {exc}") from exc
+    if r.status_code in (403, 404):
+        raise NotionAccessDenied(
+            f"Notion {path} returned {r.status_code} — the integration cannot see "
+            f"this database. Share the page with it in Notion; retrying will not "
+            f"help. {r.text[:160]}")
     if r.status_code != 200:
         raise NotionUnavailable(
             f"Notion {path} returned {r.status_code}: {r.text[:200]}")

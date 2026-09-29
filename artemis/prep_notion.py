@@ -37,7 +37,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from artemis.notion_meal_plan import (  # noqa: F401  (NotionUnavailable re-exported)
+from artemis.notion_meal_plan import (  # noqa: F401  (re-exported)
+    NotionAccessDenied,
     NotionUnavailable,
     _get,
     _headers,
@@ -113,6 +114,56 @@ class TokenBucket:
         return wait
 
 
+#: A whole sync run must finish inside this, or record what it managed and stop.
+#:
+#: WHY A BUDGET AT ALL, given a healthy run is ~7 s and a run with three
+#: inaccessible databases is ~2 s (both measured on the box, 2026-09-29). Because
+#: the 00:25 job is UNATTENDED: if it ever does hang, nothing is watching, and an
+#: hour later the next thing that reads `prep_sync` sees a row that simply stopped
+#: being updated with no reason attached. A budget turns that into a recorded
+#: `deadline` status naming the database it was on. It is generous on purpose —
+#: 90 s is thirteen times the healthy run, so it can only fire on something
+#: genuinely wrong.
+DEFAULT_BUDGET_SEC = 90.0
+
+
+class SyncDeadline:
+    """The run's time budget. Checked between databases and between pages.
+
+    Deliberately not a signal or a thread: this runs inside a database
+    transaction, and killing it asynchronously would leave that transaction in an
+    unknown state. Cooperative checks stop at a point where what has been written
+    is coherent and can be committed.
+    """
+
+    def __init__(self, budget_sec: float = DEFAULT_BUDGET_SEC, clock=time.monotonic):
+        self.budget_sec = budget_sec
+        self._clock = clock
+        self._start = clock()
+
+    @property
+    def elapsed(self) -> float:
+        return self._clock() - self._start
+
+    def remaining(self) -> float:
+        return max(0.0, self.budget_sec - self.elapsed)
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def request_timeout(self, cap: float = 15.0) -> float:
+        """What a single HTTP request may take: whatever is left, capped.
+
+        Never zero — a request given a zero timeout fails instantly in a way that
+        reads like a network error rather than like a budget expiring.
+        """
+        return max(1.0, min(cap, self.remaining()))
+
+
+class SyncBudgetExpired(Exception):
+    """The run ran out of time. What finished is committed; the rest is recorded."""
+
+
 @dataclass
 class SyncReport:
     """What one database's sync did. Counts, not prose — the caller renders."""
@@ -169,7 +220,8 @@ def _edited(page: dict) -> str | None:
 # ── paging ──────────────────────────────────────────────────────────────────
 
 def query_pages(db_id: str, token: str, *, since: str | None,
-                bucket: TokenBucket, report: SyncReport):
+                bucket: TokenBucket, report: SyncReport,
+                deadline: "SyncDeadline | None" = None):
     """Yield every page of `db_id`, oldest edit first.
 
     `since` filters on Notion's own last_edited_time timestamp. Sorting by it
@@ -187,9 +239,15 @@ def query_pages(db_id: str, token: str, *, since: str | None,
                                  "last_edited_time": {"on_or_after": since}}
         if cursor:
             payload["start_cursor"] = cursor
+        if deadline is not None and deadline.expired():
+            # Between pages is a safe place to stop: everything yielded so far has
+            # been stored, and the watermark has not moved past it.
+            raise SyncBudgetExpired(
+                f"out of time after {report.requests} request(s) on this database")
         report.slept_sec += bucket.take()
         report.requests += 1
-        result = _post(f"/databases/{db_id}/query", token, payload)
+        result = _post(f"/databases/{db_id}/query", token, payload,
+                       timeout=None if deadline is None else deadline.request_timeout())
         for page in result.get("results") or []:
             yield page
         if not result.get("has_more"):
@@ -466,7 +524,8 @@ def due_for_sweep(state: dict, now: datetime | None = None) -> bool:
 # ── one database ────────────────────────────────────────────────────────────
 
 def sync_one(cur, db_key: str, *, token: str, bucket: TokenBucket,
-             force_sweep: bool = False, now: datetime | None = None) -> SyncReport:
+             force_sweep: bool = False, now: datetime | None = None,
+             deadline: "SyncDeadline | None" = None) -> SyncReport:
     """Sync one Notion database into its RDS table. Returns a SyncReport.
 
     Raises NotionUnavailable on a failed read — it does NOT return a zero-row
@@ -488,7 +547,8 @@ def sync_one(cur, db_key: str, *, token: str, bucket: TokenBucket,
     seen_ids: set = set()
     newest: str | None = None
     held: list = []
-    for page in query_pages(db_id, token, since=since, bucket=bucket, report=report):
+    for page in query_pages(db_id, token, since=since, bucket=bucket, report=report,
+                            deadline=deadline):
         report.seen += 1
         row = mapper(page)
         title_ok = not _is_test_row(row.get("name") or row.get("label") or "")
@@ -596,7 +656,8 @@ def seed_on_hand(cur) -> int:
 
 
 def sync_all(cur, *, force_sweep: bool = False, rate: float = 3.0,
-             now: datetime | None = None) -> dict:
+             now: datetime | None = None,
+             budget_sec: float = DEFAULT_BUDGET_SEC) -> dict:
     """Every database, parents first. One database's failure does not stop the rest.
 
     WHY PER-DATABASE AND NOT ALL-OR-NOTHING. Each sync writes one table and each
@@ -609,37 +670,71 @@ def sync_all(cur, *, force_sweep: bool = False, rate: float = 3.0,
     What a failure must never do is (a) advance that database's watermark or
     (b) run its sweep. Either would be the fail-open shape: a sweep off the back
     of an outage marks every row deleted, and an advanced watermark skips every
-    edit made during it. `sync_one` raises before reaching both, and the handler
-    below records status='unavailable' WITHOUT touching last_edited or
-    last_full_sweep.
+    edit made during it. `sync_one` raises before reaching both, and the handlers
+    below record a status WITHOUT touching last_edited or last_full_sweep.
 
-    The caller decides what a partial sync means. It is visible rather than
-    silent: an unsynced `store items` leaves every list line flagged no_store,
-    which is loud.
+    THREE FAILURE KINDS, RECORDED DISTINCTLY, because they need different actions:
+      no_access  the integration cannot see it (404/403). A person has to share
+                 the page; retrying learns nothing, so it is never retried.
+      deadline   the run's time budget expired. What finished is kept.
+      unavailable anything else — a timeout, a 5xx. Worth retrying next run.
+
+    The budget exists for the UNATTENDED 00:25 job. A healthy run is ~7 s and a run
+    with three inaccessible databases ~2 s (measured on the box), so 90 s can only
+    fire on something genuinely wrong — and when it does, the reason is written
+    down instead of the row just stopping.
     """
     token = _token()
     bucket = TokenBucket(rate=rate)
-    reports, failures = [], {}
+    deadline = SyncDeadline(budget_sec)
+    reports: list[SyncReport] = []
+    failed: dict[str, str] = {}
+    skipped: list[str] = []
+
     for db_key in ORDER:
+        if deadline.expired():
+            # Not attempted at all: say so rather than leaving it silent.
+            skipped.append(db_key)
+            write_state(cur, db_key, last_edited=None, swept=False,
+                        status="deadline",
+                        detail=f"run budget {budget_sec:.0f}s expired before this "
+                               f"database was attempted", rows_seen=0)
+            continue
         try:
             reports.append(sync_one(cur, db_key, token=token, bucket=bucket,
-                                    force_sweep=force_sweep, now=now))
+                                    force_sweep=force_sweep, now=now,
+                                    deadline=deadline))
+        except NotionAccessDenied as exc:
+            detail = str(exc)[:400]
+            failed[db_key] = detail
+            logger.warning("prep sync: %s NOT SHARED with the integration — %s",
+                           db_key, detail)
+            write_state(cur, db_key, last_edited=None, swept=False,
+                        status="no_access", detail=detail, rows_seen=0)
+        except SyncBudgetExpired as exc:
+            detail = str(exc)[:400]
+            failed[db_key] = detail
+            logger.warning("prep sync: %s hit the run budget — %s", db_key, detail)
+            write_state(cur, db_key, last_edited=None, swept=False,
+                        status="deadline", detail=detail, rows_seen=0)
         except NotionUnavailable as exc:
             detail = str(exc)[:400]
-            failures[db_key] = detail
+            failed[db_key] = detail
             logger.warning("prep sync: %s unavailable — %s", db_key, detail)
-            # Status only. last_edited and last_full_sweep are deliberately NOT
-            # passed, so neither moves: GREATEST() keeps the stored watermark and
-            # the CASE keeps the stored sweep time.
             write_state(cur, db_key, last_edited=None, swept=False,
                         status="unavailable", detail=detail, rows_seen=0)
+
     linked = link_food(cur)
     seeded = seed_on_hand(cur)
     return {"databases": [r.as_dict() for r in reports],
-            "failed": failures,
+            "failed": failed,
+            "skipped": skipped,
             "linked_food": linked, "seeded_on_hand": seeded,
             "requests": sum(r.requests for r in reports),
-            "slept_sec": round(sum(r.slept_sec for r in reports), 2)}
+            "slept_sec": round(sum(r.slept_sec for r in reports), 2),
+            "elapsed_sec": round(deadline.elapsed, 2),
+            "budget_sec": budget_sec,
+            "over_budget": deadline.expired()}
 
 
 # ── the one write back to Notion ────────────────────────────────────────────

@@ -285,9 +285,35 @@ def set_on_hand(cur, ingredient_id: str, *, packages=None, base=None,
     return {"ingredient_id": ingredient_id, "on_hand_base": float(base)}
 
 
+# ── one run at a time ───────────────────────────────────────────────────────
+
+#: Postgres advisory lock id for the prep refresh. Arbitrary but fixed; advisory
+#: locks share one namespace per database, so it must not collide with another.
+REFRESH_LOCK_ID = 2026_0929
+
+
+def try_lock(cur) -> bool:
+    """Take the refresh lock, or report that another run holds it.
+
+    WHY AN ADVISORY LOCK AND NOT A ROW OR A FILE. It is released automatically
+    when the connection closes — including when the process is killed — so a
+    crashed run cannot wedge the job for ever, which a "running" flag in a table
+    absolutely can. It needs no schema, and it is honest across processes: the box
+    and a person running the script by hand contend for the same lock.
+
+    The job this protects is UNATTENDED at 00:25. Two overlapping runs would both
+    walk the same watermarks and the same sweep, and the loser would advance a
+    watermark past rows the winner was still writing.
+    """
+    cur.execute("SELECT pg_try_advisory_lock(%s)", (REFRESH_LOCK_ID,))
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
 # ── the whole box-side round ────────────────────────────────────────────────
 
-def refresh(cur, today: date, *, force_sweep: bool = False) -> dict:
+def refresh(cur, today: date, *, force_sweep: bool = False,
+            budget_sec: float | None = None) -> dict:
     """Sync Notion, propose the stay, resolve its menu. The box's daily job.
 
     ORDER MATTERS and it is not arbitrary: the sync must land before the menu is
@@ -308,7 +334,14 @@ def refresh(cur, today: date, *, force_sweep: bool = False) -> dict:
     """
     from artemis import prep_notion
 
-    out: dict = {"synced": prep_notion.sync_all(cur, force_sweep=force_sweep)}
+    if not try_lock(cur):
+        # Another run is in flight. Doing nothing is the right answer: the other
+        # run is doing this work, and a second one would race it.
+        logger.warning("Prep refresh skipped — another run holds the lock")
+        return {"skipped": "another refresh is already running"}
+
+    out: dict = {"synced": prep_notion.sync_all(cur, force_sweep=force_sweep,
+                                                budget_sec=budget_sec or prep_notion.DEFAULT_BUDGET_SEC)}
     out["store_zones"] = sync_store_zones(cur)
     stay = next_stay(cur, today)
     if stay is None:
