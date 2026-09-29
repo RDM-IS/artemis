@@ -597,16 +597,46 @@ def seed_on_hand(cur) -> int:
 
 def sync_all(cur, *, force_sweep: bool = False, rate: float = 3.0,
              now: datetime | None = None) -> dict:
-    """Every database, parents first. Raises NotionUnavailable on a failed read."""
+    """Every database, parents first. One database's failure does not stop the rest.
+
+    WHY PER-DATABASE AND NOT ALL-OR-NOTHING. Each sync writes one table and each
+    sweep reads back that same table, so a failed read of `store items` cannot
+    make the `ingredients` sweep wrong — the isolation is real, not assumed. And
+    the alternative was verified useless: on 2026-09-29 three of the five
+    databases had never been shared with the integration, and an all-or-nothing
+    sync_all meant NOTHING synced, including the two that were readable.
+
+    What a failure must never do is (a) advance that database's watermark or
+    (b) run its sweep. Either would be the fail-open shape: a sweep off the back
+    of an outage marks every row deleted, and an advanced watermark skips every
+    edit made during it. `sync_one` raises before reaching both, and the handler
+    below records status='unavailable' WITHOUT touching last_edited or
+    last_full_sweep.
+
+    The caller decides what a partial sync means. It is visible rather than
+    silent: an unsynced `store items` leaves every list line flagged no_store,
+    which is loud.
+    """
     token = _token()
     bucket = TokenBucket(rate=rate)
-    reports = []
+    reports, failures = [], {}
     for db_key in ORDER:
-        reports.append(sync_one(cur, db_key, token=token, bucket=bucket,
-                                force_sweep=force_sweep, now=now))
+        try:
+            reports.append(sync_one(cur, db_key, token=token, bucket=bucket,
+                                    force_sweep=force_sweep, now=now))
+        except NotionUnavailable as exc:
+            detail = str(exc)[:400]
+            failures[db_key] = detail
+            logger.warning("prep sync: %s unavailable — %s", db_key, detail)
+            # Status only. last_edited and last_full_sweep are deliberately NOT
+            # passed, so neither moves: GREATEST() keeps the stored watermark and
+            # the CASE keeps the stored sweep time.
+            write_state(cur, db_key, last_edited=None, swept=False,
+                        status="unavailable", detail=detail, rows_seen=0)
     linked = link_food(cur)
     seeded = seed_on_hand(cur)
     return {"databases": [r.as_dict() for r in reports],
+            "failed": failures,
             "linked_food": linked, "seeded_on_hand": seeded,
             "requests": sum(r.requests for r in reports),
             "slept_sec": round(sum(r.slept_sec for r in reports), 2)}

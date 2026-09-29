@@ -306,10 +306,16 @@ def refresh(cur, today: date, *, force_sweep: bool = False) -> dict:
     before a stay day can reference it. And the stay must exist before the menu,
     because stay_day rows hang off it.
 
-    Raises NotionUnavailable rather than returning a partial result. A caller that
-    logs the exception and carries on has the previous list, which is old; a caller
-    handed a half-synced result would have a NEW list missing whatever the outage
-    interrupted, and nothing would say so.
+    TWO DIFFERENT FAILURE POLICIES, because the two failures differ in kind:
+
+      the sync  is isolated per database (`prep_notion.sync_all`). A database
+                that cannot be read keeps its old rows, its old watermark and its
+                old sweep time, and is named under `synced["failed"]`. Nothing is
+                silently dropped — an unsynced `store items` leaves every list
+                line flagged no_store, which is loud.
+      the menu  RAISES (`resolve_menu`). Its DELETE has already cleared the old
+                menu, so a partial result would be a SHORTER menu — fewer meals,
+                less food, and nothing saying a day was skipped.
     """
     from artemis import prep_notion
 
