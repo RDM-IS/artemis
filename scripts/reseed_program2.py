@@ -39,11 +39,22 @@ def _md5_outside(cur, keys) -> str:
 
 
 def _sig(b: dict) -> dict:
+    """What counts as "this row changed".
+
+    Every field the card READS belongs here. `zones` was missing, and the
+    consequence was not a wrong diff but no diff at all: adding the Z2 range to
+    `_z2` left all 42 rows reporting "unchanged", so the reseed declined to write
+    and the rows kept a zone name with no bpm. A signature narrower than the row
+    is a reseed that cannot see its own work.
+    """
     return {"display_name": b.get("display_name"),
             "type": b.get("type"),
             "exercises": [e["name"] for e in b.get("exercises", [])],
             "suggested_extra": b.get("suggested_extra"),
             "intervals": b.get("intervals"),
+            "zones": b.get("zones"),
+            "intensity": b.get("intensity"),
+            "ran_as": b.get("ran_as"),
             "duration_min": b.get("duration_min"),
             "location_key": b.get("location_key")}
 
