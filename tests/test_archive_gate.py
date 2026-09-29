@@ -123,14 +123,22 @@ class TestRubricFixtures(unittest.TestCase):
     """Tolerant: surfaces misses as a report, never hard-fails on one LLM call."""
 
     def test_rubric_states(self):
-        from artemis.briefs import triage_emails
+        from artemis.briefs import TriageUnavailable, triage_emails
         from artemis.inbox import state_from_triage
 
         misses = []
         for desc, body, expected in _RUBRIC_FIXTURES:
-            triaged = triage_emails(body)
+            # An unreadable answer now RAISES rather than returning [] -- that is
+            # the point of the change. This test is about rubric accuracy, so an
+            # unavailable triage is a skip, not a miss. An EMPTY list is still a
+            # real answer and still skips, but for a different reason, so the two
+            # messages say which happened.
+            try:
+                triaged = triage_emails(body)
+            except TriageUnavailable as exc:
+                self.skipTest(f"triage unavailable: {exc}")
             if not triaged:
-                self.skipTest("triage returned nothing (API/parse failure)")
+                self.skipTest("triage read the batch and flagged nothing")
             state = state_from_triage(triaged[0])
             if state != expected:
                 misses.append(f"  {desc}: got {state}, expected {expected}")

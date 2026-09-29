@@ -72,8 +72,37 @@ def _call_claude(
         return ""
 
 
+class TriageUnavailable(RuntimeError):
+    """The triage could not be read.
+
+    This is deliberately an EXCEPTION and not an empty list, and not a typed
+    result with an empty `items` either. Both of those can be consumed by
+    `for item in triaged:` without the caller noticing anything went wrong --
+    which is exactly the failure being fixed: an unreadable answer looked
+    identical to "nothing in your inbox needs attention". Only a raise forces
+    the question to be answered.
+
+    An empty list from `triage_emails` remains a real answer: the model read the
+    batch and nothing needed flagging.
+    """
+
+    def __init__(self, reason: str, *, truncated: bool = False, raw: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.truncated = truncated
+        self.raw = raw
+
+
 def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
-    """Classify emails by urgency and sender type, with playbook matching."""
+    """Classify emails by urgency and sender type, with playbook matching.
+
+    Returns the triaged items -- possibly an empty list, meaning the model
+    looked and flagged nothing.
+
+    Raises `TriageUnavailable` when the answer could not be obtained or read.
+    FAIL-CLOSED-RESOLVERS: "I could not check" and "you are all clear" must not
+    reach a caller the same way.
+    """
     system = TRIAGE_SYSTEM.replace("{playbooks}", playbook_text or "")
     # max_tokens was 1000, and that -- not fencing -- is what broke 20 triages in
     # five days: the failures had a median response of 2820 chars against 511 for
@@ -86,7 +115,9 @@ def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
         max_tokens=4000,
     )
     if not result:
-        return []
+        # The API call itself failed; _call_claude has already logged it. An
+        # empty string is not an empty inbox.
+        raise TriageUnavailable("the Claude call returned nothing")
     from artemis.llm_json import LlmJsonError, parse as parse_llm_json
     try:
         data = parse_llm_json(result, stop_reason=_LAST_STOP_REASON[0],
@@ -95,7 +126,7 @@ def triage_emails(emails_text: str, playbook_text: str = "") -> list[dict]:
         # The message distinguishes truncated from malformed. "Failed to parse"
         # for a truncated response is what made this look like a fencing bug.
         logger.error("Triage unusable — %s | starts: %s", exc, result[:120])
-        return []
+        raise TriageUnavailable(str(exc), truncated=exc.truncated, raw=exc.raw) from exc
     # Claude may return a bare array or a wrapped object like {"items": [...]}
     if isinstance(data, list):
         return data
