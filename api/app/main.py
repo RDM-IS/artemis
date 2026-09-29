@@ -17,7 +17,7 @@ from .database import get_db
 from .routers import (
     organizations, contacts, deals, interactions,
     commitments, invoices, founder_loans, webhooks,
-    dashboard, health as health_router,
+    dashboard, health as health_router, prep as prep_router,
 )
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
@@ -56,6 +56,11 @@ app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"], dependencies=[Depends(verify_api_key)])
 # Health/training plan — no auth (private network, gym-display frontend).
 app.include_router(health_router.router, prefix="/api/health", tags=["health"])
+# PREP-1 — shopping list + pantry. Each route carries its own
+# verify_health_api_key dependency (declared in the router, like the health
+# router's own routes) rather than one here, so the two cannot be mounted with
+# different auth by accident.
+app.include_router(prep_router.router, prefix="/api/prep", tags=["prep"])
 
 @app.get("/health")
 @app.get("/default/rdmis-crm-api/health")
