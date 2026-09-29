@@ -28,8 +28,9 @@ class Cur:
     """Serves the detector's reads; any can be made to raise."""
 
     def __init__(self, *, rows=(), samples=(), enabled=None, pending=None,
-                 raises=(), claimed=()):
+                 raises=(), claimed=(), set_spans=()):
         self.rows, self.samples, self.claimed = list(rows), list(samples), list(claimed)
+        self.set_spans = list(set_spans)
         self.enabled, self._pending, self.raises = enabled, pending, set(raises)
         self._res, self.written, self.deleted = [], [], []
 
@@ -53,6 +54,10 @@ class Cur:
             if "claimed" in self.raises:
                 raise RuntimeError("down")
             self._res = [{"window_start": a, "window_end": b} for a, b in self.claimed]
+        elif "MIN(sl.logged_at)" in s:
+            if "sets" in self.raises:
+                raise RuntimeError("down")
+            self._res = [{"first_at": a, "last_at": b} for a, b in self.set_spans]
         elif "health.plan" in s:
             if "plan" in self.raises:
                 raise RuntimeError("down")
@@ -328,3 +333,66 @@ class TestAnotherSessionsWindowIsNotCardio(unittest.TestCase):
                             raises=("claimed",)), DAY)
         self.assertFalse(out["ok"])
         self.assertIn("other sessions", out["reason"])
+
+
+class TestSetTimestampsCloseTheGap(unittest.TestCase):
+    """Round #19 shipped the overlap guard reading only ZONE-0 windows, which
+    exist only for sessions FINISHED on the iPad. A lift logged set by set with
+    no Finish left its heart-rate block eligible — so the very case the guard
+    was built for could still slip through. Every set carries a `logged_at`, and
+    the span of a session's sets says when he was training whether or not he
+    ever pressed Finish."""
+
+    def test_a_lift_WITHOUT_a_finish_still_blocks_its_own_hr(self):
+        # No ZONE-0 row at all — only set timestamps.
+        spans = [(T0 + timedelta(minutes=2), T0 + timedelta(minutes=36))]
+        out = cd.detect(Cur(rows=[plan_row()], samples=run(38, 118),
+                            claimed=[], set_spans=spans), DAY)
+        self.assertFalse(out["ok"])
+        self.assertIn("another logged session", out["reason"])
+
+    def test_a_lift_WITH_a_finish_still_blocks_it(self):
+        """The ZONE-0 path must keep working — this is not a replacement."""
+        claimed = [(T0 - timedelta(minutes=5), T0 + timedelta(minutes=45))]
+        out = cd.detect(Cur(rows=[plan_row()], samples=run(38, 118),
+                            claimed=claimed, set_spans=[]), DAY)
+        self.assertFalse(out["ok"])
+
+    def test_cardio_after_a_lift_the_same_morning_is_still_proposed(self):
+        """The guard must not swallow the day. A lift at 5:12 and cardio at
+        11:12 are two blocks, and only the first is explained."""
+        samples = run(35, 118) + run(40, 120, start=T0 + timedelta(hours=6))
+        spans = [(T0 + timedelta(minutes=2), T0 + timedelta(minutes=33))]
+        out = cd.detect(Cur(rows=[plan_row()], samples=samples,
+                            claimed=[], set_spans=spans), DAY)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["block"]["minutes"], 40)
+
+    def test_back_to_back_sessions_both_claim_their_own_window(self):
+        a = run(20, 118)
+        b = run(25, 120, start=T0 + timedelta(minutes=25))
+        spans = [(T0 + timedelta(minutes=1), T0 + timedelta(minutes=19)),
+                 (T0 + timedelta(minutes=26), T0 + timedelta(minutes=49))]
+        out = cd.detect(Cur(rows=[plan_row()], samples=a + b,
+                            claimed=[], set_spans=spans), DAY)
+        self.assertFalse(out["ok"])
+
+    def test_the_pad_catches_a_block_that_starts_in_the_warm_up(self):
+        """A set is logged AFTER it is done, so the block starts before the
+        first timestamp. Without the pad it would slip past."""
+        spans = [(T0 + timedelta(minutes=4), T0 + timedelta(minutes=36))]
+        out = cd.detect(Cur(rows=[plan_row()], samples=run(38, 118),
+                            claimed=[], set_spans=spans), DAY)
+        self.assertFalse(out["ok"])
+
+    def test_an_unreadable_set_span_read_posts_nothing(self):
+        out = cd.detect(Cur(rows=[plan_row()], samples=run(38, 118),
+                            raises=("sets",)), DAY)
+        self.assertFalse(out["ok"])
+        self.assertIn("other sessions", out["reason"])
+
+    def test_the_query_excludes_cardio_rows_from_the_claimed_set(self):
+        """A cardio row's OWN sets must not disqualify its own block."""
+        import inspect
+        src = inspect.getsource(cd._claimed_windows)
+        self.assertEqual(src.count("session_type NOT IN"), 2)

@@ -44,6 +44,12 @@ MAX_GAP_SEC = zones.MAX_SAMPLE_GAP_SEC
 
 CARDIO_TYPES = ("cardio_z2", "cardio_intervals")
 
+#: Padding either side of a session's logged sets when treating them as a
+#: window. A set is logged after it is done and the warm-up before the first one
+#: already raises the heart rate, so the elevated block starts before the first
+#: timestamp and ends after the last.
+SET_WINDOW_PAD_MIN = 5
+
 
 def is_enabled(cur) -> bool:
     """Default OFF. An unreadable flag is OFF too -- a standing automation that
@@ -151,12 +157,39 @@ def _claimed_windows(cur, day: date) -> list[tuple]:
     cardio session in his record that never happened, and he would have to
     notice to undo it.
     """
+    windows: list[tuple] = []
+
+    # (1) ZONE-0 windows: a session that was FINISHED on the iPad has one.
     cur.execute(
         "SELECT z.window_start, z.window_end FROM health.session_hr_zones z "
         "JOIN health.plan p ON p.plan_id = z.plan_id "
         "WHERE p.plan_date = %s AND p.session_type NOT IN %s", (day, CARDIO_TYPES))
-    return [((r["window_start"], r["window_end"]) if isinstance(r, dict)
-             else (r[0], r[1])) for r in cur.fetchall()]
+    windows += [((r["window_start"], r["window_end"]) if isinstance(r, dict)
+                 else (r[0], r[1])) for r in cur.fetchall()]
+
+    # (2) SET TIMESTAMPS: a session with logged sets and no Finish has no ZONE-0
+    # row, so (1) alone left its heart-rate block eligible -- the exact gap
+    # flagged at the end of round #19. Every set carries a `logged_at`, which is
+    # enough: the span of a session's sets says when he was training whether or
+    # not he ever pressed Finish.
+    #
+    # +/- PAD_MIN either side because the first set is logged AFTER it is done
+    # and the warm-up before it raises the heart rate too. Without the pad, a
+    # block starting during the warm-up would begin before the first set's
+    # timestamp and slip past the guard.
+    cur.execute(
+        "SELECT MIN(sl.logged_at) AS first_at, MAX(sl.logged_at) AS last_at "
+        "FROM health.session_log sl JOIN health.plan p ON p.plan_id = sl.plan_id "
+        "WHERE p.plan_date = %s AND p.session_type NOT IN %s "
+        "  AND sl.logged_via <> 'inferred' "
+        "GROUP BY sl.plan_id", (day, CARDIO_TYPES))
+    pad = timedelta(minutes=SET_WINDOW_PAD_MIN)
+    for r in cur.fetchall():
+        first_at = r["first_at"] if isinstance(r, dict) else r[0]
+        last_at = r["last_at"] if isinstance(r, dict) else r[1]
+        if first_at and last_at:
+            windows.append((first_at - pad, last_at + pad))
+    return windows
 
 
 def _overlaps(block: dict, windows) -> bool:
