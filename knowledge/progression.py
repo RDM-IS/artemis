@@ -37,6 +37,13 @@ def rep_range(exercise: dict) -> tuple[int, int] | None:
     no top of range to reach, so they cannot double-progress and must not be
     guessed into it.
     """
+    # A HOLD has no top of range to reach. This used to be a claim in the
+    # docstring above and nothing more: the regex happily matched "3x30-45s" and
+    # returned (30, 45), so a side plank would have had load advice computed from
+    # seconds read as reps. The format field is the authority — a duration
+    # exercise carries no target_reps either.
+    if exercise.get("format") == "duration" or exercise.get("duration_sec") is not None:
+        return None
     m = _RANGE.search(str(exercise.get("notes") or ""))
     if m:
         low, high = int(m.group(2)), int(m.group(3))

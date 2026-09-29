@@ -324,6 +324,69 @@ class TestStoreLocation(unittest.TestCase):
         self.assertIsNone(row["store"])
 
 
+class TestPackageTieBreak(unittest.TestCase):
+    """Ryan's spec rule, adopted 2026-09-29: on a rank tie, prefer the SMALLEST
+    package that still covers the need. It serves the "<= 1 package over per item"
+    acceptance criterion — buying the smallest carton that does the job is what
+    keeps the overshoot inside one package."""
+
+    def two(self, size_a, size_b, need, **kw):
+        beans = ing("ing-beans")
+        items = [item("si-a", "ing-beans", "st-aldi", rank=1, package_size=size_a, **kw),
+                 item("si-b", "ing-beans", "st-aldi", rank=1, package_size=size_b, **kw)]
+        return pm.choose_item(items, beans, STORES, need=need)["package_size"]
+
+    def test_the_smallest_package_that_covers_the_need_wins(self):
+        # need 400: the 454 tub covers it with 54 g over; the 1000 bag with 600.
+        self.assertEqual(self.two(1000.0, 454.0, 400.0), 454.0)
+
+    def test_a_package_that_covers_beats_one_that_does_not_even_if_smaller(self):
+        self.assertEqual(self.two(200.0, 454.0, 400.0), 454.0)
+
+    def test_when_nothing_covers_the_need_the_largest_wins(self):
+        # 1200 needed, packages of 200 and 500: the 500 takes 3 trips to the shelf
+        # instead of 6. Fewest packages, not smallest.
+        self.assertEqual(self.two(200.0, 500.0, 1200.0), 500.0)
+
+    def test_with_no_need_price_decides(self):
+        beans = ing("ing-beans")
+        items = [item("si-a", "ing-beans", "st-aldi", rank=1, package_size=1000.0, price=9.0),
+                 item("si-b", "ing-beans", "st-aldi", rank=1, package_size=200.0, price=2.0)]
+        self.assertEqual(
+            pm.choose_item(items, beans, STORES, need=None)["package_size"], 200.0)
+
+    def test_rank_still_beats_every_package_consideration(self):
+        # A rank-1 item wins even when a rank-2 item has the tidier package.
+        beans = ing("ing-beans")
+        items = [item("si-a", "ing-beans", "st-aldi", rank=1, package_size=1000.0),
+                 item("si-b", "ing-beans", "st-coop", rank=2, package_size=454.0)]
+        self.assertEqual(
+            pm.choose_item(items, beans, STORES, need=400.0)["package_size"], 1000.0)
+
+    def test_the_choice_is_stable_across_runs(self):
+        beans = ing("ing-beans")
+        items = [item("si-a", "ing-beans", "st-aldi", rank=1, package_size=454.0),
+                 item("si-b", "ing-beans", "st-aldi", rank=1, package_size=454.0)]
+        picks = {pm.choose_item(list(reversed(items)) if i % 2 else items,
+                               beans, STORES, need=400.0)["notion_id"]
+                 for i in range(4)}
+        self.assertEqual(len(picks), 1)
+
+    def test_it_keeps_the_overshoot_inside_one_package(self):
+        # The acceptance criterion, stated as a property: whatever is chosen,
+        # buying ceil(need/size) packages must not overshoot by a whole package.
+        beans = ing("ing-beans", on_hand_base=0.0)
+        for need in (100.0, 400.0, 900.0, 1500.0):
+            items = [item("si-a", "ing-beans", "st-aldi", rank=1, package_size=s)
+                     for s in (200.0, 454.0, 1000.0)]
+            for i, it in enumerate(items):
+                it["notion_id"] = f"si-{i}"
+            chosen = pm.choose_item(items, beans, STORES, need=need)
+            size = chosen["package_size"]
+            pkgs = pm.packages_for(need, size)
+            self.assertLess(pkgs * size - need, size, f"need={need} size={size}")
+
+
 class TestAisles(unittest.TestCase):
     ZONES = {"zones": [{"name": "Produce", "order": 1, "keywords": ["carrot"]},
                        {"name": "Dairy", "order": 2, "keywords": ["milk"]}]}

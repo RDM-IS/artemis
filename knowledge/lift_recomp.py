@@ -72,6 +72,47 @@ _GOOD_PAIRS = frozenset({
 })
 
 
+# ── holds are prescribed in SECONDS, never in reps ──────────────────────────
+#
+# A side plank has no rep count. "3x15-25" on one is not a slightly odd
+# prescription, it is a meaningless one — and worse, it PARSES: the double
+# progression reads a range out of the exercise's notes, so "3x30-45s" would have
+# been read as 30-45 reps and the load advice computed from it.
+#
+# So a hold declares its seconds here and the builder emits `format: "duration"`
+# with no `target_reps` at all. `progression.rep_range` refuses a duration-format
+# exercise outright, which is what its docstring already claimed and nothing
+# enforced.
+HOLD_SECONDS: dict[str, tuple[int, int]] = {
+    # Ryan's number for the hotel table, 2026-09-29.
+    "Side plank": (30, 45),
+    # The other holds this program can emit, for the same reason: so that adding
+    # one to a strength table cannot silently acquire a rep range.
+    "Plank": (30, 60),
+    "Hollow hold": (20, 40),
+    "Ball plank": (30, 45),
+}
+
+
+def is_hold(name: str) -> bool:
+    return name in HOLD_SECONDS
+
+
+def hold_seconds(name: str) -> tuple[int, int]:
+    """(low, high) seconds. Raises on a movement that is not a declared hold, so
+    a caller cannot ask for seconds and silently receive a default."""
+    try:
+        return HOLD_SECONDS[name]
+    except KeyError:
+        raise KeyError(f"{name!r} is not a declared hold; "
+                       f"known: {sorted(HOLD_SECONDS)}") from None
+
+
+def hold_label(name: str) -> str:
+    lo, hi = hold_seconds(name)
+    return f"{lo}-{hi}s"
+
+
 def applies(week_num) -> bool:
     """True for a week this scheme governs. Weeks before FIRST_WEEK keep the old
     prescription, which is what makes the reseed safe: nothing before 10/11 moves."""

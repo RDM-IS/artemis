@@ -21,6 +21,7 @@ Auth: the same X-API-Key the rest of gym-display's calls use, validated against
 `rdmis/dev/health-api-key`. The Cloudflare Access proxy attaches it server-side.
 """
 
+import json
 import logging
 from datetime import date, datetime
 from typing import Any, Optional
@@ -28,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from knowledge import prep_store
@@ -285,3 +286,340 @@ def _num(v):
     Decimal is not JSON-serialisable; None must survive as None, because None and
     0 are different answers throughout this subsystem."""
     return None if v is None else float(v)
+
+
+# ── PREP-2: the prep board ──────────────────────────────────────────────────
+#
+# The SCHEDULER IS NOT HERE, on purpose. It runs in the browser
+# (gym-display/src/lib/prep-schedule.ts) so that starting a card early, marking one
+# done or adding five minutes re-flows the board with the Wi-Fi off — which is the
+# normal state of a kitchen. These endpoints serve the steps and the kitchen
+# profile it needs, and record what happened.
+#
+# `schedule_json` on a session is therefore a RECORD, never the authority: the
+# board recomputes on open. A stored schedule the code no longer agrees with is the
+# same stale-answer problem the shopping list avoids by recomputing every read.
+
+class StepIn(BaseModel):
+    step_no: int = Field(ge=1, le=99)
+    name: str = Field(min_length=1, max_length=120)
+    resource: str
+    mode: str = "active"
+    base_min: float = Field(default=0, ge=0, le=600)
+    per_serving_min: float = Field(default=0, ge=0, le=120)
+    temp_f: Optional[int] = Field(default=None, ge=100, le=600)
+    batch_key: Optional[str] = Field(default=None, max_length=60)
+    keep_separate: bool = False
+    keep_separate_note: Optional[str] = Field(default=None, max_length=200)
+    shortcut_key: Optional[str] = Field(default=None, max_length=60)
+    notes: Optional[str] = Field(default=None, max_length=300)
+
+
+class StepsIn(BaseModel):
+    recipe_id: str = Field(min_length=1, max_length=64)
+    steps: list[StepIn] = Field(default_factory=list, max_length=40)
+
+
+_RESOURCES = ("hands", "oven", "stove", "air_fryer", "counter", "fridge")
+_MODES = ("active", "passive", "unattended")
+
+
+@router.get("/steps")
+def get_steps(db: Session = Depends(get_db),
+              _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    """Every recipe with its steps, for the editor.
+
+    Recipes with NO steps are included — "this one has none yet" is precisely what
+    the editor exists to fix, and filtering them out would hide the work.
+    """
+    fetch = _fetch_for(db)
+    try:
+        rows = prep_store.all_steps(fetch)
+    except SQLAlchemyError:
+        logger.exception("prep steps read failed")
+        raise HTTPException(status_code=500, detail={"error": "read_failed"})
+    out: dict[str, dict] = {}
+    for r in rows:
+        rec = out.setdefault(r["notion_id"], {
+            "recipe_id": r["notion_id"], "name": r["name"], "slug": r["slug"],
+            "servings": _num(r["servings"]), "plan_eligible": r["plan_eligible"],
+            "steps": []})
+        if r["step_no"] is None:
+            continue
+        rec["steps"].append(_step_out(r))
+    recipes = sorted(out.values(), key=lambda x: (x["name"] or "").lower())
+    return {"recipes": recipes,
+            "with_steps": sum(1 for r in recipes if r["steps"]),
+            "without_steps": sum(1 for r in recipes if not r["steps"]),
+            "resources": list(_RESOURCES), "modes": list(_MODES)}
+
+
+@router.put("/steps")
+def put_steps(body: StepsIn, db: Session = Depends(get_db),
+              _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    """Replace one recipe's steps.
+
+    DELETE-THEN-INSERT in one transaction rather than a diff: the editor sends the
+    whole list, and there is no state in which half the steps are the new ones.
+    Sending an empty list is a legitimate "this recipe is not batch-prepped", which
+    is the right answer for anything cooked fresh on the day.
+    """
+    for s in body.steps:
+        if s.resource not in _RESOURCES:
+            raise HTTPException(status_code=400, detail={
+                "error": "bad_resource", "message": f"{s.resource!r} is not one of "
+                f"{', '.join(_RESOURCES)}"})
+        if s.mode not in _MODES:
+            raise HTTPException(status_code=400, detail={
+                "error": "bad_mode", "message": f"{s.mode!r} is not one of "
+                f"{', '.join(_MODES)}"})
+        if s.resource == "oven" and s.temp_f is None:
+            # An oven step with no temperature cannot be shared with another oven
+            # step and the scheduler would have to guess. The database CHECK says
+            # the same thing; refusing here gives a message instead of a 500.
+            raise HTTPException(status_code=400, detail={
+                "error": "oven_needs_temp",
+                "message": f"{s.name!r} is an oven step and needs a temperature"})
+    numbers = [s.step_no for s in body.steps]
+    if len(set(numbers)) != len(numbers):
+        raise HTTPException(status_code=400, detail={
+            "error": "duplicate_step_no", "message": "step numbers must be unique"})
+    try:
+        conn = db.connection()
+        conn.exec_driver_sql(prep_store.DELETE_STEPS_SQL, (body.recipe_id,))
+        for s in sorted(body.steps, key=lambda x: x.step_no):
+            conn.exec_driver_sql(prep_store.INSERT_STEP_SQL, (
+                body.recipe_id, s.step_no, s.name, s.resource, s.mode,
+                s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+                s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes))
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("prep steps write failed for %s", body.recipe_id)
+        raise HTTPException(status_code=500, detail={"error": "write_failed"})
+    return {"recipe_id": body.recipe_id, "steps": len(body.steps)}
+
+
+@router.get("/board")
+def get_board(stay_id: Optional[int] = Query(default=None),
+              db: Session = Depends(get_db),
+              _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    """Everything the browser needs to SCHEDULE the session itself.
+
+    Deliberately not a schedule: the recipes, their servings still to cook, their
+    steps and the kitchen. The board computes the plan, so it can recompute it
+    offline when a card starts late.
+    """
+    fetch = _fetch_for(db)
+    stay = _resolve_stay(fetch, stay_id, db)
+    try:
+        rows = prep_store.steps_for_stay(fetch, stay["id"])
+        kitchen = prep_store.kitchen_profile(fetch)
+    except SQLAlchemyError:
+        logger.exception("prep board read failed for stay %s", stay["id"])
+        raise HTTPException(status_code=500, detail={"error": "read_failed"})
+
+    recipes: dict[str, dict] = {}
+    stepless: list[str] = []
+    for r in rows:
+        rec = recipes.setdefault(r["notion_id"], {
+            "notionId": r["notion_id"], "name": r["name"],
+            "servings": _num(r["servings"]) or 0, "grams": None, "steps": []})
+        if r["step_no"] is None:
+            continue
+        rec["steps"].append({
+            "stepNo": r["step_no"], "name": r["step_name"],
+            "resource": r["resource"], "mode": r["mode"],
+            "baseMin": _num(r["base_min"]) or 0,
+            "perServingMin": _num(r["per_serving_min"]) or 0,
+            "tempF": r["temp_f"], "batchKey": r["batch_key"],
+            "keepSeparate": r["keep_separate"],
+            "keepSeparateNote": r["keep_separate_note"],
+            "shortcutKey": r["shortcut_key"], "notes": r["notes"]})
+    for rec in recipes.values():
+        if not rec["steps"]:
+            stepless.append(rec["name"])
+    return {
+        "stay": {"id": stay["id"], "start_date": stay["start_date"].isoformat(),
+                 "end_date": stay["end_date"].isoformat()},
+        "recipes": [r for r in recipes.values() if r["steps"]],
+        # Named, not dropped: a recipe with servings to cook and no steps is work
+        # the board cannot show him, and silence would look like nothing to do.
+        "stepless": sorted(stepless),
+        "kitchen": {
+            "ovenSlots": kitchen["oven_slots"], "burners": kitchen["burners"],
+            "airFryerSlots": kitchen["air_fryer_slots"],
+            "preheatMin": kitchen["preheat_min"],
+            "tempChangeMin": kitchen["temp_change_min"],
+            "fillerMin": kitchen["filler_min"],
+            "fillerName": kitchen["filler_name"]},
+    }
+
+
+class SessionIn(BaseModel):
+    stay_id: Optional[int] = None
+    session_date: date
+    status: str = "planned"
+    schedule_json: Optional[dict[str, Any]] = None
+    shortcuts: list[str] = Field(default_factory=list, max_length=20)
+    planned_min: Optional[int] = Field(default=None, ge=0, le=1440)
+    hands_on_min: Optional[int] = Field(default=None, ge=0, le=1440)
+
+
+class EventIn(BaseModel):
+    session_id: int
+    task_key: str = Field(min_length=1, max_length=120)
+    task_name: Optional[str] = Field(default=None, max_length=160)
+    resource: Optional[str] = None
+    kind: str
+    planned_min: Optional[float] = Field(default=None, ge=0, le=600)
+    actual_min: Optional[float] = Field(default=None, ge=0, le=600)
+
+
+_SESSION_STATUS = ("planned", "running", "done", "abandoned")
+_EVENT_KINDS = ("start", "done", "extend", "skip")
+
+
+@router.post("/session")
+def post_session(body: SessionIn, db: Session = Depends(get_db),
+                 _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    """Record a session. `started_at` is set when it first becomes `running`.
+
+    That timestamp is the anchor every timer on the board is derived from. Interval
+    timers drift and then die when the tab sleeps, and an iPad on a kitchen counter
+    locks constantly — an absolute start plus an offset is correct after a lock, a
+    reload and an aeroplane-mode blip alike.
+    """
+    if body.status not in _SESSION_STATUS:
+        raise HTTPException(status_code=400, detail={
+            "error": "bad_status", "message": f"one of {', '.join(_SESSION_STATUS)}"})
+    try:
+        res = db.connection().exec_driver_sql("""
+            INSERT INTO nutrition.prep_session
+              (stay_id, session_date, status, started_at, schedule_json, shortcuts,
+               planned_min, hands_on_min)
+            VALUES (%s, %s, %s, CASE WHEN %s = 'running' THEN now() ELSE NULL END,
+                    %s::jsonb, %s::jsonb, %s, %s)
+            RETURNING id""",
+            (body.stay_id, body.session_date, body.status, body.status,
+             json.dumps(body.schedule_json) if body.schedule_json else None,
+             json.dumps(body.shortcuts), body.planned_min, body.hands_on_min))
+        session_id = res.scalar()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail={
+            "error": "no_stay", "message": f"no stay {body.stay_id}"})
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("prep session write failed")
+        raise HTTPException(status_code=500, detail={"error": "write_failed"})
+    return {"session_id": session_id, "status": body.status}
+
+
+@router.post("/session/{session_id}/status")
+def patch_session(session_id: int, status: str = Query(...),
+                  db: Session = Depends(get_db),
+                  _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    if status not in _SESSION_STATUS:
+        raise HTTPException(status_code=400, detail={"error": "bad_status"})
+    try:
+        res = db.connection().exec_driver_sql("""
+            UPDATE nutrition.prep_session SET
+              status = %s,
+              -- started_at is set ONCE. Re-starting a paused session must not move
+              -- the anchor every running timer is measured from.
+              started_at = CASE WHEN %s = 'running' AND started_at IS NULL
+                                THEN now() ELSE started_at END,
+              finished_at = CASE WHEN %s IN ('done','abandoned')
+                                 THEN now() ELSE finished_at END,
+              actual_min = CASE WHEN %s IN ('done','abandoned') AND started_at IS NOT NULL
+                                THEN EXTRACT(EPOCH FROM (now() - started_at))/60
+                                ELSE actual_min END,
+              updated_at = now()
+            WHERE id = %s RETURNING status, started_at, actual_min""",
+            (status, status, status, status, session_id))
+        row = res.fetchone()
+        if row is None:
+            db.rollback()
+            raise HTTPException(status_code=404, detail={"error": "no_session"})
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("prep session status failed for %s", session_id)
+        raise HTTPException(status_code=500, detail={"error": "write_failed"})
+    return {"session_id": session_id, "status": row[0],
+            "started_at": row[1].isoformat() if row[1] else None,
+            "actual_min": _num(row[2])}
+
+
+@router.post("/event")
+def post_event(body: EventIn, db: Session = Depends(get_db),
+               _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    """Log one start / done / extend / skip.
+
+    `planned_min` and `actual_min` side by side is the whole point: the difference
+    is the correction the duration estimates need. NOTHING READS THIS YET and
+    nothing should pretend to — the estimates stay the spec's starting numbers
+    until there is data. Recording from the first session is free; back-filling it
+    later is impossible.
+    """
+    if body.kind not in _EVENT_KINDS:
+        raise HTTPException(status_code=400, detail={
+            "error": "bad_kind", "message": f"one of {', '.join(_EVENT_KINDS)}"})
+    delta = (None if body.planned_min is None or body.actual_min is None
+             else round(body.actual_min - body.planned_min, 2))
+    try:
+        db.connection().exec_driver_sql("""
+            INSERT INTO nutrition.prep_event
+              (session_id, task_key, task_name, resource, kind, planned_min,
+               actual_min, delta_min)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (body.session_id, body.task_key, body.task_name, body.resource,
+             body.kind, body.planned_min, body.actual_min, delta))
+        db.commit()
+    except IntegrityError:
+        # A session id that does not exist is a KNOWN condition, not a server
+        # fault: the foreign key is doing its job. A 500 here would send the
+        # caller looking for a broken endpoint instead of a stale session id.
+        db.rollback()
+        raise HTTPException(status_code=404, detail={
+            "error": "no_session", "message": f"no session {body.session_id}"})
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("prep event write failed")
+        raise HTTPException(status_code=500, detail={"error": "write_failed"})
+    return {"logged": body.kind, "delta_min": delta}
+
+
+@router.get("/sessions")
+def get_sessions(stay_id: Optional[int] = Query(default=None),
+                 db: Session = Depends(get_db),
+                 _=Depends(verify_health_api_key)) -> dict[str, Any]:
+    fetch = _fetch_for(db)
+    try:
+        rows = prep_store.sessions_for(fetch, stay_id)
+    except SQLAlchemyError:
+        logger.exception("prep sessions read failed")
+        raise HTTPException(status_code=500, detail={"error": "read_failed"})
+    return {"sessions": [{
+        "id": r["id"], "stay_id": r["stay_id"],
+        "session_date": r["session_date"].isoformat(),
+        "status": r["status"],
+        "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+        "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+        "planned_min": r["planned_min"], "hands_on_min": r["hands_on_min"],
+        "actual_min": _num(r["actual_min"]), "shortcuts": r["shortcuts"],
+    } for r in rows]}
+
+
+def _step_out(r: dict) -> dict:
+    return {
+        "step_id": r.get("step_id"), "step_no": r["step_no"],
+        "name": r["step_name"], "resource": r["resource"], "mode": r["mode"],
+        "base_min": _num(r["base_min"]), "per_serving_min": _num(r["per_serving_min"]),
+        "temp_f": r["temp_f"], "batch_key": r["batch_key"],
+        "keep_separate": r["keep_separate"],
+        "keep_separate_note": r["keep_separate_note"],
+        "shortcut_key": r["shortcut_key"], "notes": r["notes"],
+    }

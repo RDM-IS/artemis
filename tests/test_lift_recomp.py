@@ -345,6 +345,155 @@ class TestDoubleProgressionFollowsTheNewRange(unittest.TestCase):
         self.assertEqual(progression.rep_range(self._ex(week_num=4)), (10, 12))
 
 
+class TestHoldsAreNeverPrescribedInReps(unittest.TestCase):
+    """A side plank has no rep count.
+
+    "3×15-25" on a hold is not a slightly odd prescription, it is a meaningless
+    one — and worse, it PARSED: `progression.rep_range` reads a range out of the
+    notes, so "3×30-45s" would have been read as 30-45 reps and load advice
+    computed from it. Its docstring already claimed a duration hold "cannot
+    double-progress and must not be guessed into it"; nothing enforced that.
+    """
+
+    LOCATIONS = ("office", "richfield", "hotel")
+
+    def _every_exercise(self):
+        for key in self.LOCATIONS:
+            display = {"office": "office gym", "richfield": "Richfield",
+                       "hotel": "hotel gym"}[key]
+            for wk in range(1, 8):
+                for st in ("strength_a", "strength_b", "strength_c"):
+                    blocks, _, _, _ = ho._strength(st, wk, location=display,
+                                                   location_key=key)
+                    for ex in blocks["exercises"]:
+                        yield key, wk, st, ex
+
+    def test_no_hold_anywhere_carries_a_rep_target(self):
+        for key, wk, st, ex in self._every_exercise():
+            if lr.is_hold(ex["name"]):
+                where = f"{key} wk{wk} {st} {ex['name']}"
+                self.assertEqual(ex["format"], "duration", where)
+                self.assertNotIn("target_reps", ex, where)
+                self.assertIsNotNone(ex.get("duration_sec"), where)
+
+    def test_no_non_hold_is_accidentally_timed(self):
+        for key, wk, st, ex in self._every_exercise():
+            if not lr.is_hold(ex["name"]):
+                self.assertEqual(ex["format"], "reps",
+                                 f"{key} wk{wk} {st} {ex['name']}")
+
+    def test_a_holds_note_states_seconds(self):
+        blocks, _, _, _ = ho._strength("strength_b", 5, location="hotel gym",
+                                       location_key="hotel")
+        plank = next(e for e in blocks["exercises"] if e["name"] == "Side plank")
+        self.assertIn("30-45s", plank["notes"])
+        self.assertIn("each side", plank["notes"])
+
+    def test_progression_refuses_a_hold_outright(self):
+        from knowledge import progression
+        blocks, _, _, _ = ho._strength("strength_b", 5, location="hotel gym",
+                                       location_key="hotel")
+        plank = next(e for e in blocks["exercises"] if e["name"] == "Side plank")
+        # The trap: the notes DO contain "3×30-45", which the regex matches.
+        self.assertIsNone(progression.rep_range(plank))
+        out = progression.advance(exercise=plank, sets=[{"reps_done": 45}],
+                                  rpe_cap=8.0, load_config=None)
+        self.assertEqual(out["action"], "unknown")
+
+    def test_every_declared_hold_has_a_sane_range(self):
+        for name, (lo, hi) in lr.HOLD_SECONDS.items():
+            self.assertLess(lo, hi, name)
+            self.assertGreaterEqual(lo, 10, name)
+            self.assertLessEqual(hi, 120, name)
+
+    def test_asking_for_seconds_on_a_non_hold_raises(self):
+        with self.assertRaises(KeyError):
+            lr.hold_seconds("Leg press")
+
+
+class TestHotelGym(unittest.TestCase):
+    """Approved by Ryan 2026-09-29 ("approve hotel")."""
+
+    def _build(self, st, wk=5):
+        return ho._strength(st, wk, location="hotel gym", location_key="hotel")
+
+    def test_the_hotel_can_hold_all_three_lifts(self):
+        for st in ("strength_a", "strength_b", "strength_c"):
+            self.assertTrue(ho.can_hold("hotel", st), st)
+
+    def test_every_hotel_substitute_has_a_profile_and_a_class(self):
+        for st, table in ho.LOCATION_SUBS["hotel"].items():
+            for office_name, sub in table.items():
+                self.assertIn(sub[0], ho.LIFT_PROFILE, f"{st}: {sub[0]}")
+                ho.class_for(sub[0])          # raises if unclassed
+
+    def test_no_hotel_movement_needs_equipment_the_hotel_lacks(self):
+        """The hotel has dumbbells, one FLAT bench, a treadmill and a bike — no
+        machines, no cables, no bands, no ball. A substitute in one of those
+        classes would be undoable in the room."""
+        allowed = {"dumbbell", "bodyweight"}
+        for st in ("strength_a", "strength_b", "strength_c"):
+            blocks, _, _, _ = self._build(st)
+            for ex in blocks["exercises"]:
+                self.assertIn(ex["equipment_class"], allowed,
+                              f"{st}: {ex['name']} is {ex['equipment_class']}")
+
+    def test_the_incline_slot_is_the_feet_elevated_push_up(self):
+        # There is no incline bench, and a second flat press would repeat
+        # Strength A's, leaving the week with two flat presses and no upper chest.
+        blocks, _, _, _ = self._build("strength_b")
+        names = [e["name"] for e in blocks["exercises"]]
+        self.assertIn("Feet-elevated push-up", names)
+        self.assertNotIn("Incline DB press", names)
+        self.assertEqual(names.count("DB bench press"), 0)
+
+    def test_no_hotel_pair_contends_for_the_single_bench(self):
+        for wk in range(1, 8):
+            for st in ("strength_a", "strength_b", "strength_c"):
+                blocks, _, _, _ = self._build(st, wk)
+                for a, b in blocks.get("supersets") or []:
+                    sa, sb = ho.station_for(a), ho.station_for(b)
+                    if sa is None or sb is None:
+                        continue
+                    self.assertNotEqual(sa, sb, f"hotel wk{wk} {st}: {a} + {b}")
+
+    def test_every_hotel_lift_fits_the_window_in_the_weeks_the_scheme_governs(self):
+        # Weeks 1-4 of block 1 keep the OLD prescription and its 62-minute
+        # Strength B by design, and no away stay falls in them (both hunting stays
+        # are in November, which is block 2 — where every week is a recomp week).
+        # Asserting the cap on a week that deliberately kept the old scheme would
+        # be asserting the opposite of what makes the reseed safe.
+        for wk in range(1, 8):
+            if not ho.recomp_applies(wk):
+                continue
+            for st in ("strength_a", "strength_b", "strength_c"):
+                _, _, _, minutes = self._build(st, wk)
+                self.assertLessEqual(minutes, lr.OFFICE_CAP_MIN,
+                                     f"hotel wk{wk} {st} = {minutes}")
+
+    def test_and_in_every_block_2_week_since_that_is_when_he_travels(self):
+        from artemis import block2
+        for wk in range(1, 7):
+            for st in ("strength_a", "strength_b", "strength_c"):
+                spec = {"plan_date": block2.start_date(), "slot": "morning",
+                        "session_type": st, "week_num": wk,
+                        "location": "hotel gym", "location_key": "hotel",
+                        "day_type": "msp_work", "pos": 1, "wk0": False}
+                row = block2._build_one(spec)
+                self.assertLessEqual(row["est_duration_min"], lr.OFFICE_CAP_MIN,
+                                     f"block2 hotel wk{wk} {st}")
+
+    def test_the_dumbbell_cap_is_not_a_stall_under_this_scheme(self):
+        # The point of doing this under LIFT-RECOMP: 50 lb is a ceiling you grind
+        # into at 5 reps and just the load at 12-20.
+        from artemis import away
+        self.assertEqual(away.HOTEL_GYM_INVENTORY["dumbbell"]["max"], 50)
+        blocks, _, _, _ = self._build("strength_a")
+        for ex in blocks["exercises"]:
+            if ex["equipment_class"] == "dumbbell":
+                self.assertGreaterEqual(ex["target_reps"], 20)
+
+
 class TestDensityIsAnExpectationNotATarget(unittest.TestCase):
     def test_a_strength_row_carries_no_invented_hr_target(self):
         """Ryan's reason for supersets is that HR stays up. That is stated as an
