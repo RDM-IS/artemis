@@ -254,7 +254,7 @@ def steps_for_stay(fetch, stay_id: int) -> list:
         )
         SELECT r.notion_id, r.name, r.slug, m.servings,
                s.step_no, s.name AS step_name, s.resource, s.mode,
-               s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+               s.base_min, s.per_serving_min, s.temp_f, s.batch_key, s.chain_key,
                s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes
           FROM make m
           JOIN nutrition.prep_recipe r ON r.notion_id = m.rid
@@ -269,7 +269,7 @@ def all_steps(fetch) -> list:
     return fetch("""
         SELECT r.notion_id, r.name, r.slug, r.servings, r.plan_eligible,
                s.id AS step_id, s.step_no, s.name AS step_name, s.resource, s.mode,
-               s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+               s.base_min, s.per_serving_min, s.temp_f, s.batch_key, s.chain_key,
                s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes
           FROM nutrition.prep_recipe r
           LEFT JOIN nutrition.recipe_step s ON s.recipe_notion_id = r.notion_id
@@ -284,8 +284,9 @@ DELETE_STEPS_SQL = "DELETE FROM nutrition.recipe_step WHERE recipe_notion_id = %
 INSERT_STEP_SQL = """
 INSERT INTO nutrition.recipe_step
   (recipe_notion_id, step_no, name, resource, mode, base_min, per_serving_min,
-   temp_f, batch_key, keep_separate, keep_separate_note, shortcut_key, notes)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+   temp_f, batch_key, chain_key, keep_separate, keep_separate_note, shortcut_key,
+   notes)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 

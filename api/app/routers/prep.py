@@ -309,6 +309,8 @@ class StepIn(BaseModel):
     per_serving_min: float = Field(default=0, ge=0, le=120)
     temp_f: Optional[int] = Field(default=None, ge=100, le=600)
     batch_key: Optional[str] = Field(default=None, max_length=60)
+    #: null = a BARRIER waiting for every chain. See migration 053.
+    chain_key: Optional[str] = Field(default=None, max_length=60)
     keep_separate: bool = False
     keep_separate_note: Optional[str] = Field(default=None, max_length=200)
     shortcut_key: Optional[str] = Field(default=None, max_length=60)
@@ -390,7 +392,7 @@ def put_steps(body: StepsIn, db: Session = Depends(get_db),
         for s in sorted(body.steps, key=lambda x: x.step_no):
             conn.exec_driver_sql(prep_store.INSERT_STEP_SQL, (
                 body.recipe_id, s.step_no, s.name, s.resource, s.mode,
-                s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+                s.base_min, s.per_serving_min, s.temp_f, s.batch_key, s.chain_key,
                 s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes))
         db.commit()
     except SQLAlchemyError:
@@ -433,6 +435,7 @@ def get_board(stay_id: Optional[int] = Query(default=None),
             "baseMin": _num(r["base_min"]) or 0,
             "perServingMin": _num(r["per_serving_min"]) or 0,
             "tempF": r["temp_f"], "batchKey": r["batch_key"],
+            "chainKey": r["chain_key"],
             "keepSeparate": r["keep_separate"],
             "keepSeparateNote": r["keep_separate_note"],
             "shortcutKey": r["shortcut_key"], "notes": r["notes"]})
@@ -619,6 +622,7 @@ def _step_out(r: dict) -> dict:
         "name": r["step_name"], "resource": r["resource"], "mode": r["mode"],
         "base_min": _num(r["base_min"]), "per_serving_min": _num(r["per_serving_min"]),
         "temp_f": r["temp_f"], "batch_key": r["batch_key"],
+        "chain_key": r["chain_key"],
         "keep_separate": r["keep_separate"],
         "keep_separate_note": r["keep_separate_note"],
         "shortcut_key": r["shortcut_key"], "notes": r["notes"],
