@@ -243,3 +243,48 @@ class TestTheLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheWindowFindsRealDurations(unittest.TestCase):
+    """The first version only looked at `log_type = 'cardio_block'`, which
+    matched NOTHING in this database -- every duration that exists is on a
+    `session_summary` row. A window rule that only recognises a log type nobody
+    writes finds no windows, and the backfill reported bad_window for a session
+    whose duration was sitting right there."""
+
+    class Cur:
+        def __init__(self, rows): self.rows, self._res = rows, []
+        def execute(self, sql, params=None): self._res = self.rows
+        def fetchall(self): return self._res
+
+    def _row(self, log_type, dur, at):
+        return {"log_type": log_type, "duration_sec": dur, "logged_at": at}
+
+    def test_a_session_summary_duration_is_used(self):
+        end = T0 + timedelta(minutes=33)
+        cur = self.Cur([self._row("session_summary", 1980, end)])
+        start, stop, src = hr_zones.window_for(cur, 1)
+        self.assertEqual((start, stop), (end - timedelta(seconds=1980), end))
+        self.assertIn("session_summary", src)
+
+    def test_the_longest_duration_wins_over_a_per_exercise_row(self):
+        """Plan 107 has both a 45 s row and a 1980 s row. The 45 s one is an
+        exercise, not the session."""
+        end = T0 + timedelta(minutes=33)
+        cur = self.Cur([self._row("session_summary", 45, T0 + timedelta(minutes=5)),
+                        self._row("session_summary", 1980, end)])
+        start, stop, _ = hr_zones.window_for(cur, 1)
+        self.assertEqual(int((stop - start).total_seconds()), 1980)
+
+    def test_a_cardio_block_still_wins_over_a_summary(self):
+        end = T0 + timedelta(minutes=30)
+        cur = self.Cur([self._row("session_summary", 9999, end),
+                        self._row("cardio_block", 1800, end)])
+        _s, _e, src = hr_zones.window_for(cur, 1)
+        self.assertIn("cardio_block", src)
+
+    def test_a_null_duration_does_not_become_a_window(self):
+        cur = self.Cur([self._row("session_summary", None, T0)])
+        start, _stop, src = hr_zones.window_for(cur, 1)
+        self.assertIsNone(start)
+        self.assertIn("one log row", src)

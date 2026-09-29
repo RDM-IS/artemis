@@ -33,12 +33,19 @@ def window_for(cur, plan_id: int) -> tuple:
 
     Two ways, in order of trustworthiness:
 
-    1. A `cardio_block` log with a real `duration_sec` -- its `logged_at` is when
-       the block was finished, so the window is [logged_at - duration, logged_at].
+    1. ANY log row carrying a real `duration_sec` -- its `logged_at` is when the
+       block finished, so the window is [logged_at - duration, logged_at]. This
+       was originally restricted to `log_type = 'cardio_block'`, which matched
+       NOTHING: the durations that exist in this database are on
+       `session_summary` rows (1770 s and 1980 s on plans 106 and 107). A window
+       rule that only recognises a log type nobody writes finds no windows.
     2. Otherwise the span of the session's own log rows, first to last.
 
-    A single log row gives a zero-length span, which is `bad_window`, not a
-    guess: one row says when something happened, not for how long.
+    A single log row with no duration gives a zero-length span, which is
+    `bad_window`, not a guess: one row says when something happened, not for how
+    long. The plan's INTENDED duration is deliberately not a fallback -- it is a
+    prediction, and a zone breakdown computed over a window he did not actually
+    train is a fabricated number wearing a real one's clothes.
     """
     cur.execute(
         "SELECT log_type, duration_sec, logged_at FROM health.session_log "
@@ -51,10 +58,20 @@ def window_for(cur, plan_id: int) -> tuple:
     def _get(r, key, idx):
         return r[key] if isinstance(r, dict) else r[idx]
 
-    for r in rows:
-        if _get(r, "log_type", 0) == "cardio_block" and _get(r, "duration_sec", 1):
-            end = _get(r, "logged_at", 2)
-            return end - timedelta(seconds=int(_get(r, "duration_sec", 1))), end, "cardio_block duration"
+    # Prefer a cardio_block if one exists, then any row with a duration. The
+    # longest wins: a 45 s row beside a 1980 s row on the same session is a
+    # per-exercise entry, not the session.
+    with_duration = [r for r in rows if _get(r, "duration_sec", 1)]
+    blocks = [r for r in with_duration if _get(r, "log_type", 0) == "cardio_block"]
+    best = None
+    if blocks:
+        best, why = max(blocks, key=lambda r: int(_get(r, "duration_sec", 1))), "cardio_block duration"
+    elif with_duration:
+        best = max(with_duration, key=lambda r: int(_get(r, "duration_sec", 1)))
+        why = f"{_get(best, 'log_type', 0)} duration"
+    if best is not None:
+        end = _get(best, "logged_at", 2)
+        return end - timedelta(seconds=int(_get(best, "duration_sec", 1))), end, why
 
     first = _get(rows[0], "logged_at", 2)
     last = _get(rows[-1], "logged_at", 2)
