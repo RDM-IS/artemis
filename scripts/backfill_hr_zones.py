@@ -44,14 +44,18 @@ def main() -> int:
         counts: Counter = Counter()
         rows = []
         for s in sessions:
+            # Positional fallbacks must match the SELECT's column order, which
+            # gained `slot` when this was widened past cardio -- the first run
+            # after that printed every session's type as "morning".
             plan_id = s["plan_id"] if isinstance(s, dict) else s[0]
             plan_date = s["plan_date"] if isinstance(s, dict) else s[1]
-            stype = s["session_type"] if isinstance(s, dict) else s[2]
+            slot = s["slot"] if isinstance(s, dict) else s[2]
+            stype = s["session_type"] if isinstance(s, dict) else s[3]
             row = hr_zones.compute_for_plan(cur, plan_id)
             counts[row["status"]] += 1
             rows.append((plan_date, stype, row))
             line = hr_zones.describe(row)
-            print(f"  {plan_date} {stype:17s} {row['status']:21s} "
+            print(f"  {plan_date} {slot:7s} {stype:15s} {row['status']:21s} "
                   f"samples={row.get('sample_count', 0):5d}  {line}")
 
         print("\nby status:", dict(counts))
