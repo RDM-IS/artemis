@@ -36,6 +36,7 @@ existing import.
 """
 
 import json
+import logging
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -55,6 +56,9 @@ from knowledge.machine_setup import parse_setup
 from ..database import get_db
 
 router = APIRouter()
+
+#: STATUS-2's fail-closed sections log WHY a section could not be read.
+logger = logging.getLogger(__name__)
 
 CT = ZoneInfo("America/Chicago")
 
@@ -1727,6 +1731,111 @@ class WeightSummary(BaseModel):
     change: float
 
 
+# ── STATUS-2 ────────────────────────────────────────────────────────────────
+# Every section below is INDEPENDENTLY fail-closed. `Section.ok` is False when
+# the read failed, and `reason` says so on the card. The distinction that
+# matters: "0 cardio minutes this week" is an ANSWER -- he did not train -- and
+# "I could not read your cardio" is not. A section that showed 0 for both would
+# quietly turn a database problem into a training judgement.
+
+
+class Section(BaseModel):
+    """Whether this section could be read at all."""
+    ok: bool = True
+    reason: Optional[str] = None
+
+
+class WeightGoal(BaseModel):
+    section: Section = Field(default_factory=Section)
+    avg_7d: Optional[float] = None
+    change_since_start: Optional[float] = None
+    lb_per_week: Optional[float] = None
+    days_7d: int = 0                  # how many of the 7 carry a weigh-in
+
+
+class CardioGoal(BaseModel):
+    section: Section = Field(default_factory=Section)
+    minutes_this_week: Optional[int] = None
+    minutes_target: int = 150
+    #: Minutes with a heart rate in each zone. Null (not 0) when no cardio log
+    #: carries HR at all -- "no zone data" is not "0 minutes in Z2".
+    z2_minutes: Optional[int] = None
+    z4_minutes: Optional[int] = None
+    has_zone_data: bool = False
+    #: From the next cardio_intervals ROW, which is where the wake job writes the
+    #: gate's answer. The Lambda deliberately does not evaluate the gate: that
+    #: would be a second evaluation against a different read at a different
+    #: moment, and the card and the wake post could then disagree.
+    interval_gate: Optional[str] = None          # "intervals" | "z2_variant" | "unresolved"
+    interval_gate_reason: Optional[str] = None
+    interval_gate_date: Optional[date] = None
+
+
+class StrengthGoal(BaseModel):
+    section: Section = Field(default_factory=Section)
+    sessions_done: Optional[int] = None
+    sessions_planned: Optional[int] = None
+    lifts_progressed_14d: Optional[int] = None
+
+
+class NutritionGoal(BaseModel):
+    section: Section = Field(default_factory=Section)
+    days_logged: Optional[int] = None
+    days_window: int = 7
+    avg_protein_g: Optional[float] = None
+    avg_fiber_g: Optional[float] = None
+    #: ONLY from health.nutrition_target, which only a dietitian's numbers go
+    #: into. Artemis never sets one, so null here means "no target exists" and
+    #: the card must not invent a comparison.
+    target_protein_g: Optional[int] = None
+    target_fiber_g: Optional[int] = None
+    target_set_by: Optional[str] = None
+
+
+class Goals(BaseModel):
+    weight: WeightGoal = Field(default_factory=WeightGoal)
+    cardio: CardioGoal = Field(default_factory=CardioGoal)
+    strength: StrengthGoal = Field(default_factory=StrengthGoal)
+    nutrition: NutritionGoal = Field(default_factory=NutritionGoal)
+
+
+class CardioWeek(BaseModel):
+    week_start: date
+    minutes: int
+    sessions: int
+
+
+class CardioDetail(BaseModel):
+    section: Section = Field(default_factory=Section)
+    weeks: list[CardioWeek] = Field(default_factory=list)
+    resting_hr: list[TrendPoint] = Field(default_factory=list)
+
+
+class NutritionDay(BaseModel):
+    day: date
+    kcal: Optional[float] = None
+    protein_g: Optional[float] = None
+    fiber_g: Optional[float] = None
+    items: int = 0
+
+
+class NutritionDetail(BaseModel):
+    section: Section = Field(default_factory=Section)
+    days: list[NutritionDay] = Field(default_factory=list)
+
+
+class SleepDay(BaseModel):
+    day: date
+    sleep_hrs: Optional[float] = None
+    resting_hr: Optional[int] = None
+    energy: Optional[int] = None
+
+
+class SleepRecovery(BaseModel):
+    section: Section = Field(default_factory=Section)
+    days: list[SleepDay] = Field(default_factory=list)
+
+
 class OverviewResponse(BaseModel):
     date: date
     timezone: str
@@ -1740,6 +1849,13 @@ class OverviewResponse(BaseModel):
     weight_30d: list[TrendPoint] = Field(default_factory=list)
     weight_summary: Optional[WeightSummary] = None
     previous_program_end: Optional[date] = None
+    # STATUS-2 (2026-09-28). ADDITIVE ONLY: every key above is untouched and
+    # every key below has a default, so a gym-display build that predates this
+    # change keeps working against the new Lambda and vice versa.
+    goals: Goals = Field(default_factory=Goals)
+    cardio_detail: CardioDetail = Field(default_factory=CardioDetail)
+    nutrition_7d: NutritionDetail = Field(default_factory=NutritionDetail)
+    sleep_recovery: SleepRecovery = Field(default_factory=SleepRecovery)
 
 
 def _md(d: date) -> str:
@@ -2579,6 +2695,194 @@ def post_ingest(
     )
 
 
+# ── STATUS-2 builders ───────────────────────────────────────────────────────
+# Each returns its section with ok=False and a reason rather than raising, so
+# one unreadable table cannot blank the whole Status page -- and cannot silently
+# report zeros either.
+
+def _fail(model, exc: Exception, what: str):
+    logger.warning("STATUS-2: could not read %s", what, exc_info=True)
+    return model(section=Section(ok=False, reason=f"couldn't read {what}"))
+
+
+def _weight_goal(db: Session, today: date, anchor: Optional[date]) -> WeightGoal:
+    try:
+        rows = db.execute(text(
+            "SELECT state_date, weight_lbs FROM health.daily_state "
+            "WHERE weight_lbs IS NOT NULL AND state_date <= :t "
+            "ORDER BY state_date DESC LIMIT 60"), {"t": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(WeightGoal, exc, "weight")
+    if not rows:
+        # A real answer: nothing has been weighed. Not a failure.
+        return WeightGoal(days_7d=0)
+    recent = [r for r in rows if (today - r["state_date"]).days < 7]
+    avg7 = round(sum(float(r["weight_lbs"]) for r in recent) / len(recent), 1) if recent else None
+    change = rate = None
+    if anchor:
+        at_start = [r for r in rows if r["state_date"] >= anchor]
+        if at_start and avg7 is not None:
+            first = at_start[-1]
+            change = round(avg7 - float(first["weight_lbs"]), 1)
+            weeks = max((today - first["state_date"]).days, 1) / 7.0
+            rate = round(change / weeks, 2)
+    return WeightGoal(avg_7d=avg7, change_since_start=change,
+                      lb_per_week=rate, days_7d=len(recent))
+
+
+def _cardio_goal(db: Session, today: date, week_start: date) -> CardioGoal:
+    try:
+        rows = db.execute(text(
+            "SELECT sl.duration_sec, sl.hr_avg "
+            "FROM health.session_log sl JOIN health.plan p ON p.plan_id = sl.plan_id "
+            "WHERE p.plan_date BETWEEN :a AND :b "
+            "  AND p.session_type IN ('cardio_z2', 'cardio_intervals') "
+            "  AND sl.logged_via <> 'inferred'"),
+            {"a": week_start, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(CardioGoal, exc, "cardio minutes")
+    minutes = int(round(sum((r["duration_sec"] or 0) for r in rows) / 60.0))
+    with_hr = [r for r in rows if r["hr_avg"]]
+    z2 = z4 = None
+    if with_hr:
+        # The row carries the zone ranges (PROGRAM-2), but a logged average is a
+        # single number: bucket it by the same boundaries artemis uses.
+        z2 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
+                           if 105 <= int(r["hr_avg"]) <= 122) / 60.0))
+        z4 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
+                           if 139 <= int(r["hr_avg"]) <= 157) / 60.0))
+    gate = gate_reason = gate_date = None
+    try:
+        # EVENING-1: two rows share a date, so a per-day read has to say which
+        # slot it means. Interval cardio is a morning session (the evening slot
+        # carries recovery_flow), and an unpinned read would take an arbitrary
+        # one. tests/lambda_api/test_plan_range.py caught this before it shipped.
+        nxt = db.execute(text(
+            "SELECT plan_date, blocks FROM health.plan WHERE slot = 'morning' "
+            "  AND session_type = 'cardio_intervals' AND plan_date >= :t "
+            "ORDER BY plan_date LIMIT 1"), {"t": today}).mappings().first()
+        if nxt:
+            blocks = nxt["blocks"] or {}
+            if isinstance(blocks, str):
+                blocks = json.loads(blocks)
+            gate_date = nxt["plan_date"]
+            ran_as = blocks.get("ran_as")
+            gate = ran_as if ran_as in ("intervals", "z2_variant") else "unresolved"
+            gate_reason = blocks.get("z2_variant_reason")
+    except Exception:                                           # noqa: BLE001
+        logger.warning("STATUS-2: could not read the interval gate row", exc_info=True)
+        gate = None
+    return CardioGoal(minutes_this_week=minutes, z2_minutes=z2, z4_minutes=z4,
+                      has_zone_data=bool(with_hr), interval_gate=gate,
+                      interval_gate_reason=gate_reason, interval_gate_date=gate_date)
+
+
+def _strength_goal(db: Session, today: date, program: Optional[ProgramInfo],
+                   progress: list[StrengthProgressRow]) -> StrengthGoal:
+    try:
+        done = program.sessions_done if program else None
+        planned = program.sessions_planned if program else None
+        progressed = sum(1 for r in progress if r.trend == "up")
+        return StrengthGoal(sessions_done=done, sessions_planned=planned,
+                            lifts_progressed_14d=progressed)
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(StrengthGoal, exc, "strength progress")
+
+
+def _nutrition_goal(db: Session, today: date) -> NutritionGoal:
+    since = today - timedelta(days=6)
+    try:
+        rows = db.execute(text(
+            "SELECT logged_date, SUM(protein_g) p, SUM(fiber_g) f "
+            "FROM health.nutrition_log WHERE logged_date BETWEEN :a AND :b "
+            "GROUP BY logged_date"), {"a": since, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(NutritionGoal, exc, "nutrition")
+    days = len(rows)
+    avg_p = round(sum(float(r["p"] or 0) for r in rows) / days, 1) if days else None
+    avg_f = round(sum(float(r["f"] or 0) for r in rows) / days, 1) if days else None
+    tp = tf = set_by = None
+    try:
+        # ONLY a dietitian's numbers land here. Artemis never writes this table,
+        # so an empty result means "no target", never "target of zero".
+        t = db.execute(text(
+            "SELECT protein_g, fiber_g, set_by FROM health.nutrition_target "
+            "WHERE effective_from <= :t AND (effective_to IS NULL OR effective_to >= :t) "
+            "ORDER BY effective_from DESC LIMIT 1"), {"t": today}).mappings().first()
+        if t:
+            tp, tf, set_by = t["protein_g"], t["fiber_g"], t["set_by"]
+    except Exception:                                           # noqa: BLE001
+        logger.warning("STATUS-2: could not read the nutrition target", exc_info=True)
+    return NutritionGoal(days_logged=days, avg_protein_g=avg_p, avg_fiber_g=avg_f,
+                         target_protein_g=tp, target_fiber_g=tf, target_set_by=set_by)
+
+
+def _cardio_detail(db: Session, today: date) -> CardioDetail:
+    since = today - timedelta(days=55)
+    try:
+        weeks = db.execute(text(
+            "SELECT (date_trunc('week', p.plan_date)::date) wk, "
+            "       SUM(COALESCE(sl.duration_sec, 0)) secs, COUNT(DISTINCT p.plan_id) n "
+            "FROM health.plan p JOIN health.session_log sl ON sl.plan_id = p.plan_id "
+            # EVENING-1 again. The session_type filter already excludes the
+            # evening slot (it carries recovery_flow), so this changes no result
+            # -- it says which slot is meant instead of relying on that.
+            "WHERE p.slot = 'morning' "
+            "  AND p.session_type IN ('cardio_z2', 'cardio_intervals') "
+            "  AND p.plan_date BETWEEN :a AND :b AND sl.logged_via <> 'inferred' "
+            "GROUP BY 1 ORDER BY 1"), {"a": since, "b": today}).mappings().all()
+        hr = db.execute(text(
+            "SELECT state_date, resting_hr FROM health.daily_state "
+            "WHERE resting_hr IS NOT NULL AND state_date BETWEEN :a AND :b "
+            "ORDER BY state_date"), {"a": since, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(CardioDetail, exc, "cardio history")
+    return CardioDetail(
+        weeks=[CardioWeek(week_start=r["wk"], minutes=int(round((r["secs"] or 0) / 60.0)),
+                          sessions=int(r["n"])) for r in weeks],
+        resting_hr=[TrendPoint(date=r["state_date"], value=float(r["resting_hr"])) for r in hr])
+
+
+def _nutrition_detail(db: Session, today: date) -> NutritionDetail:
+    since = today - timedelta(days=6)
+    try:
+        rows = db.execute(text(
+            "SELECT logged_date, SUM(kcal) k, SUM(protein_g) p, SUM(fiber_g) f, COUNT(*) n "
+            "FROM health.nutrition_log WHERE logged_date BETWEEN :a AND :b "
+            "GROUP BY logged_date ORDER BY logged_date"),
+            {"a": since, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(NutritionDetail, exc, "nutrition history")
+    by_day = {r["logged_date"]: r for r in rows}
+    days = []
+    for i in range(7):
+        d = since + timedelta(days=i)
+        r = by_day.get(d)
+        days.append(NutritionDay(
+            day=d,
+            kcal=float(r["k"]) if r and r["k"] is not None else None,
+            protein_g=float(r["p"]) if r and r["p"] is not None else None,
+            fiber_g=float(r["f"]) if r and r["f"] is not None else None,
+            items=int(r["n"]) if r else 0))
+    return NutritionDetail(days=days)
+
+
+def _sleep_recovery(db: Session, today: date) -> SleepRecovery:
+    since = today - timedelta(days=13)
+    try:
+        rows = db.execute(text(
+            "SELECT state_date, sleep_hrs, resting_hr, energy FROM health.daily_state "
+            "WHERE state_date BETWEEN :a AND :b ORDER BY state_date"),
+            {"a": since, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(SleepRecovery, exc, "sleep and recovery")
+    return SleepRecovery(days=[SleepDay(
+        day=r["state_date"],
+        sleep_hrs=float(r["sleep_hrs"]) if r["sleep_hrs"] is not None else None,
+        resting_hr=int(r["resting_hr"]) if r["resting_hr"] is not None else None,
+        energy=int(r["energy"]) if r["energy"] is not None else None) for r in rows])
+
+
 @router.get("/overview", response_model=OverviewResponse)
 def get_overview(
     db: Session = Depends(get_db),
@@ -2718,6 +3022,16 @@ def get_overview(
         patterns=_patterns(db),
         flags=build_flags(history_days, logs_by_plan, today),
         weight_30d=weight,
+        # STATUS-2: each section reads independently and fails closed on its own.
+        goals=Goals(
+            weight=_weight_goal(db, today, prog["anchor"] if prog else None),
+            cardio=_cardio_goal(db, today, program.week_start if program else today),
+            strength=_strength_goal(db, today, program, strength_progress(names, set_rows)),
+            nutrition=_nutrition_goal(db, today),
+        ),
+        cardio_detail=_cardio_detail(db, today),
+        nutrition_7d=_nutrition_detail(db, today),
+        sleep_recovery=_sleep_recovery(db, today),
         weight_summary=weight_summary(weight),
         previous_program_end=previous_end,
     )
