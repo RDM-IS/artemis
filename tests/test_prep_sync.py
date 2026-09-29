@@ -4,6 +4,7 @@ These are the parts of the sync that have no database and no network, so they ca
 be asserted directly rather than inferred from a run. PUBLIC-FIXTURES: no real
 Notion ids and no real ingredient names.
 """
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
 
 import unittest
 from datetime import datetime, timedelta, timezone

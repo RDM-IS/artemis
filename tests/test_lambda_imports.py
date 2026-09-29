@@ -15,6 +15,7 @@ It also checks the reverse direction of the same fact: a module the shipped code
 imports from `knowledge` has to EXIST in knowledge/, since a plausible-looking
 `knowledge.<thing>` that lives elsewhere is exactly how the original bug read.
 """
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
 
 import ast
 import unittest

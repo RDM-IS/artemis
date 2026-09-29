@@ -7,6 +7,7 @@ history scan concluded gym-display's fixtures were synthetic and was wrong,
 because it checked the wrong field names. Ids that cannot be Notion ids make that
 mistake impossible to repeat here: there is nothing to cross-check.
 """
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
 
 import unittest
 from datetime import date

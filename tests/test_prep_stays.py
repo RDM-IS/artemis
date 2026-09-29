@@ -7,6 +7,7 @@ checked here rather than only against RDS.
 PUBLIC-FIXTURES: the dates are in 2031 and the day types are the cycle's own
 vocabulary. Nothing here is a real date of Ryan's.
 """
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
 
 import unittest
 from datetime import date, timedelta
