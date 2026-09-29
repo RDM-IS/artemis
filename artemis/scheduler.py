@@ -286,6 +286,12 @@ class ArtemisScheduler:
             # 00:20 — SESSION-LIB: rebuild the on-demand session library for the
             # new day (program week and location may have changed). SILENT.
             CronSpec("session_library", "job_session_library", 0, 20),
+            # 00:25 — PREP-1: Notion -> RDS procurement sync, propose the next
+            # Minneapolis stay, resolve its menu. SILENT, and after the 00:15
+            # pre-fill on purpose: the pre-fill refreshes nutrition.food, and
+            # link_food() joins the procurement rows to it by Notion page id.
+            # Running first would link against yesterday's mirror.
+            CronSpec("prep_refresh", "job_prep_refresh", 0, 25),
             CronSpec("vault_sync", "job_vault_sync", 3, 30),
             # DRIFT-ALARM: hourly, phase-gated to wake+open inside the job.
             # tier="health" is the POSTING phase gate (wake as well as open),
@@ -2038,6 +2044,76 @@ class ArtemisScheduler:
                 recipes["synced"] if recipes else "skipped", len(locked))
         except Exception:
             logger.exception("Nutrition pre-fill failed")
+
+    def job_prep_refresh(self):
+        """00:25 local — PREP-1: sync the procurement databases, propose the stay.
+
+        SILENT BY DESIGN, and that is what keeps it off the standing-automation
+        gate: it posts nothing and sends nothing. It mirrors Notion into RDS and
+        writes a stay PROPOSAL that Ryan confirms in the Prep tab. The pantry
+        NUDGE — which does post — is a separate, flag-gated thing and ships off
+        (nutrition.prep_config key `pantry_nudge`).
+
+        Each phase is savepointed, for the reason job_nutrition_prefill states: a
+        Notion outage or one bad row must cost that phase, never the phases after
+        it. The sync already isolates itself per database, but a psycopg2 error
+        inside an upsert would abort the whole transaction, and then a readable
+        `store items` would be lost to an unrelated failure in `recipe lines`.
+
+        THE MENU PHASE IS ALL-OR-NOTHING WITHIN ITS SAVEPOINT. resolve_menu
+        deletes the old menu before rebuilding it, so a partial rebuild is a
+        SHORTER menu — fewer meals, a smaller shopping list, and nothing saying a
+        day was skipped. Rolling back to the savepoint restores the previous menu
+        intact, which is old but complete.
+        """
+        try:
+            from artemis import prep
+            from knowledge.db import get_connection
+
+            today = _local_today()
+            synced = stay = menu = None
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SAVEPOINT prep_sync")
+                try:
+                    from artemis import prep_notion
+                    synced = prep_notion.sync_all(cur)
+                    prep.sync_store_zones(cur)
+                    cur.execute("RELEASE SAVEPOINT prep_sync")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT prep_sync")
+                    logger.warning("Prep sync skipped: %s", exc)
+
+                cur.execute("SAVEPOINT prep_stay")
+                try:
+                    found = prep.next_stay(cur, today)
+                    if found is None:
+                        cur.execute("RELEASE SAVEPOINT prep_stay")
+                    else:
+                        start, end = found
+                        stay_id = prep.upsert_stay(cur, start, end,
+                                                  shop_date=max(start, today))
+                        stay = (stay_id, start, end)
+                        menu = prep.resolve_menu(cur, stay_id, start, end)
+                        cur.execute("RELEASE SAVEPOINT prep_stay")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT prep_stay")
+                    logger.warning("Prep stay/menu skipped: %s", exc)
+
+            if synced:
+                ok = [d["db"] for d in synced["databases"]]
+                logger.info("Prep sync: ok=%s failed=%s linked=%s seeded=%s",
+                            ok, list(synced.get("failed") or {}),
+                            synced.get("linked_food"), synced.get("seeded_on_hand"))
+            if stay:
+                logger.info("Prep stay #%s %s..%s; menu days=%d no_source=%d",
+                            stay[0], stay[1], stay[2],
+                            len((menu or {}).get("days") or []),
+                            len((menu or {}).get("no_source") or []))
+            else:
+                logger.info("Prep: no Minneapolis stay in the lookahead window")
+        except Exception:
+            logger.exception("Prep refresh failed")
 
     def job_meal_nudge(self):
         """MEAL-NUDGE — one line, 60 min before quiet, only if nothing is logged.
