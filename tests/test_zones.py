@@ -25,9 +25,20 @@ class TestZones(unittest.TestCase):
                 self.assertAlmostEqual(hi, zones.HR_MAX * pct[1], delta=1)
 
     def test_an_unknown_zone_is_None_not_a_guess(self):
-        self.assertIsNone(zones.zone_range("Z3"))
-        self.assertIsNone(zones.zone_block("Z3"))
-        self.assertIn("no range recorded", zones.describe("Z3"))
+        # Z3 was the example here until ZONE-0 filled in Z1, Z3 and Z5. The
+        # assertion is about an UNKNOWN zone returning None rather than a
+        # guessed range, so it needs a zone that is genuinely absent — keeping
+        # "Z3" would have tested nothing once Z3 existed.
+        for absent in ("Z6", "Z0", "", "zone2"):
+            with self.subTest(absent):
+                self.assertIsNone(zones.zone_range(absent))
+                self.assertIsNone(zones.zone_block(absent))
+                self.assertIn("no range recorded", zones.describe(absent))
+
+    def test_the_three_added_zones_have_ranges_now(self):
+        for zone in ("Z1", "Z3", "Z5"):
+            with self.subTest(zone):
+                self.assertIsNotNone(zones.zone_range(zone))
 
     def test_the_row_block_carries_its_provenance(self):
         """A screen showing a range must be able to say where it came from."""
