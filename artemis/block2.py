@@ -157,13 +157,21 @@ def _build_one(spec: dict) -> dict:
     tables would quietly change what a block 1 reseed produces.
     """
     old_ramp, old_intervals = office.RAMP, office.INTERVAL_WEEKS
+    old_recomp_from = office.RECOMP_FROM_WEEK
     try:
         office.RAMP = {w: (sets, rpe, old_ramp[min(w, max(old_ramp))][2])
                        for w, (sets, rpe) in RAMP.items()}
         office.INTERVAL_WEEKS = dict(INTERVAL_WEEKS)
+        # LIFT-RECOMP applies to ALL of block 2. Block 2 numbers its weeks 1-6
+        # again from the start, so leaving block 1's "from week 5" in place would
+        # have given block 2's first FOUR weeks the old strength-biased scheme
+        # and only its last two the new one — in a block that does not exist yet,
+        # so nothing would have contradicted it.
+        office.RECOMP_FROM_WEEK = 1
         row = office.build_row(spec)
     finally:
         office.RAMP, office.INTERVAL_WEEKS = old_ramp, old_intervals
+        office.RECOMP_FROM_WEEK = old_recomp_from
     row["phase"] = PHASE
     row["notes"] = f"{row['blocks']['display_name']} | {NAME} wk{spec['week_num']}"
     return row

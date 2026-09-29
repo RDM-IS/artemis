@@ -173,7 +173,12 @@ def shopping_list(fetch, stay_id: int) -> dict:
         lines=state["lines"], ingredients=state["ingredients"],
         store_items=state["store_items"], stores=state["stores"],
         seed=load_config(fetch, "store_rank_seed"),
-        store_zones_by_chain=store_zones(fetch))
+        store_zones_by_chain=store_zones(fetch),
+        # A Minneapolis stay cannot be fed from the Wisconsin store. Configurable
+        # so a stay elsewhere does not need a code change; the code default is
+        # MPLS and a `store_locations` config row overrides it.
+        locations=load_config(fetch, "store_locations",
+                              list(prep_math.DEFAULT_STORE_LOCATIONS)))
     groups = prep_math.group_by_store(lines)
     sync = sync_status(fetch)
     flags: dict = {}

@@ -36,41 +36,30 @@ LOOKAHEAD_DAYS = 28
 
 # ── stays ───────────────────────────────────────────────────────────────────
 
-def _away_dates(cur, start: date, end: date) -> set:
-    """Every date covered by an AWAY stay in the window.
-
-    Read explicitly rather than through `cycle.day_type()`, which CANNOT return
-    'away': `cycle._VALID_DAY_TYPES` is built from the 14-day pattern tuple and
-    `away` only ever exists as an override, so day_type() falls back to the base
-    pattern for those days (migration 050 documents this as intended). For stays
-    that fallback is not harmless — a hotel week in the base pattern reads as
-    msp_work, and a stay would be proposed for a fortnight he is not in the flat.
-    """
-    from artemis import away
-    stays = away.load_stays(cur, start, end)
-    out = set()
-    for stay in stays:
-        d = max(stay.start, start)
-        last = min(stay.end, end)
-        while d <= last:
-            out.add(d)
-            d += timedelta(days=1)
-    return out
-
-
 def day_type_map(cur, start: date, end: date) -> dict:
     """{date: day_type} over the window, overrides honoured, away days marked.
 
-    Propagates `cycle.OverrideLookupError`. A stay proposed from an unreadable
-    override table would be a plausible wrong answer that then drives a shopping
-    list — exactly the fail-open shape FAIL-CLOSED-RESOLVERS exists to forbid.
+    Goes through `nutrition.meal_day_type` — the ONE resolver that may answer
+    "what kind of day is this, for food" (AWAY-DAYKIND, 2026-09-29). This used to
+    hold its own copy of the away lookup, written because `cycle.day_type()`
+    cannot return `away`. Two copies of that condition is how the two answers
+    drift: the round that wrote this one did not notice that
+    `nutrition.resolve_meal_source` still asked `cycle.day_type()` and so would
+    pre-fill a work-day menu for the same fortnight this correctly excluded from
+    a stay. The away stays are prefetched ONCE for the window and threaded in, so
+    delegating costs one query rather than one per day.
+
+    Propagates `cycle.OverrideLookupError` and `away.AwayLookupError`. A stay
+    proposed from an unreadable override table would be a plausible wrong answer
+    that then drives a shopping list — the fail-open shape
+    FAIL-CLOSED-RESOLVERS exists to forbid.
     """
-    from artemis import cycle
-    away = _away_dates(cur, start, end)
+    from artemis import away, nutrition
+    stays = away.load_stays(cur, start, end)
     out = {}
     d = start
     while d <= end:
-        out[d] = "away" if d in away else cycle.day_type(d)
+        out[d] = nutrition.meal_day_type(d, stays=stays)
         d += timedelta(days=1)
     return out
 

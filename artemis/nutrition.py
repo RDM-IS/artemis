@@ -155,6 +155,42 @@ def day_kind(day_type: str | None) -> str:
     return KIND_OFF
 
 
+def meal_day_type(d: date, *, cur=None, stays=None) -> str:
+    """The day type MEALS use for `d`. NOT necessarily the schedule's day type.
+
+    AWAY-DAYKIND (2026-09-29). `day_kind()` above has mapped `away` to
+    KIND_TRAVEL since the AWAY round, and it was DEAD CODE: every caller asked
+    `cycle.day_type(d)`, which cannot return `away` because its valid set is
+    built from the 14-day pattern and `away` only exists as an override. So a
+    hunting fortnight resolved to `msp_work` and would have been pre-filled with
+    a work-day menu, which is precisely what the mapping existed to stop.
+
+    The fix is deliberately NOT to widen `cycle.day_type()`. The schedule should
+    keep following the pattern underneath a trip — wake, quiet hours and business
+    hours are about the clock, not the bed — and widening its return domain would
+    also mean `DAY_TYPE_HOURS['away']`, a KeyError in `open_on`, `quiet_on` and
+    `boundaries` until someone chose hours for a day type that has none.
+
+    Instead there are two readers of one fact: the schedule asks
+    `cycle.day_type()`, and anything deciding about FOOD asks here. This is the
+    only function that may answer the meal question, so the two cannot drift.
+
+    `stays` lets a caller resolving a whole WINDOW prefetch the away stays once
+    rather than querying per day — `prep.day_type_map` does, over 35 days. It
+    goes through the same `away.stay_on` the single-date path uses, so batching
+    does not create a second definition of "is this an away day"; that is why it
+    is threaded through here instead of prep keeping its own copy.
+
+    Propagates `away.AwayLookupError` — a failed override read must not resolve
+    to a home menu (FAIL-CLOSED-RESOLVERS).
+    """
+    from artemis import away, cycle
+    hit = away.stay_on(stays, d) if stays is not None else away.covers(d, cur=cur)
+    if hit is not None:
+        return away.DAY_TYPE
+    return cycle.day_type(d)
+
+
 def _default_row_for(kind: str) -> str | None:
     from artemis import notion_meal_plan as nmp
     return {KIND_WORK: nmp.DEFAULT_DAY_NAME,
@@ -196,10 +232,11 @@ def resolve_meal_source(d: date) -> MealSource:
     Reads Notion; touches no database and writes nothing. Every branch here
     corresponds to exactly one `prefill_day` outcome, which is the point.
     """
-    from artemis import cycle
     from artemis import notion_meal_plan as nmp
 
-    day_type = cycle.day_type(d)
+    # meal_day_type, NOT cycle.day_type: an away day is a travel day for meals
+    # and cycle.day_type() can never say so. See meal_day_type's docstring.
+    day_type = meal_day_type(d)
     kind = day_kind(day_type)
     picked = None            # three-state: True / False / None = the lookup never ran
     try:

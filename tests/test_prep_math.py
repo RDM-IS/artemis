@@ -18,12 +18,20 @@ STAY = {"start_date": date(2031, 3, 2), "end_date": date(2031, 3, 8),
         "shop_date": date(2031, 3, 2)}
 
 CO_OP = {"notion_id": "st-coop", "name": "Co-op North", "chain": "Eastside Co-op",
-         "active": True}
-ALDI = {"notion_id": "st-aldi", "name": "Aldi West", "chain": "Aldi", "active": True}
-CUB = {"notion_id": "st-cub", "name": "Cub South", "chain": "Cub Foods", "active": True}
+         "active": True, "location": "MPLS"}
+ALDI = {"notion_id": "st-aldi", "name": "Aldi West", "chain": "Aldi",
+        "active": True, "location": "MPLS"}
+CUB = {"notion_id": "st-cub", "name": "Cub South", "chain": "Cub Foods",
+       "active": True, "location": "MPLS"}
 SHUT = {"notion_id": "st-shut", "name": "Closed Market", "chain": "Aldi",
-        "active": False}
-STORES = {s["notion_id"]: s for s in (CO_OP, ALDI, CUB, SHUT)}
+        "active": False, "location": "MPLS"}
+#: The Wisconsin store. Active, well ranked, and unreachable on a Minneapolis stay.
+FARM = {"notion_id": "st-wi", "name": "Farm Market", "chain": "Piggly Wiggly",
+        "active": True, "location": "WI"}
+#: A store whose location nobody recorded. Not assumed to be the right one.
+NOWHERE = {"notion_id": "st-none", "name": "Unplaced Market", "chain": "Aldi",
+           "active": True}
+STORES = {s["notion_id"]: s for s in (CO_OP, ALDI, CUB, SHUT, FARM, NOWHERE)}
 
 
 def ing(nid, **kw):
@@ -263,6 +271,57 @@ class TestRanking(unittest.TestCase):
         row = next(r for r in lines if r["ingredient_id"] == "ing-saffron")
         self.assertIn(pm.FLAG_NO_STORE, row["flags"])
         self.assertIsNone(row["packages"])
+
+
+class TestStoreLocation(unittest.TestCase):
+    """A Minneapolis stay cannot be fed from the Wisconsin store.
+
+    Found on 2026-09-29 by reading Ryan's source spec, which filters on
+    `location = 'MPLS'` in both its prose and its SQL. The shipped PREP-1 code did
+    not, so once `stores` syncs, Piggly Wiggly could have won on rank for an MSP
+    stay. It had not produced a wrong answer yet only because the database is
+    unshared — which is luck, not a guard.
+    """
+
+    def test_a_wisconsin_store_is_never_chosen_for_a_minneapolis_stay(self):
+        beans = ing("ing-beans")
+        chosen = pm.choose_item(
+            [item("si-wi", "ing-beans", "st-wi", rank=1)], beans, STORES)
+        self.assertIsNone(chosen)
+
+    def test_it_loses_even_when_it_outranks_the_local_one(self):
+        beans = ing("ing-beans")
+        chosen = pm.choose_item(
+            [item("si-wi", "ing-beans", "st-wi", rank=1),
+             item("si-aldi", "ing-beans", "st-aldi", rank=3)], beans, STORES)
+        self.assertEqual(chosen["_store"]["notion_id"], "st-aldi")
+
+    def test_a_store_with_no_location_recorded_is_excluded(self):
+        # An unknown location is not assumed to be the right one, for the same
+        # reason an uncounted ingredient is not assumed to be in stock.
+        beans = ing("ing-beans")
+        self.assertIsNone(pm.choose_item(
+            [item("si-x", "ing-beans", "st-none", rank=1)], beans, STORES))
+
+    def test_the_filter_can_be_disabled_explicitly(self):
+        beans = ing("ing-beans")
+        chosen = pm.choose_item([item("si-wi", "ing-beans", "st-wi", rank=1)],
+                                beans, STORES, locations=None)
+        self.assertEqual(chosen["_store"]["notion_id"], "st-wi")
+
+    def test_a_wisconsin_only_ingredient_is_flagged_no_store_not_omitted(self):
+        # It reaches the list saying nobody reachable sells it, rather than
+        # vanishing or being bought 300 miles away.
+        beans = ing("ing-beans", on_hand_base=0.0)
+        rows = build(
+            stay_days=[day(date(2031, 3, 3), "rec-b")],
+            recipes={"rec-b": recipe("rec-b")},
+            lines=[line("ln-b", "rec-b", "ing-beans", 500.0)],
+            ingredients={"ing-beans": beans},
+            store_items=[item("si-wi", "ing-beans", "st-wi", rank=1)])
+        row = next(r for r in rows if r["ingredient_id"] == "ing-beans")
+        self.assertIn(pm.FLAG_NO_STORE, row["flags"])
+        self.assertIsNone(row["store"])
 
 
 class TestAisles(unittest.TestCase):

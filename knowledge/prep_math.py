@@ -144,15 +144,36 @@ def effective_rank(item: dict, ingredient: dict, store: dict,
     return None, BASIS_NONE
 
 
+#: Store locations a Minneapolis stay may shop at. A Minneapolis stay cannot be
+#: fed from the Wisconsin store, and nothing in the rank ordering says so — rank
+#: is "first choice" among the stores that are actually reachable.
+#:
+#: Added 2026-09-29 after reading Ryan's source spec, which filters on
+#: `location = 'MPLS'` in both the prose and the SQL. The shipped PREP-1 code did
+#: not, so once the `stores` database syncs, Piggly Wiggly (location WI) would
+#: have been eligible for an MSP stay and could have won on rank. The list was
+#: empty at the time only because those databases are unshared, so the bug had
+#: not yet had the chance to produce a wrong answer.
+DEFAULT_STORE_LOCATIONS = ("MPLS",)
+
+
 def choose_item(items: list[dict], ingredient: dict, stores: dict,
-                seed: dict | None = None) -> dict | None:
+                seed: dict | None = None, *, locations=DEFAULT_STORE_LOCATIONS
+                ) -> dict | None:
     """The store item to buy this ingredient from, or None.
 
-    Only live items at active stores are eligible. Lowest effective rank wins; an
-    item with NO rank at all sorts after every ranked one rather than ahead of
-    them. Ties break on price then name so the answer is stable run to run —
-    a shopping list that reorders itself between refreshes reads as a bug.
+    Eligible means: the item is live, its store is live and active, AND the store
+    is in `locations`. Lowest effective rank wins; an item with NO rank at all
+    sorts after every ranked one rather than ahead of them. Ties break on price
+    then name so the answer is stable run to run — a shopping list that reorders
+    itself between refreshes reads as a bug.
+
+    `locations=None` disables the location filter. A store whose location is not
+    recorded at all is EXCLUDED when filtering: an unknown location is not
+    assumed to be the right one, for the same reason an uncounted ingredient is
+    not assumed to be in stock.
     """
+    allowed = None if locations is None else {str(x).upper() for x in locations}
     eligible = []
     for it in items:
         if it.get("deleted_at"):
@@ -160,6 +181,10 @@ def choose_item(items: list[dict], ingredient: dict, stores: dict,
         store = stores.get(it.get("store_notion_id")) or {}
         if not store or store.get("deleted_at") or not store.get("active", True):
             continue
+        if allowed is not None:
+            loc = store.get("location")
+            if loc is None or str(loc).upper() not in allowed:
+                continue
         rank, basis = effective_rank(it, ingredient, store, seed)
         eligible.append((rank if rank is not None else 10 ** 6,
                          _f(it.get("price")) if _f(it.get("price")) is not None else 10 ** 6,
@@ -292,7 +317,8 @@ def topup_split(need_by_day: dict, shop_date, shelf_life_days,
 def build_lines(*, stay: dict, stay_days: list[dict], recipes: dict,
                 lines: list[dict], ingredients: dict, store_items: list[dict],
                 stores: dict, seed: dict | None = None,
-                store_zones_by_chain: dict | None = None) -> list[dict]:
+                store_zones_by_chain: dict | None = None,
+                locations=DEFAULT_STORE_LOCATIONS) -> list[dict]:
     """One line per ingredient that has to be bought, or flagged.
 
     Recipe demand and par level are combined as a FLOOR, not a sum: Notion's own
@@ -350,7 +376,8 @@ def build_lines(*, stay: dict, stay_days: list[dict], recipes: dict,
         purchased_by_day = {d: purchased_from_as_used(q, ing) for d, q in per_day.items()}
         purchased_total = sum(purchased_by_day.values())
 
-        item = choose_item(items_by_ing.get(nid, []), ing, stores, seed)
+        item = choose_item(items_by_ing.get(nid, []), ing, stores, seed,
+                           locations=locations)
         if item is None:
             flags.append(FLAG_NO_STORE)
         elif item.get("_rank") is None or item["_rank"] > 1:
