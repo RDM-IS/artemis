@@ -1208,3 +1208,46 @@ class TestLastLoggedEndpoint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestZoneMinutesBeyondCardio(unittest.TestCase):
+    """ZONE-0 widened beyond cardio (2026-09-29). The computation cares about a
+    window and some samples, not about what the session was."""
+
+    def _post(self, log_type, sets, samples=()):
+        from datetime import timedelta as _td
+        client, app, sess = _build_log_client()
+        self.app = app
+        end = datetime(2026, 6, 8, 18, 30, 0)
+        sess.hr_samples = [{"measured_at": end - _td(seconds=1980) + _td(seconds=s),
+                            "bpm": b} for s, b in samples]
+        resp = client.post(
+            "/api/health/log", headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": None if log_type == "session_summary" else "X",
+                  "log_type": log_type, "sets": sets})
+        return resp, sess
+
+    def test_a_finished_flow_gets_a_breakdown(self):
+        dense = [(i * 30, 110) for i in range(66)]
+        resp, sess = self._post("session_summary", [{"duration_sec": 1980, "rpe_actual": 4}], dense)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["hr_zones"]["status"], "ok")
+        self.assertEqual(sess.zone_writes[0]["wsrc"], "session_summary duration")
+
+    def test_a_strength_SET_is_not_a_session(self):
+        """A strength_set carries a duration too -- 20 s for one exercise. A
+        20-second window would be a breakdown of nothing, so it is not a
+        trigger; the session_summary that finishes the workout is."""
+        resp, sess = self._post(
+            "strength_set", [{"set_num": 1, "reps_done": 10, "weight_lbs": 100,
+                              "duration_sec": 20}], [(i * 30, 110) for i in range(66)])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["hr_zones"])
+        self.assertEqual(sess.zone_writes, [])
+
+    def test_a_summary_with_no_duration_is_not_a_trigger(self):
+        resp, sess = self._post("session_summary", [{"rpe_actual": 5}],
+                                [(i * 30, 110) for i in range(66)])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["hr_zones"])
+        self.assertEqual(sess.zone_writes, [])
