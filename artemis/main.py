@@ -164,6 +164,10 @@ _QUALIFIED_SUFFIX: dict[str, str] = {
     "staples": "staples",
     "disposition": "disposition",
     "fix": "fix",
+    # BW-CIRCUIT: `yes circuit`. Deliberately NOT `yes swap` -- that is the
+    # modality swap, and two flows answering to one word is the collision
+    # CONFIRM-ARB exists to prevent.
+    "circuit": "circuit",
 }
 
 
@@ -303,6 +307,12 @@ _BARE_WORD_CONSUMERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("debrief_confirm", ("debrief",)),
     ("swap_confirm", ("swap",)),
     ("nutrition_confirm", ("target", "staples")),
+    # BW-CIRCUIT is a propose-then-confirm pending answered by `yes circuit`, so
+    # a bare `yes` COULD reach it and it counts toward ambiguity -- unlike
+    # cardio_detect, which only ever answers to `log cardio`. THE TABLE IS IN
+    # CHAIN ORDER: this sits where _handle_bw_circuit_confirm sits in the chain,
+    # because `would_have_picked` is computed from the table's order.
+    ("bw_circuit_confirm", ("circuit",)),
     ("dossier_command", ("dossier", "org")),
     ("rule_command", ("rule",)),
     ("disposition_command", ("disposition",)),
@@ -4521,6 +4531,154 @@ _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$",
 # Artemis never sets this, under any circumstances. It is the Brad Spaits rule
 # applied to his body rather than his mailbox: the flag says a VA provider has
 # cleared him for vigorous exercise, and only he can say that.
+_SWAP_CIRCUIT_RE = re.compile(
+    r"^\s*swap\s+(?P<when>today|tomorrow|\d{4}-\d{2}-\d{2})\s+for\s+"
+    r"(?:a\s+|the\s+)?bodyweight\s+circuit\s*[.!]*\s*$", re.I)
+_UNDO_CIRCUIT_RE = re.compile(r"^\s*undo\s+circuit\s*[.!]*\s*$", re.I)
+
+
+def _circuit_day(word: str):
+    from datetime import date as _d, timedelta as _td
+    from artemis.quiet_hours import local_today
+    w = word.lower()
+    if w == "today":
+        return local_today()
+    if w == "tomorrow":
+        return local_today() + _td(days=1)
+    return _d.fromisoformat(word)
+
+
+def _handle_swap_circuit(post: dict, question: str) -> bool:
+    """`swap today for bodyweight circuit` — PROPOSE, never apply. Confirmed
+    with `yes circuit`."""
+    m = _SWAP_CIRCUIT_RE.match(question or "")
+    if not m:
+        return False
+    from artemis import bw_circuit
+    from artemis.quiet_hours import set_system_value
+    from knowledge.db import get_connection
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        day = _circuit_day(m.group("when"))
+        with get_connection() as conn:
+            cur = conn.cursor()
+            ok, why = bw_circuit.can_swap(cur, day)
+            cur.execute("SELECT session_type FROM health.plan "
+                        "WHERE plan_date = %s AND slot = 'morning'", (day,))
+            row = cur.fetchone()
+            current = (row["session_type"] if isinstance(row, dict) else row[0]) if row else None
+            conn.rollback()
+        if not ok:
+            if _mm:
+                _mm.post_message(channel_id, f"Can't swap {day}: {why}.", root_id=root_id)
+            return True
+        set_system_value(bw_circuit.PENDING_KEY, day.isoformat())
+        if _mm:
+            _mm.post_message(
+                channel_id,
+                f"Swap {day} — **{current}** becomes a 25 min bodyweight circuit "
+                f"(continuous, no static rest). Reply `yes circuit` to apply, or "
+                f"ignore this. `undo circuit` puts it back afterwards.",
+                root_id=root_id)
+    except Exception:
+        logger.exception("swap circuit: failed")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't work that out — nothing changed.",
+                             root_id=root_id)
+    return True
+
+
+def _handle_bw_circuit_confirm(post: dict, question: str) -> bool:
+    """Confirm a pending circuit swap. `yes circuit` is the qualified form.
+
+    Guards on the pending FIRST, so a bare `yes` only reaches this when a swap
+    is actually staged -- and even then CONFIRM-ARB counts it as a candidate
+    rather than letting it win silently.
+    """
+    from datetime import date as _date
+    from artemis import bw_circuit, interval_gate
+    from artemis.quiet_hours import get_system_value, local_today, set_system_value
+    from knowledge.db import get_connection
+
+    raw_pending = get_system_value(bw_circuit.PENDING_KEY)
+    if not raw_pending:
+        return False
+    # CONFIRM-ARB: strip the qualifier before matching the control word, exactly
+    # as the swap and calendar confirms do.
+    q = _strip_qualifier(question, "circuit").strip().lower().rstrip(".!")
+    if q not in ("yes", "y", "yeah", "ok", "okay", "confirm", "do it"):
+        if q in ("no", "cancel", "nope"):
+            set_system_value(bw_circuit.PENDING_KEY, "")
+            if _mm:
+                _mm.post_message(post.get("channel_id", ""), "Cancelled — nothing changed.",
+                                 root_id=post.get("root_id") or post["id"])
+            return True
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        day = _date.fromisoformat(raw_pending)
+        with get_connection() as conn:
+            cur = conn.cursor()
+            ok, why = bw_circuit.can_swap(cur, day)
+            if not ok:
+                conn.rollback()
+                if _mm:
+                    _mm.post_message(channel_id, f"Can't swap {day} now: {why}.",
+                                     root_id=root_id)
+                set_system_value(bw_circuit.PENDING_KEY, "")
+                return True
+            # The gate is evaluated AT SWAP TIME for a same-day swap and
+            # persisted on the row, so the card cannot re-derive it later and
+            # disagree with what he was shown.
+            gate = interval_gate.evaluate(cur, day)
+            out = bw_circuit.swap_row(cur, day, gate={"ok": gate.ok, "reason": gate.reason})
+        set_system_value(bw_circuit.PENDING_KEY, "")
+    except Exception:
+        logger.exception("circuit confirm: failed")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't apply that — nothing changed.",
+                             root_id=root_id)
+        return True
+    if _mm:
+        note = ("full — 40s work / 20s easy, Zone 4 bursts"
+                if out["intensity"] == "full" else
+                "moderate — 30s work / 30s easy, Zone 3")
+        _mm.post_message(
+            channel_id,
+            f"Swapped {day}: **{out['replaced']}** is now a {out['minutes']} min "
+            f"bodyweight circuit, {note}. `undo circuit` puts it back.",
+            root_id=root_id)
+    return True
+
+
+def _handle_undo_circuit(post: dict, question: str) -> bool:
+    if not _UNDO_CIRCUIT_RE.match(question or ""):
+        return False
+    from artemis import bw_circuit
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            out = bw_circuit.undo(cur, local_today())
+        if _mm:
+            _mm.post_message(
+                channel_id,
+                f"Put **{out['restored']}** back." if out else
+                "Today isn't a swapped circuit — nothing to undo.", root_id=root_id)
+    except Exception:
+        logger.exception("undo circuit: failed")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't undo that — nothing changed.",
+                             root_id=root_id)
+    return True
+
+
 _CARDIO_DETECT_RE = re.compile(r"^\s*cardio\s+detect\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
 #: A QUALIFIED form, two words. It is deliberately not a bare control word and
 #: not in _BARE_WORD_CONSUMERS: a pending watch proposal must never be able to
@@ -5020,6 +5178,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
         ("intervals_cleared", _handle_intervals_cleared),
         ("cardio_detect", _handle_cardio_detect),
+        ("bw_circuit_confirm", _handle_bw_circuit_confirm),
+        ("swap_circuit", _handle_swap_circuit),
+        ("undo_circuit", _handle_undo_circuit),
         ("log_cardio", _handle_log_cardio),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
