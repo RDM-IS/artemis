@@ -103,12 +103,12 @@ LOGS = [
 ]
 
 DAILY = {
-    date(2026, 9, 12): {"weight_lbs": 290.0, "sleep_hrs": 7.0, "energy": 3,
+    date(2026, 9, 12): {"weight_lbs": 350.0, "sleep_hrs": 7.0, "energy": 3,
                         "soreness": {"pain": {"knee": 3}}},                      # pre-anchor
-    date(2026, 9, 16): {"weight_lbs": 286.0, "sleep_hrs": 6.5, "energy": 5, "soreness": {"overall": 0}},
+    date(2026, 9, 16): {"weight_lbs": 346.0, "sleep_hrs": 6.5, "energy": 5, "soreness": {"overall": 0}},
     date(2026, 9, 17): {"weight_lbs": None, "sleep_hrs": 8.0, "energy": 4,
                         "soreness": {"legs": 3, "pain": {"shoulder": 1}}},
-    TODAY: {"weight_lbs": 284.5, "sleep_hrs": 7.5, "energy": 4, "resting_hr": 58,
+    TODAY: {"weight_lbs": 344.5, "sleep_hrs": 7.5, "energy": 4, "resting_hr": 88,
             "soreness": {"quads": 2, "pain": {"shoulder": 2}}},
 }
 
@@ -258,7 +258,7 @@ class TestProgram(Base):
                          "the old 300 lb set is out of scope")
         self.assertEqual(body["previous_program_end"], "2026-09-13")
         # Body weight is NOT scoped.
-        self.assertEqual(body["weight_30d"][0], {"date": "2026-09-12", "value": 290.0})
+        self.assertEqual(body["weight_30d"][0], {"date": "2026-09-12", "value": 350.0})
 
 
 class TestToday(Base):
@@ -269,7 +269,7 @@ class TestToday(Base):
         self.assertEqual(t["day"]["status"], "partial")
         self.assertEqual(t["progress"], {"unit": "sets", "done": 1, "planned": 4})
         self.assertEqual(t["checkin"], {"date": "2026-09-18", "sleep_hrs": 7.5, "energy": 4,
-                                        "weight_lbs": 284.5, "resting_hr": 58,
+                                        "weight_lbs": 344.5, "resting_hr": 88,
                                         "soreness": {"quads": 2}, "pain": {"shoulder": 2}})
         self.assertEqual(t["adjustment"]["rules_fired"], ["pain_lighter"])
 
@@ -332,10 +332,10 @@ class TestStrengthProgress(Base):
 
         def ts(score):
             return TopSet(date=TODAY, score=score)
-        self.assertEqual(trend_of(ts(1100), ts(1000)), "up")
-        self.assertEqual(trend_of(ts(1015), ts(1000)), "flat")      # within 2%
-        self.assertEqual(trend_of(ts(985), ts(1000)), "flat")
-        self.assertEqual(trend_of(ts(900), ts(1000)), "down")
+        self.assertEqual(trend_of(ts(1100), ts(360)), "up")
+        self.assertEqual(trend_of(ts(1015), ts(360)), "flat")      # within 2%
+        self.assertEqual(trend_of(ts(345), ts(360)), "flat")
+        self.assertEqual(trend_of(ts(900), ts(360)), "down")
         self.assertIsNone(trend_of(ts(900), None))
         self.assertEqual(trend_of(ts(10), ts(0)), "up")
         d1, d2, d3 = date(2026, 9, 16), date(2026, 9, 23), date(2026, 9, 30)
@@ -426,10 +426,10 @@ class TestPatternsFlagsWeight(Base):
     def test_weight_with_zero_one_and_many_points(self):
         from api.app.routers.health import TrendPoint, weight_summary
         self.assertIsNone(weight_summary([]))
-        one = weight_summary([TrendPoint(date=TODAY, value=284.5)])
-        self.assertEqual((one.first.value, one.latest.value, one.change), (284.5, 284.5, 0.0))
+        one = weight_summary([TrendPoint(date=TODAY, value=344.5)])
+        self.assertEqual((one.first.value, one.latest.value, one.change), (344.5, 344.5, 0.0))
         many = self.overview()
-        self.assertEqual([p["value"] for p in many["weight_30d"]], [290.0, 286.0, 284.5])
+        self.assertEqual([p["value"] for p in many["weight_30d"]], [350.0, 346.0, 344.5])
         self.assertEqual(many["weight_summary"]["change"], -5.5)
         none = self.overview(FakeSession(daily={}))
         self.assertEqual((none["weight_30d"], none["weight_summary"]), ([], None))

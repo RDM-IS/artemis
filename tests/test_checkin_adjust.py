@@ -300,12 +300,12 @@ class TestSessionBScenarios(unittest.TestCase):
 
     def test_01_all_clear_no_change_and_zero_stored(self):
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("slept 8 hours, energy 5, sore 0, weight 283")
+        reply = self.checkin("slept 8 hours, energy 5, sore 0, weight 343")
         self.assertEqual(reply, "Check-in logged — run Session B as written.")
         self.assertEqual(self.db.plan[FRI], before)
         st = self.db.daily[FRI]
         self.assertEqual(st["soreness"], {"overall": 0})
-        self.assertEqual((st["sleep_hrs"], st["energy"], st["weight_lbs"]), (8.0, 5, 283.0))
+        self.assertEqual((st["sleep_hrs"], st["energy"], st["weight_lbs"]), (8.0, 5, 343.0))
 
     def _assert_shoulder_replace(self, reply):
         got = names(self.db)
@@ -334,7 +334,7 @@ class TestSessionBScenarios(unittest.TestCase):
             "raise.\nReply `original` to undo.")
 
     def test_02_shoulder_4_replaces(self):
-        self._assert_shoulder_replace(self.checkin("slept 8, energy 5, sore shoulder 4, weight 283"))
+        self._assert_shoulder_replace(self.checkin("slept 8, energy 5, sore shoulder 4, weight 343"))
         self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
 
     def test_03_eight_of_ten_is_four(self):
@@ -427,7 +427,7 @@ class TestSessionBScenarios(unittest.TestCase):
         self.db.logs.append({"plan_id": 105, "logged_via": "manual",
                              "log_type": "strength_set", "exercise": "DB goblet squat"})
         before = copy.deepcopy(self.db.plan[FRI])
-        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 283")
+        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 343")
         self.assertEqual(reply, "Logged.")
         self.assertEqual(self.db.plan[FRI], before)
         self.assertEqual(self.db.daily[FRI]["soreness"], {"shoulder": 4, "sides": {"shoulder": "unspecified"}})
@@ -480,7 +480,7 @@ class TestSessionBScenarios(unittest.TestCase):
         self.assertEqual(posted, [("No check-in yet — run Session B as written.", "health")])
 
         self.now = datetime(2026, 9, 18, 10, 20, tzinfo=timezone.utc)   # 05:20 CDT
-        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 283")
+        reply = self.checkin("slept 8, energy 5, sore shoulder 4, weight 343")
         self.assertIn("removed", reply)
         self.assertIn("adjustment", self.db.plan[FRI]["blocks"])
 
@@ -593,7 +593,7 @@ class TestWatchPrefilledDay(unittest.TestCase):
         self.db = FakeDB(office_row(FRI))
         self.db.daily[FRI] = {"sleep_hrs": 5.7, "sleep_source": "watch",
                               "resting_hr": None, "resting_hr_source": None,
-                              "weight_lbs": 282.0, "weight_source": "watch",
+                              "weight_lbs": 342.0, "weight_source": "watch",
                               "energy": None, "soreness": None, "free_text": None}
         self.cur = self.db.cursor()
         self.now = datetime(2026, 9, 18, 10, 10, tzinfo=timezone.utc)
@@ -604,7 +604,7 @@ class TestWatchPrefilledDay(unittest.TestCase):
     def test_the_checkin_goes_through_and_names_the_watch_values(self):
         reply = hc.process_checkin(self.cur, "energy 4 sore 0", FRI, checkin_id="p",
                                    now=self.now, adjust=True)
-        self.assertIn("From the watch: sleep 5.7h, weight 282. Not synced: resting HR.", reply)
+        self.assertIn("From the watch: sleep 5.7h, weight 342. Not synced: resting HR.", reply)
         self.assertTrue(hc.has_checkin(self.cur, FRI))
 
     def test_watch_sleep_never_triggers_recovery(self):
@@ -617,7 +617,7 @@ class TestWatchPrefilledDay(unittest.TestCase):
         reply = hc.process_checkin(self.cur, "slept 7 energy 4", FRI, checkin_id="p",
                                    now=self.now, adjust=True)
         self.assertEqual(self.db.daily[FRI]["sleep_source"], "manual")
-        self.assertIn("From the watch: weight 282.", reply)
+        self.assertIn("From the watch: weight 342.", reply)
         self.assertNotIn("sleep 5.7h", reply)
 
 
@@ -764,19 +764,19 @@ class TestLocationThenPain(unittest.TestCase):
 
 class TestParser(unittest.TestCase):
     def test_bare_weight_from_the_922_checkin(self):
-        """9/22's exact reply: the bare 281.5 was dropped into free_text."""
-        ci = hc.parse_checkin("Sleep 6, energy 4, soreness 0, 281.5")
-        self.assertEqual((ci.sleep_hrs, ci.energy, ci.weight_lbs), (6.0, 4, 281.5))
+        """9/22's exact reply: the bare 341.5 was dropped into free_text."""
+        ci = hc.parse_checkin("Sleep 6, energy 4, soreness 0, 341.5")
+        self.assertEqual((ci.sleep_hrs, ci.energy, ci.weight_lbs), (6.0, 4, 341.5))
         self.assertEqual(ci.soreness, {"overall": 0})
         self.assertIsNone(ci.free_text)
-        self.assertEqual(hc.classify("Sleep 6, energy 4, soreness 0, 281.5"), "checkin")
+        self.assertEqual(hc.classify("Sleep 6, energy 4, soreness 0, 341.5"), "checkin")
 
     def test_bare_weight_is_stored_manual(self):
         cur = MagicMock()
-        hc.store_checkin(cur, FRI, hc.parse_checkin("Sleep 6, energy 4, soreness 0, 281.5"))
+        hc.store_checkin(cur, FRI, hc.parse_checkin("Sleep 6, energy 4, soreness 0, 341.5"))
         sql, params = cur.execute.call_args[0]
         self.assertIn("weight_source = CASE WHEN EXCLUDED.weight_lbs IS NOT NULL THEN 'manual'", sql)
-        self.assertEqual(params[1], 281.5)
+        self.assertEqual(params[1], 341.5)
 
     def test_bare_weight_limits(self):
         cases = {
@@ -785,8 +785,8 @@ class TestParser(unittest.TestCase):
             "sleep 6, 150": 150.0,
             "sleep 6, 400": 400.0,
             "sleep 6, walked 200 steps": None,       # not a lone clause
-            "sleep 6, 281, 283": None,               # two candidates: ambiguous
-            "sleep 6, weight 283, 281": 283.0,       # labelled weight wins
+            "sleep 6, 341, 343": None,               # two candidates: ambiguous
+            "sleep 6, weight 343, 341": 343.0,       # labelled weight wins
         }
         for text, want in cases.items():
             with self.subTest(text=text):
@@ -839,9 +839,9 @@ class TestParser(unittest.TestCase):
                 self.assertEqual(hc.parse_checkin(f"{r} sore 2").soreness, {r: 2})
 
     def test_the_real_0916_checkin(self):
-        ci = hc.parse_checkin("Slept 6.5\nEnergy 5\nSore 0\nWeight 284.5")
+        ci = hc.parse_checkin("Slept 6.5\nEnergy 5\nSore 0\nWeight 344.5")
         self.assertEqual((ci.sleep_hrs, ci.energy, ci.weight_lbs, ci.soreness),
-                         (6.5, 5, 284.5, {"overall": 0}))
+                         (6.5, 5, 344.5, {"overall": 0}))
 
     def test_nothing_parsable(self):
         self.assertFalse(hc.parse_checkin("feeling ok I guess").has_data)
@@ -1064,7 +1064,7 @@ class TestRouting(unittest.TestCase):
         return self.mm.post_to_channel_id.call_args[0][1]
 
     def test_0916_messages_route_to_health_without_gmail(self):
-        r1 = self.send("Slept 6.5\nEnergy 5\nSore 0\nWeight 284.5")
+        r1 = self.send("Slept 6.5\nEnergy 5\nSore 0\nWeight 344.5")
         self.assertEqual(r1, "Logged.")                 # sets already logged that morning
         self.assertEqual(self.db.daily[date(2026, 9, 21)]["soreness"], {"overall": 0})
         r2 = self.send("Nope")
@@ -1104,7 +1104,7 @@ class TestClaimGuard(unittest.TestCase):
     EV = Evidence(
         exercises={"leg press", "db bench press", "lat pulldown", "seated leg curl",
                    "cable face pull rope", "captain's chair knee raise"},
-        loads={130.0, 160.0, 30.0, 35.0, 284.5},
+        loads={130.0, 160.0, 30.0, 35.0, 344.5},
         logged_numbers={12.0, 15.0, 130.0, 160.0, 6.5, 7.5, 8.0, 7.0},
         real_sessions=1,
     )
@@ -1122,7 +1122,7 @@ class TestClaimGuard(unittest.TestCase):
 
     def test_plan_exact_text_passes(self):
         text = ("Today: leg press 2×10-12 at RPE 6, then the lat pulldown and seated leg curl. "
-                "Last session your leg press was 160 lb for 12 reps. Body weight 284.5 lb.")
+                "Last session your leg press was 160 lb for 12 reps. Body weight 344.5 lb.")
         self.assertEqual(find_violations(text, self.EV), [])
 
     def test_15_equipment_words_and_greetings_are_not_exercises(self):

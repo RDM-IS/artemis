@@ -53,10 +53,10 @@ class TestGateStaysClosedOnOrdinaryEnglish(unittest.TestCase):
 class TestExistingShapesUnchanged(unittest.TestCase):
     def test_prior_formats_still_claim(self):
         for t in (
-            "Sleep 6, energy 4, soreness 0, 281.5",
+            "Sleep 6, energy 4, soreness 0, 341.5",
             "slept 7 energy 4 sore 0 weight 283",
             "energy 4 sore 0",
-            "rhr 58",
+            "rhr 88",
         ):
             with self.subTest(text=t):
                 self.assertEqual(classify(t), "checkin")

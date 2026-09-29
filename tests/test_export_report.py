@@ -96,13 +96,13 @@ class TestWeekly(unittest.TestCase):
         self.assertIn("| Captain's chair knee raise | — | — | bodyweight |", out)
 
     def test_checkins_and_pain_summary(self):
-        ci = {WED: {"weight_lbs": 284.5, "sleep_hrs": 6.5, "energy": 5, "soreness": None,
+        ci = {WED: {"weight_lbs": 344.5, "sleep_hrs": 6.5, "energy": 5, "soreness": None,
                     "resting_hr": None, "free_text": None},
-              WED + timedelta(days=1): {"weight_lbs": 283.0, "sleep_hrs": 6, "energy": 4,
+              WED + timedelta(days=1): {"weight_lbs": 343.0, "sleep_hrs": 6, "energy": 4,
                                         "soreness": {"overall": 0, "pain": {"shoulder": 2}},
                                         "resting_hr": None, "free_text": None}}
         out = er.md(er.build_weekly(week(date(2026, 9, 18), checkins=ci), GEN))
-        self.assertIn("284.5 lb (Wed) → 283 lb (Thu), -1.5 lb over 2 weigh-in(s)", out)
+        self.assertIn("344.5 lb (Wed) → 343 lb (Thu), -1.5 lb over 2 weigh-in(s)", out)
         self.assertIn("pain — shoulder: peak 2/5 (Thu 9/17 2)", out)
         self.assertIn("| Fri 9/18 | no check-in |", out)
 

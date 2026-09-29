@@ -109,11 +109,11 @@ class TestMorningHandler(unittest.TestCase):
                    return_value="Check-in logged — run Session A as written.") as pc, \
              patch.object(health, "_call_claude_json",
                           side_effect=AssertionError("LLM must not be called")):
-            result = health.handle_morning_intent("slept 6.5 energy 3 legs sore 3 RHR 58",
+            result = health.handle_morning_intent("slept 6.5 energy 3 legs sore 3 RHR 98",
                                                   message_id="p1")
         pc.assert_called_once()
         self.assertEqual(pc.call_args[0][0], cur)
-        self.assertEqual(pc.call_args[0][1], "slept 6.5 energy 3 legs sore 3 RHR 58")
+        self.assertEqual(pc.call_args[0][1], "slept 6.5 energy 3 legs sore 3 RHR 98")
         self.assertEqual(pc.call_args.kwargs["checkin_id"], "p1")
         self.assertEqual(result, "Check-in logged — run Session A as written.")
 
