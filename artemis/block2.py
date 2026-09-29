@@ -75,7 +75,9 @@ def week_num_for(d: date, repeats: list[date] | None = None) -> int | None:
     return (d - start).days // 7 + 1
 
 
-def build_rows(repeats: list[date] | None = None) -> list[dict]:
+def build_rows(repeats: list[date] | None = None, *,
+               placements: dict | None = None,
+               away_stays: list | None = None) -> list[dict]:
     """Every block-2 row, in memory. Reuses block 1's builders entirely.
 
     The 14-day template, the lift days, the locations and the cardio resolve all
@@ -88,23 +90,59 @@ def build_rows(repeats: list[date] | None = None) -> list[dict]:
     d = start
     while d <= end:
         wk = week_num_for(d, repeats)
-        for spec in _specs_for(d, wk):
+        for spec in _specs_for(d, wk, placements=placements, away_stays=away_stays):
             rows.append(_build_one(spec))
         d += timedelta(days=1)
     return rows
 
 
-def _specs_for(d: date, wk: int) -> list[dict]:
-    """The day's specs, from block 1's own schedule rules."""
+def _specs_for(d: date, wk: int, *, placements: dict | None = None,
+               away_stays: list | None = None) -> list[dict]:
+    """The day's specs: block 1's schedule rules, overruled by an explicit
+    placement, overruled by an away day.
+
+    The order matters and is deliberate. A HUNTING day schedules nothing at all,
+    so it wins over a placement -- otherwise a Strength A placed on a day he is
+    later marked as hunting would survive the marking, and the whole point of
+    recording the trip is that it changes the plan.
+    """
+    from artemis import away as away_mod
+
+    session = office.session_for(d)
+    location_key = office.day_location_key(d)
+    location = office.day_location(d)
+
+    if placements and d in placements:
+        placed = placements[d]
+        if isinstance(placed, str):           # a bare session_type
+            session = placed
+        else:
+            session = placed.get("session") or session
+            if placed.get("location_key"):
+                location_key = placed["location_key"]
+                # Same lookup day_location() uses, so a placed location reads
+                # on the card exactly like a scheduled one.
+                location = ((office._cycle.DEFAULT_LOCATIONS.get(location_key) or {})
+                            .get("display", location_key))
+
+    stay = away_mod.stay_on(away_stays or [], d)
+    if stay is not None:
+        policy = away_mod.policy_for(stay)
+        if policy.strength is None and policy.cardio is None:
+            # Hunting: planned rest, nothing scheduled, nothing missable.
+            session = "rest"
+        elif policy.strength == "bodyweight_circuit" and session.startswith("strength"):
+            session = "bodyweight_circuit"
+
     base = {
-        "plan_date": d, "slot": "morning",
-        "session_type": office.session_for(d),
-        "week_num": wk, "location": office.day_location(d),
-        "location_key": office.day_location_key(d),
+        "plan_date": d, "slot": "morning", "session_type": session,
+        "week_num": wk, "location": location, "location_key": location_key,
         "day_type": office.day_type(d), "pos": office.cycle_pos(d), "wk0": False,
     }
     specs = [base]
-    if office.cycle_pos(d) in office.EVENING_POS and office.evening_is_possible(d):
+    # An away day carries no evening flow: he is not at home with the mat.
+    if (stay is None and office.cycle_pos(d) in office.EVENING_POS
+            and office.evening_is_possible(d)):
         specs.append({**base, "slot": "evening",
                       "session_type": office.EVENING_SESSION})
     return specs

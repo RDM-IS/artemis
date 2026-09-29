@@ -168,6 +168,9 @@ _QUALIFIED_SUFFIX: dict[str, str] = {
     # modality swap, and two flows answering to one word is the collision
     # CONFIRM-ARB exists to prevent.
     "circuit": "circuit",
+    "trip": "trip",
+    "vacation": "vacation",
+    "hunting": "hunting",
 }
 
 
@@ -307,6 +310,9 @@ _BARE_WORD_CONSUMERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("debrief_confirm", ("debrief",)),
     ("swap_confirm", ("swap",)),
     ("nutrition_confirm", ("target", "staples")),
+    # AWAY: `yes trip` / `yes vacation` / `yes hunting`. One pending, three
+    # words, because it is one override kind with three purposes.
+    ("away_confirm", ("trip", "vacation", "hunting")),
     # BW-CIRCUIT is a propose-then-confirm pending answered by `yes circuit`, so
     # a bare `yes` COULD reach it and it counts toward ambiguity -- unlike
     # cardio_detect, which only ever answers to `log cardio`. THE TABLE IS IN
@@ -4531,6 +4537,164 @@ _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$",
 # Artemis never sets this, under any circumstances. It is the Brad Spaits rule
 # applied to his body rather than his mailbox: the flag says a VA provider has
 # cleared him for vigorous exercise, and only he can say that.
+# ── AWAY ────────────────────────────────────────────────────────────────────
+# `trip`, `vacation` and `hunting` share one regex: they are one override kind
+# with different purposes, and three near-identical regexes would be three
+# places for the date parsing to drift apart.
+_AWAY_RE = re.compile(
+    r"^\s*(?P<purpose>trip|vacation|hunting)\s+(?P<from>\d{4}-\d{2}-\d{2})\s+to\s+"
+    r"(?P<to>\d{4}-\d{2}-\d{2})(?:\s+(?P<lodging>hotel\s+gym|no\s+gym))?\s*[.!]*\s*$",
+    re.I)
+_AWAY_CANCEL_RE = re.compile(
+    r"^\s*(?:trip|vacation|hunting)\s+cancel\s+(?P<from>\d{4}-\d{2}-\d{2})\s*[.!]*\s*$",
+    re.I)
+_HOTEL_HAS_RE = re.compile(r"^\s*hotel\s+gym\s+has\s+(?P<items>.+?)\s*[.!]*\s*$", re.I)
+_PACKED_RE = re.compile(r"^\s*packed\s+(?P<item>trx|bands)\s*[.!]*\s*$", re.I)
+
+_AWAY_PENDING_KEY = "away_pending"
+
+
+def _handle_away_propose(post: dict, question: str) -> bool:
+    """`trip|vacation|hunting <from> to <to> [hotel gym|no gym]` — PROPOSE only.
+
+    Propose-then-confirm: an away period reshapes weeks of the plan, so Artemis
+    never writes one from a single line.
+    """
+    from datetime import date as _date
+    from artemis import away
+    from artemis.quiet_hours import set_system_value
+    m = _AWAY_RE.match(question or "")
+    if not m:
+        return False
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    word = m.group("purpose").lower()
+    purpose = {"trip": away.WORK, "vacation": away.VACATION,
+               "hunting": away.HUNTING}[word]
+    lodging = ((m.group("lodging") or "").lower().replace(" ", "_")
+               or away.DEFAULT_LODGING[purpose])
+    try:
+        start, end = _date.fromisoformat(m.group("from")), _date.fromisoformat(m.group("to"))
+        if end < start:
+            raise ValueError("end before start")
+    except ValueError:
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't read those dates.", root_id=root_id)
+        return True
+    pol = away.policy_for(away.Stay(start, end, purpose, lodging))
+    set_system_value(_AWAY_PENDING_KEY,
+                     f"{purpose}|{lodging}|{start.isoformat()}|{end.isoformat()}")
+    if _mm:
+        days = (end - start).days + 1
+        _mm.post_message(
+            channel_id,
+            f"**{word.title()}** {start} → {end} ({days} day{'s' if days != 1 else ''}), "
+            f"{lodging.replace('_', ' ')}. {pol.note.capitalize()}. "
+            f"These days never count as missed. Reply `yes {word}` to record it.",
+            root_id=root_id)
+    return True
+
+
+def _handle_away_confirm(post: dict, question: str) -> bool:
+    """`yes trip` / `yes vacation` / `yes hunting` — write the override."""
+    from datetime import date as _date
+    from artemis import away
+    from artemis.quiet_hours import get_system_value, set_system_value
+    from knowledge.db import get_connection
+
+    raw = get_system_value(_AWAY_PENDING_KEY)
+    if not raw:
+        return False
+    purpose, lodging, start_s, end_s = raw.split("|")
+    word = {away.WORK: "trip", away.VACATION: "vacation", away.HUNTING: "hunting"}[purpose]
+    # All three suffixes, one call — the same shape `nutrition_confirm` uses for
+    # `target`/`staples`. There is only ever ONE away pending, and trip /
+    # vacation / hunting are three names for confirming it, so stripping any of
+    # them is correct and the arbiter's qualified-form check finds all three.
+    q = _strip_qualifier(question, "trip", "vacation", "hunting").strip().lower().rstrip(".!")
+    if q in ("no", "cancel", "nope"):
+        set_system_value(_AWAY_PENDING_KEY, "")
+        if _mm:
+            _mm.post_message(post.get("channel_id", ""), "Cancelled — nothing recorded.",
+                             root_id=post.get("root_id") or post["id"])
+        return True
+    if q not in ("yes", "y", "yeah", "ok", "okay", "confirm"):
+        return False
+    channel_id, root_id = post.get("channel_id", ""), post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            away.insert(cur, away.Stay(_date.fromisoformat(start_s),
+                                       _date.fromisoformat(end_s), purpose, lodging))
+        set_system_value(_AWAY_PENDING_KEY, "")
+    except Exception:
+        logger.exception("away confirm: failed")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't record that — nothing changed.",
+                             root_id=root_id)
+        return True
+    if _mm:
+        _mm.post_message(channel_id, f"Recorded: {word} {start_s} → {end_s}. "
+                                     f"The plan follows it from the next build.",
+                         root_id=root_id)
+    return True
+
+
+def _handle_away_edit(post: dict, question: str) -> bool:
+    """`trip cancel <from>` · `hotel gym has <items>` · `packed trx|bands`."""
+    from datetime import date as _date
+    from artemis import away
+    from knowledge.db import get_connection
+    channel_id, root_id = post.get("channel_id", ""), post.get("root_id") or post["id"]
+
+    m = _AWAY_CANCEL_RE.match(question or "")
+    if m:
+        try:
+            with get_connection() as conn:
+                n = away.cancel(conn.cursor(), _date.fromisoformat(m.group("from")))
+            if _mm:
+                _mm.post_message(channel_id,
+                                 f"Cancelled that away period." if n else
+                                 "I don't have an away period starting then.",
+                                 root_id=root_id)
+        except Exception:
+            logger.exception("away cancel: failed")
+            if _mm:
+                _mm.post_message(channel_id, "I couldn't cancel that.", root_id=root_id)
+        return True
+
+    m = _HOTEL_HAS_RE.match(question or "") or _PACKED_RE.match(question or "")
+    if not m:
+        return False
+    try:
+        from artemis.quiet_hours import local_today
+        with get_connection() as conn:
+            cur = conn.cursor()
+            stays = away.load_stays(cur, local_today(), local_today())
+            if not stays:
+                if _mm:
+                    _mm.post_message(channel_id,
+                                     "That applies to a stay, and you're not away "
+                                     "today. Record the trip first.", root_id=root_id)
+                return True
+            stay = stays[0]
+            if "items" in (m.groupdict() or {}):
+                items = [i.strip() for i in re.split(r",| and ", m.group("items")) if i.strip()]
+                away.set_attr(cur, stay.start, "hotel_inventory", items)
+                msg = f"Noted for this stay: {', '.join(items)}."
+            else:
+                kit = sorted(stay.kit | {m.group("item").lower()})
+                away.set_attr(cur, stay.start, "kit", kit)
+                msg = f"Packed: {', '.join(kit)}."
+        if _mm:
+            _mm.post_message(channel_id, msg, root_id=root_id)
+    except Exception:
+        logger.exception("away edit: failed")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't record that.", root_id=root_id)
+    return True
+
+
 _SWAP_CIRCUIT_RE = re.compile(
     r"^\s*swap\s+(?P<when>today|tomorrow|\d{4}-\d{2}-\d{2})\s+for\s+"
     r"(?:a\s+|the\s+)?bodyweight\s+circuit\s*[.!]*\s*$", re.I)
@@ -5178,7 +5342,10 @@ def _handle_mention(post: dict, thread: list[dict]):
         # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
         ("intervals_cleared", _handle_intervals_cleared),
         ("cardio_detect", _handle_cardio_detect),
+        ("away_confirm", _handle_away_confirm),
         ("bw_circuit_confirm", _handle_bw_circuit_confirm),
+        ("away_propose", _handle_away_propose),
+        ("away_edit", _handle_away_edit),
         ("swap_circuit", _handle_swap_circuit),
         ("undo_circuit", _handle_undo_circuit),
         ("log_cardio", _handle_log_cardio),

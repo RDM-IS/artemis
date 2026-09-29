@@ -1344,6 +1344,12 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
         return _yoga_strength(location or LOCATION)
     if session_type in ("core", "mobility"):
         return _extra(session_type, location or LOCATION)
+    if session_type == "bodyweight_circuit":
+        # BW-CIRCUIT. Without this the type fell through to the rest/mobility
+        # branch and a placed circuit rendered as "Rest / Mobility" -- a row
+        # that says one thing and does another.
+        from artemis import bw_circuit
+        return bw_circuit.build(gate=gate, location=location or LOCATION)
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
     if session_type.startswith("strength"):

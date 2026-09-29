@@ -1,5 +1,8 @@
-"""BW-CIRCUIT — "swap today for a bodyweight circuit". CONTENT IS A DRAFT
-pending Ryan's approval (round #20 report).
+"""BW-CIRCUIT — "swap today for a bodyweight circuit".
+
+CONTENT APPROVED by Ryan 2026-09-29, with one simplification: the push station
+is just "Push-up". He adjusts the variant on the day, and prescribing an incline
+regression he never asked for is the app deciding how hard his push-up is.
 
 One session type, reused by AWAY's no-gym and vacation modes so there is ONE
 content source rather than three.
@@ -22,8 +25,15 @@ sharpest thing in the program and "I could not check" must not look like "go".
 
 from __future__ import annotations
 
-#: DRAFT (2026-09-29) — awaiting Ryan's approval.
-CONTENT_IS_A_DRAFT = True
+#: APPROVED 2026-09-29 (Ryan, 11:54). Kept as a named constant rather than
+#: deleted: the row carries it, so a session seeded while it was a draft can
+#: still be told apart from one seeded after.
+CONTENT_IS_A_DRAFT = False
+
+#: NEVER. Ryan, 2026-09-29: "no burpees, ever." A guard test greps every builder
+#: and content table, because the cost of this rule being broken is not a bad
+#: session -- it is him losing trust that the program does what he asked.
+FORBIDDEN_MOVEMENTS = ("burpee",)
 
 WARMUP_SEC = 300          # 5 min, moving throughout
 COOLDOWN_SEC = 300        # 5 min, march down into easy mobility
@@ -37,8 +47,10 @@ MODERATE = (30, 30, 3)
 #: jumping variant `impact on` swaps in. `needs` names the kit that unlocks the
 #: better version of that station.
 STATIONS: tuple[dict, ...] = (
+    # Just "Push-up" (Ryan, 11:54): he adjusts the variant on the day, and
+    # prescribing a regression he did not ask for is the app deciding how hard
+    # his push-up is.
     {"slot": "push", "low": "Push-up", "impact": "Push-up",
-     "regression": "Incline push-up (hands on bench or counter)",
      "cue": "Chest to fist height. Elbows about 45 degrees, not flared."},
     # THE PULL IS THE WEAK LINK WITHOUT KIT, and the draft says so rather than
     # pretending otherwise: nothing bodyweight pulls the way a row does.

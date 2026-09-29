@@ -258,9 +258,18 @@ class TestQualifiedFormsAllWork(unittest.TestCase):
         src = inspect.getsource(m)
         for flow in sorted(m.consuming_flows()):
             with self.subTest(flow=flow):
-                self.assertIn(f'_strip_qualifier(question, "{flow}"', src.replace(
-                    '_strip_qualifier(question, "target", "staples")',
-                    '_strip_qualifier(question, "target") _strip_qualifier(question, "staples")'))
+                # A handler may strip several suffixes in one call when they
+                # share ONE pending: nutrition_confirm does it for
+                # target/staples, and away_confirm for trip/vacation/hunting.
+                flat = (src
+                        .replace('_strip_qualifier(question, "target", "staples")',
+                                 '_strip_qualifier(question, "target") '
+                                 '_strip_qualifier(question, "staples")')
+                        .replace('_strip_qualifier(question, "trip", "vacation", "hunting")',
+                                 '_strip_qualifier(question, "trip") '
+                                 '_strip_qualifier(question, "vacation") '
+                                 '_strip_qualifier(question, "hunting")'))
+                self.assertIn(f'_strip_qualifier(question, "{flow}"', flat)
 
 
 # ---------------------------------------------------------------------------

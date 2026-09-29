@@ -146,7 +146,11 @@ KIND_WORK, KIND_TRAVEL, KIND_OFF = "work", "travel", "off"
 def day_kind(day_type: str | None) -> str:
     if day_type == "msp_work":
         return KIND_WORK
-    if day_type == "travel":
+    # AWAY (2026-09-29): an away day is a TRAVEL day for meals — no pre-fill,
+    # logging only. Falling through to KIND_OFF would have pre-filled a home
+    # menu for a week he is in a hotel, which is worse than no plan: he would
+    # have to notice it was wrong before ignoring it.
+    if day_type in ("travel", "away"):
         return KIND_TRAVEL
     return KIND_OFF
 
