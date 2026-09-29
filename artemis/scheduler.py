@@ -13,7 +13,12 @@ from apscheduler.triggers.cron import CronTrigger
 
 from artemis import config
 from artemis import morning_brief
-from artemis.briefs import generate_meeting_brief, generate_morning_brief, triage_emails
+from artemis.briefs import (
+    TriageUnavailable,
+    generate_meeting_brief,
+    generate_morning_brief,
+    triage_emails,
+)
 from artemis.calendar import CalendarClient
 from artemis.cycle import OverrideLookupError
 from artemis.commitments import (
@@ -883,7 +888,25 @@ class ArtemisScheduler:
                         full_body_fetches += 1
 
                 email_text = self.gmail.format_for_claude(non_priority)
-                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
+                try:
+                    triaged = triage_emails(email_text, playbook_text=get_playbook_text())
+                except TriageUnavailable as exc:
+                    # FAIL-CLOSED: say nothing was checked, rather than nothing
+                    # was found. Previously this returned [] and the loop below
+                    # simply did not run, so an unreadable answer and a clean
+                    # inbox produced the same silence. Nothing is archived and no
+                    # thread state is written, which leaves the mail in the inbox
+                    # for the next pass -- the safe direction.
+                    logger.error("Inbox triage unavailable (%d emails left untouched): %s",
+                                 len(non_priority), exc)
+                    self._post(
+                        config.CHANNEL_OPS,
+                        f"\u26a0\ufe0f Could not triage {len(non_priority)} email"
+                        f"{'' if len(non_priority) == 1 else 's'} — "
+                        f"{'the reply was cut off' if exc.truncated else 'the reply was unreadable'}. "
+                        f"Left in the inbox; I'll retry. This is NOT an all-clear.",
+                    )
+                    triaged = []
 
                 for i, item in enumerate(triaged):
                     urgency = item.get("urgency", "low")
@@ -2402,7 +2425,26 @@ class ArtemisScheduler:
 
                 # Track in inbox + triage
                 email_text = self.gmail.format_for_claude(new_messages)
-                triaged = triage_emails(email_text, playbook_text=get_playbook_text())
+                try:
+                    triaged = triage_emails(email_text, playbook_text=get_playbook_text())
+                except TriageUnavailable as exc:
+                    # This site marks every id SEEN before triaging, so a failure
+                    # here used to lose those messages for the life of the
+                    # process -- they were never re-polled and never triaged.
+                    # Putting the ids back is the actual fix; the log line alone
+                    # would have been a tidier way to lose the same mail.
+                    for m in new_messages:
+                        self._seen_message_ids.discard(m["id"])
+                    logger.error("Poll triage unavailable (%d emails un-marked for retry): %s",
+                                 len(new_messages), exc)
+                    self._post(
+                        config.CHANNEL_OPS,
+                        f"\u26a0\ufe0f Could not triage {len(new_messages)} new email"
+                        f"{'' if len(new_messages) == 1 else 's'} — "
+                        f"{'the reply was cut off' if exc.truncated else 'the reply was unreadable'}. "
+                        f"Queued for the next poll. This is NOT an all-clear.",
+                    )
+                    triaged = []
 
                 for i, item in enumerate(triaged):
                     orig = new_messages[i] if i < len(new_messages) else None

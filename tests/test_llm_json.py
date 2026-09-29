@@ -159,3 +159,85 @@ class TestThereIsOnlyOneCopyLeft(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTriageFailsClosed(unittest.TestCase):
+    """FAIL-CLOSED-RESOLVERS applied to triage.
+
+    `triage_emails` returned `[]` for BOTH "the model flagged nothing" and "I
+    could not read the answer". The consuming loop is `for item in triaged:`, so
+    both produced the same silence: no post, no thread state, no archive -- an
+    unreadable inbox check was indistinguishable from a clean inbox.
+
+    An empty list is still a real answer. A failure raises.
+    """
+
+    def _briefs(self, *, text, stop=None):
+        from artemis import briefs
+        self._orig = briefs._call_claude
+        briefs._LAST_STOP_REASON[0] = stop
+
+        def fake(*a, **kw):
+            briefs._LAST_STOP_REASON[0] = stop
+            return text
+        briefs._call_claude = fake
+        self.addCleanup(lambda: setattr(briefs, "_call_claude", self._orig))
+        return briefs
+
+    def test_an_empty_array_is_a_real_answer(self):
+        b = self._briefs(text="[]")
+        self.assertEqual(b.triage_emails("synthetic"), [])
+
+    def test_items_come_back_when_the_answer_reads(self):
+        b = self._briefs(text='```json\n[{"urgency": "low"}]\n```')
+        self.assertEqual(b.triage_emails("synthetic"), [{"urgency": "low"}])
+
+    def test_an_unreadable_answer_raises(self):
+        b = self._briefs(text="I cannot do that.")
+        with self.assertRaises(b.TriageUnavailable) as ctx:
+            b.triage_emails("synthetic")
+        self.assertFalse(ctx.exception.truncated)
+
+    def test_a_truncated_answer_raises_and_says_it_was_truncated(self):
+        b = self._briefs(text='```json\n[\n  {\n    "urgency": "hi',
+                         stop="max_tokens")
+        with self.assertRaises(b.TriageUnavailable) as ctx:
+            b.triage_emails("synthetic")
+        self.assertTrue(ctx.exception.truncated)
+
+    def test_no_response_at_all_raises(self):
+        """_call_claude returns "" when the API call itself failed. An empty
+        string is not an empty inbox."""
+        b = self._briefs(text="")
+        with self.assertRaises(b.TriageUnavailable):
+            b.triage_emails("synthetic")
+
+    def test_it_is_not_a_ValueError_so_the_json_handlers_do_not_swallow_it(self):
+        from artemis.briefs import TriageUnavailable
+        self.assertFalse(issubclass(TriageUnavailable, ValueError))
+        self.assertTrue(issubclass(TriageUnavailable, RuntimeError))
+
+
+class TestBothCallersHandleIt(unittest.TestCase):
+    """A raise nobody catches is a crashed scheduler job, so the two call sites
+    are part of the contract."""
+
+    def _scheduler_src(self):
+        return (pathlib.Path(__file__).resolve().parent.parent
+                / "artemis" / "scheduler.py").read_text()
+
+    def test_every_triage_call_is_guarded(self):
+        src = self._scheduler_src()
+        self.assertEqual(src.count("triage_emails(email_text"), 2)
+        self.assertEqual(src.count("except TriageUnavailable"), 2)
+
+    def test_neither_site_reports_an_all_clear(self):
+        src = self._scheduler_src()
+        self.assertEqual(src.count("NOT an all-clear"), 2)
+
+    def test_the_poll_site_releases_the_seen_ids(self):
+        """That site marks ids SEEN before triaging, so without this a failure
+        lost the mail for the life of the process -- never re-polled, never
+        triaged. The log line alone would have been a tidier way to lose it."""
+        src = self._scheduler_src()
+        self.assertIn("_seen_message_ids.discard", src)
