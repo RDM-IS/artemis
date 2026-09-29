@@ -455,3 +455,71 @@ class TestNoProgram(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOneReadOneStatus(unittest.TestCase):
+    """STATUS-2: the tile and the detail section below it must agree.
+
+    They were four builders with four try/excepts, so a failure in one and not
+    the other put "couldn't read nutrition" on the tile while the section below
+    listed seven days of numbers. Two answers to one question is worse than
+    either alone: it says the page cannot be trusted without saying which half
+    to believe.
+    """
+
+    class Boom:
+        """A db whose reads raise — the case that used to split the two."""
+        def __init__(self, fail_on: str):
+            self.fail_on = fail_on
+
+        def execute(self, clause, params=None):
+            if self.fail_on in str(clause):
+                raise RuntimeError("down")
+            class R:
+                def mappings(self_inner): return self_inner
+                def all(self_inner): return []
+                def first(self_inner): return None
+            return R()
+
+    def test_a_failed_nutrition_read_degrades_the_tile_AND_the_detail(self):
+        from api.app.routers.health import _nutrition
+        goal, detail = _nutrition(self.Boom("health.nutrition_log"), date(2026, 9, 28))
+        self.assertFalse(goal.section.ok)
+        self.assertFalse(detail.section.ok)
+        self.assertEqual(goal.section.reason, detail.section.reason)
+        # And no numbers survive on either side.
+        self.assertIsNone(goal.days_logged)
+        self.assertEqual(detail.days, [])
+
+    def test_a_failed_cardio_read_degrades_the_tile_AND_the_detail(self):
+        from api.app.routers.health import _cardio
+        goal, detail = _cardio(self.Boom("health.plan"), date(2026, 9, 28), date(2026, 9, 27))
+        self.assertFalse(goal.section.ok)
+        self.assertFalse(detail.section.ok)
+        self.assertEqual(goal.section.reason, detail.section.reason)
+        self.assertIsNone(goal.minutes_this_week)
+        self.assertEqual(detail.weeks, [])
+
+    def test_a_successful_read_marks_both_ok(self):
+        from api.app.routers.health import _cardio, _nutrition
+        ok_db = self.Boom("nothing-matches-this")
+        g, d = _nutrition(ok_db, date(2026, 9, 28))
+        self.assertTrue(g.section.ok)
+        self.assertTrue(d.section.ok)
+        # An empty but readable week is 0 days logged and seven placeholder rows,
+        # not a failure.
+        self.assertEqual(g.days_logged, 0)
+        self.assertEqual(len(d.days), 7)
+        cg, cd = _cardio(ok_db, date(2026, 9, 28), date(2026, 9, 27))
+        self.assertTrue(cg.section.ok and cd.section.ok)
+        self.assertEqual(cg.minutes_this_week, 0)
+
+    def test_there_is_exactly_one_builder_per_domain(self):
+        """The split is what allowed the disagreement, so the shape is pinned."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[2] / "api" / "app" / "routers" / "health.py").read_text()
+        for gone in ("def _cardio_goal", "def _cardio_detail",
+                     "def _nutrition_goal", "def _nutrition_detail"):
+            self.assertNotIn(gone, src, f"{gone} is back — two reads, two statuses")
+        self.assertIn("def _cardio(", src)
+        self.assertIn("def _nutrition(", src)
