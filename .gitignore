@@ -15,6 +15,14 @@ scripts/seed_data/*
 # Per-machine editor/agent state.
 .claude/settings.local.json
 
+# Handoff notes and round reports. These quote real logged sessions -- dates,
+# set counts, session spans -- to reason about the plan, and artemis is public.
+# The Mac had this in .git/info/exclude, which is per-clone: the box and any
+# fresh clone had no such protection, so one `git add -A` there would have
+# published real health data. An ignore rule only helps where it is committed
+# (2026-09-28).
+.claude/handoff/
+
 # Retired store — SQLite is gone and tests guard against its return.
 artemis.db
 
