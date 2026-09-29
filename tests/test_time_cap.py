@@ -47,7 +47,11 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(office.duration_verdict("strength_a", 3, None)[0], "ok")
 
     def test_calibration_pending_slots_warn_instead_of_reject(self):
-        for st, wk, est in (("strength_b", 3, 62), ("strength_b", 6, 62), ("strength_c", 5, 67)):
+        # LIFT-RECOMP (2026-09-29) narrowed this set to weeks 3-4, which are the
+        # only ones still carrying the OLD prescription and its 62-minute
+        # estimate. Weeks 5-6 became 50 and 54 through supersets and no longer
+        # need an exemption at all.
+        for st, wk, est in (("strength_b", 3, 62), ("strength_b", 4, 62)):
             with self.subTest(st=st, wk=wk):
                 kind, msg = office.duration_verdict(st, wk, est)
                 self.assertEqual(kind, "pending")
@@ -56,16 +60,44 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(office.duration_verdict("strength_c", 4, 67)[0], "reject")
         self.assertEqual(office.duration_verdict("strength_b", 7, 62)[0], "reject")
 
+    def test_the_weeks_that_stopped_needing_an_exemption_lost_it(self):
+        """An exemption that outlives its cause is a cap that has quietly stopped
+        applying. Weeks 5-6 fit the window on their own now, so a 60+ row there
+        must be REJECTED again rather than waved through."""
+        for st, wk in (("strength_b", 5), ("strength_b", 6),
+                       ("strength_c", 5), ("strength_c", 6)):
+            with self.subTest(st=st, wk=wk):
+                self.assertNotIn((st, wk), office.CALIBRATION_PENDING)
+                self.assertEqual(office.duration_verdict(st, wk, 62)[0], "reject")
+
+    def test_the_exemption_covers_exactly_the_weeks_that_need_it(self):
+        # Every pending slot must actually exceed the cap under the builder;
+        # anything that does not is a stale exemption.
+        for st, wk in sorted(office.CALIBRATION_PENDING):
+            _, _, _, minutes = office._strength(st, wk)
+            self.assertGreaterEqual(minutes, office.HARD_MAX_MIN,
+                                    f"{st} wk{wk} is {minutes} min — drop it from "
+                                    f"CALIBRATION_PENDING")
+
 
 class TestValidateRows(unittest.TestCase):
     def test_current_program_validates_with_notes_and_is_unchanged(self):
         notes = office.validate_rows(ROWS)
-        self.assertEqual(len([n for n in notes if "recalibrated" in n]), 6)
-        # weeks 3-6 stay as planned: exercises and the finisher untouched
+        # Two, not six: LIFT-RECOMP brought weeks 5-6 inside the window, so only
+        # the two week-3/4 Strength B rows still warn.
+        self.assertEqual(len([n for n in notes if "recalibrated" in n]), 2)
         by = {(r["session_type"], r["week_num"]): r for r in ROWS}
+        # Content is still untouched — the duration came down through DENSITY, not
+        # by cutting an exercise or dropping the finisher.
         self.assertEqual(len(by[("strength_b", 3)]["blocks"]["exercises"]), 7)
+        self.assertEqual(len(by[("strength_b", 5)]["blocks"]["exercises"]), 7)
         self.assertIn("finisher", by[("strength_c", 5)]["blocks"])
-        self.assertEqual(by[("strength_c", 5)]["est_duration_min"], 67)
+        # and week 5 now fits, where it used to be 67
+        self.assertEqual(by[("strength_c", 5)]["est_duration_min"], 54)
+        self.assertLessEqual(by[("strength_c", 5)]["est_duration_min"],
+                             office.HARD_MAX_MIN)
+        # weeks 3-4 deliberately did NOT move
+        self.assertEqual(by[("strength_b", 3)]["est_duration_min"], 62)
 
     def test_a_60_plus_row_outside_the_pending_slots_fails_the_reseed(self):
         rows = copy.deepcopy(ROWS)
