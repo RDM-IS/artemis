@@ -131,11 +131,13 @@ def _call_claude_json(system: str, user_msg: str, max_tokens: int = 600) -> dict
         system=system,
         messages=[{"role": "user", "content": user_msg}],
     )
-    text = response.content[0].text.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text.strip())
+    from artemis.llm_json import parse as parse_llm_json, stop_reason_of
+    # One fence-stripper for the whole box. This copy could not see a trailing
+    # fence with prose after it, and reported a truncated response as malformed.
+    # Still raises, as it always has -- callers depend on that.
+    return parse_llm_json(response.content[0].text,
+                          stop_reason=stop_reason_of(response),
+                          what="health LLM response")
 
 
 def _call_claude_text(system: str, user_msg: str, max_tokens: int = 200) -> str:

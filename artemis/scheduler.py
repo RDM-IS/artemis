@@ -1593,12 +1593,8 @@ class ArtemisScheduler:
 
         try:
             result = _call_claude(system, user_prompt)
-            import json as _json
-            cleaned = result.strip()
-            cleaned = re.sub(r'^```json\s*', '', cleaned)
-            cleaned = re.sub(r'^```\s*', '', cleaned)
-            cleaned = re.sub(r'\s*```$', '', cleaned)
-            extracted = _json.loads(cleaned.strip())
+            from artemis.llm_json import parse as parse_llm_json
+            extracted = parse_llm_json(result, what="date-range extraction")
             start_date = extracted.get("start_date")
             end_date = extracted.get("end_date")
             duration = extracted.get("duration_minutes") or config.DEFAULT_SLOT_DURATION

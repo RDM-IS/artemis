@@ -2,9 +2,7 @@
 
 import base64
 import hashlib
-import json
 import logging
-import re
 from dataclasses import dataclass, field
 
 import anthropic
@@ -104,13 +102,8 @@ def _call_claude_text(text: str, user_context: str) -> list[dict]:
     raw = response.content[0].text.strip()
     log_claude_call("claude-sonnet-4-6", prompt_hash, len(raw))
 
-    # Strip markdown fences
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"^```\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-
-    return json.loads(raw)
+    from artemis.llm_json import parse as parse_llm_json
+    return parse_llm_json(raw, what="parser response")
 
 
 def _call_claude_vision(image_bytes: bytes, mime_type: str, user_context: str) -> list[dict]:
@@ -151,12 +144,8 @@ def _call_claude_vision(image_bytes: bytes, mime_type: str, user_context: str) -
     raw = response.content[0].text.strip()
     log_claude_call("claude-sonnet-4-6", prompt_hash, len(raw))
 
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"^```\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-
-    return json.loads(raw)
+    from artemis.llm_json import parse as parse_llm_json
+    return parse_llm_json(raw, what="extraction response")
 
 
 _DOCTYPE_SYSTEM = (
@@ -230,13 +219,8 @@ def parse_sales_plan(text: str, filename: str = "") -> SalesPlanContext:
     raw = response.content[0].text.strip()
     log_claude_call("claude-sonnet-4-6", prompt_hash, len(raw))
 
-    # Strip markdown fences
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"^```\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-
-    data = json.loads(raw)
+    from artemis.llm_json import parse as parse_llm_json
+    data = parse_llm_json(raw, what="sales plan context")
     return SalesPlanContext(
         account_name=data.get("account_name", "Unknown"),
         tier=data.get("tier"),

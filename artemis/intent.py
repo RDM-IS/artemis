@@ -253,13 +253,8 @@ def route_intent(
         text = response.content[0].text.strip()
         log_claude_call("claude-haiku-4-5-20251001", prompt_hash, len(text))
 
-        # Strip markdown fences if present
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"^```\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-        data = json.loads(text)
+        from artemis.llm_json import parse as parse_llm_json
+        data = parse_llm_json(text, what="intent classification")
 
         # Support both old "action" and new "primary_action" keys
         primary = data.get("primary_action") or data.get("action", "general_reply")

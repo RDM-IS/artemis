@@ -1,8 +1,6 @@
 """Scheduling assistant — detect meeting requests, draft responses (Learning mode)."""
 
-import json
 import logging
-import re
 from datetime import date as _date_type, datetime
 
 import anthropic
@@ -44,14 +42,10 @@ def detect_scheduling_request(email_body: str, sender: str) -> dict | None:
             system=_DETECTION_SYSTEM,
             messages=[{"role": "user", "content": f"From: {sender}\n\n{email_body[:3000]}"}],
         )
-        text = response.content[0].text.strip()
-        # Strip markdown fences if present
-        text = re.sub(r'^```json\s*', '', text)
-        text = re.sub(r'^```\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-        text = text.strip()
-
-        result = json.loads(text)
+        from artemis.llm_json import parse as parse_llm_json, stop_reason_of
+        result = parse_llm_json(response.content[0].text,
+                                stop_reason=stop_reason_of(response),
+                                what="scheduling response")
     except Exception:
         logger.debug("Scheduling detection failed for email from %s", sender)
         return None

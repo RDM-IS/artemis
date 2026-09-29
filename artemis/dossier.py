@@ -762,10 +762,9 @@ def _llm_call(system: str, user: str, max_tokens: int = 1600) -> tuple[dict | No
                      "output_tokens": getattr(u, "output_tokens", 0) or 0}
         raw = resp.content[0].text.strip()
         log_claude_call(_extract_model(), prompt_hash, len(raw))
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"^```\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-        data = json.loads(raw)
+        from artemis.llm_json import parse as parse_llm_json, stop_reason_of
+        data = parse_llm_json(raw, stop_reason=stop_reason_of(resp),
+                              what="dossier LLM response")
         return (data if isinstance(data, dict) else None), usage
     except Exception:
         logger.exception("dossier LLM call failed")
