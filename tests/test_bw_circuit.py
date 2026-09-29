@@ -45,11 +45,16 @@ def a_row(session_type="strength_a"):
             "target_rpe": 7.0, "target_hr_zone": 3, "est_duration_min": 55}
 
 
-class TestTheContentIsMarkedDraft(unittest.TestCase):
+class TestTheContentIsMarkedApproved(unittest.TestCase):
+    """Was TestTheContentIsMarkedDraft. Ryan approved the content 2026-09-29,
+    so the assertion flips with it rather than being deleted -- the flag still
+    travels on the row, so a session seeded while it was a draft can be told
+    apart from one seeded after."""
+
     def test_the_source_says_so(self):
-        self.assertTrue(bw.CONTENT_IS_A_DRAFT)
+        self.assertFalse(bw.CONTENT_IS_A_DRAFT)
         blocks, *_ = bw.build(gate={"ok": True})
-        self.assertTrue(blocks["content_is_draft"])
+        self.assertFalse(blocks["content_is_draft"])
 
 
 class TestNoStaticRest(unittest.TestCase):
@@ -238,3 +243,79 @@ class TestTheCommandsDoNotCollide(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRyansApprovals(unittest.TestCase):
+    """Ryan, 2026-09-29 11:54."""
+
+    def test_the_content_is_approved_not_a_draft(self):
+        self.assertFalse(bw.CONTENT_IS_A_DRAFT)
+        blocks, *_ = bw.build(gate={"ok": True})
+        self.assertFalse(blocks["content_is_draft"])
+
+    def test_the_push_station_is_just_a_push_up(self):
+        """He adjusts the variant on the day; prescribing a regression he did
+        not ask for is the app deciding how hard his push-up is."""
+        push = [s for s in bw.STATIONS if s["slot"] == "push"][0]
+        self.assertEqual(push["low"], "Push-up")
+        self.assertEqual(push["impact"], "Push-up")
+        self.assertNotIn("regression", push)
+
+    def test_the_other_stations_keep_their_regressions(self):
+        """Only the push was simplified."""
+        for slot in ("pull", "legs", "core", "burst"):
+            st = [s for s in bw.STATIONS if s["slot"] == slot][0]
+            with self.subTest(slot):
+                self.assertIn("regression", st)
+
+
+class TestNoBurpeesEver(unittest.TestCase):
+    """Ryan, 2026-09-29: "no burpees, ever."
+
+    The cost of this rule being broken is not a bad session — it is him losing
+    trust that the program does what he asked. So it is checked against every
+    builder and content table in the repo, not just this module's constants.
+    """
+
+    def test_no_session_this_module_builds_contains_one(self):
+        for gate in ({"ok": True}, {"ok": False, "reason": "x"}, None):
+            for impact in (False, True):
+                for kit in (set(), {"trx"}, {"bands"}):
+                    blocks, *_ = bw.build(gate=gate, impact=impact, kit=kit)
+                    for step in blocks["steps"]:
+                        with self.subTest(gate=bool(gate), impact=impact, kit=tuple(kit)):
+                            for bad in bw.FORBIDDEN_MOVEMENTS:
+                                self.assertNotIn(bad, step["name"].lower())
+                                self.assertNotIn(bad, (step.get("cue") or "").lower())
+
+    def test_no_session_ANY_builder_produces_contains_one(self):
+        """Checks what is BUILT, not what is written down.
+
+        A first version grepped the source and flagged `health_guard`'s known-
+        exercise list and a comment in `health.py`. Those are RECOGNISERS — they
+        exist so that a logged "burpees" parses — not builders prescribing one.
+        Forbidding the word in source would forbid understanding him saying it.
+        What matters is that nothing Artemis PRESCRIBES is a burpee.
+        """
+        from artemis import health_office as office
+        names = []
+        for row in office.build_rows():
+            b = row["blocks"]
+            names += [e.get("name", "") for e in b.get("exercises", [])]
+            names += [s.get("name", "") for s in b.get("steps", [])]
+            fin = b.get("finisher") or {}
+            names += [e.get("name", "") for e in fin.get("exercises", [])]
+        for extra in ("core", "mobility", "yoga_strength"):
+            blocks, *_ = office._build(extra, 5)
+            names += [e.get("name", "") for e in blocks.get("exercises", [])]
+            names += [s.get("name", "") for s in blocks.get("steps", [])]
+        self.assertTrue(names, "nothing was built — the guard would pass vacuously")
+        for name in names:
+            for bad in bw.FORBIDDEN_MOVEMENTS:
+                with self.subTest(name):
+                    self.assertNotIn(bad, name.lower())
+
+    def test_the_guard_would_actually_catch_one(self):
+        """A scan that cannot fail is not a guard."""
+        self.assertIn("burpee", bw.FORBIDDEN_MOVEMENTS)
+        self.assertIn("burpee", "Burpee to push-up".lower())
