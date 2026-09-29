@@ -211,6 +211,98 @@ def shopping_list(fetch, stay_id: int) -> dict:
     }
 
 
+# ── PREP-2: steps, the kitchen profile, and sessions ────────────────────────
+
+DEFAULT_KITCHEN = {
+    "oven_slots": 2, "burners": 2, "air_fryer_slots": 1,
+    "preheat_min": 10, "temp_change_min": 5,
+    "filler_min": 6, "filler_name": "Clean as you go",
+}
+
+
+def kitchen_profile(fetch) -> dict:
+    """The kitchen, from config, with the code default underneath.
+
+    Ryan's answer to the spec's open question is the default: 1 oven with 2 usable
+    racks, 2 burners, 1 air fryer. Merged over the default rather than replacing it,
+    so a config row that sets only `burners` does not silently drop the preheat
+    time to zero and make every oven step start instantly.
+    """
+    stored = load_config(fetch, "kitchen_profile") or {}
+    out = dict(DEFAULT_KITCHEN)
+    if isinstance(stored, dict):
+        out.update({k: v for k, v in stored.items() if v is not None})
+    return out
+
+
+def steps_for_stay(fetch, stay_id: int) -> list:
+    """Every step of every recipe the stay still has to cook, with its servings.
+
+    Recipes with nothing left to make are excluded here rather than in the browser:
+    the scheduler should never see a zero-serving recipe, and `servings_to_make` is
+    a fact about the stay, which is this side's business.
+    """
+    return fetch("""
+        WITH make AS (
+            SELECT sd.recipe_notion_id AS rid,
+                   GREATEST(0, SUM(sd.servings)
+                               - COALESCE(MAX(r.prepped_on_hand), 0)) AS servings
+              FROM nutrition.prep_stay_day sd
+              JOIN nutrition.prep_recipe r ON r.notion_id = sd.recipe_notion_id
+             WHERE sd.stay_id = %s AND r.deleted_at IS NULL AND r.plan_eligible
+             GROUP BY sd.recipe_notion_id
+        )
+        SELECT r.notion_id, r.name, r.slug, m.servings,
+               s.step_no, s.name AS step_name, s.resource, s.mode,
+               s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+               s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes
+          FROM make m
+          JOIN nutrition.prep_recipe r ON r.notion_id = m.rid
+          LEFT JOIN nutrition.recipe_step s ON s.recipe_notion_id = r.notion_id
+         WHERE m.servings > 0
+         ORDER BY r.name, s.step_no""", (stay_id,))
+
+
+def all_steps(fetch) -> list:
+    """Every recipe and its steps, for the editor. Recipes with no steps included,
+    because "this one has none yet" is what the editor exists to fix."""
+    return fetch("""
+        SELECT r.notion_id, r.name, r.slug, r.servings, r.plan_eligible,
+               s.id AS step_id, s.step_no, s.name AS step_name, s.resource, s.mode,
+               s.base_min, s.per_serving_min, s.temp_f, s.batch_key,
+               s.keep_separate, s.keep_separate_note, s.shortcut_key, s.notes
+          FROM nutrition.prep_recipe r
+          LEFT JOIN nutrition.recipe_step s ON s.recipe_notion_id = r.notion_id
+         WHERE r.deleted_at IS NULL AND NOT r.archived
+         ORDER BY r.name, s.step_no""", ())
+
+
+#: Replace one recipe's steps wholesale. The editor sends the whole list, so a
+#: delete-then-insert in one transaction is both simpler and safer than diffing —
+#: there is no state in which half a recipe's steps are the new ones.
+DELETE_STEPS_SQL = "DELETE FROM nutrition.recipe_step WHERE recipe_notion_id = %s"
+INSERT_STEP_SQL = """
+INSERT INTO nutrition.recipe_step
+  (recipe_notion_id, step_no, name, resource, mode, base_min, per_serving_min,
+   temp_f, batch_key, keep_separate, keep_separate_note, shortcut_key, notes)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+
+def sessions_for(fetch, stay_id: int | None, limit: int = 20) -> list:
+    if stay_id is None:
+        return fetch("""
+            SELECT id, stay_id, session_date, status, started_at, finished_at,
+                   planned_min, hands_on_min, actual_min, shortcuts
+              FROM nutrition.prep_session ORDER BY session_date DESC, id DESC
+             LIMIT %s""", (limit,))
+    return fetch("""
+        SELECT id, stay_id, session_date, status, started_at, finished_at,
+               planned_min, hands_on_min, actual_min, shortcuts
+          FROM nutrition.prep_session WHERE stay_id = %s
+         ORDER BY session_date DESC, id DESC LIMIT %s""", (stay_id, limit))
+
+
 # ── pantry ──────────────────────────────────────────────────────────────────
 
 #: The preferred live store item per ingredient — the one whose package the
