@@ -2036,8 +2036,32 @@ def _format_target_only(nxt: dict) -> str:
     return ""
 
 
-def _suggestion_from_last(last: dict) -> str:
-    """Trainer suggestion driven by last time's RPE on the top set."""
+def _suggestion_from_last(last: dict, *, exercise: dict | None = None,
+                          rpe_cap: float | None = None,
+                          load_config: dict | None = None) -> str:
+    """Trainer suggestion.
+
+    DOUBLE PROGRESSION when the caller supplies the exercise and the room
+    (PROGRAM-2 Block 2, Ryan 2026-09-28): every set at the top of the rep range
+    within the RPE cap earns ONE LOAD STEP FOR THIS ROOM; otherwise same load,
+    one more rep. Falls back to the old RPE-only line when the caller has
+    neither -- older call sites keep working rather than losing their
+    suggestion.
+
+    The old line hard-coded +5 lb, which does not exist at Richfield: its
+    PowerBlocks move in 10s and cannot make 45. A suggestion naming a weight the
+    room cannot make is worse than no suggestion, because the obvious repair --
+    round to something available -- is a different weight from the one he was
+    told to lift.
+    """
+    if exercise is not None:
+        from knowledge import progression
+        result = progression.advance(exercise=exercise, sets=last.get("sets", []),
+                                     rpe_cap=rpe_cap, load_config=load_config)
+        if result["action"] != "unknown":
+            return progression.describe(result)
+        # An "unknown" falls through: the RPE line below still says something
+        # useful, and silence here would be a worse answer than a rough one.
     top = _top_set(last.get("sets", []))
     rpe = top.get("rpe_actual")
     wt = top.get("weight_lbs")
@@ -2053,13 +2077,30 @@ def _suggestion_from_last(last: dict) -> str:
     return f"Match or beat {_fmt_num(wt)}lb." if wt is not None else "Match or beat it."
 
 
+def _load_config_for(exercise: dict) -> dict | None:
+    """The room's load config, when the exercise dict does not carry it."""
+    key = exercise.get("location_key")
+    if not key:
+        return None
+    try:
+        from knowledge import load_config
+        return load_config.for_location(key)
+    except Exception:                                           # noqa: BLE001
+        logger.debug("no load_config for %s", key, exc_info=True)
+        return None
+
+
 def _format_next_line(nxt: dict, session_type: str, prefix: str = "Next") -> str:
     """'Next: tricep extension — last time 20lb RPE 6. Try 25. Waiting.'"""
     last = last_time(nxt["name"], session_type)
     seg = f"{prefix}: {nxt['name']}"
     if last and last.get("sets"):
         seg += f" — last time {_format_last(last)}."
-        sug = _suggestion_from_last(last)
+        # The row already carries the room's load_config (LOCATION-1) and the
+        # session's RPE cap, so double progression needs no extra read.
+        sug = _suggestion_from_last(
+            last, exercise=nxt, rpe_cap=nxt.get("rpe_cap"),
+            load_config=(nxt.get("load_config") or _load_config_for(nxt)))
         if sug:
             seg += f" {sug}"
     else:
