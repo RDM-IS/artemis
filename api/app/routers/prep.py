@@ -34,23 +34,29 @@ from sqlalchemy.orm import Session
 from knowledge import prep_store
 
 from ..database import get_db
-from .health import verify_health_api_key
+from .health import _active_timezone, verify_health_api_key
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-def _local_today() -> date:
-    """Today in the ACTIVE timezone, read from the database.
+def _local_today(db: Session) -> date:
+    """Today in the ACTIVE timezone, resolved the way the health router does.
 
     RDS runs UTC and a bare current_date is a day ahead of Ryan after ~19:00
-    local, which would move the stay a shopping trip early. The zone is passed as
-    a parameter and never interpolated, and it is never hard-coded here — see
-    CLAUDE.md's date-anchoring rule and tests/test_date_anchoring.py.
+    local, which would move the stay a shopping trip early. The zone comes from
+    `_active_timezone(db)` — the same helper the health router uses — so a
+    `set timezone to <place>` override moves Prep with everything else. It is
+    never hard-coded here and never interpolated into SQL.
+
+    NOT `knowledge.config`: config.py lives in artemis/, and the Lambda package
+    ships only api/, knowledge/ and migrations/ (PACKAGE-IDENTITY). Importing it
+    here raised ImportError on every stay-dependent route, caught by hitting the
+    deployed endpoints rather than by any test — the pantry route, which needs no
+    date, was the only one that worked.
     """
-    from knowledge import config
-    return datetime.now(ZoneInfo(config.HOME_TIMEZONE)).date()
+    return datetime.now(ZoneInfo(_active_timezone(db))).date()
 
 
 def _fetch_for(db: Session):
@@ -69,9 +75,9 @@ def _fetch_for(db: Session):
     return fetch
 
 
-def _resolve_stay(fetch, stay_id: Optional[int]) -> dict:
+def _resolve_stay(fetch, stay_id: Optional[int], db: Session) -> dict:
     stay = (prep_store.get_stay(fetch, stay_id) if stay_id
-            else prep_store.current_stay(fetch, _local_today()))
+            else prep_store.current_stay(fetch, _local_today(db)))
     if stay is None:
         raise HTTPException(
             status_code=404,
@@ -117,7 +123,7 @@ def get_stay(stay_id: Optional[int] = Query(default=None),
              db: Session = Depends(get_db),
              _=Depends(verify_health_api_key)):
     fetch = _fetch_for(db)
-    stay = _resolve_stay(fetch, stay_id)
+    stay = _resolve_stay(fetch, stay_id, db)
     rows = fetch("SELECT day_date, count(*) AS meals FROM nutrition.prep_stay_day "
                  "WHERE stay_id = %s GROUP BY day_date", (stay["id"],))
     return StayOut(
@@ -181,7 +187,7 @@ def shopping(stay_id: Optional[int] = Query(default=None),
              db: Session = Depends(get_db),
              _=Depends(verify_health_api_key)) -> dict[str, Any]:
     fetch = _fetch_for(db)
-    stay = _resolve_stay(fetch, stay_id)
+    stay = _resolve_stay(fetch, stay_id, db)
     try:
         return prep_store.shopping_list(fetch, stay["id"])
     except SQLAlchemyError:
@@ -194,7 +200,7 @@ def macros(stay_id: Optional[int] = Query(default=None),
            db: Session = Depends(get_db),
            _=Depends(verify_health_api_key)) -> dict[str, Any]:
     fetch = _fetch_for(db)
-    stay = _resolve_stay(fetch, stay_id)
+    stay = _resolve_stay(fetch, stay_id, db)
     try:
         return prep_store.macro_check(fetch, stay["id"])
     except SQLAlchemyError:
@@ -269,9 +275,8 @@ def set_count(body: CountIn, db: Session = Depends(get_db),
         db.rollback()
         logger.exception("prep pantry write failed for %s", body.ingredient_id)
         raise HTTPException(status_code=500, detail={"error": "write_failed"})
-    from knowledge import config
     return {"ingredient_id": body.ingredient_id, "on_hand_base": float(base),
-            "counted_at": datetime.now(ZoneInfo(config.HOME_TIMEZONE))
+            "counted_at": datetime.now(ZoneInfo(_active_timezone(db)))
                                   .isoformat(timespec="seconds")}
 
 
