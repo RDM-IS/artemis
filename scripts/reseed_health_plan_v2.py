@@ -368,10 +368,10 @@ def reseed_flow_days(start: date, dry_run: bool) -> int:
             return 0
         try:
             for r in rows:
-                cur.execute(office._UPSERT_SQL, (
-                    r["plan_date"], r["phase"], r["week_num"], r["session_type"],
-                    json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
-                    r["est_duration_min"], r["generated_by"], r["notes"]))
+                # Was a hand-written 10-tuple against an 11-placeholder statement:
+                # `slot` went missing when migration 042 added it, so this script
+                # would have raised on its first row. One helper, one column order.
+                cur.execute(office._UPSERT_SQL, office.upsert_params(r))
             cur.execute(
                 "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
                 "outcome, token_count, api_cost_usd, metadata, source, manual_gap) "
@@ -477,10 +477,10 @@ def reseed_strength_days(start: date, dry_run: bool, allow_logged: bool) -> int:
             return 0
         try:
             for r in changed:
-                cur.execute(office._UPSERT_SQL, (
-                    r["plan_date"], r["phase"], r["week_num"], r["session_type"],
-                    json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
-                    r["est_duration_min"], r["generated_by"], r["notes"]))
+                # Was a hand-written 10-tuple against an 11-placeholder statement:
+                # `slot` went missing when migration 042 added it, so this script
+                # would have raised on its first row. One helper, one column order.
+                cur.execute(office._UPSERT_SQL, office.upsert_params(r))
             cur.execute(
                 "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
                 "outcome, token_count, api_cost_usd, metadata, source, manual_gap) "

@@ -717,9 +717,14 @@ def _intervals(week_num: int, location: str = LOCATION, location_key: str = "off
     """A `cardio_intervals` session, or its Z2 variant when the week or the gate
     says so.
 
-    `gate` is None when nobody asked, and otherwise the GATE's own answer; a
-    blocked gate names the condition that failed on the card, because "why is
-    this Z2 today" is the first thing he will ask.
+    `gate` is the GATE's own answer, and **its absence is a FAIL, not a pass.**
+    A row is seeded weeks ahead, long before the gate could be evaluated for its
+    day, so "nobody has asked yet" has to resolve to the Z2 variant -- otherwise
+    every seeded row would ship as intervals and the gate would only ever be able
+    to take Zone 4 away on the morning, which is the wrong direction. The only
+    thing that turns a row into intervals is a gate that was evaluated and
+    passed. A blocked gate names the condition that failed on the card, because
+    "why is this Zone 2 today" is the first thing he will ask.
     """
     from knowledge import cardio as cardio_cfg
     from knowledge import zones
@@ -727,10 +732,13 @@ def _intervals(week_num: int, location: str = LOCATION, location_key: str = "off
     resolved, equipment = _cardio_common(location, location_key, on)
     modality = resolved.get("modality")
     spec = INTERVAL_WEEKS.get(week_num)
-    blocked = bool(gate and not gate.get("ok"))
+    # FAIL-CLOSED: no gate answer is a fail. `gate and gate.get("ok")` -- not
+    # `gate and not gate.get("ok")`, which read an absent gate as a pass.
+    blocked = not (gate and gate.get("ok"))
     reason = None
     if blocked:
-        reason = gate.get("reason")
+        reason = (gate.get("reason") if gate else
+                  "the interval gate has not been evaluated for this day yet")
     elif spec is None:
         reason = (f"week {week_num} is the deload — easy Z2" if week_num == 7
                   else f"week {week_num} runs Z2 by the plan; intervals start in week 5")
@@ -1707,6 +1715,26 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
 # Writer — caller owns the transaction
 # ============================================================================
 
+def upsert_params(row: dict) -> tuple:
+    """The params for `_UPSERT_SQL`, in its column order.
+
+    This used to be written out at each call site -- here, in the reseed script,
+    and a third time when the interval gate started rewriting a resolved day.
+    The SQL and its params are one fact, and three copies of a positional
+    11-tuple is three chances to put `target_rpe` where `target_hr_zone` goes.
+
+    `json.dumps` is deliberately called WITHOUT `default=str`: every block this
+    builder produces is plain-JSON-serialisable (asserted by
+    tests/test_interval_gate.py), so a value that is not is a bug, and a date
+    silently becoming "2026-10-04" in a card field is a wrong value that writes
+    cleanly. Better to raise.
+    """
+    return (row["plan_date"], row.get("slot", "morning"), row["phase"], row["week_num"],
+            row["session_type"], json.dumps(row["blocks"]), row["target_rpe"],
+            row["target_hr_zone"], row["est_duration_min"], row["generated_by"],
+            row["notes"])
+
+
 _UPSERT_SQL = """
 INSERT INTO health.plan
     (plan_date, slot, phase, week_num, session_type, blocks,
@@ -1762,11 +1790,7 @@ def write_rows(cur, rows: list[dict], validate: list[dict] | None = None) -> int
     """
     duration_notes = validate_rows(validate if validate is not None else rows)
     for r in rows:
-        cur.execute(_UPSERT_SQL, (
-            r["plan_date"], r.get("slot", "morning"), r["phase"], r["week_num"], r["session_type"],
-            json.dumps(r["blocks"]), r["target_rpe"], r["target_hr_zone"],
-            r["est_duration_min"], r["generated_by"], r["notes"],
-        ))
+        cur.execute(_UPSERT_SQL, upsert_params(r))
     cur.execute(
         "INSERT INTO acos.audit_log (agent, persona, action, domain, confidence, "
         "outcome, token_count, api_cost_usd, metadata) "
