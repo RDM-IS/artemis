@@ -154,6 +154,60 @@ def load_stays(cur, start: date, end: date) -> list[Stay]:
     return out
 
 
+class AwayLookupError(RuntimeError):
+    """The override table could not be read. NOT "he is not away"."""
+
+
+def covers(d: date, *, cur=None) -> Stay | None:
+    """The away stay covering `d`, or None. THE one away resolver.
+
+    AWAY-DAYKIND (2026-09-29). `cycle.day_type()` cannot return `away` —
+    `_VALID_DAY_TYPES` is built from the 14-day pattern tuple and `away` only
+    ever exists as an override — and migration 050 documents that fallback as
+    intended, because the SCHEDULE (wake, quiet hours, business hours) should
+    keep following the pattern underneath a trip. The consequence nobody had
+    traced was that **meal resolution asked the same function**, so an away day
+    resolved to `msp_work` and a hotel fortnight would have been pre-filled with
+    a work-day menu — the exact thing `day_kind("away")` was written to prevent,
+    on code that could never run.
+
+    So this is the second reader: the schedule keeps `cycle.day_type()`, and
+    anything deciding about FOOD asks here. One function, so the two cannot
+    drift apart the way a copied condition would.
+
+    FAIL-CLOSED-RESOLVERS: `None` means the table was read and covers nothing.
+    A read that FAILS raises `AwayLookupError`. Answering "not away" from a
+    failed read is what plans a home menu for a week in a hotel, and it writes
+    perfectly cleanly.
+
+    `cur` is used when the caller has one; otherwise a connection is opened
+    here. That own-connection read is safe for meals in a way it was NOT safe for
+    the 2026-09-26 plan rebuild: nothing inserts an away override in the same
+    uncommitted transaction as a meal resolution. **Pass `cur` anyway whenever
+    one exists** — a caller inside a transaction that has just written an
+    override must see it, and passing the cursor is the only thing that
+    guarantees that.
+    """
+    if cur is not None:
+        return stay_on(load_stays(cur, d, d), d)
+
+    from knowledge.db import get_connection
+    from knowledge.dbguard import RealDbInTestError
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                return stay_on(load_stays(c, d, d), d)
+    except RealDbInTestError:
+        # The ONE swallow, and it is not a failed read: TEST-DB-GUARD raises this
+        # only while a test is running, and no test has an overrides table, so
+        # "nothing covers this day" is the honest answer. NARROW ON PURPOSE —
+        # widening it to Exception re-creates the fail-open defect above.
+        return None
+    except Exception as exc:
+        raise AwayLookupError(
+            f"could not read away overrides for {d}: {exc}") from exc
+
+
 def stay_on(stays: list[Stay], d: date) -> Stay | None:
     for s in stays:
         if s.covers(d):
