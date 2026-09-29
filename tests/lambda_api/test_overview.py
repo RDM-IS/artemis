@@ -332,10 +332,13 @@ class TestStrengthProgress(Base):
 
         def ts(score):
             return TopSet(date=TODAY, score=score)
-        self.assertEqual(trend_of(ts(1100), ts(360)), "up")
-        self.assertEqual(trend_of(ts(1015), ts(360)), "flat")      # within 2%
-        self.assertEqual(trend_of(ts(345), ts(360)), "flat")
-        self.assertEqual(trend_of(ts(900), ts(360)), "down")
+        # These are STRENGTH SCORES (load x reps), not bodyweight. The
+        # PUBLIC-FIXTURES shift caught 1000 and 985 as if they were weights and
+        # moved them into the 300s, which broke the 2% band the test is about.
+        self.assertEqual(trend_of(ts(1100), ts(1000)), "up")
+        self.assertEqual(trend_of(ts(1015), ts(1000)), "flat")      # within 2%
+        self.assertEqual(trend_of(ts(985), ts(1000)), "flat")
+        self.assertEqual(trend_of(ts(900), ts(1000)), "down")
         self.assertIsNone(trend_of(ts(900), None))
         self.assertEqual(trend_of(ts(10), ts(0)), "up")
         d1, d2, d3 = date(2026, 9, 16), date(2026, 9, 23), date(2026, 9, 30)

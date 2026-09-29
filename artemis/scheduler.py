@@ -233,6 +233,9 @@ class ArtemisScheduler:
         # cycle like every other phase job — never a hard-coded clock time and
         # never a hard-coded zone, and it moves with a `set timezone` override.
         "meal_nudge": "quiet",
+        # CARDIO-DETECT: 30 min before quiet, for the same reason — after the
+        # day's last cardio slot, derived from the cycle rather than a clock.
+        "cardio_detect": "quiet",
         "quiet_hours_start": "quiet",
     }
 
@@ -263,6 +266,9 @@ class ArtemisScheduler:
             elif job_id == "meal_nudge":
                 out[job_id] = _minus_minutes(t.hour, t.minute,
                                              config.MEAL_NUDGE_LEAD_MIN)
+            elif job_id == "cardio_detect":
+                out[job_id] = _minus_minutes(t.hour, t.minute,
+                                             config.CARDIO_DETECT_LEAD_MIN)
             else:
                 out[job_id] = (t.hour, t.minute)
         return out
@@ -320,6 +326,10 @@ class ArtemisScheduler:
                 # LOCATION (office 04:30 · Richfield 06:00 · Brown Deer/home 07:30).
                 CronSpec("wake", "job_wake", *t["wake"], tier="health"),
                 # wake + 45 min — one nudge if no check-in arrived (FRIDAY-1).
+                # CARDIO-DETECT — standing automation, and the job itself is a
+                # no-op unless `cardio detect on` has been sent.
+                CronSpec("cardio_detect", "job_cardio_detect", *t["cardio_detect"],
+                         tier="health"),
                 CronSpec("checkin_nudge", "job_checkin_nudge", *t["checkin_nudge"],
                          tier="health"),
                 # open: business holds flush, then the brief. Follows the DAY TYPE
@@ -570,6 +580,51 @@ class ArtemisScheduler:
         self.mm.post_message(config.CHANNEL_OPS, text)
         if not checked_in:
             set_system_value(checkin_key(_local_today()), "open")
+
+    def job_cardio_detect(self):
+        """CARDIO-DETECT: offer today's unlogged cardio from the watch, once.
+
+        Posts NOTHING unless a block clears every condition. A missing proposal
+        costs one manual log; a wrong one costs the truth of the training record
+        that the gate and the reports read.
+        """
+        try:
+            from artemis import cardio_detect
+            from artemis.quiet_hours import local_today, local_tz
+            from knowledge.db import get_connection
+            with get_connection() as conn:
+                cur = conn.cursor()
+                if not cardio_detect.is_enabled(cur):
+                    return
+                today = local_today()
+                cardio_detect.clear_expired(cur, today)
+                if cardio_detect.pending(cur):
+                    # Never twice for the same row: an offer already stands.
+                    logger.info("cardio detect: a proposal is already pending")
+                    return
+                out = cardio_detect.detect(cur, today, tz=local_tz())
+                cardio_detect.record_decision(
+                    cur, today, out.get("row"), out.get("block"),
+                    outcome="proposed" if out["ok"] else "nothing_to_propose",
+                    reason=out.get("reason"))
+                if not out["ok"]:
+                    logger.info("cardio detect: %s", out.get("reason"))
+                    return
+                row, block = out["row"], out["block"]
+                cardio_detect.set_pending(cur, {
+                    "day": today.isoformat(), "plan_id": row["plan_id"],
+                    "session_type": row["session_type"],
+                    "display_name": (row.get("blocks") or {}).get("display_name"),
+                    "location_key": (row.get("blocks") or {}).get("location_key"),
+                    "start": block["start"], "end": block["end"],
+                    "minutes": block["minutes"], "avg_bpm": block["avg_bpm"],
+                    "median_bpm": block["median_bpm"],
+                    "sample_count": block["sample_count"]})
+                line = cardio_detect.propose_line(row, block)
+            self.mm.post_message(config.CHANNEL_OPS, line)
+        except Exception:
+            # FAIL-CLOSED: say nothing rather than guess.
+            logger.exception("Cardio detect failed — posting nothing")
 
     def job_wake(self):
         """Wake (time from CYCLE-1's location table) — health only; business

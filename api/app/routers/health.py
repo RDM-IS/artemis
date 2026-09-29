@@ -577,7 +577,8 @@ def get_status(
 #
 # Schema notes (see migrations/013_health_schema.sql):
 #   - log_type     IN ('strength_set', 'cardio_block', 'session_summary')
-#   - logged_via   IN ('mattermost', 'voice', 'manual', 'inferred')
+#   - logged_via   IN ('mattermost', 'voice', 'manual', 'inferred',
+#                     'watch_confirmed')   -- CARDIO-DETECT, migration 048
 #
 # `gym-display` writes use logged_via='manual'. The CHECK constraint does NOT
 # accept 'gym_display' today; widening it is a future migration if a separate

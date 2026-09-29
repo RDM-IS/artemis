@@ -764,7 +764,8 @@ class TestLocationThenPain(unittest.TestCase):
 
 class TestParser(unittest.TestCase):
     def test_bare_weight_from_the_922_checkin(self):
-        """9/22's exact reply: the bare 341.5 was dropped into free_text."""
+        """The 9/22 shape: a bare number at the end was dropped into free_text.
+        The value is synthetic (PUBLIC-FIXTURES); only the SHAPE is his."""
         ci = hc.parse_checkin("Sleep 6, energy 4, soreness 0, 341.5")
         self.assertEqual((ci.sleep_hrs, ci.energy, ci.weight_lbs), (6.0, 4, 341.5))
         self.assertEqual(ci.soreness, {"overall": 0})

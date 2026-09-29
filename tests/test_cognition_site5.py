@@ -141,10 +141,28 @@ class TestConsumerTable(unittest.TestCase):
         self.assertIn("convert", m._POST_CHAIN_CONSUMERS)
         self.assertIn("convert", m.consuming_flows())
 
-    def test_fix_is_the_only_flow_that_cannot_consume_a_bare_word(self):
-        self.assertEqual(m._NON_CONSUMING_FLOWS, frozenset({"fix"}))
-        self.assertNotIn("fix", m.consuming_flows())
+    def test_every_non_consuming_flow_is_gated_on_a_qualified_form(self):
+        """Was `fix is the only flow`. CARDIO-DETECT added a second
+        (2026-09-29), so the assertion moved from a hard-coded set to the
+        PROPERTY that earns membership: a flow belongs here only if a bare
+        control word could never reach it.
+
+        `fix` is gated on `fix`/`done`/a deviation-shaped line; `cardio_detect`
+        on the qualified phrase `log cardio`. Neither is a control word. The
+        stake is higher for cardio_detect than for fix: a bare `yes` meant for a
+        calendar confirm reaching it would WRITE a training session Ryan never
+        agreed to."""
+        self.assertEqual(m._NON_CONSUMING_FLOWS, frozenset({"fix", "cardio_detect"}))
+        for flow in m._NON_CONSUMING_FLOWS:
+            with self.subTest(flow):
+                self.assertNotIn(flow, m.consuming_flows())
         self.assertNotIn("_handle_nutrition_fix", self._bare_word_handlers())
+        self.assertNotIn("_handle_log_cardio", self._bare_word_handlers())
+
+    def test_log_cardio_is_qualified_and_never_matches_a_control_word(self):
+        for word in ("yes", "y", "yeah", "ok", "okay", "confirm", "no", "cancel"):
+            with self.subTest(word):
+                self.assertIsNone(m._LOG_CARDIO_RE.match(word))
 
     def test_every_probed_flow_is_either_consuming_or_named_non_consuming(self):
         """`_open_pending_flows` can return 13 flow names. Each must be classified,

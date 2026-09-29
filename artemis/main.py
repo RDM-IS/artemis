@@ -317,7 +317,13 @@ _POST_CHAIN_CONSUMERS: tuple[str, ...] = ("convert",)
 #: `_handle_nutrition_fix` is gated on `fix`, `done` or a deviation-shaped line,
 #: and none of those is a control word. A `fix` correction being open must
 #: therefore not make a bare `yes` ambiguous — it could never have claimed it.
-_NON_CONSUMING_FLOWS: frozenset[str] = frozenset({"fix"})
+#: `cardio_detect` joins it for the same reason (CARDIO-DETECT, 2026-09-29): a
+#: pending watch proposal is answered by the QUALIFIED phrase `log cardio` and
+#: by nothing else, so an open proposal must not make a bare `yes` ambiguous —
+#: it could never have claimed one. Getting this wrong would be worse here than
+#: elsewhere: a `yes` meant for a calendar confirm would write a training
+#: session Ryan never agreed to.
+_NON_CONSUMING_FLOWS: frozenset[str] = frozenset({"fix", "cardio_detect"})
 
 
 def consuming_flows() -> frozenset[str]:
@@ -4515,6 +4521,95 @@ _MEAL_NUDGE_RE = re.compile(r"^\s*meal\s+nudge\s+(?P<state>on|off)\s*[.!]*\s*$",
 # Artemis never sets this, under any circumstances. It is the Brad Spaits rule
 # applied to his body rather than his mailbox: the flag says a VA provider has
 # cleared him for vigorous exercise, and only he can say that.
+_CARDIO_DETECT_RE = re.compile(r"^\s*cardio\s+detect\s+(?P<state>on|off)\s*[.!]*\s*$", re.I)
+#: A QUALIFIED form, two words. It is deliberately not a bare control word and
+#: not in _BARE_WORD_CONSUMERS: a pending watch proposal must never be able to
+#: claim a `yes` that was meant for a calendar confirm or a delete.
+_LOG_CARDIO_RE = re.compile(r"^\s*log\s+cardio\s*[.!]*\s*$", re.I)
+
+
+def _handle_cardio_detect(post: dict, question: str) -> bool:
+    """`cardio detect on|off` — CARDIO-DETECT is a standing automation, so
+    activating it is human-gated and it ships OFF."""
+    m = _CARDIO_DETECT_RE.match(question or "")
+    if not m:
+        return False
+    from artemis.cardio_detect import ENABLED_KEY
+    from artemis.quiet_hours import set_system_value
+    on = m.group("state").lower() == "on"
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        set_system_value(ENABLED_KEY, "true" if on else "")
+    except Exception:
+        logger.exception("cardio detect: could not store the flag")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't store that — it is unchanged.",
+                             root_id=root_id)
+        return True
+    if _mm:
+        _mm.post_message(
+            channel_id,
+            ("Cardio detection is ON. If the watch shows a long enough elevated block "
+             "on a day with unlogged cardio, I'll offer it once and you reply "
+             "`log cardio` to record it. I never write the session myself.")
+            if on else
+            "Cardio detection is OFF. I won't look at the watch for unlogged cardio.",
+            root_id=root_id)
+    return True
+
+
+def _handle_log_cardio(post: dict, question: str) -> bool:
+    """`log cardio` — confirm the pending watch proposal. HE writes the session;
+    the proposal was only ever a draft."""
+    if not _LOG_CARDIO_RE.match(question or ""):
+        return False
+    from datetime import date as _date
+    from artemis import cardio_detect
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            today = local_today()
+            cardio_detect.clear_expired(cur, today)
+            prop = cardio_detect.pending(cur)
+            if not prop:
+                if _mm:
+                    _mm.post_message(
+                        channel_id,
+                        "Nothing pending — I haven't offered a watch block to log. "
+                        "Log it on the iPad, or turn detection on with "
+                        "`cardio detect on`.", root_id=root_id)
+                return True
+            written = cardio_detect.confirm(cur, prop, on=today)
+            cardio_detect.set_pending(cur, None)
+            cardio_detect.record_decision(
+                cur, today, {"plan_id": prop.get("plan_id"),
+                             "session_type": prop.get("session_type")},
+                {"start": prop.get("start"), "end": prop.get("end"),
+                 "minutes": prop.get("minutes"),
+                 "sample_count": prop.get("sample_count"),
+                 "median_bpm": prop.get("median_bpm")},
+                outcome="confirmed", reason="Ryan replied `log cardio`")
+    except Exception:
+        logger.exception("log cardio: could not write the session")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't write that — nothing was logged. "
+                                         "The traceback is in the log.", root_id=root_id)
+        return True
+    if _mm:
+        where = f" on the {written['modality']}" if written.get("modality") else ""
+        _mm.post_message(
+            channel_id,
+            f"Logged {written['minutes']} min{where} from the watch. "
+            f"It counts as a real session for the interval gate and the reports.",
+            root_id=root_id)
+    return True
+
+
 _INTERVALS_CLEARED_RE = re.compile(
     r"^\s*intervals\s+(?P<neg>not\s+)?cleared\s*[.!]*\s*$", re.I)
 
@@ -4924,6 +5019,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("week_ahead", _handle_week_ahead),
         # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
         ("intervals_cleared", _handle_intervals_cleared),
+        ("cardio_detect", _handle_cardio_detect),
+        ("log_cardio", _handle_log_cardio),
         ("vault_command", _handle_vault_command),
         ("dossier_command", _handle_dossier_command),
         ("grocery_staples", _handle_grocery_staples),
