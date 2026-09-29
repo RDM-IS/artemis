@@ -300,6 +300,43 @@ class TestGrouping(unittest.TestCase):
         self.assertIsNone(groups[-1]["store_id"])
 
 
+class TestShopDateWindow(unittest.TestCase):
+    """A stay already in progress must not be shopped for retrospectively."""
+
+    def test_days_before_the_shop_date_are_not_bought(self):
+        # The stay runs 03-02..03-08 but he shops on 03-06: only 03-06 onward
+        # counts. On 2026-09-29 the real stay covering the 10/04 shop had started
+        # on 09/28, so without this a week of meals would be bought twice.
+        stay = {"start_date": date(2031, 3, 2), "end_date": date(2031, 3, 8),
+                "shop_date": date(2031, 3, 6)}
+        beans = ing("ing-beans", on_hand_base=0.0)
+        rows = build(
+            stay=stay,
+            stay_days=[day(date(2031, 3, 2), "rec-b"), day(date(2031, 3, 3), "rec-b"),
+                       day(date(2031, 3, 6), "rec-b"), day(date(2031, 3, 7), "rec-b")],
+            recipes={"rec-b": recipe("rec-b")},
+            lines=[line("ln-b", "rec-b", "ing-beans", 100.0)],
+            ingredients={"ing-beans": beans},
+            store_items=[item("si-b", "ing-beans", "st-aldi", rank=1,
+                              package_size=100.0)])
+        row = next(r for r in rows if r["ingredient_id"] == "ing-beans")
+        # 2 remaining days x 100 g, not 4 x 100 g.
+        self.assertEqual(row["purchased_base"], 200.0)
+        self.assertEqual(row["packages"], 2)
+
+    def test_a_stay_wholly_ahead_is_bought_in_full(self):
+        beans = ing("ing-beans", on_hand_base=0.0)
+        rows = build(
+            stay_days=[day(date(2031, 3, 3), "rec-b"), day(date(2031, 3, 4), "rec-b")],
+            recipes={"rec-b": recipe("rec-b")},
+            lines=[line("ln-b", "rec-b", "ing-beans", 100.0)],
+            ingredients={"ing-beans": beans},
+            store_items=[item("si-b", "ing-beans", "st-aldi", rank=1,
+                              package_size=100.0)])
+        row = next(r for r in rows if r["ingredient_id"] == "ing-beans")
+        self.assertEqual(row["purchased_base"], 200.0)
+
+
 class TestEnoughOnHand(unittest.TestCase):
     def test_a_fully_stocked_ingredient_is_not_on_the_list(self):
         beans = ing("ing-beans", on_hand_base=5000.0)

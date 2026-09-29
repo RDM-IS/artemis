@@ -327,9 +327,10 @@ def refresh(cur, today: date, *, force_sweep: bool = False) -> dict:
         out["detail"] = "no Minneapolis stay found in the lookahead window"
         return out
     start, end = stay
-    # The shop happens on the first day of the stay unless Ryan says otherwise;
-    # upsert_stay keeps a shop_date he has already set.
-    stay_id = upsert_stay(cur, start, end, shop_date=start)
+    # The shop happens on the first day of the stay, or TODAY if the stay is
+    # already running — a default shop date in the past would build a list for
+    # days already eaten. upsert_stay keeps a shop_date Ryan has already set.
+    stay_id = upsert_stay(cur, start, end, shop_date=max(start, today))
     out["stay"] = {"id": stay_id, "start": start.isoformat(), "end": end.isoformat()}
     out["menu"] = resolve_menu(cur, stay_id, start, end)
     return out

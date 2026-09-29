@@ -337,7 +337,14 @@ def build_lines(*, stay: dict, stay_days: list[dict], recipes: dict,
         if not ing or ing.get("deleted_at"):
             continue
         flags: list[str] = []
-        per_day = {d: q for d, q in (need.get(nid) or {}).items()}
+        # ONLY DAYS FROM THE SHOP DATE ONWARD. A stay already in progress has days
+        # behind it that have been eaten, and food cannot be bought for
+        # yesterday. Counting them would inflate every quantity by however long
+        # the stay had been running — on 2026-09-29 the stay covering the 10/04
+        # shop had started on 09/28, so a whole week of meals would have been
+        # bought twice.
+        per_day = {d: q for d, q in (need.get(nid) or {}).items()
+                   if shop_date is None or d >= shop_date}
 
         as_used_total = sum(per_day.values())
         purchased_by_day = {d: purchased_from_as_used(q, ing) for d, q in per_day.items()}
