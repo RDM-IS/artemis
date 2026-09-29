@@ -2730,33 +2730,54 @@ def _weight_goal(db: Session, today: date, anchor: Optional[date]) -> WeightGoal
                       lb_per_week=rate, days_7d=len(recent))
 
 
-def _cardio_goal(db: Session, today: date, week_start: date) -> CardioGoal:
+def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, CardioDetail]:
+    """The cardio TILE and the cardio DETAIL from ONE read, sharing ONE status.
+
+    They were two builders with two try/excepts, so a failure in one and not the
+    other put "couldn't read cardio" on the tile while the section below it
+    happily listed weekly minutes. Two answers to one question is worse than
+    either answer alone: it tells him the page cannot be trusted without telling
+    him which half to believe.
+
+    The cost of one status per domain is that a failure in any read hides the
+    rest of the domain. That is the right direction -- the reason names what
+    failed, and a section that shows some of its data while silently dropping
+    the rest is the thing being fixed.
+    """
+    since = today - timedelta(days=55)
     try:
         rows = db.execute(text(
-            "SELECT sl.duration_sec, sl.hr_avg "
-            "FROM health.session_log sl JOIN health.plan p ON p.plan_id = sl.plan_id "
-            "WHERE p.plan_date BETWEEN :a AND :b "
+            "SELECT p.plan_date, sl.duration_sec, sl.hr_avg, p.plan_id "
+            "FROM health.plan p JOIN health.session_log sl ON sl.plan_id = p.plan_id "
+            # EVENING-1: the session_type filter already excludes the evening
+            # recovery_flow row; this says which slot is meant rather than
+            # relying on that.
+            "WHERE p.slot = 'morning' "
             "  AND p.session_type IN ('cardio_z2', 'cardio_intervals') "
-            "  AND sl.logged_via <> 'inferred'"),
-            {"a": week_start, "b": today}).mappings().all()
+            "  AND p.plan_date BETWEEN :a AND :b AND sl.logged_via <> 'inferred' "
+            "ORDER BY p.plan_date"), {"a": since, "b": today}).mappings().all()
+        hr = db.execute(text(
+            "SELECT state_date, resting_hr FROM health.daily_state "
+            "WHERE resting_hr IS NOT NULL AND state_date BETWEEN :a AND :b "
+            "ORDER BY state_date"), {"a": since, "b": today}).mappings().all()
     except Exception as exc:                                    # noqa: BLE001
-        return _fail(CardioGoal, exc, "cardio minutes")
-    minutes = int(round(sum((r["duration_sec"] or 0) for r in rows) / 60.0))
-    with_hr = [r for r in rows if r["hr_avg"]]
+        logger.warning("STATUS-2: could not read cardio", exc_info=True)
+        down = Section(ok=False, reason="couldn't read cardio")
+        return CardioGoal(section=down), CardioDetail(section=down)
+
+    this_week = [r for r in rows if r["plan_date"] >= week_start]
+    minutes = int(round(sum((r["duration_sec"] or 0) for r in this_week) / 60.0))
+    with_hr = [r for r in this_week if r["hr_avg"]]
     z2 = z4 = None
     if with_hr:
-        # The row carries the zone ranges (PROGRAM-2), but a logged average is a
-        # single number: bucket it by the same boundaries artemis uses.
         z2 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
                            if 105 <= int(r["hr_avg"]) <= 122) / 60.0))
         z4 = int(round(sum((r["duration_sec"] or 0) for r in with_hr
                            if 139 <= int(r["hr_avg"]) <= 157) / 60.0))
+
     gate = gate_reason = gate_date = None
     try:
-        # EVENING-1: two rows share a date, so a per-day read has to say which
-        # slot it means. Interval cardio is a morning session (the evening slot
-        # carries recovery_flow), and an unpinned read would take an arbitrary
-        # one. tests/lambda_api/test_plan_range.py caught this before it shipped.
+        # EVENING-1: pinned to the morning slot, where interval cardio lives.
         nxt = db.execute(text(
             "SELECT plan_date, blocks FROM health.plan WHERE slot = 'morning' "
             "  AND session_type = 'cardio_intervals' AND plan_date >= :t "
@@ -2772,39 +2793,51 @@ def _cardio_goal(db: Session, today: date, week_start: date) -> CardioGoal:
     except Exception:                                           # noqa: BLE001
         logger.warning("STATUS-2: could not read the interval gate row", exc_info=True)
         gate = None
-    return CardioGoal(minutes_this_week=minutes, z2_minutes=z2, z4_minutes=z4,
+
+    by_week: dict[date, dict[str, int]] = {}
+    for r in rows:
+        wk = r["plan_date"] - timedelta(days=(r["plan_date"].weekday() + 1) % 7)
+        acc = by_week.setdefault(wk, {"secs": 0, "plans": set()})
+        acc["secs"] += r["duration_sec"] or 0
+        acc["plans"].add(r["plan_id"])
+
+    goal = CardioGoal(minutes_this_week=minutes, z2_minutes=z2, z4_minutes=z4,
                       has_zone_data=bool(with_hr), interval_gate=gate,
                       interval_gate_reason=gate_reason, interval_gate_date=gate_date)
+    detail = CardioDetail(
+        weeks=[CardioWeek(week_start=wk, minutes=int(round(a["secs"] / 60.0)),
+                          sessions=len(a["plans"]))
+               for wk, a in sorted(by_week.items())],
+        resting_hr=[TrendPoint(date=r["state_date"], value=float(r["resting_hr"])) for r in hr])
+    return goal, detail
 
 
-def _strength_goal(db: Session, today: date, program: Optional[ProgramInfo],
-                   progress: list[StrengthProgressRow]) -> StrengthGoal:
-    try:
-        done = program.sessions_done if program else None
-        planned = program.sessions_planned if program else None
-        progressed = sum(1 for r in progress if r.trend == "up")
-        return StrengthGoal(sessions_done=done, sessions_planned=planned,
-                            lifts_progressed_14d=progressed)
-    except Exception as exc:                                    # noqa: BLE001
-        return _fail(StrengthGoal, exc, "strength progress")
+def _nutrition(db: Session, today: date) -> tuple[NutritionGoal, NutritionDetail]:
+    """The nutrition TILE and the 7-day DETAIL from ONE read, sharing ONE status.
 
-
-def _nutrition_goal(db: Session, today: date) -> NutritionGoal:
+    The per-day rows ARE what the tile averages, so computing them twice was two
+    chances to disagree about the same seven days -- which is exactly what the
+    round-#17 screenshot showed.
+    """
     since = today - timedelta(days=6)
     try:
         rows = db.execute(text(
-            "SELECT logged_date, SUM(protein_g) p, SUM(fiber_g) f "
+            "SELECT logged_date, SUM(kcal) k, SUM(protein_g) p, SUM(fiber_g) f, COUNT(*) n "
             "FROM health.nutrition_log WHERE logged_date BETWEEN :a AND :b "
-            "GROUP BY logged_date"), {"a": since, "b": today}).mappings().all()
-    except Exception as exc:                                    # noqa: BLE001
-        return _fail(NutritionGoal, exc, "nutrition")
+            "GROUP BY logged_date ORDER BY logged_date"),
+            {"a": since, "b": today}).mappings().all()
+    except Exception:                                           # noqa: BLE001
+        logger.warning("STATUS-2: could not read nutrition", exc_info=True)
+        down = Section(ok=False, reason="couldn't read nutrition")
+        return NutritionGoal(section=down), NutritionDetail(section=down)
+
     days = len(rows)
     avg_p = round(sum(float(r["p"] or 0) for r in rows) / days, 1) if days else None
     avg_f = round(sum(float(r["f"] or 0) for r in rows) / days, 1) if days else None
     tp = tf = set_by = None
     try:
         # ONLY a dietitian's numbers land here. Artemis never writes this table,
-        # so an empty result means "no target", never "target of zero".
+        # so an empty result means "no target", never "a target of zero".
         t = db.execute(text(
             "SELECT protein_g, fiber_g, set_by FROM health.nutrition_target "
             "WHERE effective_from <= :t AND (effective_to IS NULL OR effective_to >= :t) "
@@ -2813,58 +2846,37 @@ def _nutrition_goal(db: Session, today: date) -> NutritionGoal:
             tp, tf, set_by = t["protein_g"], t["fiber_g"], t["set_by"]
     except Exception:                                           # noqa: BLE001
         logger.warning("STATUS-2: could not read the nutrition target", exc_info=True)
-    return NutritionGoal(days_logged=days, avg_protein_g=avg_p, avg_fiber_g=avg_f,
-                         target_protein_g=tp, target_fiber_g=tf, target_set_by=set_by)
 
-
-def _cardio_detail(db: Session, today: date) -> CardioDetail:
-    since = today - timedelta(days=55)
-    try:
-        weeks = db.execute(text(
-            "SELECT (date_trunc('week', p.plan_date)::date) wk, "
-            "       SUM(COALESCE(sl.duration_sec, 0)) secs, COUNT(DISTINCT p.plan_id) n "
-            "FROM health.plan p JOIN health.session_log sl ON sl.plan_id = p.plan_id "
-            # EVENING-1 again. The session_type filter already excludes the
-            # evening slot (it carries recovery_flow), so this changes no result
-            # -- it says which slot is meant instead of relying on that.
-            "WHERE p.slot = 'morning' "
-            "  AND p.session_type IN ('cardio_z2', 'cardio_intervals') "
-            "  AND p.plan_date BETWEEN :a AND :b AND sl.logged_via <> 'inferred' "
-            "GROUP BY 1 ORDER BY 1"), {"a": since, "b": today}).mappings().all()
-        hr = db.execute(text(
-            "SELECT state_date, resting_hr FROM health.daily_state "
-            "WHERE resting_hr IS NOT NULL AND state_date BETWEEN :a AND :b "
-            "ORDER BY state_date"), {"a": since, "b": today}).mappings().all()
-    except Exception as exc:                                    # noqa: BLE001
-        return _fail(CardioDetail, exc, "cardio history")
-    return CardioDetail(
-        weeks=[CardioWeek(week_start=r["wk"], minutes=int(round((r["secs"] or 0) / 60.0)),
-                          sessions=int(r["n"])) for r in weeks],
-        resting_hr=[TrendPoint(date=r["state_date"], value=float(r["resting_hr"])) for r in hr])
-
-
-def _nutrition_detail(db: Session, today: date) -> NutritionDetail:
-    since = today - timedelta(days=6)
-    try:
-        rows = db.execute(text(
-            "SELECT logged_date, SUM(kcal) k, SUM(protein_g) p, SUM(fiber_g) f, COUNT(*) n "
-            "FROM health.nutrition_log WHERE logged_date BETWEEN :a AND :b "
-            "GROUP BY logged_date ORDER BY logged_date"),
-            {"a": since, "b": today}).mappings().all()
-    except Exception as exc:                                    # noqa: BLE001
-        return _fail(NutritionDetail, exc, "nutrition history")
     by_day = {r["logged_date"]: r for r in rows}
-    days = []
+    day_rows = []
     for i in range(7):
         d = since + timedelta(days=i)
         r = by_day.get(d)
-        days.append(NutritionDay(
+        day_rows.append(NutritionDay(
             day=d,
             kcal=float(r["k"]) if r and r["k"] is not None else None,
             protein_g=float(r["p"]) if r and r["p"] is not None else None,
             fiber_g=float(r["f"]) if r and r["f"] is not None else None,
             items=int(r["n"]) if r else 0))
-    return NutritionDetail(days=days)
+
+    goal = NutritionGoal(days_logged=days, avg_protein_g=avg_p, avg_fiber_g=avg_f,
+                         target_protein_g=tp, target_fiber_g=tf, target_set_by=set_by)
+    return goal, NutritionDetail(days=day_rows)
+
+
+def _strength_goal(db: Session, today: date, program: Optional[ProgramInfo],
+                   progress: list[StrengthProgressRow]) -> StrengthGoal:
+    """Strength reads nothing of its own -- it reuses the program counts and the
+    strength_progress rows the response already computes, so there is no second
+    read here to disagree with anything."""
+    try:
+        return StrengthGoal(
+            sessions_done=program.sessions_done if program else None,
+            sessions_planned=program.sessions_planned if program else None,
+            lifts_progressed_14d=sum(1 for r in progress if r.trend == "up"))
+    except Exception:                                           # noqa: BLE001
+        logger.warning("STATUS-2: could not read strength progress", exc_info=True)
+        return StrengthGoal(section=Section(ok=False, reason="couldn't read strength progress"))
 
 
 def _sleep_recovery(db: Session, today: date) -> SleepRecovery:
@@ -3011,6 +3023,10 @@ def get_overview(
         ).mappings().first()
         previous_end = older["d"] if older else None
 
+    # STATUS-2: one read per domain, so the tile and the section below it cannot
+    # disagree about the same data.
+    _cardio_pair = _cardio(db, today, program.week_start if program else today)
+    _nutrition_pair = _nutrition(db, today)
     return OverviewResponse(
         date=today,
         timezone=tz_name,
@@ -3025,12 +3041,12 @@ def get_overview(
         # STATUS-2: each section reads independently and fails closed on its own.
         goals=Goals(
             weight=_weight_goal(db, today, prog["anchor"] if prog else None),
-            cardio=_cardio_goal(db, today, program.week_start if program else today),
+            cardio=_cardio_pair[0],
             strength=_strength_goal(db, today, program, strength_progress(names, set_rows)),
-            nutrition=_nutrition_goal(db, today),
+            nutrition=_nutrition_pair[0],
         ),
-        cardio_detail=_cardio_detail(db, today),
-        nutrition_7d=_nutrition_detail(db, today),
+        cardio_detail=_cardio_pair[1],
+        nutrition_7d=_nutrition_pair[1],
         sleep_recovery=_sleep_recovery(db, today),
         weight_summary=weight_summary(weight),
         previous_program_end=previous_end,
