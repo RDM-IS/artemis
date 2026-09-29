@@ -49,6 +49,12 @@ INVENTORY: dict[str, tuple[tuple[str, str], ...]] = {
     "brown_deer": (("treadmill", "treadmill"),),
     "office": (("treadmill", "treadmill"), ("elliptical", "elliptical"),
                ("bike", "upright"), ("bike", "recumbent")),
+    #: The generic hotel gym (approved with the hotel strength tables
+    #: 2026-09-29). ASSUMED, like the rest of that inventory: a treadmill and an
+    #: upright bike are what almost every hotel gym has. Without this entry a
+    #: hotel cardio row resolved to "no cardio equipment at this location", which
+    #: is honest but wrong for a room that has both.
+    "hotel": (("treadmill", "treadmill"), ("bike", "upright")),
     #: MSP home has none. The empty tuple is the point: it resolves to the
     #: explicit no-equipment state rather than borrowing the office's.
     "msp_home": (),

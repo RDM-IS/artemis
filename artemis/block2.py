@@ -133,6 +133,16 @@ def _specs_for(d: date, wk: int, *, placements: dict | None = None,
             session = "rest"
         elif policy.strength == "bodyweight_circuit" and session.startswith("strength"):
             session = "bodyweight_circuit"
+        elif policy.strength == "hotel_gym":
+            # The program continues; only the room changed. Route to the approved
+            # hotel substitution tables (Ryan, 2026-09-29) so the card names
+            # dumbbells and a flat bench instead of the office's machines.
+            #
+            # Cardio moves too: the hotel's treadmill and upright bike are in
+            # knowledge/cardio.py, so a Z2 row here resolves to one of those
+            # rather than to "no cardio equipment at this location".
+            location_key = "hotel"
+            location = "hotel gym"
 
     base = {
         "plan_date": d, "slot": "morning", "session_type": session,

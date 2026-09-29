@@ -158,15 +158,27 @@ DEFAULT_STORE_LOCATIONS = ("MPLS",)
 
 
 def choose_item(items: list[dict], ingredient: dict, stores: dict,
-                seed: dict | None = None, *, locations=DEFAULT_STORE_LOCATIONS
-                ) -> dict | None:
+                seed: dict | None = None, *, locations=DEFAULT_STORE_LOCATIONS,
+                need: float | None = None) -> dict | None:
     """The store item to buy this ingredient from, or None.
 
     Eligible means: the item is live, its store is live and active, AND the store
     is in `locations`. Lowest effective rank wins; an item with NO rank at all
-    sorts after every ranked one rather than ahead of them. Ties break on price
-    then name so the answer is stable run to run — a shopping list that reorders
-    itself between refreshes reads as a bug.
+    sorts after every ranked one rather than ahead of them.
+
+    TIE-BREAK, in order (Ryan's spec, adopted 2026-09-29):
+      1. an item whose package COVERS the need, before one that does not;
+      2. among those that cover it, the SMALLEST such package;
+      3. among those that do not, the LARGEST, since it takes fewest of them;
+      4. then price, then name.
+
+    (1)-(3) serve the spec's "<= 1 package over per item" criterion: buying the
+    smallest carton that still does the job is what keeps the overshoot inside one
+    package. Price and name remain as the final tie-break so the answer is stable
+    run to run — a shopping list that reorders itself between refreshes reads as a
+    bug. `need` is the PURCHASED quantity; with `need=None` the package rules are
+    skipped and price decides, which is right for a line that exists only to
+    restock a staple.
 
     `locations=None` disables the location filter. A store whose location is not
     recorded at all is EXCLUDED when filtering: an unknown location is not
@@ -186,13 +198,25 @@ def choose_item(items: list[dict], ingredient: dict, stores: dict,
             if loc is None or str(loc).upper() not in allowed:
                 continue
         rank, basis = effective_rank(it, ingredient, store, seed)
+        size = _f(it.get("package_size"))
+        # covers: 0 sorts before 1. size_key: ascending for a package that covers
+        # the need, DESCENDING (negated) for one that does not, so the first pick
+        # among non-covering packages is the largest and therefore the fewest.
+        if need is None or size is None or size <= 0:
+            covers, size_key = 1, 0.0
+        elif size >= need:
+            covers, size_key = 0, size
+        else:
+            covers, size_key = 1, -size
+        price = _f(it.get("price"))
         eligible.append((rank if rank is not None else 10 ** 6,
-                         _f(it.get("price")) if _f(it.get("price")) is not None else 10 ** 6,
+                         covers, size_key,
+                         price if price is not None else 10 ** 6,
                          it.get("name") or "", it, rank, basis, store))
     if not eligible:
         return None
-    eligible.sort(key=lambda t: (t[0], t[1], t[2]))
-    _, _, _, it, rank, basis, store = eligible[0]
+    eligible.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4]))
+    it, rank, basis, store = eligible[0][5:]
     out = dict(it)
     out["_rank"] = rank
     out["_rank_basis"] = basis
@@ -376,8 +400,12 @@ def build_lines(*, stay: dict, stay_days: list[dict], recipes: dict,
         purchased_by_day = {d: purchased_from_as_used(q, ing) for d, q in per_day.items()}
         purchased_total = sum(purchased_by_day.values())
 
+        # `need` is the purchased quantity, which is what the tie-break measures
+        # a package against. It is known before the item is chosen, and `short`
+        # is not — short depends on the package size, so it cannot also decide it.
         item = choose_item(items_by_ing.get(nid, []), ing, stores, seed,
-                           locations=locations)
+                           locations=locations,
+                           need=purchased_total if purchased_total > 0 else None)
         if item is None:
             flags.append(FLAG_NO_STORE)
         elif item.get("_rank") is None or item["_rank"] > 1:

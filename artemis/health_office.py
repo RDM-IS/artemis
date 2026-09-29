@@ -199,6 +199,10 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "Plank": "bodyweight",
     "Side plank": "bodyweight",
     "Hollow hold": "bodyweight",
+    # hotel substitutes (approved 2026-09-29)
+    "Feet-elevated push-up": "bodyweight",
+    "Bent-over DB rear delt raise": "dumbbell",
+    "Prone back extension": "bodyweight",
     "Dead bug": "bodyweight",
     "Bird dog": "bodyweight",
     "Ball plank": "bodyweight",
@@ -331,6 +335,12 @@ LIFT_PROFILE: dict[str, tuple[str, str, str | None]] = {
     "Stability-ball back extension": (_LP, _CORE,  "stability ball"),
     "Stability-ball crunch":         (_LP, _CORE,  "stability ball"),
     "Stability-ball hamstring curl": (_LP, _LOWER, "stability ball"),
+    # hotel — approved 2026-09-29. No station for any of them except the bench
+    # movements above, which are shared with the office table.
+    "Feet-elevated push-up":         (_LC, _PUSH,  None),
+    "Bent-over DB rear delt raise":  (_LP, _PULL,  None),
+    "Prone back extension":          (_LP, _CORE,  None),
+    "Side plank":                    (_LP, _CORE,  None),
     # Richfield — bands. One anchor assumed; "Band leg extension" is seated with
     # the band under the foot and needs none.
     "Band seated row":               (_LC, _PULL,  "band anchor"),
@@ -410,17 +420,75 @@ RICHFIELD_A_SUBS: dict[str, tuple[str, str, int, bool]] = {
 
 #: What the gym is called on the row, per location. The office keeps its
 #: per-session equipment list; anywhere else names what the session uses.
+# ── HOTEL GYM — approved by Ryan 2026-09-29 ("approve hotel") ───────────────
+#
+# The generic hotel gym, from away.HOTEL_GYM_INVENTORY and deliberately
+# conservative: dumbbells 5-50 lb in 5s, ONE FLAT BENCH (no incline), treadmill,
+# upright bike. `hotel gym has <items>` replaces the assumption for one stay.
+#
+# LIFT-RECOMP is what makes this table work at all: under a 5-rep scheme the
+# 50 lb cap is a ceiling you grind into, and at 12-20 reps it is simply the load.
+#
+# THE INCLINE SLOT IS THE ONE THAT NEEDED AN ARGUMENT, and it is the same
+# argument as Richfield's. There is no incline bench. A second flat press would
+# just repeat Strength A's, leaving the week with two flat presses and no upper
+# chest. A FEET-ELEVATED PUSH-UP keeps the upper-chest and front-delt bias the
+# incline press exists for (Ryan's instruction, 2026-09-29). The trade, stated:
+# the load is bodyweight only, so progression there is reps and foot height
+# rather than dumbbells.
+#
+# BENCH CONTENTION is the real constraint here, not the dumbbell cap. A needs the
+# one bench for 2 of 6 movements, B for 1 of 7, C for 3 of 6 — and the superset
+# pairer never pairs two movements that need it, which is why C comes out at 42
+# min rather than shorter. Assuming one bench is the safe direction; a hotel with
+# two only improves it.
+HOTEL_A_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Leg press":                  ("DB goblet squat", "12-20", 20, False),
+    "Lat pulldown":               ("1-arm DB row", "12-20", 20, True),
+    "Seated leg curl":            ("DB Romanian deadlift", "12-20", 20, False),
+    "Cable face pull (rope)":     ("Bent-over DB rear delt raise", "15-25", 25, False),
+    "Captain's chair knee raise": ("Lying leg raise", "15-25", 25, False),
+    # DB bench press is native — the hotel has dumbbells and a flat bench.
+}
+
+HOTEL_B_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Seated cable row":      ("1-arm DB row", "12-20", 20, True),
+    "Incline DB press":      ("Feet-elevated push-up", "12-20", 20, False),
+    "Leg extension":         ("DB split squat", "12-20", 20, True),
+    "Rear delt fly":         ("Bent-over DB rear delt raise", "15-25", 25, False),
+    # A hold: the seconds come from _recomp.HOLD_SECONDS, not from this tuple.
+    "Cable Pallof press":    ("Side plank", "30-45s", 45, True),
+    "Seated back extension": ("Prone back extension", "15-25", 25, False),
+    # DB goblet squat is native.
+}
+
+HOTEL_C_SUBS: dict[str, tuple[str, str, int, bool]] = {
+    "Pec fly":             ("DB fly", "15-25", 25, False),
+    "Single-arm cable row": ("1-arm DB row", "12-20", 20, True),
+    "Calf press":          ("Standing DB calf raise", "15-25", 25, False),
+    "Ab machine crunch":   ("Lying leg raise", "15-25", 25, False),
+    # DB Romanian deadlift and Seated DB shoulder press are native.
+}
+
 LOCATION_EQUIPMENT: dict[str, list[str]] = {
     # CONFIRMED by Ryan 2026-09-28 15:14. "to 80 lb" was wrong: they pair to 90.
     "richfield": ["PowerBlocks (to 90 lb)", "flat bench", "stability ball",
                   "resistance bands + wall anchors", "TRX", "curl bar",
                   "bike on trainer", "yoga mat"],
+    # ASSUMED, not confirmed: what almost every hotel gym has. `hotel gym has
+    # <items>` records a real one for a stay. Assuming a cable stack and being
+    # wrong means walking to a machine that is not there; assuming dumbbells and
+    # a treadmill and being wrong is recoverable in a way the reverse is not.
+    "hotel": ["dumbbells (5-50 lb, 5 lb steps)", "flat bench", "treadmill",
+              "upright bike"],
 }
 
 #: Which office session each location can hold, and how.
 LOCATION_SUBS: dict[str, dict[str, dict[str, tuple[str, str, int, bool]]]] = {
     "richfield": {"strength_a": RICHFIELD_A_SUBS, "strength_b": RICHFIELD_B_SUBS,
                   "strength_c": RICHFIELD_SUBS},
+    "hotel": {"strength_a": HOTEL_A_SUBS, "strength_b": HOTEL_B_SUBS,
+              "strength_c": HOTEL_C_SUBS},
 }
 
 
@@ -677,6 +745,14 @@ def _exercise(name, rng, top, per_side, machine, sets, week_num, *, wk0=False) -
     # ones and they stay in force for weeks 1-4 — that is deliberately how the
     # reseed leaves everything before 10/11 untouched, rather than by filtering
     # dates afterwards and hoping.
+    # A HOLD is prescribed in seconds and carries no target_reps. Checked before
+    # the rep logic, because a hold has no rep range to compute.
+    if _recomp.is_hold(name):
+        lo, hi = _recomp.hold_seconds(name)
+        notes = [f"{sets}×{lo}-{hi}s" + (" each side" if per_side else "")]
+        return {"name": name, "format": "duration", "duration_sec": hi,
+                "rest_after_sec": 60, "notes": "; ".join(notes),
+                "equipment_class": class_for(name)}
     if recomp_applies(week_num):
         lift_class = lift_class_for(name)
         rng = _recomp.rep_label(lift_class)
