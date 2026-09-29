@@ -38,6 +38,62 @@ def store_zones(fetch) -> dict:
     return load_config(fetch, "store_zones", {}) or {}
 
 
+# ── sync health ─────────────────────────────────────────────────────────────
+
+def sync_status(fetch) -> dict:
+    """Per-database sync state, and which databases are BLOCKING the list.
+
+    Why the list carries this rather than leaving it to a dashboard: on
+    2026-09-29 three of the five Notion databases had never been shared with the
+    integration, and the resulting list was EMPTY while sixteen meals were
+    planned. An empty list is indistinguishable from "nothing to buy" — the one
+    failure that is completely silent in the shop, because he simply buys nothing.
+
+    `blocked` names the databases whose absence removes quantities or stores from
+    the calculation. `recipe_lines` blocks every quantity; `store_items` and
+    `stores` block every package count and every aisle. `ingredients` and
+    `recipes` are listed too, because without them there is nothing at all.
+    """
+    rows = fetch("SELECT db_key, last_status, last_run, last_edited, "
+                 "       last_full_sweep, rows_seen, last_detail "
+                 "  FROM nutrition.prep_sync ORDER BY db_key", ())
+    counts = fetch("""
+        SELECT 'ingredients' AS db_key, count(*) AS n FROM nutrition.prep_ingredient
+                WHERE deleted_at IS NULL
+        UNION ALL SELECT 'recipes', count(*) FROM nutrition.prep_recipe
+                WHERE deleted_at IS NULL
+        UNION ALL SELECT 'recipe_lines', count(*) FROM nutrition.prep_recipe_line
+                WHERE deleted_at IS NULL
+        UNION ALL SELECT 'stores', count(*) FROM nutrition.prep_store
+                WHERE deleted_at IS NULL
+        UNION ALL SELECT 'store_items', count(*) FROM nutrition.prep_store_item
+                WHERE deleted_at IS NULL""", ())
+    by_key = {r["db_key"]: int(r["n"]) for r in counts}
+    out, blocked = [], []
+    for r in rows:
+        rows_in_rds = by_key.get(r["db_key"], 0)
+        ok = r["last_status"] == "ok" and rows_in_rds > 0
+        out.append({
+            "db": r["db_key"], "status": r["last_status"],
+            "rows_in_rds": rows_in_rds,
+            "last_run": r["last_run"].isoformat() if r["last_run"] else None,
+            "last_full_sweep": (r["last_full_sweep"].isoformat()
+                                if r["last_full_sweep"] else None),
+            "detail": (r["last_detail"] or "")[:300] or None,
+        })
+        if not ok:
+            blocked.append(r["db_key"])
+    # A database with no prep_sync row at all has never been attempted, which is
+    # also a blocker and would otherwise be invisible.
+    for key in ("ingredients", "recipes", "recipe_lines", "stores", "store_items"):
+        if key not in {r["db"] for r in out}:
+            out.append({"db": key, "status": "never_run", "rows_in_rds":
+                        by_key.get(key, 0), "last_run": None,
+                        "last_full_sweep": None, "detail": None})
+            blocked.append(key)
+    return {"databases": out, "blocked": sorted(set(blocked))}
+
+
 # ── stays ───────────────────────────────────────────────────────────────────
 
 _STAY_COLS = ("id, start_date, end_date, source, shop_date, confirmed_at, notes")
@@ -119,6 +175,7 @@ def shopping_list(fetch, stay_id: int) -> dict:
         seed=load_config(fetch, "store_rank_seed"),
         store_zones_by_chain=store_zones(fetch))
     groups = prep_math.group_by_store(lines)
+    sync = sync_status(fetch)
     flags: dict = {}
     for ln in lines:
         for f in ln["flags"]:
@@ -136,6 +193,11 @@ def shopping_list(fetch, stay_id: int) -> dict:
         "stores": groups,
         "item_count": len(lines),
         "flags": flags,
+        # THE LIST SAYS WHEN IT CANNOT BE TRUSTED. An unsynced database removes
+        # quantities or stores from the calculation, and the result is a SHORT
+        # list that looks finished. See sync_status().
+        "sync": sync,
+        "incomplete": bool(sync["blocked"]),
         "day_count": len({r["day_date"] for r in state["stay_days"]}),
         "menu_days": [
             {"day": d.isoformat(),
