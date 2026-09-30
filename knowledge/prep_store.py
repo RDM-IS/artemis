@@ -15,7 +15,7 @@ Notion. Stays and menus are resolved on the box and read back from RDS here.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from knowledge import prep_math
 
@@ -204,10 +204,9 @@ def shopping_list(fetch, stay_id: int) -> dict:
         "sync": sync,
         "incomplete": bool(sync["blocked"]),
         "day_count": len({r["day_date"] for r in state["stay_days"]}),
-        "menu_days": [
-            {"day": d.isoformat(),
-             "meals": sum(1 for r in state["stay_days"] if r["day_date"] == d)}
-            for d in sorted({r["day_date"] for r in state["stay_days"]})],
+        # Every day of the stay, menu or not — see macro_check for why a missing
+        # day is worse than a day that says it has none.
+        "menu_days": _menu_days(stay, state["stay_days"]),
     }
 
 
@@ -304,6 +303,24 @@ def sessions_for(fetch, stay_id: int | None, limit: int = 20) -> list:
          ORDER BY session_date DESC, id DESC LIMIT %s""", (stay_id, limit))
 
 
+def _menu_days(stay: dict, stay_days: list) -> list:
+    """One entry per day of the stay, in order, with its meal count.
+
+    A day with no menu is reported with `meals: 0`, not omitted. Sunday 10/04 —
+    a travel day whose default row does not exist in Notion — was vanishing from
+    the list entirely, which reads as a day that is fine rather than a gap.
+    """
+    counts: dict = {}
+    for r in stay_days:
+        counts[r["day_date"]] = counts.get(r["day_date"], 0) + 1
+    out = []
+    d = stay["start_date"]
+    while d <= stay["end_date"]:
+        out.append({"day": d.isoformat(), "meals": counts.get(d, 0)})
+        d += timedelta(days=1)
+    return out
+
+
 # ── pantry ──────────────────────────────────────────────────────────────────
 
 #: The preferred live store item per ingredient — the one whose package the
@@ -395,6 +412,7 @@ def macro_check(fetch, stay_id: int) -> dict:
     report every day as comfortably inside a limit nothing measured, which is the
     one wrong answer that looks like good news.
     """
+    stay = get_stay(fetch, stay_id)
     trows = fetch(
         "SELECT kcal, protein_g, carb_g, fat_g, fiber_g, sugar_g, "
         "       plant_meals_min, set_by, provisional, effective_from "
@@ -440,9 +458,32 @@ def macro_check(fetch, stay_id: int) -> dict:
 
     no_data = [k for k in ("sugar_g", "plant_meals_min") if t.get(k) is not None]
 
+    # EVERY DAY OF THE STAY APPEARS, including the ones with no menu.
+    #
+    # Sunday 10/04 was simply missing from the list, because it is a travel day and
+    # the `default day — travel day` row does not exist in Notion, so it has no
+    # stay_day rows to group. A day that silently vanishes reads as a day that is
+    # fine; a day that says "no menu" reads as a gap to fill. They are different
+    # answers and only one of them is true.
+    if stay is not None:
+        d = stay["start_date"]
+        while d <= stay["end_date"]:
+            by_day.setdefault(d, {
+                "totals": {k: 0.0 for k in keys}, "missing": set(),
+                "placeholder": False, "meals": 0})
+            d += timedelta(days=1)
+
     days = []
     for d in sorted(by_day):
         info = by_day[d]
+        if info["meals"] == 0:
+            # No menu at all: report the gap and NOTHING else. Chips computed from
+            # zero totals would say "under every target", which is true of an empty
+            # day in the way that is useless.
+            days.append({"day": d.isoformat(), "meals": 0, "totals": None,
+                         "chips": [], "no_data": no_data, "placeholder": False,
+                         "missing": [], "no_menu": True})
+            continue
         chips = []
         for key in CEILINGS + FLOORS:
             limit = t.get(key)
@@ -459,5 +500,6 @@ def macro_check(fetch, stay_id: int) -> dict:
                      "totals": {k: round(v, 1) for k, v in info["totals"].items()},
                      "chips": chips, "no_data": no_data,
                      "placeholder": info["placeholder"],
-                     "missing": sorted(info["missing"])[:8]})
-    return {"target": t, "days": days}
+                     "missing": sorted(info["missing"])[:8], "no_menu": False})
+    return {"target": t, "days": days,
+            "days_without_menu": sum(1 for x in days if x["no_menu"])}
