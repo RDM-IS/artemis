@@ -130,7 +130,8 @@ def _workout_section(plan: dict | None) -> list[str]:
     # PROGRAM-2: a day seeded as intervals that is running Zone 2 says WHY, in
     # the post as well as on the card. Both read the same row, so they cannot
     # disagree -- the gate resolved the row before this message was composed.
-    if blocks.get("ran_as") == "z2_variant" and blocks.get("z2_variant_reason"):
+    if blocks.get("ran_as") == "z2_variant" and blocks.get("z2_variant_reason") \
+            and not blocks.get("row_build"):
         lines.append(f"Not intervals today: {blocks['z2_variant_reason']}.")
     if resolved.get("equipment"):
         lines.append(f"Uses: {', '.join(resolved['equipment'])}")

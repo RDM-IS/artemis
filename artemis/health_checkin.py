@@ -522,7 +522,7 @@ def _units(blocks: dict) -> list[str]:
     steady block itself (its display name is in the region map)."""
     if blocks.get("exercises"):
         return [e["name"] for e in blocks["exercises"]]
-    if blocks.get("type") == "steady":
+    if blocks.get("type") == "steady" or blocks.get("row_build"):
         return [blocks.get("display_name") or "Zone 2 Cardio"]
     return []
 
@@ -931,6 +931,9 @@ def render_plan_lines(plan: dict) -> list[str]:
     b = coerce_blocks(plan.get("blocks"))
     session_rpe = b.get("rpe_cap", plan.get("target_rpe"))
     lines: list[str] = []
+    if b.get("row_build"):
+        from artemis import row_build
+        lines.append(row_build.summary_line(b))
     if b.get("type") == "steady":
         eq = ", ".join(b.get("equipment") or [])
         rng = b.get("target_range_min")

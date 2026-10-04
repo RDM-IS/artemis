@@ -597,6 +597,7 @@ from artemis.cycle import (  # noqa: E402
 )
 from artemis import cycle as _cycle  # noqa: E402
 from knowledge import load_config as _load_config  # noqa: E402
+from artemis import row_build as _row_build  # noqa: E402
 
 CYCLE_ANCHOR = _cycle.DEFAULT_ANCHOR
 DAY_OFF_WORK = {5}                 # the wi Friday is a day off work
@@ -936,6 +937,11 @@ def _z2(week_num: int, location: str = LOCATION, location_key: str = "office", o
     if lo != hi:
         blocks["target_range_min"] = [lo, hi]
     est = hi + _prep.cooldown_min(location_key)
+    # ROW-BUILD (Ryan, 2026-10-04): on the rower, the easy session runs as the
+    # row build -- intervals at a stroke rate he can finish -- not a steady block.
+    if _row_build.applies(blocks):
+        blocks = _row_build.apply(blocks)
+        est = _row_build.est_minutes(blocks) + _prep.cooldown_min(location_key)
     return blocks, 4.0, 2, est
 
 
@@ -1021,6 +1027,12 @@ def _intervals(week_num: int, location: str = LOCATION, location_key: str = "off
         if not modality:
             blocks["no_equipment"] = True
         est = INTERVAL_WARMUP_MIN + work_min + INTERVAL_COOLDOWN_MIN
+        # ROW-BUILD: the Z2 variant on the rower is the row build. `ran_as` and
+        # its reason stay on the row -- it is still "not Zone 4 today", and the
+        # Lambda's gate tile reads them.
+        if _row_build.applies(blocks):
+            blocks = _row_build.apply(blocks)
+            est = _row_build.est_minutes(blocks)
         # target_hr_zone is an INTEGER column -- `_z2` returns 2, not "Zone 2".
         return blocks, None, 2, est
 

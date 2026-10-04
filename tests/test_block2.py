@@ -168,7 +168,10 @@ class TestTheRowsItBuilds(unittest.TestCase):
         for r in self.ROWS:
             if r["session_type"] == "cardio_intervals":
                 with self.subTest(str(r["plan_date"])):
-                    self.assertEqual(r["blocks"]["type"], "steady")
+                    # ROW-BUILD: on the rower the Z2 variant is the row build,
+                    # so the type is no longer the tell. "Not Zone 4" is.
+                    self.assertEqual(r["blocks"]["ran_as"], "z2_variant")
+                    self.assertNotIn("intervals", r["blocks"])
                     self.assertEqual(r["target_hr_zone"], 2)
 
     def test_building_block_2_does_not_change_block_1(self):

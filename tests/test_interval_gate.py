@@ -218,6 +218,8 @@ class TestAnAbsentGateIsAFail(unittest.TestCase):
 
     def test_no_gate_builds_the_z2_variant(self):
         blocks, _rpe, zone, _est = self._blocks(None)
+        # ROW-BUILD: with no date the room has no rower, so this is the plain
+        # steady Z2. The rower case is asserted on the seeded row below.
         self.assertEqual(blocks["type"], "steady")
         self.assertEqual(blocks["ran_as"], "z2_variant")
         self.assertEqual(zone, 2)
@@ -241,7 +243,11 @@ class TestAnAbsentGateIsAFail(unittest.TestCase):
         from artemis import health_office as office
         row = office.build_row(_spec())
         self.assertEqual(row["session_type"], "cardio_intervals")
-        self.assertEqual(row["blocks"]["type"], "steady")
+        # ROW-BUILD (2026-10-04): MSP home has the rower on this date, so the
+        # Z2 variant runs as the row build. What must hold is "not Zone 4".
+        self.assertEqual(row["blocks"]["ran_as"], "z2_variant")
+        self.assertNotIn("intervals", row["blocks"], "no Zone 4 prescription")
+        self.assertTrue(row["blocks"]["row_build"], "on the rower the Z2 variant is the row build")
         self.assertEqual(row["target_hr_zone"], 2)
 
 
@@ -271,7 +277,9 @@ class TestResolveDay(unittest.TestCase):
         self.assertEqual(out["outcome"], "z2_variant")
         self.assertIn("intervals cleared", out["reason"])
         blocks = json.loads(cur.upserted[0][5])
-        self.assertEqual(blocks["type"], "steady")
+        self.assertEqual(blocks["ran_as"], "z2_variant")
+        self.assertNotIn("intervals", blocks, "no Zone 4 prescription")
+        self.assertTrue(blocks["row_build"], "on the rower the Z2 variant is the row build")
         self.assertIn("intervals cleared", blocks["z2_variant_reason"])
         self.assertEqual(cur.upserted[0][7], 2)
 
@@ -280,7 +288,9 @@ class TestResolveDay(unittest.TestCase):
         out = self._resolve(cur)
         self.assertEqual(out["outcome"], "z2_variant")
         self.assertIn("couldn't check", out["reason"])
-        self.assertEqual(json.loads(cur.upserted[0][5])["type"], "steady")
+        written = json.loads(cur.upserted[0][5])
+        self.assertEqual(written["ran_as"], "z2_variant")
+        self.assertNotIn("intervals", written, "no Zone 4 prescription")
 
     def test_one_decision_row_per_day_and_the_day_is_marked(self):
         cur = self._cur()
@@ -343,6 +353,23 @@ class TestTheCardAndThePostAgree(unittest.TestCase):
                 "est_duration_min": 55, "plan_date": INTERVAL_DAY}
         lines = wake._workout_section(plan)
         text = "\n".join(lines)
+        # ROW-BUILD (2026-10-04): this day is on the rower, so it runs the row
+        # build. The interval card does not show the Zone 4 reason for that
+        # shape, so the post does not either -- they still agree -- and the row
+        # keeps the reason for the gate tile.
+        self.assertTrue(blocks["row_build"])
+        self.assertIn("intervals cleared", blocks["z2_variant_reason"])
+        self.assertNotIn("Not intervals today:", text)
+        self.assertIn("Row build", text)
+
+    def test_off_the_rower_the_post_quotes_the_reason_the_card_carries(self):
+        from artemis import wake
+        blocks = {"type": "steady", "display_name": "Zone 2 – Bike", "ran_as": "z2_variant",
+                  "z2_variant_reason": "you haven't sent `intervals cleared` yet",
+                  "cardio": {"modality": "bike"}, "duration_min": 40}
+        text = "\n".join(wake._workout_section(
+            {"session_type": "cardio_intervals", "blocks": blocks,
+             "est_duration_min": 55, "plan_date": INTERVAL_DAY}))
         self.assertIn("Not intervals today:", text)
         # The card reads blocks["z2_variant_reason"]; the post must quote it, not
         # compose its own version of why.

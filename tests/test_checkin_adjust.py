@@ -649,7 +649,9 @@ class TestFlows(unittest.TestCase):
         # EVENING-1 moved 9/25's flow to the evening; PROGRAM-2 then made that
         # Friday a Richfield cardio morning, so the nudge DOES fire now — and it
         # names the session, which is the point of the nudge.
-        self.assertIn("Zone 2", hc.nudge_text(office_row(date(2026, 9, 25))) or "")
+        # ROW-BUILD (2026-10-04): Richfield still had the rower on that date, so
+        # the session it names is the row build.
+        self.assertIn("Row build", hc.nudge_text(office_row(date(2026, 9, 25))) or "")
         self.assertIsNone(hc.nudge_text(None))
 
     def test_a_pain_day_off_clears_the_evening_too(self):

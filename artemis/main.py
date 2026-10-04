@@ -4967,6 +4967,41 @@ def _handle_intervals_cleared(post: dict, question: str) -> bool:
     return True
 
 
+# ROW-BUILD: `row repeat` — hold the row build at the step just rowed.
+_ROW_REPEAT_RE = re.compile(r"^\s*row\s+repeat\s*[.!]*\s*$", re.I)
+
+
+def _handle_row_repeat(post: dict, question: str) -> bool:
+    """`row repeat` — the clock ran out but the stroke rate did not hold. A water
+    rower reports nothing, so only Ryan can say; this keeps the next row day on
+    the same step. It names ONE session, so it cannot outlive it."""
+    if not _ROW_REPEAT_RE.match(question or ""):
+        return False
+    from artemis import row_build
+    from artemis.quiet_hours import local_today
+    from knowledge.db import get_connection
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        with get_connection() as conn:
+            got = row_build.hold_last(conn.cursor(), local_today())
+    except Exception:
+        logger.exception("row repeat: could not store the hold")
+        if _mm:
+            _mm.post_message(channel_id, "I couldn't store that — nothing changed. "
+                                         "The traceback is in the log.", root_id=root_id)
+        return True
+    if _mm:
+        if got["held"]:
+            spec = row_build.step_spec(got["step"])
+            text = (f"Held — your next row day repeats step {got['step']} "
+                    f"({row_build.describe(spec)}), the one you rowed {got['plan_date']}.")
+        else:
+            text = "There's no logged row-build session to repeat yet — nothing changed."
+        _mm.post_message(channel_id, text, root_id=root_id)
+    return True
+
+
 # WEEK-AHEAD: `week ahead` — read-only lookahead, no confirm.
 _WEEK_AHEAD_RE = re.compile(r"^\s*week\s+ahead\s*[.!?]*\s*$", re.I)
 
@@ -5341,6 +5376,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         ("week_ahead", _handle_week_ahead),
         # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
         ("intervals_cleared", _handle_intervals_cleared),
+        # ROW-BUILD `row repeat` — deterministic, ahead of the LLM.
+        ("row_repeat", _handle_row_repeat),
         ("cardio_detect", _handle_cardio_detect),
         ("away_confirm", _handle_away_confirm),
         ("bw_circuit_confirm", _handle_bw_circuit_confirm),

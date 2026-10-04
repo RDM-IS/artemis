@@ -577,6 +577,17 @@ class ArtemisScheduler:
                 interval_gate.resolve_day(conn.cursor(), _local_today())
         except Exception:
             logger.exception("Interval gate resolve failed — the day stays Zone 2")
+        # ROW-BUILD: AFTER the gate, which may have just rebuilt the row. Sets
+        # today's rower session to the step the logs say. Its own transaction and
+        # its own failure: an unresolved row still carries step 1's shape and
+        # says the step is not confirmed, so the post goes out either way.
+        try:
+            from artemis import row_build
+            from knowledge.db import get_connection
+            with get_connection() as conn:
+                row_build.resolve_day(conn.cursor(), _local_today())
+        except Exception:
+            logger.exception("Row build resolve failed — the row stays as seeded")
         held = take_holds("health")
         # Ryan can check in before the wake post. Then the post doesn't ask
         # again and the check-in key is left as it is.
