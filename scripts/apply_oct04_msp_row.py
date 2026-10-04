@@ -12,7 +12,11 @@ being written by hand. Saturday is left alone: unlogged, it reads as missed.
 
 Guarded both ways: the md5 over every row OUTSIDE the day proves nothing else
 moved, AND the rebuilt row is re-read and matched -- including that it is a
-`cardio_z2` on `row`, which is the whole point of the change.
+cardio on `row`, which is the whole point of the change.
+
+The day already carried a richfield override (the original travel plan). The
+newer msp_home one wins -- `cycle.override_for()` reads newest first -- and the
+older row is left in place as history rather than revoked.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ sys.path.insert(0, ".")
 DAYS = (date(2026, 10, 4),)
 LOCATION_KEY = "msp_home"
 REASON = "Ryan 2026-10-04: in MSP a day early; Z2 on the rower at msp_home, not the bike"
-EXPECT_TYPE = "cardio_z2"
+CARDIO_TYPES = ("cardio_z2", "cardio_intervals")
 EXPECT_MODALITY = "row"
 
 
@@ -66,7 +70,8 @@ def main() -> int:
             pcur = pre.cursor()
             pcur.execute(
                 "SELECT 1 FROM acos.cycle_day_overrides WHERE start_date = %s "
-                "AND end_date = %s AND revoked_at IS NULL", (DAYS[0], DAYS[-1]))
+                "AND end_date = %s AND location = %s AND revoked_at IS NULL",
+                (DAYS[0], DAYS[-1], LOCATION_KEY))
             if pcur.fetchone() is None:
                 pcur.execute(
                     "INSERT INTO acos.cycle_day_overrides "
@@ -83,7 +88,8 @@ def main() -> int:
 
         cur.execute(
             "SELECT 1 FROM acos.cycle_day_overrides WHERE start_date = %s "
-            "AND end_date = %s AND revoked_at IS NULL", (DAYS[0], DAYS[-1]))
+            "AND end_date = %s AND location = %s AND revoked_at IS NULL",
+                (DAYS[0], DAYS[-1], LOCATION_KEY))
         have_override = cur.fetchone() is not None
         print(f"location override already present: {have_override}")
 
@@ -109,13 +115,13 @@ def main() -> int:
         not_row = [f"{d} {slot}: {r['session_type']} on "
                    f"{(r['blocks'].get('cardio') or {}).get('modality')}"
                    for (d, slot), r in sorted(built.items())
-                   if r["session_type"] == EXPECT_TYPE
+                   if r["session_type"] in CARDIO_TYPES
                    and (r["blocks"].get("cardio") or {}).get("modality") != EXPECT_MODALITY]
-        if not any(r["session_type"] == EXPECT_TYPE for r in built.values()):
-            not_row.append(f"no {EXPECT_TYPE} row is built for {DAYS[0]}")
+        if not any(r["session_type"] in CARDIO_TYPES for r in built.values()):
+            not_row.append(f"no cardio row is built for {DAYS[0]}")
         if not_row and args.commit:
             conn.rollback()
-            print("\nABORTED — not a Z2 row: " + "; ".join(not_row))
+            print("\nABORTED — not cardio on the rower: " + "; ".join(not_row))
             return 1
         if not_row:
             print("WOULD ABORT on commit — " + "; ".join(not_row))
