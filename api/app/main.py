@@ -18,6 +18,7 @@ from .routers import (
     organizations, contacts, deals, interactions,
     commitments, invoices, founder_loans, webhooks,
     dashboard, health as health_router, prep as prep_router,
+    nutrition_export as nutrition_export_router,
 )
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=True)
@@ -61,6 +62,11 @@ app.include_router(health_router.router, prefix="/api/health", tags=["health"])
 # router's own routes) rather than one here, so the two cannot be mounted with
 # different auth by accident.
 app.include_router(prep_router.router, prefix="/api/prep", tags=["prep"])
+# HEALTH-EXPORT-1 — settled nutrition days -> an iOS Shortcut -> Apple Health.
+# Its own key (verify_health_export_key, declared on each route): the display
+# key is rejected here and this key is rejected everywhere else.
+app.include_router(nutrition_export_router.router, prefix="/api/nutrition/export",
+                   tags=["nutrition-export"])
 
 @app.get("/health")
 @app.get("/default/rdmis-crm-api/health")

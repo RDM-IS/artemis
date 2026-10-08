@@ -149,6 +149,19 @@ def get_watch_ingest_key() -> str:
     return secret["api_key"]
 
 
+def get_health_export_key() -> str:
+    """Returns the HEALTH-EXPORT-1 key used by /api/nutrition/export/* ONLY.
+
+    Its own key for the same reason the watch ingest has one (HARDEN-1): it
+    lives in an iOS Shortcut on Ryan's phone. It is rejected on every other
+    route, and every other key is rejected on these, so a leak exposes settled
+    per-slot macro totals and nothing else — not the plan, not sessions, not
+    weight.
+    Secret name: rdmis/dev/health-export-key"""
+    secret = get_secret("rdmis/dev/health-export-key")
+    return secret["api_key"]
+
+
 def get_vault_repo() -> dict:
     """Returns {clone_url, token} for the private Obsidian vault repo (PB-011).
     Token is a fine-grained, READ-ONLY PAT (Contents: read) scoped to RDM-IS/vault.
