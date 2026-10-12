@@ -177,6 +177,12 @@ OVERRIDE_TIMEOUT_MINUTES = int(os.environ.get("OVERRIDE_TIMEOUT_MINUTES", "30"))
 # check-in but never rewrites today's plan. The nudge fires this many minutes
 # after WAKE_TIME when no check-in has arrived (training days only).
 CHECKIN_ADJUST = os.environ.get("CHECKIN_ADJUST", "1").strip().lower() not in ("0", "false", "no", "off")
+# TIMERS-PAUSED (Ryan, 2026-10-12): every scheduled job — interval and cron —
+# is off until RDMIS launch; Artemis runs on keywords only, to stop paying for
+# unattended LLM triage. Nothing is deleted: set TIMED_JOBS_ENABLED=1 in .env and
+# restart to bring the full schedule back exactly as registered. Read by
+# main.py only; ArtemisScheduler takes it as a constructor argument.
+TIMED_JOBS_ENABLED = os.environ.get("TIMED_JOBS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 CHECKIN_NUDGE_OFFSET_MIN = int(os.environ.get("CHECKIN_NUDGE_OFFSET_MIN", "45"))
 # MEAL-NUDGE: minutes BEFORE the day's quiet start. Derived from the cycle, so
 # this is a lead time and never a clock time — it moves with the day type and

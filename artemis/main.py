@@ -1579,6 +1579,36 @@ def _handle_morning_brief_command(post: dict, question: str) -> bool:
     return True
 
 
+_TRIAGE_NOW_PHRASES = frozenset({"triage now", "check email", "check mail", "poll inbox"})
+
+
+def _handle_triage_now(post: dict, question: str) -> bool:
+    """TIMERS-PAUSED — one inbox triage pass on demand, the replacement for the
+    5-minute timer. Same code path as the timer (force=True skips the open-phase
+    gate), then the batched summary. Spends tokens only when new mail exists.
+    Returns True if handled."""
+    q = question.lower().strip().rstrip("?.! ")
+    if q not in _TRIAGE_NOW_PHRASES:
+        return False
+
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    if _sched is None:
+        reply = "⚠️ Triage unavailable — scheduler not ready yet."
+    else:
+        n = _sched.job_inbox_triage(force=True)
+        if n is None:
+            reply = "⚠️ Triage failed — Gmail could not be read. Nothing was checked."
+        elif n == 0:
+            reply = "No new mail since the last pass."
+        else:
+            _sched.job_post_triage_batch(force=True)
+            reply = f"Triaged {n} new message{'' if n == 1 else 's'} — see #artemis-ops."
+    if _mm:
+        _mm.post_to_channel_id(channel_id, reply, root_id=root_id)
+    return True
+
+
 def _handle_version_command(post: dict, question: str) -> bool:
     """OPS-1 deterministic `version` — deploy-accurate version truth, never an LLM
     guess. Replies with VERSION (`1.4.0+<sha7>`), the running commit's subject line,
@@ -5333,6 +5363,9 @@ def _handle_mention(post: dict, thread: list[dict]):
         # P1/P3 on-demand morning brief — deterministic, ahead of the LLM path and
         # the `morning`-prefixed check-in classifier.
         ("morning_brief_command", _handle_morning_brief_command),
+        # TIMERS-PAUSED `triage now` — deterministic trigger; the LLM runs only
+        # inside the triage pass, never to route the command.
+        ("triage_now", _handle_triage_now),
         ("version_command", _handle_version_command),
         # COGNITION-1 `gaps` — read-only, deterministic, ahead of the LLM.
         ("gaps_command", _handle_gaps_command),
@@ -5781,7 +5814,9 @@ def _post_startup_message(mm: MattermostClient, gmail: GmailClient, calendar: Ca
         f"\u2705 Artemis online \u2014 {ts}\n"
         f"Version: {version}\n"
         f"Gmail: {gmail_status}. Calendar: {cal_status}. "
-        f"Scheduler: {job_count} jobs running."
+        + (f"Scheduler: {job_count} jobs running."
+           if sched.timers_enabled else
+           "Scheduler: timers PAUSED — keywords only (`triage now`, `morning brief`).")
     )
     try:
         mm.post_message(config.CHANNEL_OPS, msg)
@@ -5928,7 +5963,8 @@ def main():
     _mm.start_websocket()
 
     # Start scheduler
-    _sched = ArtemisScheduler(_mm, _gmail, _calendar)
+    _sched = ArtemisScheduler(_mm, _gmail, _calendar,
+                              timers_enabled=config.TIMED_JOBS_ENABLED)
     _sched.start()
 
     # Run catch-up processing for any gap since last run
