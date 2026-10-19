@@ -600,6 +600,13 @@ class LogSetIn(BaseModel):
     hr_peak: Optional[int] = Field(default=None, ge=0, le=300)
     is_skipped: bool = False
     notes: Optional[str] = None
+    #: ROW-CIRCUIT (migration 055): strokes/min HELD in a rowing block, and the
+    #: block's own window from the iPad's clock. `logged_at` is insert time and
+    #: cannot bound an exercise saved minutes later on a record card; these can,
+    #: which is what per-exercise heart rate is computed over.
+    stroke_rate: Optional[int] = Field(default=None, ge=10, le=60)
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
 
 
 class HrZonesOut(BaseModel):
@@ -816,6 +823,12 @@ def post_log(
             status_code=400,
             detail={"error": "empty_sets"},
         )
+    for s in body.sets:
+        if s.started_at and s.ended_at and s.ended_at < s.started_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "window_reversed",
+                        "fix": "ended_at must not be before started_at"})
 
     # DELETED 2026-09-25: this used to fall back to "today's morning row" when
     # plan_id was omitted, so a log could attach to whatever happened to be
@@ -860,14 +873,16 @@ def post_log(
             duration_sec, distance_m,
             hr_avg, hr_peak, rpe_actual,
             notes, is_skipped, logged_via,
-            modality, device, adhoc_session_type
+            modality, device, adhoc_session_type,
+            stroke_rate, started_at, ended_at
         ) VALUES (
             :plan_id, :log_type, :exercise,
             :set_num, :reps_done, :weight_lbs,
             :duration_sec, :distance_m,
             :hr_avg, :hr_peak, :rpe_actual,
             :notes, :is_skipped, :logged_via,
-            :modality, :device, :adhoc_session_type
+            :modality, :device, :adhoc_session_type,
+            :stroke_rate, :started_at, :ended_at
         )
         RETURNING log_id, plan_id, log_type, exercise,
                   set_num, reps_done, weight_lbs,
@@ -898,6 +913,9 @@ def post_log(
                     "modality": body.modality,
                     "device": body.device,
                     "adhoc_session_type": adhoc_type,
+                    "stroke_rate": s.stroke_rate,
+                    "started_at": s.started_at,
+                    "ended_at": s.ended_at,
                 },
             ).mappings().first()
             if row is not None:
@@ -928,6 +946,12 @@ def post_log(
                     "modality": None,
                     "device": None,
                     "adhoc_session_type": adhoc_type,
+                    # ROW-CIRCUIT (055): the summary has no stroke rate or window
+                    # of its own. Bound explicitly -- an unbound name 500s every
+                    # POST that carries session_rpe (the 043 incident).
+                    "stroke_rate": None,
+                    "started_at": None,
+                    "ended_at": None,
                 },
             ).mappings().first()
             if row is not None:
@@ -2432,6 +2456,59 @@ def get_library(
     lib["stale"] = lib.get("generated_on") != today
     lib["today"] = today
     return lib
+
+
+# ---------------------------------------------------------------------------
+# /row-circuit — ROW-CIRCUIT (Ryan, 2026-10-19). The start screen's
+# prescription: today's rounds as "+1 stroke/min" or "+1:00 each round" over
+# the last session he logged, the default being the lever that did not move
+# last time. The math is knowledge.row_circuit; this only reads the history.
+#
+# FAIL-CLOSED-RESOLVERS: a failed history read is NOT "no history". It returns
+# available False with the reason; it never falls back to the first-session
+# ladder, which would quietly reset months of progression to 20 strokes/min.
+# ---------------------------------------------------------------------------
+
+@router.get("/row-circuit")
+def get_row_circuit(
+    rounds: Optional[int] = Query(default=None, ge=1, le=8),
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    from knowledge import row_circuit as rc
+    try:
+        tz = _active_timezone(db)
+        params = {"t": rc.SESSION_TYPE, "tz": tz, "row": rc.ROW_EXERCISE}
+        row_rows = db.execute(text("""
+            SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
+                   duration_sec, stroke_rate, logged_at
+            FROM health.session_log
+            WHERE adhoc_session_type = :t AND log_type = 'cardio_block'
+              AND exercise = :row AND logged_via <> 'inferred'
+              AND stroke_rate IS NOT NULL AND started_at IS NOT NULL
+            ORDER BY started_at DESC
+            LIMIT 64
+        """), params).mappings().all()
+        rep_rows = db.execute(text("""
+            SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
+                   exercise, reps_done, logged_at
+            FROM health.session_log
+            WHERE adhoc_session_type = :t AND log_type = 'strength_set'
+              AND logged_via <> 'inferred' AND started_at IS NOT NULL
+              AND reps_done IS NOT NULL
+            ORDER BY started_at DESC
+            LIMIT 128
+        """), params).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("row-circuit: history read failed")
+        return {"available": False,
+                "reason": "Couldn't read your last row circuit, so there is no "
+                          "prescription. Nothing was reset."}
+    history = rc.group_history([dict(r) for r in row_rows])
+    out = rc.prescription(history, rounds)
+    out["available"] = True
+    out["last_reps"] = rc.last_reps([dict(r) for r in rep_rows])
+    return out
 
 
 # ---------------------------------------------------------------------------
