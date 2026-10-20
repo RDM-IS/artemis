@@ -239,6 +239,11 @@ class TestDidNotFinish(unittest.TestCase):
         p = rc.prescription(h, 1)
         self.assertTrue(p["options"]["rate"]["ok"])
 
+    def test_the_first_ever_session_defaults_to_the_ladder_itself(self):
+        p = rc.prescription([], 6, "ladder")
+        self.assertEqual(p["default"], "repeat")
+        self.assertEqual(rates(p["options"]["repeat"]), [20, 21, 22, 23, 24, 25])
+
     def test_rows_from_before_056_still_read_as_held_and_finished(self):
         rows = [{"day": date(2031, 3, 10), "set_num": 1, "duration_sec": 200,
                  "stroke_rate": 15, "logged_at": T0}]
