@@ -2472,24 +2472,32 @@ def get_library(
 @router.get("/row-circuit")
 def get_row_circuit(
     rounds: Optional[int] = Query(default=None, ge=1, le=8),
+    #: ROW-LADDER: `ladder` is the rower-only climb. Its history is its own,
+    #: keyed by the exercise on its Row blocks (knowledge.row_circuit.KINDS).
+    kind: str = Query(default="circuit", pattern="^(circuit|ladder)$"),
     db: Session = Depends(get_db),
     _api_key: str = Depends(verify_health_api_key),
 ) -> dict[str, Any]:
     from knowledge import row_circuit as rc
+    spec = rc.kind_spec(kind)
     try:
         tz = _active_timezone(db)
-        params = {"t": rc.SESSION_TYPE, "tz": tz, "row": rc.ROW_EXERCISE}
+        params = {"t": spec["session_type"], "tz": tz, "row": spec["exercise"]}
+        # Identity is the exercise name + a stroke rate, NOT adhoc_session_type:
+        # a ladder run as the day's planned cardio is logged against its
+        # plan_id, and it must still count. stroke_rate is written only by the
+        # row screens, so no other cardio log can match.
         row_rows = db.execute(text("""
             SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
                    duration_sec, stroke_rate, logged_at
             FROM health.session_log
-            WHERE adhoc_session_type = :t AND log_type = 'cardio_block'
+            WHERE log_type = 'cardio_block'
               AND exercise = :row AND logged_via <> 'inferred'
               AND stroke_rate IS NOT NULL AND started_at IS NOT NULL
             ORDER BY started_at DESC
             LIMIT 64
         """), params).mappings().all()
-        rep_rows = db.execute(text("""
+        rep_rows = [] if not spec["floor"] else db.execute(text("""
             SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
                    exercise, reps_done, logged_at
             FROM health.session_log
@@ -2502,10 +2510,10 @@ def get_row_circuit(
     except SQLAlchemyError:
         logger.exception("row-circuit: history read failed")
         return {"available": False,
-                "reason": "Couldn't read your last row circuit, so there is no "
+                "reason": f"Couldn't read your last {spec['display_name'].lower()}, so there is no "
                           "prescription. Nothing was reset."}
     history = rc.group_history([dict(r) for r in row_rows])
-    out = rc.prescription(history, rounds)
+    out = rc.prescription(history, rounds, kind)
     out["available"] = True
     out["last_reps"] = rc.last_reps([dict(r) for r in rep_rows])
     return out

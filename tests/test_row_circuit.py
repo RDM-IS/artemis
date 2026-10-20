@@ -164,5 +164,36 @@ class TestGroupHistory(unittest.TestCase):
         self.assertEqual(rc.last_reps(rows), {"1": {"Push-up": 5}, "2": {"Dead bug": 6}})
 
 
+
+class TestLadder(unittest.TestCase):
+    """ROW-LADDER: the same climb with no floor work and its own defaults."""
+
+    def test_no_floor_work_but_one_entry_per_round(self):
+        p = rc.prescription([], None, "ladder")
+        self.assertEqual(p["rounds"], rc.KINDS["ladder"]["default_rounds"])
+        self.assertEqual(p["stations"], [[]] * p["rounds"])
+        self.assertEqual(p["session_type"], "row_ladder")
+        self.assertEqual(p["row_exercise"], "Row ladder")
+
+    def test_progresses_the_same_way(self):
+        last = session((240, 15), (240, 16))
+        p = rc.prescription([last], 2, "ladder")
+        self.assertEqual(rates(p["options"]["rate"]), [16, 17])
+        self.assertEqual(lengths(p["options"]["time"]), [300, 300])
+
+    def test_the_circuit_keeps_its_stations_and_names(self):
+        p = rc.prescription([], None, "circuit")
+        self.assertEqual(p["row_exercise"], "Row")
+        self.assertTrue(all(len(st) == 3 for st in p["stations"]))
+
+    def test_the_two_kinds_never_share_an_exercise_name(self):
+        names = [k["exercise"] for k in rc.KINDS.values()]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_an_unknown_kind_raises(self):
+        with self.assertRaises(KeyError):
+            rc.prescription([], 4, "circuitt")
+
+
 if __name__ == "__main__":
     unittest.main()

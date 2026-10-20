@@ -36,6 +36,23 @@ SESSION_TYPE = "row_circuit"
 DISPLAY_NAME = "Row circuit"
 ROW_EXERCISE = "Row"
 
+#: ROW-LADDER (Ryan, 2026-10-19 21:23): the same climb with the floor work
+#: removed -- row, rest minute, row -- and ONE record card at the end, because a
+#: card every round would stop the rowing it exists to measure. It replaces
+#: ROW-BUILD (#269, closed) on the planned rower cardio days, and runs on demand.
+#:
+#: Each kind keeps its OWN history, keyed by the exercise name on its Row
+#: blocks: 22 spm between push-up rounds is not 22 spm rowed straight, so one
+#: must never progress the other. `stroke_rate` is written only by these two
+#: screens, so exercise + stroke_rate is the identity whether a session was
+#: launched on demand (adhoc) or as the day's planned cardio (plan_id).
+KINDS: dict[str, dict] = {
+    "circuit": {"session_type": "row_circuit", "display_name": "Row circuit",
+                "exercise": "Row", "default_rounds": 4, "floor": True},
+    "ladder": {"session_type": "row_ladder", "display_name": "Row ladder",
+               "exercise": "Row ladder", "default_rounds": 6, "floor": False},
+}
+
 #: First session ever, round i (0-based) rows at START_RATE + i for START_WORK_SEC.
 #: 20/21/22/23 at 4:00 is the session he did on 2026-10-19, minus the rate he
 #: overshot in round 3.
@@ -101,9 +118,14 @@ class RowRound:
         return {"round": self.round, "work_sec": self.work_sec, "spm": self.spm}
 
 
-def clamp_rounds(n: int | None) -> int:
+def kind_spec(kind: str) -> dict:
+    """Raises KeyError on an unknown kind: a typo must not become a circuit."""
+    return KINDS[kind]
+
+
+def clamp_rounds(n: int | None, default: int = DEFAULT_ROUNDS) -> int:
     if n is None:
-        return DEFAULT_ROUNDS
+        return default
     return max(MIN_ROUNDS, min(MAX_ROUNDS, int(n)))
 
 
@@ -204,10 +226,12 @@ def stations_for_round(round_num: int) -> list[dict]:
     return out
 
 
-def prescription(history: list[list[RowRound]], rounds: int | None) -> dict:
+def prescription(history: list[list[RowRound]], rounds: int | None,
+                 kind: str = "circuit") -> dict:
     """Everything the start screen needs. `history` is newest first: one list
-    of rounds per logged session, each in round order."""
-    n = clamp_rounds(rounds)
+    of rounds per logged session of THIS kind, each in round order."""
+    spec = kind_spec(kind)
+    n = clamp_rounds(rounds, spec["default_rounds"])
     last = history[0] if history else []
     prev = history[1] if len(history) > 1 else []
     base = resize(last, n)
@@ -224,10 +248,12 @@ def prescription(history: list[list[RowRound]], rounds: int | None) -> dict:
                      if len(history) == 1 else
                      "last time didn't move one lever alone — the rate goes up first")
     else:
-        why = "no logged row circuit yet — starting the ladder"
+        why = f"no logged {spec['display_name'].lower()} yet — starting the ladder"
     return {
-        "session_type": SESSION_TYPE,
-        "display_name": DISPLAY_NAME,
+        "kind": kind,
+        "session_type": spec["session_type"],
+        "display_name": spec["display_name"],
+        "row_exercise": spec["exercise"],
         "rounds": n,
         "min_rounds": MIN_ROUNDS,
         "max_rounds": MAX_ROUNDS,
@@ -243,7 +269,9 @@ def prescription(history: list[list[RowRound]], rounds: int | None) -> dict:
             "between_moves_sec": BETWEEN_MOVES_SEC, "back_on_rower_sec": BACK_ON_ROWER_SEC,
             "cooldown_sec": COOLDOWN_SEC,
         },
-        "stations": [stations_for_round(i + 1) for i in range(n)],
+        # The ladder has no floor work: an empty list per round, not a missing
+        # key, so the screen's per-round indexing has one shape for both kinds.
+        "stations": [stations_for_round(i + 1) if spec["floor"] else [] for i in range(n)],
     }
 
 

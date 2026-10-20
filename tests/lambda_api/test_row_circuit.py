@@ -101,6 +101,18 @@ class TestPrescriptionEndpoint(unittest.TestCase):
         self.assertNotIn("options", body)
         self.assertIn("Nothing was reset", body["reason"])
 
+    def test_ladder_reads_its_own_exercise_and_no_reps(self):
+        sess = _HistorySession(rep_rows=[{"day": date(2031, 3, 10), "set_num": 1,
+                                          "exercise": "Push-up", "reps_done": 7, "logged_at": T}])
+        body = self._get(sess, "?kind=ladder").json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["session_type"], "row_ladder")
+        self.assertEqual(body["last_reps"], {})
+        self.assertEqual([p["row"] for p in sess.params], ["Row ladder"])
+
+    def test_an_unknown_kind_is_refused(self):
+        self.assertEqual(self._get(_HistorySession(), "?kind=sprint").status_code, 422)
+
     def test_rounds_out_of_range_is_refused(self):
         self.assertEqual(self._get(_HistorySession(), "?rounds=9").status_code, 422)
 
