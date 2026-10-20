@@ -113,6 +113,13 @@ class TestPrescriptionEndpoint(unittest.TestCase):
     def test_an_unknown_kind_is_refused(self):
         self.assertEqual(self._get(_HistorySession(), "?kind=sprint").status_code, 422)
 
+    def test_a_ride_reads_heart_rate_columns(self):
+        sess = _HistorySession()
+        body = self._get(sess, "?kind=ride").json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["unit"], "bpm")
+        self.assertEqual([p["row"] for p in sess.params], ["Ride ladder"])
+
     def test_rounds_out_of_range_is_refused(self):
         self.assertEqual(self._get(_HistorySession(), "?rounds=9").status_code, 422)
 
@@ -197,3 +204,40 @@ class TestLogColumns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _StrengthSession:
+    def __init__(self, row=None, fail=False):
+        self.row, self.fail = row, fail
+
+    def execute(self, stmt, params=None):
+        if "health.session_log" in str(stmt).lower():
+            if self.fail:
+                raise SQLAlchemyError("boom")
+            return _Rows([self.row] if self.row else [])
+        return _Rows([])
+
+
+class TestStrengthNext(unittest.TestCase):
+    def tearDown(self):
+        from api.app.main import app
+        from api.app.routers import health as health_router
+        app.dependency_overrides.clear()
+        health_router._HEALTH_API_KEY = None
+
+    def _get(self, sess):
+        return _client(sess).get("/api/health/strength-next", headers={"X-API-Key": VALID_KEY}).json()
+
+    def test_next_after_each(self):
+        for last, nxt in (("strength_a", "strength_b"), ("strength_b", "strength_c"),
+                          ("strength_c", "strength_a")):
+            body = self._get(_StrengthSession({"session_type": last, "at": T}))
+            self.assertEqual(body["session_type"], nxt, last)
+
+    def test_no_history_is_a(self):
+        self.assertEqual(self._get(_StrengthSession())["session_type"], "strength_a")
+
+    def test_a_failed_read_is_unavailable_never_a(self):
+        body = self._get(_StrengthSession(fail=True))
+        self.assertFalse(body["available"])
+        self.assertNotIn("session_type", body)

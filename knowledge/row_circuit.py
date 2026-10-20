@@ -51,7 +51,34 @@ KINDS: dict[str, dict] = {
                 "exercise": "Row", "default_rounds": 4, "floor": True},
     "ladder": {"session_type": "row_ladder", "display_name": "Row ladder",
                "exercise": "Row ladder", "default_rounds": 6, "floor": False},
+    # QUICK-START (Ryan, 2026-10-20): "Row in MPLS | Ride in Richfield | Run in
+    # BD -- all about the same activities: row @ spm, run @ zone, ride @ zone."
+    # The same ladder, climbing a heart-rate target in 5 bpm steps instead of a
+    # stroke rate, with the same levers and the same DNF rule. The round value
+    # is still called `spm` in the payload, and `unit` says what it is.
+    "ride": {"session_type": "ride_ladder", "display_name": "Ride ladder",
+             "exercise": "Ride ladder", "default_rounds": 6, "floor": False,
+             "unit": "bpm", "start": 110, "step": 5, "min": 90, "max": 160,
+             "modality": "bike", "device": "indoor trainer"},
+    "run": {"session_type": "run_ladder", "display_name": "Run ladder",
+            "exercise": "Run ladder", "default_rounds": 6, "floor": False,
+            "unit": "bpm", "start": 110, "step": 5, "min": 90, "max": 160,
+            "modality": "treadmill", "device": "treadmill"},
 }
+
+#: Stroke-rate kinds when a kind does not say otherwise.
+_SPM_DEFAULTS = {"unit": "spm", "start": None, "step": None, "min": None, "max": None,
+                 "modality": "row", "device": "water"}
+
+
+def spec_for(kind: str) -> dict:
+    """The kind with every default filled in. KeyError on an unknown kind."""
+    s = {**_SPM_DEFAULTS, **KINDS[kind]}
+    s["start"] = s["start"] if s["start"] is not None else START_RATE
+    s["step"] = s["step"] if s["step"] is not None else RATE_STEP
+    s["min"] = s["min"] if s["min"] is not None else MIN_RATE
+    s["max"] = s["max"] if s["max"] is not None else MAX_RATE
+    return s
 
 #: First session ever, round i (0-based) rows at START_RATE + i for START_WORK_SEC.
 #: 20/21/22/23 at 4:00 is the session he did on 2026-10-19, minus the rate he
@@ -122,7 +149,7 @@ class RowRound:
 
 def kind_spec(kind: str) -> dict:
     """Raises KeyError on an unknown kind: a typo must not become a circuit."""
-    return KINDS[kind]
+    return spec_for(kind)
 
 
 def clamp_rounds(n: int | None, default: int = DEFAULT_ROUNDS) -> int:
@@ -131,12 +158,13 @@ def clamp_rounds(n: int | None, default: int = DEFAULT_ROUNDS) -> int:
     return max(MIN_ROUNDS, min(MAX_ROUNDS, int(n)))
 
 
-def default_base(rounds: int) -> list[RowRound]:
-    """The first session ever: 20, 21, 22 … at 4:00."""
-    return [RowRound(i + 1, START_WORK_SEC, START_RATE + i) for i in range(rounds)]
+def default_base(rounds: int, start: int = START_RATE, step: int = RATE_STEP) -> list[RowRound]:
+    """The first session ever: 20, 21, 22 … at 4:00 (or 110, 115, 120 … bpm)."""
+    return [RowRound(i + 1, START_WORK_SEC, start + i * step) for i in range(rounds)]
 
 
-def resize(last: list[RowRound], rounds: int) -> list[RowRound]:
+def resize(last: list[RowRound], rounds: int, start: int = START_RATE,
+           step: int = RATE_STEP, cap: int = MAX_RATE) -> list[RowRound]:
     """Last session's rounds, fitted to today's count.
 
     Fewer rounds: the first ones (the ladder climbs, so dropping the top keeps
@@ -144,11 +172,11 @@ def resize(last: list[RowRound], rounds: int) -> list[RowRound]:
     before it, at that round's length -- the same climb continued.
     """
     if not last:
-        return default_base(rounds)
+        return default_base(rounds, start, step)
     out = [RowRound(i + 1, r.work_sec, r.spm) for i, r in enumerate(last[:rounds])]
     while len(out) < rounds:
         prev = out[-1]
-        out.append(RowRound(len(out) + 1, prev.work_sec, min(MAX_RATE, prev.spm + RATE_STEP)))
+        out.append(RowRound(len(out) + 1, prev.work_sec, min(cap, prev.spm + step)))
     return out
 
 
@@ -176,7 +204,8 @@ def default_lever(last: list[RowRound], prev: list[RowRound]) -> str:
     return "rate" if moved in (None, "time") else "time"
 
 
-def option(base: list[RowRound], lever: str | None) -> dict:
+def option(base: list[RowRound], lever: str | None, *, step: int = RATE_STEP,
+           cap: int = MAX_RATE, unit: str = "spm") -> dict:
     """One prescription. `lever` None = same as last time.
 
     `ok` False with a `reason` when a cap would be crossed; the option is then
@@ -186,14 +215,15 @@ def option(base: list[RowRound], lever: str | None) -> dict:
     rounds: list[RowRound] = []
     for r in base:
         if lever == "rate":
-            rounds.append(RowRound(r.round, r.work_sec, r.spm + RATE_STEP))
+            rounds.append(RowRound(r.round, r.work_sec, r.spm + step))
         elif lever == "time":
             rounds.append(RowRound(r.round, r.work_sec + TIME_STEP_SEC, r.spm))
         else:
             rounds.append(r)
     reason = None
-    if any(r.spm > MAX_RATE for r in rounds):
-        reason = f"a round would go above {MAX_RATE} strokes/min"
+    if any(r.spm > cap for r in rounds):
+        reason = (f"a round would go above {cap} strokes/min" if unit == "spm"
+                  else f"a round would go above {cap} bpm")
     elif any(r.work_sec > MAX_WORK_SEC for r in rounds):
         reason = f"a round would go past {MAX_WORK_SEC // 60} min"
     return {
@@ -202,17 +232,19 @@ def option(base: list[RowRound], lever: str | None) -> dict:
         "reason": reason,
         "rounds": [r.as_dict() for r in rounds],
         "row_sec": sum(r.work_sec for r in rounds),
-        "label": label_for(lever, rounds),
+        "label": label_for(lever, rounds, unit=unit, step=step),
     }
 
 
-def label_for(lever: str | None, rounds: list[RowRound]) -> str:
+def label_for(lever: str | None, rounds: list[RowRound], *, unit: str = "spm",
+              step: int = RATE_STEP) -> str:
     rates = "/".join(str(r.spm) for r in rounds)
     lengths = sorted({r.work_sec for r in rounds})
     length = (_clock(lengths[0]) if len(lengths) == 1
               else "/".join(_clock(r.work_sec) for r in rounds))
-    head = {"rate": "+1 stroke/min", "time": "+1:00 each round"}.get(lever or "", "Same as last time")
-    return f"{head} — {rates} spm · {length}"
+    up = "+1 stroke/min" if unit == "spm" else f"+{step} bpm"
+    head = {"rate": up, "time": "+1:00 each round"}.get(lever or "", "Same as last time")
+    return f"{head} — {rates} {unit} · {length}"
 
 
 def _clock(sec: int) -> str:
@@ -234,17 +266,19 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
     of rounds per logged session of THIS kind, each in round order."""
     spec = kind_spec(kind)
     n = clamp_rounds(rounds, spec["default_rounds"])
+    kw = {"step": spec["step"], "cap": spec["max"], "unit": spec["unit"]}
     last = history[0] if history else []
     prev = history[1] if len(history) > 1 else []
-    base = resize(last, n)
+    base = resize(last, n, spec["start"], spec["step"], spec["max"])
     default = default_lever(last, prev)
-    options = {lv: option(base, lv) for lv in LEVERS}
+    options = {lv: option(base, lv, **kw) for lv in LEVERS}
     # ROW-DNF (Ryan, 2026-10-20): "if I can't do all sets at their target, we
     # shouldn't advance." Only rounds he is doing again today count: a round
     # dropped by choosing fewer rounds is not being repeated.
     unfinished = [r for r in last[:n] if not r.finished]
     if unfinished:
-        words = ", ".join(f"round {r.round} ({r.spm} spm, {_clock(r.work_sec)})" for r in unfinished)
+        words = ", ".join(f"round {r.round} ({r.spm} {spec['unit']}, {_clock(r.work_sec)})"
+                          for r in unfinished)
         for lv in LEVERS:
             options[lv]["ok"] = False
             options[lv]["reason"] = f"last time {words} wasn't finished — repeat it first"
@@ -281,7 +315,10 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
         "base": [r.as_dict() for r in base],
         "has_history": bool(history),
         "last_rounds": len(last),
-        "options": {**options, "repeat": option(base, None)},
+        "options": {**options, "repeat": option(base, None, **kw)},
+        "unit": spec["unit"], "step": spec["step"],
+        "value_min": spec["min"], "value_max": spec["max"],
+        "modality": spec["modality"], "device": spec["device"],
         "unfinished": [r.as_dict() for r in unfinished],
         "default": default,
         "why": why,

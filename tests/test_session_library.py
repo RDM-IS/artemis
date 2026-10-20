@@ -119,9 +119,13 @@ class TestMakeupState(unittest.TestCase):
         self.assertEqual(sl.makeup_state(rows, self.TODAY, self.WS)["not_done"], [])
 
     def test_extras_only_in_the_general_list(self):
-        from knowledge.session_types import is_training
-        for st in sl.LIBRARY_TYPES:
+        # QUICK-START (2026-10-20): strength A/B/C joined the library for the
+        # Strength button; every OTHER entry is still a low-impact extra.
+        from knowledge.session_types import EXTRA_TYPES, is_training
+        for st in EXTRA_TYPES:
             self.assertFalse(is_training(st), st)
+        self.assertEqual(set(sl.LIBRARY_TYPES) - set(EXTRA_TYPES),
+                         {"strength_a", "strength_b", "strength_c"})
 
 
 class TestExtras(unittest.TestCase):
@@ -129,10 +133,15 @@ class TestExtras(unittest.TestCase):
 
     def test_every_room_offers_all_extras(self):
         lib = _build()
+        from artemis import health_office as office
         for loc in lib["locations"]:
-            self.assertEqual([s["session_type"] for s in loc["sessions"]],
-                             ["recovery_flow", "core", "mobility", "yoga_strength"],
+            types = [s["session_type"] for s in loc["sessions"]]
+            self.assertEqual(types[:4], ["recovery_flow", "core", "mobility", "yoga_strength"],
                              loc["key"])
+            # QUICK-START: strength only where the room can hold it.
+            want = [t for t in ("strength_a", "strength_b", "strength_c")
+                    if office.can_hold(loc["key"], t)]
+            self.assertEqual(types[4:], want, loc["key"])
 
     def test_core_is_light_and_says_when(self):
         e = sl.entry_for("core", "office", D)

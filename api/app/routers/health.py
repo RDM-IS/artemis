@@ -612,6 +612,9 @@ class LogSetIn(BaseModel):
     target_spm: Optional[int] = Field(default=None, ge=10, le=60)
     target_sec: Optional[int] = Field(default=None, ge=1, le=3600)
     dnf: Optional[bool] = None
+    #: QUICK-START (migration 057): the heart-rate target of a ride or run
+    #: ladder round. What he held goes in hr_avg.
+    target_bpm: Optional[int] = Field(default=None, ge=60, le=220)
 
 
 class HrZonesOut(BaseModel):
@@ -880,7 +883,7 @@ def post_log(
             notes, is_skipped, logged_via,
             modality, device, adhoc_session_type,
             stroke_rate, started_at, ended_at,
-            target_spm, target_sec, dnf
+            target_spm, target_sec, dnf, target_bpm
         ) VALUES (
             :plan_id, :log_type, :exercise,
             :set_num, :reps_done, :weight_lbs,
@@ -889,7 +892,7 @@ def post_log(
             :notes, :is_skipped, :logged_via,
             :modality, :device, :adhoc_session_type,
             :stroke_rate, :started_at, :ended_at,
-            :target_spm, :target_sec, :dnf
+            :target_spm, :target_sec, :dnf, :target_bpm
         )
         RETURNING log_id, plan_id, log_type, exercise,
                   set_num, reps_done, weight_lbs,
@@ -926,6 +929,7 @@ def post_log(
                     "target_spm": s.target_spm,
                     "target_sec": s.target_sec,
                     "dnf": s.dnf,
+                    "target_bpm": s.target_bpm,
                 },
             ).mappings().first()
             if row is not None:
@@ -965,6 +969,7 @@ def post_log(
                     "target_spm": None,
                     "target_sec": None,
                     "dnf": None,
+                    "target_bpm": None,
                 },
             ).mappings().first()
             if row is not None:
@@ -2487,7 +2492,7 @@ def get_row_circuit(
     rounds: Optional[int] = Query(default=None, ge=1, le=8),
     #: ROW-LADDER: `ladder` is the rower-only climb. Its history is its own,
     #: keyed by the exercise on its Row blocks (knowledge.row_circuit.KINDS).
-    kind: str = Query(default="circuit", pattern="^(circuit|ladder)$"),
+    kind: str = Query(default="circuit", pattern="^(circuit|ladder|ride|run)$"),
     db: Session = Depends(get_db),
     _api_key: str = Depends(verify_health_api_key),
 ) -> dict[str, Any]:
@@ -2500,7 +2505,24 @@ def get_row_circuit(
         # a ladder run as the day's planned cardio is logged against its
         # plan_id, and it must still count. stroke_rate is written only by the
         # row screens, so no other cardio log can match.
-        row_rows = db.execute(text("""
+        # Two fixed statements, chosen by the kind's unit -- never a column name
+        # built from input. A heart-rate ladder's held value is hr_avg and its
+        # target target_bpm; they come back under the stroke-rate names so one
+        # grouping function reads both.
+        if spec["unit"] == "bpm":
+            history_sql = """
+            SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
+                   duration_sec, hr_avg AS stroke_rate, logged_at,
+                   target_bpm AS target_spm, target_sec, dnf
+            FROM health.session_log
+            WHERE log_type = 'cardio_block'
+              AND exercise = :row AND logged_via <> 'inferred'
+              AND target_bpm IS NOT NULL AND started_at IS NOT NULL
+            ORDER BY started_at DESC
+            LIMIT 64
+            """
+        else:
+            history_sql = """
             SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
                    duration_sec, stroke_rate, logged_at,
                    target_spm, target_sec, dnf
@@ -2511,7 +2533,8 @@ def get_row_circuit(
               AND started_at IS NOT NULL
             ORDER BY started_at DESC
             LIMIT 64
-        """), params).mappings().all()
+            """
+        row_rows = db.execute(text(history_sql), params).mappings().all()
         rep_rows = [] if not spec["floor"] else db.execute(text("""
             SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
                    exercise, reps_done, logged_at
@@ -2532,6 +2555,46 @@ def get_row_circuit(
     out["available"] = True
     out["last_reps"] = rc.last_reps([dict(r) for r in rep_rows])
     return out
+
+
+# ---------------------------------------------------------------------------
+# /strength-next — QUICK-START (Ryan, 2026-10-20): the Strength button gives
+# "next in rotation": A -> B -> C after the last strength session he LOGGED,
+# planned or launched. The session itself is the library's entry for the room
+# he picks. A failed read is unavailable, never "A": a default here would
+# silently restart the rotation.
+# ---------------------------------------------------------------------------
+
+STRENGTH_ROTATION = ("strength_a", "strength_b", "strength_c")
+
+
+@router.get("/strength-next")
+def get_strength_next(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    try:
+        row = db.execute(text("""
+            SELECT COALESCE(p.session_type, sl.adhoc_session_type) AS session_type,
+                   max(sl.logged_at) AS at
+            FROM health.session_log sl
+            LEFT JOIN health.plan p ON p.plan_id = sl.plan_id
+            WHERE sl.logged_via <> 'inferred' AND NOT sl.is_skipped
+              AND COALESCE(p.session_type, sl.adhoc_session_type) = ANY(:types)
+            GROUP BY 1
+            ORDER BY at DESC
+            LIMIT 1
+        """), {"types": list(STRENGTH_ROTATION)}).mappings().first()
+    except SQLAlchemyError:
+        logger.exception("strength-next: read failed")
+        return {"available": False,
+                "reason": "Couldn't read your last strength session, so there is no next one."}
+    if not row:
+        return {"available": True, "session_type": STRENGTH_ROTATION[0], "after": None}
+    last = row["session_type"]
+    nxt = STRENGTH_ROTATION[(STRENGTH_ROTATION.index(last) + 1) % len(STRENGTH_ROTATION)]
+    return {"available": True, "session_type": nxt, "after": last,
+            "after_at": row["at"].isoformat() if row["at"] else None}
 
 
 # ---------------------------------------------------------------------------
