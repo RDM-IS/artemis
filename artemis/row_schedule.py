@@ -32,9 +32,10 @@ office gym, but the rower is at home: the session happens at 05:00 before he
 leaves, so the row carries `msp_home`, which also stops the wake post adding the
 office-gym departure checklist to a morning he trains at home.
 
-**Override-aware.** A day an override moves out of Minneapolis (Wisconsin, a
-trip) gets no row from this table: the cycle position says what a NORMAL day
-is, and an override says this day is not normal.
+**Override-aware, both ways.** A day an override moves OUT of Minneapolis
+(Wisconsin, a trip) gets no row. A Wisconsin day an override moves INTO
+Minneapolis gets one from `OVERRIDE_BY_POS`, because "every MPLS day" means the
+day he is there, not the day the pattern says he would be.
 
 The planned rows are `cardio_z2` with `blocks.row_kind` naming the screen, so
 no CHECK constraint changes (not an ENUM-EXPAND). The cost is that reports
@@ -59,6 +60,14 @@ ROW_BY_POS: dict[int, str] = {
     0: "ladder", 1: "circuit", 2: "ladder", 3: "circuit", 4: "ladder",
     9: "ladder", 10: "circuit", 11: "ladder", 12: "circuit", 13: "ladder",
 }
+
+#: The Wisconsin positions, for a day an OVERRIDE puts in Minneapolis (Ryan,
+#: 2026-10-19 22:18: "fix override to fit MPLS" -- 10/24-10/26 were the case).
+#: Chosen so the whole 14-day ring, filled, still never has two circuit
+#: mornings in a row: ...Thu ladder, Fri circuit, Sat ladder, Sun circuit,
+#: Mon ladder, Tue ladder... A NORMAL Wisconsin day never reaches this table,
+#: because the location check comes first.
+OVERRIDE_BY_POS: dict[int, str] = {5: "circuit", 6: "ladder", 7: "circuit", 8: "ladder"}
 
 #: Locations that mean "in Minneapolis this morning". Anything else -- a
 #: Wisconsin override, a trip -- gets no row from the table.
@@ -87,7 +96,7 @@ def kind_for(pos: int, d: date, location_key: str) -> str | None:
         return None
     if location_key not in MSP_LOCATIONS:
         return None
-    return ROW_BY_POS.get(pos)
+    return ROW_BY_POS.get(pos) or OVERRIDE_BY_POS.get(pos)
 
 
 def place(spec: dict, locations: dict) -> dict:

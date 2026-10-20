@@ -130,6 +130,42 @@ class TestOverrides(unittest.TestCase):
         self.assertNotIn("row_kind", r["blocks"])
 
 
+class TestOverrideIntoMinneapolis(unittest.TestCase):
+    """Ryan, 2026-10-19 22:18: a Wisconsin day overridden to Minneapolis is a
+    Minneapolis day, so it rows too."""
+
+    def test_the_filled_ring_never_has_two_circuits_in_a_row(self):
+        ring = {**rs.ROW_BY_POS, **rs.OVERRIDE_BY_POS}
+        self.assertEqual(set(ring), set(range(14)))
+        for pos in range(14):
+            if ring[pos] == "circuit":
+                self.assertNotEqual(ring[(pos + 1) % 14], "circuit", pos)
+
+    def test_a_wisconsin_position_rows_only_when_the_location_is_minneapolis(self):
+        d = REAL_FROM + timedelta(days=4)                 # first wk-1 Saturday after
+        while cycle.cycle_pos(d) != 6:
+            d += timedelta(days=1)
+        with patch.object(rs, "ROW_FROM", REAL_FROM):
+            self.assertIsNone(rs.kind_for(6, d, "brown_deer"))
+            self.assertEqual(rs.kind_for(6, d, "msp_home"), "ladder")
+
+    def test_an_override_weekend_in_minneapolis_is_built_as_rows(self):
+        sat = REAL_FROM
+        while cycle.cycle_pos(sat) != 6:
+            sat += timedelta(days=1)
+        days = {sat, sat + timedelta(days=1), sat + timedelta(days=2)}
+
+        def override(d, *a, **k):
+            return {"location": "msp_home"} if d in days else None
+        with patch.object(rs, "ROW_FROM", REAL_FROM), \
+             patch.object(cycle, "override_for", side_effect=override):
+            rows = office.build_rows()
+            office.validate_rows(rows)
+        got = {r["plan_date"]: r["blocks"].get("row_kind") for r in rows
+               if r["slot"] == "morning" and r["plan_date"] in days}
+        self.assertEqual([got[d] for d in sorted(days)], ["ladder", "circuit", "ladder"])
+
+
 class TestBlock2(unittest.TestCase):
     def test_block_2_mornings_follow_the_table_unless_placed_or_away(self):
         from artemis import block2
