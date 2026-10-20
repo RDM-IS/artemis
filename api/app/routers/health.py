@@ -2598,6 +2598,85 @@ def get_strength_next(
 
 
 # ---------------------------------------------------------------------------
+# /recommend — RECOMMEND (Ryan, 2026-10-20): which Start button to HIGHLIGHT.
+# Read-only; the rule is knowledge/recommend.py. Sessions and Status both read
+# this, so they cannot disagree. Any failed read -> available False, and the
+# page highlights nothing rather than something plausible.
+# ---------------------------------------------------------------------------
+
+@router.get("/recommend")
+def get_recommend(
+    db: Session = Depends(get_db),
+    _api_key: str = Depends(verify_health_api_key),
+) -> dict[str, Any]:
+    from knowledge import recommend as rec
+    try:
+        tz = ZoneInfo(_active_timezone(db))
+        now = datetime.now(tz)
+        today = now.date()
+        plan = db.execute(text("""
+            SELECT p.plan_id, p.session_type, p.blocks,
+                   EXISTS (SELECT 1 FROM health.session_log sl
+                           WHERE sl.plan_id = p.plan_id AND sl.logged_via <> 'inferred') AS logged
+            FROM health.plan p
+            WHERE p.plan_date = :d AND p.slot = 'morning'
+        """), {"d": today}).mappings().first()
+        # What was DONE, by type: a planned row's type or a launched session's.
+        done = db.execute(text("""
+            SELECT COALESCE(p.session_type, sl.adhoc_session_type) AS t, max(sl.logged_at) AS at
+            FROM health.session_log sl
+            LEFT JOIN health.plan p ON p.plan_id = sl.plan_id
+            WHERE sl.logged_via <> 'inferred' AND NOT sl.is_skipped
+              AND COALESCE(p.session_type, sl.adhoc_session_type) = ANY(:types)
+            GROUP BY 1
+        """), {"types": list(rec.STRENGTH_TYPES) + list(rec.MORE_TYPES)}).mappings().all()
+        lib_row = db.execute(text("SELECT value FROM acos.system_state WHERE key = :k"),
+                             {"k": SESSION_LIBRARY_KEY}).mappings().first()
+    except SQLAlchemyError:
+        logger.exception("recommend: read failed")
+        return {"available": False, "reason": "Couldn't read today's plan or history."}
+
+    last = {r["t"]: r["at"] for r in done if r["at"] is not None}
+    strength_times = [v for k, v in last.items() if k in rec.STRENGTH_TYPES]
+    last_strength = max(strength_times) if strength_times else None
+    next_strength = None
+    if last_strength is not None:
+        latest = max((k for k in last if k in rec.STRENGTH_TYPES), key=lambda k: last[k])
+        rot = rec.STRENGTH_TYPES
+        next_strength = rot[(rot.index(latest) + 1) % len(rot)]
+    else:
+        next_strength = rec.STRENGTH_TYPES[0]
+
+    room_holds = None
+    try:
+        lib = json.loads(lib_row["value"]) if lib_row and lib_row.get("value") else None
+        if lib:
+            key = lib.get("today_location_key")
+            loc = next((l for l in lib.get("locations", []) if l.get("key") == key), None)
+            if loc is not None:
+                room_holds = any(s.get("session_type") == next_strength
+                                 for s in loc.get("sessions", []))
+    except (TypeError, ValueError):
+        room_holds = None
+
+    blocks = plan["blocks"] if plan else None
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except ValueError:
+            blocks = None
+    out = rec.recommend(
+        now=now, planned_type=plan["session_type"] if plan else None,
+        planned_blocks=blocks, planned_logged=bool(plan and plan["logged"]),
+        room_holds_strength=room_holds, next_strength=next_strength,
+        last_strength_at=last_strength.astimezone(tz) if last_strength else None,
+        last_more={k: v for k, v in last.items() if k in rec.MORE_TYPES})
+    if out.get("available"):
+        out["plan_id"] = plan["plan_id"] if plan else None
+    return out
+
+
+# ---------------------------------------------------------------------------
 # /makeup — MAKEUP-2 (Ryan, 2026-09-27): the one session not done this program
 # week is made up on today's rest day. The missed row becomes rest ("made up
 # on <date>"); today's rest row becomes the session, as the box's seeder built
