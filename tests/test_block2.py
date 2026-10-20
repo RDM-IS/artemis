@@ -9,6 +9,25 @@ from datetime import date, timedelta
 from artemis import block2, health_office as office
 from knowledge import load_config as lc, progression as pr
 
+# ROW-SCHEDULE (2026-10-19): block 2's MSP mornings are rows now. This file
+# tests block 2's LIFT machinery (ramp, double progression, intervals), which
+# still runs wherever the rowing schedule steps aside, so it keeps its frame
+# with the schedule pushed past the block. tests/test_row_schedule.py covers
+# the rows in block 2.
+from unittest.mock import patch as _patch  # noqa: E402
+
+from artemis import row_schedule as _row_schedule  # noqa: E402
+
+_NO_ROW_SCHEDULE = _patch.object(_row_schedule, "ROW_FROM", date(9999, 1, 1))
+
+
+def setUpModule():
+    _NO_ROW_SCHEDULE.start()
+
+
+def tearDownModule():
+    _NO_ROW_SCHEDULE.stop()
+
 
 def sets(n, reps, weight, rpe):
     return [{"reps_done": reps, "weight_lbs": weight, "rpe_actual": rpe} for _ in range(n)]

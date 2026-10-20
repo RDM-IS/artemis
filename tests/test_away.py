@@ -323,4 +323,11 @@ class TestBlock2HonoursPlacementsAndAway(unittest.TestCase):
     def test_days_outside_the_placement_keep_the_template(self):
         untouched = self._morning(date(2026, 12, 8))
         from artemis import health_office as office
-        self.assertEqual(untouched["session_type"], office.session_for(date(2026, 12, 8)))
+        from artemis import row_schedule
+        d = date(2026, 12, 8)
+        # ROW-SCHEDULE (2026-10-19): "the template" is now the rowing table on an
+        # MSP morning, and session_for() everywhere else.
+        kind = row_schedule.kind_for(office.cycle_pos(d), d, office.day_location_key(d))
+        want = row_schedule.SESSION_TYPE if kind else office.session_for(d)
+        self.assertEqual(untouched["session_type"], want)
+        self.assertEqual(untouched["blocks"].get("row_kind"), kind)
