@@ -241,3 +241,55 @@ class TestStrengthNext(unittest.TestCase):
         body = self._get(_StrengthSession(fail=True))
         self.assertFalse(body["available"])
         self.assertNotIn("session_type", body)
+
+
+class _RecSession:
+    def __init__(self, plan=None, done=(), lib=None, fail=False):
+        self.plan, self.done, self.lib, self.fail = plan, list(done), lib, fail
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt).lower()
+        if self.fail and "health." in sql:
+            raise SQLAlchemyError("boom")
+        if "from health.plan p" in sql and "slot = 'morning'" in sql:
+            return _Rows([self.plan] if self.plan else [])
+        if "group by 1" in sql:
+            return _Rows(self.done)
+        if "acos.system_state" in sql:
+            import json as _j
+            return _Rows([{"value": _j.dumps(self.lib)}] if self.lib else [])
+        return _Rows([])
+
+
+class TestRecommendEndpoint(unittest.TestCase):
+    LIB = {"today_location_key": "office", "locations": [
+        {"key": "office", "sessions": [{"session_type": "strength_c"}, {"session_type": "core"}]}]}
+
+    def tearDown(self):
+        from api.app.main import app
+        from api.app.routers import health as health_router
+        app.dependency_overrides.clear()
+        health_router._HEALTH_API_KEY = None
+
+    def _get(self, sess):
+        return _client(sess).get("/api/health/recommend", headers={"X-API-Key": VALID_KEY}).json()
+
+    def test_row_done_recommends_the_next_lift(self):
+        plan = {"plan_id": 7, "session_type": "cardio_z2", "logged": True,
+                "blocks": {"row_kind": "ladder", "cardio": {"modality": "row"}}}
+        # The endpoint uses the real clock, so these are well in the PAST (and
+        # years before any real log, for PUBLIC-FIXTURES).
+        done = [{"t": "strength_b", "at": datetime(2020, 3, 1, 10, tzinfo=timezone.utc)},
+                {"t": "mobility", "at": datetime(2020, 3, 2, 10, tzinfo=timezone.utc)}]
+        body = self._get(_RecSession(plan, done, self.LIB))
+        self.assertTrue(body["available"])
+        self.assertEqual((body["primary"], body["strength"]), ("strength", "strength_c"))
+        self.assertEqual(body["more"], ["core"])
+
+    def test_a_failed_read_highlights_nothing(self):
+        self.assertFalse(self._get(_RecSession(fail=True))["available"])
+
+    def test_no_library_is_unavailable_once_strength_is_in_question(self):
+        plan = {"plan_id": 7, "session_type": "cardio_z2", "logged": True,
+                "blocks": {"row_kind": "ladder", "cardio": {"modality": "row"}}}
+        self.assertFalse(self._get(_RecSession(plan, [], None))["available"])
