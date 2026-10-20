@@ -40,9 +40,20 @@ from artemis import cycle as _cycle_for_build  # noqa: E402
 _NO_OVERRIDES = patch.object(_cycle_for_build, "override_for", return_value=None)
 _NO_OVERRIDES.start()
 
+# ROW-SCHEDULE (2026-10-19): from ROW_FROM every MSP morning is a row, which
+# replaces the A/B/C weeks this file describes. The strength machinery still
+# exists and still seeds every week before ROW_FROM, so this file keeps testing
+# it in the frame it was written for -- the rowing schedule pushed past the
+# block. tests/test_row_schedule.py tests the real date.
+from artemis import row_schedule as _row_schedule  # noqa: E402
+
+_NO_ROW_SCHEDULE = patch.object(_row_schedule, "ROW_FROM", date(9999, 1, 1))
+_NO_ROW_SCHEDULE.start()
+
 
 def tearDownModule():
     _NO_OVERRIDES.stop()
+    _NO_ROW_SCHEDULE.stop()
 
 
 _ROWS = office.build_rows()

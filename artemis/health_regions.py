@@ -138,6 +138,10 @@ _reg("Bike intervals", {"legs"}, {"knee", "hip"})
 _reg("Treadmill intervals", {"legs"}, {"knee", "hip"})
 _reg("Elliptical intervals", {"legs"}, {"knee", "hip"})
 _reg("Recovery Z2 + Mobility", {"legs"}, {"knee", "hip"})
+# ROW-SCHEDULE (2026-10-19): the planned MSP mornings. The circuit adds push-ups
+# and core, so a shoulder or wrist counts against it as well.
+_reg("Row ladder", {"legs", "back"}, {"knee", "hip", "low back"})
+_reg("Row circuit", {"legs", "back", "chest", "core"}, {"knee", "hip", "low back", "shoulder", "wrist"})
 _reg("Treadmill incline walk", {"legs"}, {"calves", "knee", "hip"})
 _reg("Elliptical", {"legs"}, {"knee", "hip"})
 _reg("Recumbent bike", {"legs"}, {"knee"})

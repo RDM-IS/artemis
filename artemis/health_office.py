@@ -1724,12 +1724,18 @@ def build_schedule(repeats: list[date] | None = None) -> list[dict]:
     reps = repeat_starts() if repeats is None else repeats
     end = program_end(reps)
     specs: list[dict] = []
+    from artemis import row_schedule
     d = WEEK2_START
     while d <= end:
-        specs.append({"plan_date": d, "slot": "morning", "session_type": session_for(d),
-                      "week_num": week_num_for(d, reps), "location": day_location(d),
-                      "location_key": day_location_key(d), "day_type": day_type(d),
-                      "pos": cycle_pos(d), "wk0": False})
+        morning = {"plan_date": d, "slot": "morning", "session_type": session_for(d),
+                   "week_num": week_num_for(d, reps), "location": day_location(d),
+                   "location_key": day_location_key(d), "day_type": day_type(d),
+                   "pos": cycle_pos(d), "wk0": False}
+        # ROW-SCHEDULE (Ryan, 2026-10-19): every MSP morning from ROW_FROM is a
+        # row at MSP home -- a ladder or a circuit by cycle position. The
+        # location check is override-aware, so a day moved out of Minneapolis
+        # keeps whatever its own day type plans.
+        specs.append(row_schedule.place(morning, _cycle.DEFAULT_LOCATIONS))
         # EVENING-1: four evenings a week, and never one in a transit segment.
         if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
             specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
@@ -1753,6 +1759,12 @@ def build_row(spec: dict) -> dict:
                                     location_key=spec.get("location_key", "office"),
                                     on=spec.get("plan_date"), gate=spec.get("gate"))
     blocks = copy.deepcopy(blocks)
+    if spec.get("row_kind"):
+        # ROW-SCHEDULE: the ONE place a planned row becomes a ladder or a circuit,
+        # so the seeder and any rebuild cannot describe two different sessions.
+        from artemis import row_schedule
+        blocks = row_schedule.apply(blocks, spec["row_kind"])
+        est = row_schedule.EST_MIN[spec["row_kind"]]
     extra = suggested_extra(session_type, spec.get("pos"))
     if extra:
         # Display only: a NAME the card and the wake post show as one line. It
@@ -1914,10 +1926,31 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     # SCHEDULE-2: exactly 3 lifts per program week, and every row's location is
     # the one CYCLE-1 derives for that date.
     from collections import Counter
+
+    from artemis import row_schedule
     lifts = Counter(calendar_week_start(r["plan_date"]) for r in rows
                     if r["session_type"].startswith("strength"))
     for wk in sorted({calendar_week_start(r["plan_date"]) for r in rows}):
-        assert lifts[wk] == 3, f"week of {wk} has {lifts[wk]} lifts, expected 3"
+        # ROW-SCHEDULE: three lifts a week until the rowing schedule starts. The
+        # week it starts in is mixed by construction, and from then on an MSP
+        # morning is a row, so the count only holds for weeks wholly before it.
+        if wk + timedelta(days=6) < row_schedule.ROW_FROM:
+            assert lifts[wk] == 3, f"week of {wk} has {lifts[wk]} lifts, expected 3"
+        elif wk >= row_schedule.ROW_FROM:
+            assert lifts[wk] == 0, f"week of {wk} has {lifts[wk]} lifts, expected none (rowing)"
+    # ROW-SCHEDULE: every morning the table names is that row, and no other is.
+    for r in rows:
+        if r.get("slot", "morning") != "morning":
+            continue
+        d = r["plan_date"]
+        want_kind = row_schedule.kind_for(cycle_pos(d), d, day_location_key(d))
+        got_kind = r["blocks"].get("row_kind")
+        assert got_kind == want_kind, f"{d}: row_kind {got_kind!r}, schedule says {want_kind!r}"
+        if want_kind:
+            assert r["session_type"] == row_schedule.SESSION_TYPE, \
+                f"{d}: a {want_kind} day must be {row_schedule.SESSION_TYPE}"
+            assert r["blocks"].get("location_key") == row_schedule.LOCATION_KEY, \
+                f"{d}: a {want_kind} day happens where the rower is"
     # EVENING-1: evenings are yoga, four a week, and never on the road.
     evenings = [r for r in rows if r.get("slot") == "evening"]
     for r in evenings:
@@ -1945,6 +1978,11 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
         assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"])), \
             f"{r['plan_date']}: a session cannot be placed on the road"
         want = day_location(r["plan_date"], r.get("slot", "morning"))
+        if r["blocks"].get("row_kind"):
+            # ROW-SCHEDULE: a row morning happens where the rower is, at home,
+            # even on a day the cycle anchors at the office.
+            key = row_schedule.LOCATION_KEY
+            want = (_cycle.DEFAULT_LOCATIONS.get(key) or {}).get("display", key)
         got = r["blocks"].get("location")
         assert got == want, f"{r['plan_date']}: location {got!r}, cycle says {want!r}"
     rejects, notes = duration_findings(rows)

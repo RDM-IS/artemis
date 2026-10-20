@@ -149,6 +149,18 @@ def _specs_for(d: date, wk: int, *, placements: dict | None = None,
         "week_num": wk, "location": location, "location_key": location_key,
         "day_type": office.day_type(d), "pos": office.cycle_pos(d), "wk0": False,
     }
+    # ROW-SCHEDULE (2026-10-19): an MSP morning is a row in block 2 too. An
+    # explicit placement and an away day are decisions about THAT day, so both
+    # win over the table, as they win over session_for().
+    if not (placements and d in placements) and stay is None:
+        from artemis import row_schedule
+        morning = row_schedule.place(base, office._cycle.DEFAULT_LOCATIONS)
+        if morning is not base:
+            # The evening keeps the day's own room, not the row's.
+            specs = [morning]
+            if office.cycle_pos(d) in office.EVENING_POS and office.evening_is_possible(d):
+                specs.append({**base, "slot": "evening", "session_type": office.EVENING_SESSION})
+            return specs
     specs = [base]
     # An away day carries no evening flow: he is not at home with the mat.
     if (stay is None and office.cycle_pos(d) in office.EVENING_POS
