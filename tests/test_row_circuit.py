@@ -252,5 +252,41 @@ class TestDidNotFinish(unittest.TestCase):
         self.assertEqual((h[0][0].spm, h[0][0].work_sec), (15, 200))
 
 
+
+class TestZoneLadders(unittest.TestCase):
+    """QUICK-START: ride and run climb a heart-rate target in 5 bpm steps."""
+
+    def test_first_ride_is_the_ladder_from_110(self):
+        p = rc.prescription([], None, "ride")
+        self.assertEqual(p["unit"], "bpm")
+        self.assertEqual(p["default"], "repeat")
+        self.assertEqual(rates(p["options"]["repeat"]), [110, 115, 120, 125, 130, 135])
+        self.assertEqual(p["modality"], "bike")
+
+    def test_the_rate_lever_is_plus_five_bpm(self):
+        last = session((200, 100), (200, 105))
+        p = rc.prescription([last], 2, "run")
+        self.assertEqual(rates(p["options"]["rate"]), [105, 110])
+        self.assertIn("+5 bpm", p["options"]["rate"]["label"])
+        self.assertEqual(p["modality"], "treadmill")
+
+    def test_the_bpm_cap_disables_the_lever(self):
+        last = session((200, 160))
+        p = rc.prescription([last], 1, "ride")
+        self.assertFalse(p["options"]["rate"]["ok"])
+        self.assertIn("bpm", p["options"]["rate"]["reason"])
+
+    def test_dnf_holds_a_zone_ladder_too(self):
+        rows = [{"day": date(2031, 3, 10), "set_num": 1, "target_spm": 100, "target_sec": 200,
+                 "stroke_rate": 100, "duration_sec": 90, "dnf": True, "logged_at": T0}]
+        p = rc.prescription(rc.group_history(rows), 1, "run")
+        self.assertEqual(p["default"], "repeat")
+        self.assertFalse(p["options"]["time"]["ok"])
+
+    def test_no_two_kinds_share_an_exercise(self):
+        names = [k["exercise"] for k in rc.KINDS.values()]
+        self.assertEqual(len(names), len(set(names)))
+
+
 if __name__ == "__main__":
     unittest.main()

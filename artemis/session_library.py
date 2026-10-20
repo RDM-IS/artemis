@@ -35,9 +35,12 @@ SYSTEM_KEY = "session_library"
 
 from knowledge.session_types import EXTRA_TYPES, REST_TYPES, is_training  # noqa: E402
 
-#: Extras only (Ryan, 2026-09-27): yoga / core / mobility, every day. Strength
-#: and cardio appear ONLY as a makeup, on a rest day — see makeup_state().
-LIBRARY_TYPES = EXTRA_TYPES
+#: Extras (Ryan, 2026-09-27): yoga / core / mobility, every day.
+#: QUICK-START (Ryan, 2026-10-20): "give me buttons to decide what I want to do
+#: and when" -- so strength A/B/C are in the library too, wherever the room can
+#: hold them, and gym-display's Strength button picks the next in rotation.
+#: The Extras list on the screen still shows only EXTRA_TYPES.
+LIBRARY_TYPES = EXTRA_TYPES + ("strength_a", "strength_b", "strength_c")
 
 #: Pseudo-locations with no room to train in.
 _NOT_A_ROOM = frozenset({"transit", "outside"})
@@ -57,11 +60,17 @@ def _supported(location_key: str, session_type: str) -> bool:
 
 def entry_for(session_type: str, location_key: str, today: date) -> dict:
     """One launchable session — the row the seeder would write, minus the date."""
+    from artemis import block2
     from artemis import cycle
     from artemis import health_office as office
-    row = office.build_row({
+    # QUICK-START: past block 1's last day, office.week_num_for() runs off the
+    # end of block 1's ramp and strength would quietly vanish from the library
+    # on 11/01. Inside block 2, build with block 2's week and ramp.
+    wk2 = block2.week_num_for(today)
+    builder = block2._build_one if wk2 else office.build_row
+    row = builder({
         "plan_date": today, "slot": "morning", "session_type": session_type,
-        "week_num": office.week_num_for(today),
+        "week_num": wk2 or office.week_num_for(today),
         # The same display the seeder puts on rows (health_office.day_location):
         # the builder compares it to the office's name.
         "location": (cycle.DEFAULT_LOCATIONS.get(location_key) or {}).get("display", location_key),
