@@ -195,5 +195,57 @@ class TestLadder(unittest.TestCase):
             rc.prescription([], 4, "circuitt")
 
 
+
+class TestDidNotFinish(unittest.TestCase):
+    """ROW-DNF (Ryan, 2026-10-20): "if I can't do all sets at their target, we
+    shouldn't advance." Synthetic: 15-18 spm, 200 s rounds, year 2031."""
+
+    def _rows(self, *rounds):
+        """(set_num, target_spm, target_sec, held_spm, dnf)"""
+        return [{"day": date(2031, 3, 10), "set_num": n, "target_spm": t, "target_sec": ts,
+                 "stroke_rate": h, "duration_sec": ts, "dnf": dnf, "logged_at": T0}
+                for n, t, ts, h, dnf in rounds]
+
+    def test_a_dnf_round_blocks_both_levers_and_repeats_the_targets(self):
+        h = rc.group_history(self._rows((1, 15, 200, 15, False), (2, 16, 200, 16, True)))
+        p = rc.prescription(h, 2)
+        self.assertEqual(p["default"], "repeat")
+        self.assertFalse(p["options"]["rate"]["ok"])
+        self.assertFalse(p["options"]["time"]["ok"])
+        self.assertIn("round 2", p["options"]["rate"]["reason"])
+        self.assertEqual(rates(p["options"]["repeat"]), [15, 16])
+        self.assertEqual(lengths(p["options"]["repeat"]), [200, 200])
+        self.assertEqual([r["round"] for r in p["unfinished"]], [2])
+
+    def test_the_base_is_the_target_not_the_seconds_actually_rowed(self):
+        rows = self._rows((1, 16, 200, 16, True))
+        rows[0]["duration_sec"] = 70           # held 70 s of a 200 s round
+        p = rc.prescription(rc.group_history(rows), 1)
+        self.assertEqual(lengths(p["options"]["repeat"]), [200])
+
+    def test_holding_below_target_is_unfinished_even_without_the_flag(self):
+        h = rc.group_history(self._rows((1, 16, 200, 15, False)))
+        self.assertFalse(h[0][0].finished)
+        self.assertEqual(rc.prescription(h, 1)["default"], "repeat")
+
+    def test_all_finished_advances_from_the_targets(self):
+        h = rc.group_history(self._rows((1, 15, 200, 15, False), (2, 16, 200, 17, False)))
+        p = rc.prescription(h, 2)
+        self.assertEqual(p["unfinished"], [])
+        self.assertEqual(rates(p["options"]["rate"]), [16, 17])
+
+    def test_a_dropped_dnf_round_does_not_block(self):
+        h = rc.group_history(self._rows((1, 15, 200, 15, False), (2, 16, 200, 16, True)))
+        p = rc.prescription(h, 1)
+        self.assertTrue(p["options"]["rate"]["ok"])
+
+    def test_rows_from_before_056_still_read_as_held_and_finished(self):
+        rows = [{"day": date(2031, 3, 10), "set_num": 1, "duration_sec": 200,
+                 "stroke_rate": 15, "logged_at": T0}]
+        h = rc.group_history(rows)
+        self.assertTrue(h[0][0].finished)
+        self.assertEqual((h[0][0].spm, h[0][0].work_sec), (15, 200))
+
+
 if __name__ == "__main__":
     unittest.main()
