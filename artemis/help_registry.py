@@ -31,7 +31,8 @@ COMMANDS: list[Command] = [
     # ── brief ── (handler: morning_brief_command)
     Command("brief", "morning brief", "Your day, composed live (calendar, commitments, inbox)", "morning brief"),
 
-    # ── email ── (handlers: inbox_listing, disposition_command, done_command, inbox_command)
+    # ── email ── (handlers: triage_now, inbox_listing, disposition_command, done_command, inbox_command)
+    Command("email", "triage now", "Poll Gmail and triage new mail once (timers are paused)", "triage now"),
     Command("email", "inbox", "List the inbox, numbered", "inbox"),
     Command("email", "more", "Next page of the current inbox listing", "more"),
     Command("email", "archive <#>", "Archive listed emails (single, range, or batch)", "archive 1-4"),

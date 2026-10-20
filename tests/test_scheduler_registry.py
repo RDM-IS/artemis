@@ -590,5 +590,91 @@ class TestLiveRegistryMatchesTheCode(unittest.TestCase):
         self.assertIn("for spec in INTERVAL_SPECS:", body)
 
 
+
+class TestTimersPaused(unittest.TestCase):
+    """TIMERS-PAUSED (Ryan, 2026-10-12): until RDMIS launch Artemis runs on
+    keywords only. A paused scheduler registers NOTHING — at start(), on a
+    `set timezone`, or on a location recompute — and skips the boot catch-up.
+    Each case would fail if the gate were removed: the enabled twin registers
+    jobs through the same path."""
+
+    def _make(self, enabled):
+        from artemis.scheduler import ArtemisScheduler
+        s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock(), timers_enabled=enabled)
+        fake = MagicMock()
+        fake.get_job.return_value = None
+        s.scheduler = fake
+        return s, fake
+
+    def _start(self, enabled):
+        s, fake = self._make(enabled)
+        with patch("artemis.scheduler.check_billing_scopes", return_value=(True, [])), \
+             patch("artemis.scheduler.load_playbooks"), \
+             patch("artemis.quiet_hours.get_active_timezone", return_value="America/Chicago"), \
+             patch("artemis.quiet_hours.set_system_value"):
+            s.start()
+        return s, fake
+
+    def test_paused_start_registers_zero_jobs_but_still_starts(self):
+        s, fake = self._start(False)
+        fake.add_job.assert_not_called()
+        fake.start.assert_called_once()
+        self.assertEqual(s._applied_tz, "America/Chicago")
+
+    def test_enabled_start_still_registers_jobs(self):
+        _, fake = self._start(True)
+        self.assertGreater(fake.add_job.call_count, 0)
+
+    def test_timezone_change_while_paused_registers_nothing(self):
+        s, fake = self._make(False)
+        with patch("artemis.quiet_hours.set_system_value") as rec, \
+             patch.object(s, "cron_specs", side_effect=AssertionError("read the cycle")):
+            s.apply_timezone(SAO_PAULO)
+        fake.add_job.assert_not_called()
+        fake.reschedule_job.assert_not_called()
+        self.assertEqual(s._applied_tz, SAO_PAULO)
+        rec.assert_called_with("scheduler_tz", SAO_PAULO)
+
+    def test_paused_catchup_never_polls_or_triages(self):
+        s, _ = self._make(False)
+        s.gmail = MagicMock()
+        with patch("artemis.briefs.triage_emails") as triage:
+            s.run_catchup()
+        s.gmail.assert_not_called()
+        self.assertFalse(s.gmail.method_calls)
+        triage.assert_not_called()
+
+    def test_default_is_enabled_so_existing_callers_are_unchanged(self):
+        from artemis.scheduler import ArtemisScheduler
+        self.assertTrue(ArtemisScheduler(MagicMock(), MagicMock(), MagicMock()).timers_enabled)
+
+    def test_main_passes_the_config_flag_and_it_defaults_off(self):
+        src = (_REPO_ROOT / "artemis" / "main.py").read_text()
+        self.assertIn("timers_enabled=config.TIMED_JOBS_ENABLED", src)
+        cfg = (_REPO_ROOT / "artemis" / "config.py").read_text()
+        self.assertIn('os.environ.get("TIMED_JOBS_ENABLED", "0")', cfg)
+
+
+class TestTriageNowForce(unittest.TestCase):
+    """`triage now` must run outside open hours, and must not report an
+    all-clear for a pass that failed."""
+
+    def setUp(self):
+        from artemis.scheduler import ArtemisScheduler
+        self.s = ArtemisScheduler(MagicMock(), MagicMock(), MagicMock(), timers_enabled=False)
+
+    def test_force_bypasses_the_open_gate(self):
+        with patch.object(self.s, "_is_open", return_value=False), \
+             patch.object(self.s, "_poll_gmail", return_value=[]) as poll:
+            self.assertEqual(self.s.job_inbox_triage(), 0)
+            poll.assert_not_called()
+            self.assertEqual(self.s.job_inbox_triage(force=True), 0)
+            poll.assert_called_once()
+
+    def test_failure_is_none_not_zero(self):
+        with patch.object(self.s, "_poll_gmail", side_effect=RuntimeError("gmail down")):
+            self.assertIsNone(self.s.job_inbox_triage(force=True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

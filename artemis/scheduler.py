@@ -197,7 +197,14 @@ class ArtemisScheduler:
         mm: MattermostClient,
         gmail: GmailClient,
         calendar: CalendarClient,
+        *,
+        timers_enabled: bool = True,
     ):
+        # TIMERS-PAUSED: False registers NO jobs at all — not at start(), not on a
+        # timezone change, not on a location recompute — and skips the boot
+        # catch-up. Defaults True so every existing caller and test is unchanged;
+        # main.py passes config.TIMED_JOBS_ENABLED explicitly.
+        self.timers_enabled = timers_enabled
         self.mm = mm
         self.gmail = gmail
         self.calendar = calendar
@@ -395,6 +402,21 @@ class ArtemisScheduler:
             logger.error("apply_timezone: unknown zone %r — keeping %s", tz_name, self._applied_tz)
             return
 
+        if not self.timers_enabled:
+            # TIMERS-PAUSED: record the zone (quiet_hours and `set timezone` still
+            # read it) but register nothing. Returning here, before cron_specs(),
+            # also means a paused box never reads the cycle for job times.
+            self._applied_tz = tz_name
+            self._cron_specs = []
+            self._applied_cron_times = {}
+            self._location_degraded = False
+            try:
+                set_system_value("scheduler_tz", tz_name)
+            except Exception:
+                logger.warning("could not record scheduler_tz — continuing", exc_info=True)
+            logger.info("Scheduler timezone recorded: %s (timers PAUSED — 0 cron jobs)", tz_name)
+            return
+
         # FAIL-CLOSED-RESOLVERS, softened at THIS boundary only (Ryan, 2026-09-26).
         # cron_times() reads the cycle, which reads acos.cycle_day_overrides, which
         # RAISES when it cannot be read. Letting that propagate killed the service
@@ -468,8 +490,11 @@ class ArtemisScheduler:
         # ── Interval jobs (timezone-independent) ──
         # INTERVAL_SPECS is the registry; no add_job(..., "interval", ...) call
         # may live outside this loop. Business intervals check _is_open().
-        scopes_ok, missing = check_billing_scopes()
+        # TIMERS-PAUSED: the loop is skipped whole; the registry is untouched.
+        scopes_ok, missing = check_billing_scopes() if self.timers_enabled else (True, [])
         for spec in INTERVAL_SPECS:
+            if not self.timers_enabled:
+                break
             if spec.needs_billing_scopes and not scopes_ok:
                 logger.warning("%s %s disabled — missing scopes: %s",
                                spec.note or spec.id, spec.id, missing)
@@ -486,8 +511,11 @@ class ArtemisScheduler:
         # Load playbooks at startup
         load_playbooks()
 
+        # Started even when paused: an empty scheduler keeps get_jobs() honest
+        # (the startup post and the ops strip report 0) and costs nothing.
         self.scheduler.start()
-        logger.info("Scheduler started (cron tz=%s)", self._applied_tz)
+        logger.info("Scheduler started (cron tz=%s)%s", self._applied_tz,
+                    "" if self.timers_enabled else " — TIMERS PAUSED, keywords only")
 
     def stop(self):
         self.scheduler.shutdown()
@@ -871,10 +899,15 @@ class ArtemisScheduler:
                 subject, state, res.get("detail", "?"),
             )
 
-    def job_inbox_triage(self):
-        """Poll Gmail, classify new messages, archive, and execute playbooks."""
-        if not self._is_open():
-            return
+    def job_inbox_triage(self, force: bool = False) -> int | None:
+        """Poll Gmail, classify new messages, archive, and execute playbooks.
+
+        `force` (the `triage now` keyword) skips the open-phase gate. Returns the
+        number of new messages handled, or None when the pass failed — never 0
+        for a failure, so the keyword cannot report an all-clear it didn't see."""
+        if not force and not self._is_open():
+            return 0
+        handled = 0
         try:
             messages = self._poll_gmail(max_results=20)
             if messages:
@@ -883,17 +916,18 @@ class ArtemisScheduler:
                 m for m in messages if m["id"] not in self._seen_message_ids
             ]
             if not new_messages:
-                return
+                return 0
 
             for m in new_messages:
                 self._seen_message_ids.add(m["id"])
+            handled = len(new_messages)
 
             # Feature #1: chat-authored playbook rules run FIRST — a user rule is a
             # hard rule and takes precedence over the LLM triage. Matched messages
             # are disposed through the audited primitive and removed from the pool.
             new_messages = self._apply_playbook_rules(new_messages)
             if not new_messages:
-                return
+                return handled
 
             # Immediate post for priority contacts
             priority_msgs = [
@@ -1056,6 +1090,8 @@ class ArtemisScheduler:
         except Exception as exc:
             self._record_gmail_failure(str(exc))
             logger.exception("Inbox triage failed")
+            return None
+        return handled
 
     def _check_scheduling_request(self, msg: dict, email_text: str):
         """Detect scheduling requests and post approval to Mattermost (Learning mode)."""
@@ -1145,9 +1181,9 @@ class ArtemisScheduler:
         except Exception:
             logger.debug("Scheduling detection error for %s", msg.get("from_email", ""), exc_info=True)
 
-    def job_post_triage_batch(self):
-        """Post batched triage summary."""
-        if not self._is_open():
+    def job_post_triage_batch(self, force: bool = False):
+        """Post batched triage summary. `force`: the `triage now` keyword."""
+        if not force and not self._is_open():
             return
         if not self._pending_triage:
             return
@@ -2516,6 +2552,12 @@ class ArtemisScheduler:
     def run_catchup(self):
         """Run catch-up processing after startup to handle missed emails during downtime."""
         from artemis.quiet_hours import get_system_value, set_system_value
+
+        if not self.timers_enabled:
+            # TIMERS-PAUSED: the catch-up is an unattended LLM triage pass over
+            # the downtime gap — exactly the spend being switched off.
+            logger.info("Catch-up skipped — timers paused (use `triage now`)")
+            return
 
         last_run = get_system_value("last_run_at")
         now = datetime.utcnow()
