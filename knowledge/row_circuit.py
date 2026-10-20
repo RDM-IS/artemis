@@ -249,6 +249,11 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
             options[lv]["ok"] = False
             options[lv]["reason"] = f"last time {words} wasn't finished — repeat it first"
         default = "repeat"
+    if not history:
+        # The FIRST session is the ladder itself (20, 21, 22 ...), not a step
+        # past it. Defaulting to a lever here made the first-ever ladder start
+        # at 21 (found 2026-10-20: targets 21-26 on day one).
+        default = "repeat"
     if default != "repeat" and not options[default]["ok"]:
         other = "time" if default == "rate" else "rate"
         default = other if options[other]["ok"] else "repeat"
