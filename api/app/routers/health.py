@@ -607,6 +607,11 @@ class LogSetIn(BaseModel):
     stroke_rate: Optional[int] = Field(default=None, ge=10, le=60)
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    #: ROW-DNF (migration 056): what the round was prescribed, and whether he
+    #: finished it at that target. Progression reads these.
+    target_spm: Optional[int] = Field(default=None, ge=10, le=60)
+    target_sec: Optional[int] = Field(default=None, ge=1, le=3600)
+    dnf: Optional[bool] = None
 
 
 class HrZonesOut(BaseModel):
@@ -874,7 +879,8 @@ def post_log(
             hr_avg, hr_peak, rpe_actual,
             notes, is_skipped, logged_via,
             modality, device, adhoc_session_type,
-            stroke_rate, started_at, ended_at
+            stroke_rate, started_at, ended_at,
+            target_spm, target_sec, dnf
         ) VALUES (
             :plan_id, :log_type, :exercise,
             :set_num, :reps_done, :weight_lbs,
@@ -882,7 +888,8 @@ def post_log(
             :hr_avg, :hr_peak, :rpe_actual,
             :notes, :is_skipped, :logged_via,
             :modality, :device, :adhoc_session_type,
-            :stroke_rate, :started_at, :ended_at
+            :stroke_rate, :started_at, :ended_at,
+            :target_spm, :target_sec, :dnf
         )
         RETURNING log_id, plan_id, log_type, exercise,
                   set_num, reps_done, weight_lbs,
@@ -916,6 +923,9 @@ def post_log(
                     "stroke_rate": s.stroke_rate,
                     "started_at": s.started_at,
                     "ended_at": s.ended_at,
+                    "target_spm": s.target_spm,
+                    "target_sec": s.target_sec,
+                    "dnf": s.dnf,
                 },
             ).mappings().first()
             if row is not None:
@@ -952,6 +962,9 @@ def post_log(
                     "stroke_rate": None,
                     "started_at": None,
                     "ended_at": None,
+                    "target_spm": None,
+                    "target_sec": None,
+                    "dnf": None,
                 },
             ).mappings().first()
             if row is not None:
@@ -2489,11 +2502,13 @@ def get_row_circuit(
         # row screens, so no other cardio log can match.
         row_rows = db.execute(text("""
             SELECT (started_at AT TIME ZONE :tz)::date AS day, set_num,
-                   duration_sec, stroke_rate, logged_at
+                   duration_sec, stroke_rate, logged_at,
+                   target_spm, target_sec, dnf
             FROM health.session_log
             WHERE log_type = 'cardio_block'
               AND exercise = :row AND logged_via <> 'inferred'
-              AND stroke_rate IS NOT NULL AND started_at IS NOT NULL
+              AND (stroke_rate IS NOT NULL OR target_spm IS NOT NULL)
+              AND started_at IS NOT NULL
             ORDER BY started_at DESC
             LIMIT 64
         """), params).mappings().all()

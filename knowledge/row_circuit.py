@@ -113,6 +113,8 @@ class RowRound:
     round: int          # 1-based
     work_sec: int
     spm: int
+    #: ROW-DNF: False when he did not finish this round at its target.
+    finished: bool = True
 
     def as_dict(self) -> dict:
         return {"round": self.round, "work_sec": self.work_sec, "spm": self.spm}
@@ -237,11 +239,25 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
     base = resize(last, n)
     default = default_lever(last, prev)
     options = {lv: option(base, lv) for lv in LEVERS}
-    if not options[default]["ok"]:
+    # ROW-DNF (Ryan, 2026-10-20): "if I can't do all sets at their target, we
+    # shouldn't advance." Only rounds he is doing again today count: a round
+    # dropped by choosing fewer rounds is not being repeated.
+    unfinished = [r for r in last[:n] if not r.finished]
+    if unfinished:
+        words = ", ".join(f"round {r.round} ({r.spm} spm, {_clock(r.work_sec)})" for r in unfinished)
+        for lv in LEVERS:
+            options[lv]["ok"] = False
+            options[lv]["reason"] = f"last time {words} wasn't finished — repeat it first"
+        default = "repeat"
+    if default != "repeat" and not options[default]["ok"]:
         other = "time" if default == "rate" else "rate"
         default = other if options[other]["ok"] else "repeat"
     moved = moved_lever(last, prev)
-    if history:
+    if unfinished:
+        why = (f"{'Round' if len(unfinished) == 1 else 'Rounds'} "
+               f"{', '.join(str(r.round) for r in unfinished)} didn't finish last time, "
+               "so today repeats the same targets")
+    elif history:
         why = {"rate": "last time added a stroke/min, so a minute is the default today",
                "time": "last time added a minute, so a stroke/min is the default today",
                }.get(moved or "", "one session logged so far — the rate goes up first"
@@ -261,6 +277,7 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
         "has_history": bool(history),
         "last_rounds": len(last),
         "options": {**options, "repeat": option(base, None)},
+        "unfinished": [r.as_dict() for r in unfinished],
         "default": default,
         "why": why,
         "rest": {"sec": REST_SEC, "rate": REST_RATE},
@@ -279,7 +296,13 @@ def group_history(rows: list[dict], *, max_sessions: int = 2) -> list[list[RowRo
     """Logged Row blocks -> sessions, newest first.
 
     `rows` carry `day` (the ACTIVE-timezone date the block started), `set_num`
-    (the round), `duration_sec`, `stroke_rate` and `logged_at`, in any order.
+    (the round), `duration_sec`, `stroke_rate` and `logged_at`, in any order,
+    and since ROW-DNF (migration 056) `target_spm`, `target_sec` and `dnf`.
+
+    ROW-DNF: a round's base is its TARGET, and it counts as finished only when
+    `dnf` is not set AND the rate held reached the target. A row written before
+    056 has no target, so its target is what was held, and it counts as
+    finished -- the rule that applied when it was written.
     One session per day; a round logged twice that day keeps its LATEST log,
     because the record card can be re-saved and the last save is the one he
     meant. A row with no stroke rate or no duration is skipped -- it cannot
@@ -287,7 +310,10 @@ def group_history(rows: list[dict], *, max_sessions: int = 2) -> list[list[RowRo
     """
     by_day: dict = {}
     for r in rows:
-        if r.get("stroke_rate") is None or not r.get("duration_sec") or not r.get("set_num"):
+        has_target = r.get("target_spm") is not None and r.get("target_sec")
+        if not r.get("set_num"):
+            continue
+        if not has_target and (r.get("stroke_rate") is None or not r.get("duration_sec")):
             continue
         day = by_day.setdefault(r["day"], {})
         cur = day.get(int(r["set_num"]))
@@ -296,9 +322,19 @@ def group_history(rows: list[dict], *, max_sessions: int = 2) -> list[list[RowRo
     sessions = []
     for day in sorted(by_day, reverse=True)[:max_sessions]:
         rounds = by_day[day]
-        sessions.append([RowRound(i + 1, int(rounds[k]["duration_sec"]), int(rounds[k]["stroke_rate"]))
-                         for i, k in enumerate(sorted(rounds))])
+        sessions.append([_round_of(i + 1, rounds[k]) for i, k in enumerate(sorted(rounds))])
     return sessions
+
+
+def _round_of(n: int, r: dict) -> RowRound:
+    if r.get("target_spm") is not None and r.get("target_sec"):
+        spm, sec = int(r["target_spm"]), int(r["target_sec"])
+        held = r.get("stroke_rate")
+        finished = not r.get("dnf") and (held is None or int(held) >= spm)
+    else:
+        spm, sec = int(r["stroke_rate"]), int(r["duration_sec"])
+        finished = not r.get("dnf")
+    return RowRound(n, sec, spm, finished)
 
 
 def last_reps(rows: list[dict]) -> dict[str, dict[str, int]]:

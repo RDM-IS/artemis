@@ -160,6 +160,24 @@ class TestLogColumns(unittest.TestCase):
         self.assertIsNone(summary["stroke_rate"])
         self.assertIsNone(summary["started_at"])
 
+    def test_targets_and_dnf_are_written(self):
+        r, seen = self._post({
+            "adhoc_session_type": "row_ladder", "exercise": "Row ladder", "log_type": "cardio_block",
+            "modality": "row",
+            "sets": [{"set_num": 2, "duration_sec": 70, "stroke_rate": 12,
+                      "target_spm": 12, "target_sec": 130, "dnf": True}],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((seen[0]["target_spm"], seen[0]["target_sec"], seen[0]["dnf"]), (12, 130, True))
+
+    def test_a_dnf_blocks_advancing_through_the_endpoint(self):
+        rows = [{"day": date(2031, 3, 10), "set_num": 1, "duration_sec": 70, "stroke_rate": 11,
+                 "target_spm": 11, "target_sec": 100, "dnf": True, "logged_at": T}]
+        body = _client(_HistorySession(rows)).get(
+            "/api/health/row-circuit?rounds=1&kind=ladder", headers={"X-API-Key": VALID_KEY}).json()
+        self.assertEqual(body["default"], "repeat")
+        self.assertFalse(body["options"]["rate"]["ok"])
+
     def test_a_reversed_window_is_refused(self):
         r, seen = self._post({
             "adhoc_session_type": "row_circuit", "exercise": "Push-up", "log_type": "strength_set",
