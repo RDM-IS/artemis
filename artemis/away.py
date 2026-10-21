@@ -285,7 +285,11 @@ def placements(cur, start: date, end: date) -> dict:
         # The location rides on the SAME row, so one date's plan is one row. A
         # separate placement table would let a location and a session for the
         # same day drift apart, and then nothing could say which was current.
-        entry = {"session": session, "location_key": g("location", 3)}
+        entry = {"session": session, "location_key": g("location", 3),
+                 # CAL-OCT (2026-10-21): a travel day home can also carry an
+                 # evening session and an extra to suggest with it.
+                 "evening": (attrs or {}).get("evening"),
+                 "extra": (attrs or {}).get("extra")}
         d, last = g("start_date", 0), g("end_date", 1)
         while d <= last:
             if start <= d <= end:

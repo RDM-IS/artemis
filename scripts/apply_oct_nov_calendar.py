@@ -16,16 +16,17 @@ of ours and the old ones that would compete are revoked first):
 
   10/23 Fri         home (day off; rows)
   10/24-25 Sat-Sun  vacation, no gym, at home -> nothing planned
-  10/26 Mon         travel                     -> rest
+  10/26 Mon         travel out                 -> morning row
   10/27-28 Tue-Wed  work trip, hotel gym       -> Strength C, then Z2 (hotel)
-  10/29 Thu         travel                     -> rest
+  10/29 Thu         travel home                -> rest; yoga + mobility evening
   10/30 Fri         home (day off; rows)
-  11/06-08 Fri-Sun  Brown Deer (Sun: drive back to MSP)
+  11/06-07 Fri-Sat  Brown Deer
+  11/08 Sun         Brown Deer, drive to MSP   -> yoga + mobility evening
   11/09 Mon         home (day off)
   11/20-22          hunting, Richfield, no gym
   11/23-26          Richfield: Strength A, B, C, then Z2 on the bike (11/26)
   11/27-29          hunting, Richfield, no gym
-  11/30 Mon         travel to MSP              -> rest
+  11/30 Mon         travel to MSP              -> rest; yoga + mobility evening
 
 Revoked (not deleted): the 9/29 November placement set, the 9/29 10/24-10/26
 msp_home override, and the 9/29 hunting stays -- all replaced above. 12/1-12/4
@@ -63,12 +64,16 @@ REPLACES = ("Ryan 2026-09-29: approved Nov placement%",
 OVERRIDES = [
     ("loc",   D(2026, 10, 23), D(2026, 10, 23), "msp_home", None, None, None, "day off, rows", "msp_home"),
     ("stay",  D(2026, 10, 24), D(2026, 10, 25), "msp_home", "vacation", "no_gym", None, "vacation at home", None),
-    ("place", D(2026, 10, 26), D(2026, 10, 26), "msp_home", None, None, "rest", "travel day", "travel"),
+    # Leaving MSP: a morning row first (Ryan, 15:10); yoga/mobility ad hoc.
+    ("loc",   D(2026, 10, 26), D(2026, 10, 26), "msp_home", None, None, None, "travel day: row, then drive", "travel"),
     ("stay",  D(2026, 10, 27), D(2026, 10, 27), "outside", "work", "hotel_gym", "strength_c", "hotel", None),
     ("stay",  D(2026, 10, 28), D(2026, 10, 28), "outside", "work", "hotel_gym", "cardio_z2", "hotel", None),
-    ("place", D(2026, 10, 29), D(2026, 10, 29), "msp_home", None, None, "rest", "travel day", "travel"),
+    # Back to MSP: rest morning, yoga + mobility evening (Ryan, 15:10).
+    ("place", D(2026, 10, 29), D(2026, 10, 29), "msp_home", None, None, "rest", "travel home: yoga + mobility evening", "travel"),
     ("loc",   D(2026, 10, 30), D(2026, 10, 30), "msp_home", None, None, None, "day off, rows", "msp_home"),
-    ("loc",   D(2026, 11, 6), D(2026, 11, 8), "brown_deer", None, None, None, "Brown Deer; Sun drive to MSP", "wi"),
+    ("loc",   D(2026, 11, 6), D(2026, 11, 7), "brown_deer", None, None, None, "Brown Deer", "wi"),
+    # Drive back to MSP: the evening (already yoga on a Sunday) gets mobility.
+    ("loc",   D(2026, 11, 8), D(2026, 11, 8), "brown_deer", None, None, None, "Brown Deer, drive to MSP", "travel"),
     ("loc",   D(2026, 11, 9), D(2026, 11, 9), "msp_home", None, None, None, "day off", "msp_home"),
     ("stay",  D(2026, 11, 20), D(2026, 11, 22), "richfield", "hunting", "no_gym", None, "hunting", None),
     ("place", D(2026, 11, 23), D(2026, 11, 23), "richfield", None, None, "strength_a", "", "wi"),
@@ -76,7 +81,7 @@ OVERRIDES = [
     ("place", D(2026, 11, 25), D(2026, 11, 25), "richfield", None, None, "strength_c", "", "wi"),
     ("place", D(2026, 11, 26), D(2026, 11, 26), "richfield", None, None, "cardio_z2", "Thanksgiving, the bike", "wi"),
     ("stay",  D(2026, 11, 27), D(2026, 11, 29), "richfield", "hunting", "no_gym", None, "hunting", None),
-    ("place", D(2026, 11, 30), D(2026, 11, 30), "msp_home", None, None, "rest", "travel to MSP", "travel"),
+    ("place", D(2026, 11, 30), D(2026, 11, 30), "msp_home", None, None, "rest", "travel home: yoga + mobility evening", "travel"),
 ]
 
 BLOCK1_END = D(2026, 10, 31)
@@ -157,6 +162,9 @@ def main() -> int:
                             "WHERE override_id = %s", (_g(r, "override_id", 0),))
             for kind, a, b, loc, purpose, lodging, session, note, dtype in OVERRIDES:
                 attrs = {"session": session} if session else {}
+                if session == "rest" and dtype == "travel":
+                    # A drive home: the evening gets yoga, with mobility suggested.
+                    attrs.update({"evening": "recovery_flow", "extra": "mobility"})
                 if note:
                     attrs["note"] = note
                 if kind == "stay":

@@ -28,10 +28,11 @@ LOC = {D(2026, 10, 23): ("msp_home", "msp_home"), D(2026, 10, 24): ("msp_home", 
 STAYS = [away.Stay(D(2026, 10, 24), D(2026, 10, 25), "vacation", "no_gym"),
          away.Stay(D(2026, 10, 27), D(2026, 10, 27), "work", "hotel_gym"),
          away.Stay(D(2026, 10, 28), D(2026, 10, 28), "work", "hotel_gym")]
-PLACED = {D(2026, 10, 26): {"session": "rest", "location_key": "msp_home"},
+PLACED = {
           D(2026, 10, 27): {"session": "strength_c", "location_key": "outside"},
           D(2026, 10, 28): {"session": "cardio_z2", "location_key": "outside"},
-          D(2026, 10, 29): {"session": "rest", "location_key": "msp_home"}}
+          D(2026, 10, 29): {"session": "rest", "location_key": "msp_home",
+                            "evening": "recovery_flow", "extra": "mobility"}}
 
 
 def _override(d, *a, **k):
@@ -67,10 +68,16 @@ class TestRyansOctober(unittest.TestCase):
             self.assertEqual(self.m[d]["session_type"], "rest", d)
             self.assertNotIn(d, self.ev, d)
 
-    def test_travel_days_are_rest_and_leaving_has_no_evening(self):
-        self.assertEqual(self.m[D(2026, 10, 26)]["session_type"], "rest")
+    def test_leaving_msp_rows_in_the_morning(self):
+        r = self.m[D(2026, 10, 26)]
+        self.assertEqual(r["blocks"]["location_key"], "msp_home")
+        self.assertIn(r["blocks"].get("row_kind"), ("ladder", "circuit"))
+
+    def test_driving_home_is_rest_then_yoga_with_mobility(self):
         self.assertEqual(self.m[D(2026, 10, 29)]["session_type"], "rest")
-        self.assertNotIn(D(2026, 10, 26), self.ev)
+        ev = next(r for r in self.rows if r["plan_date"] == D(2026, 10, 29) and r["slot"] == "evening")
+        self.assertEqual(ev["session_type"], "recovery_flow")
+        self.assertEqual(ev["blocks"].get("suggested_extra"), "mobility")
 
     def test_hotel_days_build_for_the_hotel(self):
         tue, wed = self.m[D(2026, 10, 27)], self.m[D(2026, 10, 28)]

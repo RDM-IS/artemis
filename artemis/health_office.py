@@ -1800,14 +1800,20 @@ def build_schedule(repeats: list[date] | None = None) -> list[dict]:
         # EVENING-1: four evenings a week, and never one in a transit segment.
         # An away day carries none (block 2's rule): he is not home with the mat.
         # A placed rest on a travel day is him LEAVING (10/26): no evening either.
-        leaving = bool(placed) and placed.get("session") == "rest" and day_type(d) == "travel"
-        if (stay is None and not leaving and cycle_pos(d) in EVENING_POS
-                and evening_is_possible(d)):
-            specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
-                          "week_num": week_num_for(d, reps),
-                          "location": day_location(d, "evening"),
-                          "location_key": day_location_key(d, "evening"),
-                          "day_type": day_type(d), "wk0": False})
+        placed_evening = bool(placed) and placed.get("evening") == EVENING_SESSION
+        leaving = (bool(placed) and placed.get("session") == "rest"
+                   and day_type(d) == "travel" and not placed_evening)
+        if (stay is None and not leaving and evening_is_possible(d)
+                and (cycle_pos(d) in EVENING_POS or placed_evening)):
+            ev = {"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
+                  "week_num": week_num_for(d, reps),
+                  "location": day_location(d, "evening"),
+                  "location_key": day_location_key(d, "evening"),
+                  "day_type": day_type(d), "wk0": False}
+            # Ryan, 2026-10-21: a drive back to MSP ends with yoga AND mobility.
+            if day_type(d) == "travel":
+                ev["extra"] = (placed or {}).get("extra") or "mobility"
+            specs.append(ev)
         d += timedelta(days=1)
     return specs
 
@@ -1830,7 +1836,7 @@ def build_row(spec: dict) -> dict:
         from artemis import row_schedule
         blocks = row_schedule.apply(blocks, spec["row_kind"])
         est = row_schedule.EST_MIN[spec["row_kind"]]
-    extra = suggested_extra(session_type, spec.get("pos"))
+    extra = spec.get("extra") or suggested_extra(session_type, spec.get("pos"))
     if extra:
         # Display only: a NAME the card and the wake post show as one line. It
         # seeds no row and changes nothing about what "extras" means.
@@ -1966,7 +1972,11 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     stay_days = {x for x in told if _away.stay_on(_stays, x) is not None}
     # Days with no evening by what he told us: a stay, or leaving on a travel day.
     stay_days |= {x for x, pl in _placed.items()
-                  if pl.get("session") == "rest" and day_type(x) == "travel"}
+                  if pl.get("session") == "rest" and day_type(x) == "travel"
+                  and pl.get("evening") != EVENING_SESSION}
+    # ...and days that GAIN one: a placed evening on a day the pattern has none.
+    gained_days = {x for x, pl in _placed.items()
+                   if pl.get("evening") == EVENING_SESSION and cycle_pos(x) not in EVENING_POS}
     keys = [(r["plan_date"], r.get("slot", "morning")) for r in rows]
     assert len(keys) == len(set(keys)), "duplicate (plan_date, slot)"
     mornings = sorted(r["plan_date"] for r in rows if r.get("slot", "morning") == "morning")
@@ -2050,8 +2060,9 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
         lost = sum(1 for i in range(7)
                    if (wk + timedelta(days=i)) in stay_days
                    and cycle_pos(wk + timedelta(days=i)) in EVENING_POS)
-        assert ev_per_week[wk] == 4 - lost, \
-            f"week of {wk} has {ev_per_week[wk]} evenings, expected {4 - lost}"
+        gained = sum(1 for i in range(7) if (wk + timedelta(days=i)) in gained_days)
+        assert ev_per_week[wk] == 4 - lost + gained, \
+            f"week of {wk} has {ev_per_week[wk]} evenings, expected {4 - lost + gained}"
 
     for r in rows:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])

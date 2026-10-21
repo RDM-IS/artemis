@@ -163,10 +163,18 @@ def _specs_for(d: date, wk: int, *, placements: dict | None = None,
             return specs
     specs = [base]
     # An away day carries no evening flow: he is not at home with the mat.
-    if (stay is None and office.cycle_pos(d) in office.EVENING_POS
-            and office.evening_is_possible(d)):
-        specs.append({**base, "slot": "evening",
-                      "session_type": office.EVENING_SESSION})
+    # CAL-OCT: a placement can ADD one (a drive back to MSP), with an extra.
+    placed = (placements or {}).get(d) if placements else None
+    placed_ev = isinstance(placed, dict) and placed.get("evening") == office.EVENING_SESSION
+    if (stay is None and office.evening_is_possible(d)
+            and (office.cycle_pos(d) in office.EVENING_POS or placed_ev)):
+        ev = {**base, "slot": "evening", "session_type": office.EVENING_SESSION}
+        if placed_ev and placed.get("extra"):
+            ev["extra"] = placed["extra"]
+        elif office.day_type(d) == "travel":
+            # Ryan, 2026-10-21: a drive back to MSP ends with yoga AND mobility.
+            ev["extra"] = "mobility"
+        specs.append(ev)
     return specs
 
 
