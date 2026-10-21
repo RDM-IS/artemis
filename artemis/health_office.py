@@ -1713,6 +1713,58 @@ def week_num_for(d: date, repeats: list[date] | None = None) -> int:
     return 2 + (d - WEEK2_START).days // 7 - sum(1 for r in reps if r <= d)
 
 
+def away_context(start: date, end: date) -> tuple[list, dict]:
+    """(away stays, {date: placement}) for block 1, from acos.cycle_day_overrides.
+
+    CAL-OCT (2026-10-21): block 2 already honoured trips, hunting and explicit
+    placements; block 1 did not, so a vacation weekend or a hotel day in the
+    last week of block 1 could only be planned by hand and the next rebuild
+    would revert it. One reader for both builders' inputs.
+
+    FAIL-CLOSED: a failed read RAISES. The one swallow is RealDbInTestError,
+    which only a running test can raise and which means "there is no table".
+    """
+    from artemis import away
+    from knowledge.db import get_connection
+    from knowledge.dbguard import RealDbInTestError
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            return away.load_stays(cur, start, end), away.placements(cur, start, end)
+    except RealDbInTestError:
+        return [], {}
+
+
+#: CAL-OCT: where a stay puts him when it doesn't say. A work trip with a hotel
+#: gym builds against the conservative hotel inventory.
+HOTEL_KEY, HOTEL_DISPLAY = "hotel", "hotel gym"
+
+
+def _apply_away(morning: dict, stay, placed: dict | None) -> dict:
+    """A morning spec, with the day's placement and stay applied. Pure.
+
+    Order, as in block 2: a placement names the session; a hunting or vacation
+    stay with no placement plans REST (nothing scheduled, nothing missable --
+    Ryan 2026-10-21: "vacation — nothing planned"); a work trip with a hotel gym
+    moves the room to the hotel."""
+    from artemis import away
+    out = dict(morning)
+    if placed:
+        out["session_type"] = placed["session"]
+        key = placed.get("location_key")
+        if key and key in _cycle.DEFAULT_LOCATIONS and not _cycle.DEFAULT_LOCATIONS[key].get("transit"):
+            out["location_key"] = key
+            out["location"] = _cycle.DEFAULT_LOCATIONS[key].get("display", key)
+        out["placed"] = True
+    if stay is not None:
+        out["away"] = stay.purpose
+        if stay.purpose == away.WORK and stay.lodging == away.HOTEL_GYM:
+            out["location_key"], out["location"] = HOTEL_KEY, HOTEL_DISPLAY
+        if not placed and stay.purpose in (away.HUNTING, away.VACATION):
+            out["session_type"] = "rest"
+    return out
+
+
 def build_schedule(repeats: list[date] | None = None) -> list[dict]:
     """Ordered specs {plan_date, session_type, week_num, location, wk0} from
     WEEK2_START to program_end() — OFFICE_END plus a week per repeat.
@@ -1724,7 +1776,9 @@ def build_schedule(repeats: list[date] | None = None) -> list[dict]:
     reps = repeat_starts() if repeats is None else repeats
     end = program_end(reps)
     specs: list[dict] = []
+    from artemis import away as _away
     from artemis import row_schedule
+    stays, placed_by_day = away_context(WEEK2_START, end)
     d = WEEK2_START
     while d <= end:
         morning = {"plan_date": d, "slot": "morning", "session_type": session_for(d),
@@ -1735,14 +1789,31 @@ def build_schedule(repeats: list[date] | None = None) -> list[dict]:
         # row at MSP home -- a ladder or a circuit by cycle position. The
         # location check is override-aware, so a day moved out of Minneapolis
         # keeps whatever its own day type plans.
-        specs.append(row_schedule.place(morning, _cycle.DEFAULT_LOCATIONS))
+        stay = _away.stay_on(stays, d)
+        placed = placed_by_day.get(d)
+        if stay is not None or placed:
+            # CAL-OCT: a day he told us about is planned from what he said, not
+            # from the rowing table.
+            specs.append(_apply_away(morning, stay, placed))
+        else:
+            specs.append(row_schedule.place(morning, _cycle.DEFAULT_LOCATIONS))
         # EVENING-1: four evenings a week, and never one in a transit segment.
-        if cycle_pos(d) in EVENING_POS and evening_is_possible(d):
-            specs.append({"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
-                          "week_num": week_num_for(d, reps),
-                          "location": day_location(d, "evening"),
-                          "location_key": day_location_key(d, "evening"),
-                          "day_type": day_type(d), "wk0": False})
+        # An away day carries none (block 2's rule): he is not home with the mat.
+        # A placed rest on a travel day is him LEAVING (10/26): no evening either.
+        placed_evening = bool(placed) and placed.get("evening") == EVENING_SESSION
+        leaving = (bool(placed) and placed.get("session") == "rest"
+                   and day_type(d) == "travel" and not placed_evening)
+        if (stay is None and not leaving and evening_is_possible(d)
+                and (cycle_pos(d) in EVENING_POS or placed_evening)):
+            ev = {"plan_date": d, "slot": "evening", "session_type": EVENING_SESSION,
+                  "week_num": week_num_for(d, reps),
+                  "location": day_location(d, "evening"),
+                  "location_key": day_location_key(d, "evening"),
+                  "day_type": day_type(d), "wk0": False}
+            # Ryan, 2026-10-21: a drive back to MSP ends with yoga AND mobility.
+            if day_type(d) == "travel":
+                ev["extra"] = (placed or {}).get("extra") or "mobility"
+            specs.append(ev)
         d += timedelta(days=1)
     return specs
 
@@ -1765,7 +1836,7 @@ def build_row(spec: dict) -> dict:
         from artemis import row_schedule
         blocks = row_schedule.apply(blocks, spec["row_kind"])
         est = row_schedule.EST_MIN[spec["row_kind"]]
-    extra = suggested_extra(session_type, spec.get("pos"))
+    extra = spec.get("extra") or suggested_extra(session_type, spec.get("pos"))
     if extra:
         # Display only: a NAME the card and the wake post show as one line. It
         # seeds no row and changes nothing about what "extras" means.
@@ -1888,6 +1959,24 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     validating a proposed repeat. Weekly counts are per CALENDAR week: a
     repeated week has the same week_num twice (REPEAT-WEEK)."""
     end = program_end() if end is None else end
+    # CAL-OCT: days he told us about (a stay or a placement) are planned from
+    # what he said, so the pattern checks below step aside for them.
+    from artemis import away as _away
+    _stays, _placed = away_context(WEEK2_START, end)
+    told = {d for d in _placed}
+    for st in _stays:
+        x = max(st.start, WEEK2_START)
+        while x <= min(st.end, end):
+            told.add(x)
+            x += timedelta(days=1)
+    stay_days = {x for x in told if _away.stay_on(_stays, x) is not None}
+    # Days with no evening by what he told us: a stay, or leaving on a travel day.
+    stay_days |= {x for x, pl in _placed.items()
+                  if pl.get("session") == "rest" and day_type(x) == "travel"
+                  and pl.get("evening") != EVENING_SESSION}
+    # ...and days that GAIN one: a placed evening on a day the pattern has none.
+    gained_days = {x for x, pl in _placed.items()
+                   if pl.get("evening") == EVENING_SESSION and cycle_pos(x) not in EVENING_POS}
     keys = [(r["plan_date"], r.get("slot", "morning")) for r in rows]
     assert len(keys) == len(set(keys)), "duplicate (plan_date, slot)"
     mornings = sorted(r["plan_date"] for r in rows if r.get("slot", "morning") == "morning")
@@ -1911,7 +2000,7 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
         # session. Asserting against the override-resolved `day_type` compared
         # two different frames and rejected the leave week outright — 9/29 is a
         # `wi` day carrying the positionally-correct strength_a.
-        if r["session_type"].startswith("strength"):
+        if r["session_type"].startswith("strength") and r["plan_date"] not in told:
             base_type = _cycle.DAY_TYPES[cycle_pos(r["plan_date"])]
             assert base_type == "msp_work", \
                 f"{r['plan_date']}: {r['session_type']} on a positional {base_type} day"
@@ -1928,8 +2017,10 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     from collections import Counter
 
     from artemis import row_schedule
+    # CAL-OCT: a lift he PLACED (a hotel day, a Richfield week) is his call and
+    # does not count against the rowing schedule's "no lifts" rule.
     lifts = Counter(calendar_week_start(r["plan_date"]) for r in rows
-                    if r["session_type"].startswith("strength"))
+                    if r["session_type"].startswith("strength") and r["plan_date"] not in told)
     for wk in sorted({calendar_week_start(r["plan_date"]) for r in rows}):
         # ROW-SCHEDULE: three lifts a week until the rowing schedule starts. The
         # week it starts in is mixed by construction, and from then on an MSP
@@ -1940,7 +2031,7 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
             assert lifts[wk] == 0, f"week of {wk} has {lifts[wk]} lifts, expected none (rowing)"
     # ROW-SCHEDULE: every morning the table names is that row, and no other is.
     for r in rows:
-        if r.get("slot", "morning") != "morning":
+        if r.get("slot", "morning") != "morning" or r["plan_date"] in told:
             continue
         d = r["plan_date"]
         want_kind = row_schedule.kind_for(cycle_pos(d), d, day_location_key(d))
@@ -1965,7 +2056,13 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
     full_weeks = {calendar_week_start(r["plan_date"]) for r in rows
                   if first_wk < calendar_week_start(r["plan_date"]) < last_wk}
     for wk in sorted(full_weeks):
-        assert ev_per_week[wk] == 4, f"week of {wk} has {ev_per_week[wk]} evenings, expected 4"
+        # CAL-OCT: an away day has no evening, so it comes off the four.
+        lost = sum(1 for i in range(7)
+                   if (wk + timedelta(days=i)) in stay_days
+                   and cycle_pos(wk + timedelta(days=i)) in EVENING_POS)
+        gained = sum(1 for i in range(7) if (wk + timedelta(days=i)) in gained_days)
+        assert ev_per_week[wk] == 4 - lost + gained, \
+            f"week of {wk} has {ev_per_week[wk]} evenings, expected {4 - lost + gained}"
 
     for r in rows:
         assert r["blocks"].get("day_type") == day_type(r["plan_date"])
@@ -1978,6 +2075,8 @@ def validate_rows(rows: list[dict], end: date | None = None) -> list[str]:
         assert not _cycle.is_transit(_cycle.anchor_location(r["plan_date"])), \
             f"{r['plan_date']}: a session cannot be placed on the road"
         want = day_location(r["plan_date"], r.get("slot", "morning"))
+        if r["plan_date"] in told and r.get("slot", "morning") == "morning":
+            continue
         if r["blocks"].get("row_kind"):
             # ROW-SCHEDULE: a row morning happens where the rower is, at home,
             # even on a day the cycle anchors at the office.
