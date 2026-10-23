@@ -8,7 +8,11 @@ short record card. Rounds are chosen at the start of the session.
 the app offers two ways forward and he taps one:
 
     rate   every round one stroke/min faster, same lengths     20/21/22/23 -> 21/22/23/24
-    time   every round the same rate, one minute longer         4:00 each   -> 5:00 each
+    time   every round the same rate, 15 seconds longer         4:00 each   -> 4:15 each
+
+(The time step was a full minute until 2026-10-23: +1:00 on a 4:00 round is
++25% in one tap, against ~4% for a stroke/min. Ryan, 2026-10-23: "jumping full
+minute may be too much".)
 
 The default is the lever that did NOT move last time, so tapping the default
 alternates the two, as his own rowing ladder does. "Same as last time" is always
@@ -98,7 +102,13 @@ MIN_RATE = 14
 MAX_WORK_SEC = 600
 
 RATE_STEP = 1
-TIME_STEP_SEC = 60
+TIME_STEP_SEC = 15
+
+#: MIN-ROUND (2026-10-23): a logged row shorter than this is not a round -- a
+#: test run, a mis-tap, a card saved without rowing. It is skipped when building
+#: history, so it can never become the base. Found when the 10/19 test session
+#: (rows of 1-2 s) made the next circuit prescribe 0:02 rows.
+MIN_ROUND_SEC = 60
 
 #: Ryan's rule: always a one-minute rest after each work interval, stopped or
 #: easy at 18.
@@ -243,8 +253,13 @@ def label_for(lever: str | None, rounds: list[RowRound], *, unit: str = "spm",
     length = (_clock(lengths[0]) if len(lengths) == 1
               else "/".join(_clock(r.work_sec) for r in rounds))
     up = "+1 stroke/min" if unit == "spm" else f"+{step} bpm"
-    head = {"rate": up, "time": "+1:00 each round"}.get(lever or "", "Same as last time")
+    head = {"rate": up, "time": time_label()}.get(lever or "", "Same as last time")
     return f"{head} — {rates} {unit} · {length}"
+
+
+def time_label() -> str:
+    """The time lever's name, from the step: "+0:15 each round"."""
+    return f"+{_clock(TIME_STEP_SEC)} each round"
 
 
 def _clock(sec: int) -> str:
@@ -265,9 +280,12 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
     """Everything the start screen needs. `history` is newest first: one list
     of rounds per logged session of THIS kind, each in round order."""
     spec = kind_spec(kind)
-    n = clamp_rounds(rounds, spec["default_rounds"])
+    last_logged = history[0] if history else []
+    # No count asked for: last time's count, so the base is what he did rather
+    # than a climb continued past it. The kind's default only for a first session.
+    n = clamp_rounds(rounds, len(last_logged) or spec["default_rounds"])
     kw = {"step": spec["step"], "cap": spec["max"], "unit": spec["unit"]}
-    last = history[0] if history else []
+    last = last_logged
     prev = history[1] if len(history) > 1 else []
     base = resize(last, n, spec["start"], spec["step"], spec["max"])
     default = default_lever(last, prev)
@@ -297,13 +315,24 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
                f"{', '.join(str(r.round) for r in unfinished)} didn't finish last time, "
                "so today repeats the same targets")
     elif history:
-        why = {"rate": "last time added a stroke/min, so a minute is the default today",
-               "time": "last time added a minute, so a stroke/min is the default today",
+        step = _clock(TIME_STEP_SEC)
+        why = {"rate": f"last time added a stroke/min, so +{step} is the default today",
+               "time": "last time added time, so a stroke/min is the default today",
                }.get(moved or "", "one session logged so far — the rate goes up first"
                      if len(history) == 1 else
                      "last time didn't move one lever alone — the rate goes up first")
     else:
         why = f"no logged {spec['display_name'].lower()} yet — starting the ladder"
+    # Rounds past last time's count are continued, not repeated: say so, so a
+    # 6-round screen built on a 4-round session doesn't read as "same as last time".
+    extrapolated = list(range(len(last) + 1, n + 1)) if last else []
+    if extrapolated:
+        which = (f"Round {extrapolated[0]} is" if len(extrapolated) == 1
+                 else f"Rounds {extrapolated[0]}–{extrapolated[-1]} are")
+        extrapolated_note = (f"{which} new — last time had {len(last)}, "
+                             f"so {'it continues' if len(extrapolated) == 1 else 'they continue'} the climb")
+    else:
+        extrapolated_note = None
     return {
         "kind": kind,
         "session_type": spec["session_type"],
@@ -320,6 +349,10 @@ def prescription(history: list[list[RowRound]], rounds: int | None,
         "value_min": spec["min"], "value_max": spec["max"],
         "modality": spec["modality"], "device": spec["device"],
         "unfinished": [r.as_dict() for r in unfinished],
+        "extrapolated": extrapolated,
+        "extrapolated_note": extrapolated_note,
+        "time_step_sec": TIME_STEP_SEC,
+        "time_label": time_label(),
         "default": default,
         "why": why,
         "rest": {"sec": REST_SEC, "rate": REST_RATE},
@@ -348,7 +381,8 @@ def group_history(rows: list[dict], *, max_sessions: int = 2) -> list[list[RowRo
     One session per day; a round logged twice that day keeps its LATEST log,
     because the record card can be re-saved and the last save is the one he
     meant. A row with no stroke rate or no duration is skipped -- it cannot
-    describe a round.
+    describe a round. So is a row shorter than MIN_ROUND_SEC (its target when
+    it has one, else what was rowed): that is a test or a mis-tap, not a round.
     """
     by_day: dict = {}
     for r in rows:
@@ -356,6 +390,9 @@ def group_history(rows: list[dict], *, max_sessions: int = 2) -> list[list[RowRo
         if not r.get("set_num"):
             continue
         if not has_target and (r.get("stroke_rate") is None or not r.get("duration_sec")):
+            continue
+        length = int(r["target_sec"]) if has_target else int(r["duration_sec"])
+        if length < MIN_ROUND_SEC:
             continue
         day = by_day.setdefault(r["day"], {})
         cur = day.get(int(r["set_num"]))

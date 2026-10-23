@@ -2478,7 +2478,7 @@ def get_library(
 
 # ---------------------------------------------------------------------------
 # /row-circuit — ROW-CIRCUIT (Ryan, 2026-10-19). The start screen's
-# prescription: today's rounds as "+1 stroke/min" or "+1:00 each round" over
+# prescription: today's rounds as "+1 stroke/min" or "+0:15 each round" over
 # the last session he logged, the default being the lever that did not move
 # last time. The math is knowledge.row_circuit; this only reads the history.
 #
