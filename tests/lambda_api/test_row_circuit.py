@@ -78,7 +78,7 @@ class TestPrescriptionEndpoint(unittest.TestCase):
         body = self._get(_HistorySession(rows), "?rounds=3").json()
         self.assertTrue(body["available"])
         self.assertEqual([x["spm"] for x in body["options"]["rate"]["rounds"]], [12, 13, 14])
-        self.assertEqual([x["work_sec"] for x in body["options"]["time"]["rounds"]], [160] * 3)
+        self.assertEqual([x["work_sec"] for x in body["options"]["time"]["rounds"]], [115] * 3)
         self.assertEqual(body["default"], "rate")
 
     def test_reps_come_back_for_the_record_card(self):

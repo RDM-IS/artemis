@@ -30,7 +30,8 @@ def session(*pairs):
 
 class TestRyansExample(unittest.TestCase):
     """Ryan, 2026-10-19 17:26: last time 4 rounds at 20/21/22/23 -> this time
-    21/22/23/24, or the same rates one minute longer each round."""
+    21/22/23/24, or the same rates one time step longer each round (a minute
+    until 2026-10-23, now 15 seconds)."""
 
     def setUp(self):
         self.last = session((240, 20), (240, 21), (240, 22), (240, 23))
@@ -42,7 +43,7 @@ class TestRyansExample(unittest.TestCase):
 
     def test_time_option(self):
         self.assertEqual(rates(self.p["options"]["time"]), [20, 21, 22, 23])
-        self.assertEqual(lengths(self.p["options"]["time"]), [300] * 4)
+        self.assertEqual(lengths(self.p["options"]["time"]), [240 + rc.TIME_STEP_SEC] * 4)
 
     def test_repeat_is_always_offered(self):
         self.assertEqual(rates(self.p["options"]["repeat"]), [20, 21, 22, 23])
@@ -179,7 +180,7 @@ class TestLadder(unittest.TestCase):
         last = session((240, 15), (240, 16))
         p = rc.prescription([last], 2, "ladder")
         self.assertEqual(rates(p["options"]["rate"]), [16, 17])
-        self.assertEqual(lengths(p["options"]["time"]), [300, 300])
+        self.assertEqual(lengths(p["options"]["time"]), [240 + rc.TIME_STEP_SEC] * 2)
 
     def test_the_circuit_keeps_its_stations_and_names(self):
         p = rc.prescription([], None, "circuit")
@@ -290,3 +291,78 @@ class TestZoneLadders(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTimeStep(unittest.TestCase):
+    """2026-10-23: the time lever is +0:15, not +1:00 (+25% on a 4:00 round)."""
+
+    def test_the_step_is_fifteen_seconds(self):
+        self.assertEqual(rc.TIME_STEP_SEC, 15)
+
+    def test_the_label_is_built_from_the_step(self):
+        p = rc.prescription([session((240, 20), (240, 21))], 2)
+        self.assertTrue(p["options"]["time"]["label"].startswith("+0:15 each round"))
+        self.assertEqual(p["time_label"], "+0:15 each round")
+        self.assertEqual(p["time_step_sec"], 15)
+
+    def test_no_copy_still_says_a_minute(self):
+        prev = session((240, 20), (240, 21))
+        last = session((240, 21), (240, 22))
+        why = rc.prescription([last, prev], 2)["why"]
+        self.assertNotIn("minute", why)
+        self.assertIn("+0:15", why)
+
+
+class TestMinRound(unittest.TestCase):
+    """2026-10-23: a test run's 1-2 s rows became the next circuit's base."""
+
+    def _row(self, n, **kw):
+        base = {"day": date(2031, 3, 10), "set_num": n, "stroke_rate": 15, "logged_at": T0}
+        return {**base, **kw}
+
+    def test_rows_shorter_than_a_minute_are_not_rounds(self):
+        rows = [self._row(1, duration_sec=2), self._row(2, duration_sec=1)]
+        self.assertEqual(rc.group_history(rows), [])
+
+    def test_a_short_target_is_not_a_round_either(self):
+        rows = [self._row(1, duration_sec=200, target_spm=15, target_sec=30)]
+        self.assertEqual(rc.group_history(rows), [])
+
+    def test_a_dnf_cut_short_still_counts_by_its_target(self):
+        # Stopped at 20 s of a 4:00 round: the round is real, and unfinished.
+        rows = [self._row(1, duration_sec=20, target_spm=15, target_sec=240, dnf=True)]
+        h = rc.group_history(rows)
+        self.assertEqual([(r.work_sec, r.finished) for r in h[0]], [(240, False)])
+
+    def test_exactly_a_minute_counts(self):
+        rows = [self._row(1, duration_sec=rc.MIN_ROUND_SEC)]
+        self.assertEqual(len(rc.group_history(rows)), 1)
+
+
+class TestRoundsDefaultToLastTime(unittest.TestCase):
+    def test_no_count_asked_uses_last_times_count(self):
+        last = session((240, 20), (240, 21), (240, 22), (240, 23), (240, 24))
+        p = rc.prescription([last], None, "circuit")
+        self.assertEqual(p["rounds"], 5)
+        self.assertEqual(p["extrapolated"], [])
+        self.assertIsNone(p["extrapolated_note"])
+
+    def test_first_session_uses_the_kinds_default(self):
+        self.assertEqual(rc.prescription([], None, "ladder")["rounds"],
+                         rc.KINDS["ladder"]["default_rounds"])
+
+    def test_more_rounds_than_last_time_are_flagged(self):
+        last = session((240, 20), (240, 21), (240, 22), (240, 23))
+        p = rc.prescription([last], 6)
+        self.assertEqual(p["extrapolated"], [5, 6])
+        self.assertIn("Rounds 5–6 are new", p["extrapolated_note"])
+        self.assertIn("last time had 4", p["extrapolated_note"])
+
+    def test_one_extra_round_reads_singular(self):
+        last = session((240, 20), (240, 21))
+        p = rc.prescription([last], 3)
+        self.assertEqual(p["extrapolated"], [3])
+        self.assertTrue(p["extrapolated_note"].startswith("Round 3 is new"))
+
+    def test_no_history_flags_nothing(self):
+        self.assertEqual(rc.prescription([], 6)["extrapolated"], [])
