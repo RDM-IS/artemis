@@ -20,12 +20,21 @@ from artemis import row_schedule as _row_schedule  # noqa: E402
 
 _NO_ROW_SCHEDULE = _patch.object(_row_schedule, "ROW_FROM", date(9999, 1, 1))
 
+# WEEK-TEMPLATE (2026-11-01) superseded both the rowing table and A/B/C in block
+# 2. The same reasoning holds: this file tests the LIFT machinery, so the
+# template is pushed past the block too; tests/test_week_template.py covers it.
+from artemis import week_template as _week_template  # noqa: E402
+
+_NO_WEEK_TEMPLATE = _patch.object(_week_template, "TEMPLATE_FROM", date(9999, 1, 1))
+
 
 def setUpModule():
     _NO_ROW_SCHEDULE.start()
+    _NO_WEEK_TEMPLATE.start()
 
 
 def tearDownModule():
+    _NO_WEEK_TEMPLATE.stop()
     _NO_ROW_SCHEDULE.stop()
 
 

@@ -234,6 +234,14 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "1-arm DB row": "dumbbell",
     "Standing DB calf raise": "dumbbell",
     "Stability-ball crunch": "bodyweight",
+    # FULLBODY-1 (approved 2026-11-01) — the names it adds
+    "Chest-supported DB row": "dumbbell",
+    "DB step-up": "dumbbell",
+    "DB front squat": "dumbbell",
+    "TRX single-arm row": "trx",
+    "Push-up": "bodyweight",
+    "Upright bike — Z3": "cardio",
+    "Bike — Z3": "cardio",
 }
 
 
@@ -328,6 +336,12 @@ LIFT_PROFILE: dict[str, tuple[str, str, str | None]] = {
     "DB goblet squat":               (_LC, _LOWER, None),
     "DB Romanian deadlift":          (_LC, _LOWER, None),
     "DB split squat":                (_LC, _LOWER, None),
+    # FULLBODY-1 (2026-11-01)
+    "Chest-supported DB row":        (_LC, _PULL,  "adjustable bench"),
+    "DB step-up":                    (_LC, _LOWER, "flat bench"),
+    "DB front squat":                (_LC, _LOWER, None),
+    "TRX single-arm row":            (_LC, _PULL,  "TRX"),
+    "Push-up":                       (_LC, _PUSH,  None),
     "Standing DB calf raise":        (_LP, _LOWER, None),
     # bodyweight
     "Captain's chair knee raise":    (_LP, _CORE,  "captain's chair"),
@@ -521,6 +535,11 @@ def can_hold(location_key: str, session_type: str) -> bool:
     The office holds everything it was written for; anywhere else needs a table.
     A location with no recorded inventory holds nothing.
     """
+    if session_type == "strength_full":
+        # FULLBODY-1 has its own per-room versions rather than a substitution
+        # table; the rooms it was written for are the ones that hold it.
+        from artemis import full_body
+        return location_key in full_body.ROOMS
     if location_key == "office":
         return True
     return bool(subs_for(location_key, session_type))
@@ -550,6 +569,7 @@ _DISPLAY = {
     "strength_a": "Strength A",
     "strength_b": "Strength B",
     "strength_c": "Strength C",
+    "strength_full": "Full Body",
     "cardio_z2": "Zone 2",
     # Without a modality this is the honest generic; with one it becomes
     # "Row intervals" etc. via display_name_for().
@@ -653,7 +673,7 @@ def is_office_day(d: date) -> bool:
 # back to back once a week; Ryan accepted that deliberately (test asserts
 # exactly 6 such pairs, one per program week).
 LIFT_SLOTS = (1, 3, 4)             # 1-based office-day positions within a cycle week
-LIFT_ORDER = ("strength_a", "strength_b", "strength_c")
+from knowledge.session_types import STRENGTH_LEGACY as LIFT_ORDER  # noqa: E402  (one list)
 # Ryan, 2026-09-19: Z2 sits on the office non-lift days, where the equipment is
 # reliable; the flows sit on the wi days because a mat travels. Richfield's
 # rower and trainer stay available for extra cardio — the SEEDED session there
@@ -1608,6 +1628,10 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
         return bw_circuit.build(gate=gate, location=location or LOCATION)
     if session_type == "recovery_flow":
         return _recovery_flow(location or LOCATION)
+    if session_type == "strength_full":
+        # FULLBODY-1: its own per-room versions; raises where it can't run.
+        from artemis import full_body
+        return full_body.build(location_key, location or LOCATION, on=on)
     if session_type.startswith("strength"):
         return _strength(session_type, week_num, wk0=wk0,
                          location=location or LOCATION, location_key=location_key)
@@ -1902,6 +1926,10 @@ def duration_verdict(session_type: str, week_num, est) -> tuple[str, str]:
     if est is None:
         return "ok", ""
     est = int(est)
+    # FULLBODY-1 was approved as a 60-minute session (the 2026-10-02 redesign:
+    # "60 minutes, not 45"); 60 is its length, not an overrun.
+    if session_type == "strength_full" and est <= 60:
+        return ("note", f"~{est} min — approved 60-min session") if est >= TARGET_MIN else ("ok", "")
     if est >= HARD_MAX_MIN:
         if (session_type, week_num) in CALIBRATION_PENDING:
             return "pending", (f"~{est} min — {HARD_MAX_MIN}+ allowed until the estimate "
@@ -1932,7 +1960,7 @@ def format_estimate(minutes) -> str:
     return f"~{m} min" if m > TARGET_MIN else f"{m} min"
 
 
-LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "cardio_intervals",
+LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "strength_full", "cardio_intervals",
                        "cardio_z2", "rest", "rest_mobility", "recovery_flow"}
 
 

@@ -228,14 +228,16 @@ class TestStrengthNext(unittest.TestCase):
     def _get(self, sess):
         return _client(sess).get("/api/health/strength-next", headers={"X-API-Key": VALID_KEY}).json()
 
-    def test_next_after_each(self):
-        for last, nxt in (("strength_a", "strength_b"), ("strength_b", "strength_c"),
-                          ("strength_c", "strength_a")):
+    def test_next_is_always_full_body(self):
+        """FULLBODY-1 (2026-11-01): one strength session, whatever came before —
+        and `after` still reports the last lift actually logged."""
+        for last in ("strength_a", "strength_b", "strength_c", "strength_full"):
             body = self._get(_StrengthSession({"session_type": last, "at": T}))
-            self.assertEqual(body["session_type"], nxt, last)
+            self.assertEqual(body["session_type"], "strength_full", last)
+            self.assertEqual(body["after"], last)
 
-    def test_no_history_is_a(self):
-        self.assertEqual(self._get(_StrengthSession())["session_type"], "strength_a")
+    def test_no_history_is_full_body(self):
+        self.assertEqual(self._get(_StrengthSession())["session_type"], "strength_full")
 
     def test_a_failed_read_is_unavailable_never_a(self):
         body = self._get(_StrengthSession(fail=True))

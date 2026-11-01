@@ -325,9 +325,16 @@ class TestBlock2HonoursPlacementsAndAway(unittest.TestCase):
         from artemis import health_office as office
         from artemis import row_schedule
         d = date(2026, 12, 8)
-        # ROW-SCHEDULE (2026-10-19): "the template" is now the rowing table on an
-        # MSP morning, and session_for() everywhere else.
-        kind = row_schedule.kind_for(office.cycle_pos(d), d, office.day_location_key(d))
-        want = row_schedule.SESSION_TYPE if kind else office.session_for(d)
-        self.assertEqual(untouched["session_type"], want)
-        self.assertEqual(untouched["blocks"].get("row_kind"), kind)
+        # WEEK-TEMPLATE (2026-11-01): from TEMPLATE_FROM "the template" is the
+        # 14-day week template resolved for the day's room (it superseded
+        # ROW-SCHEDULE's table, which still governs earlier dates).
+        from artemis import week_template as wt
+        from artemis import cycle as _cyc
+        self.assertTrue(wt.applies(d))
+        base = {"plan_date": d, "pos": office.cycle_pos(d),
+                "location_key": office.day_location_key(d), "location": "x",
+                "session_type": "x"}
+        want = wt.place(base, _cyc.DEFAULT_LOCATIONS)
+        self.assertEqual(untouched["session_type"], want["session_type"])
+        self.assertEqual(untouched["blocks"].get("row_kind"), want.get("row_kind"))
+        del row_schedule

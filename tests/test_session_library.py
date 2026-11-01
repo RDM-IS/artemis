@@ -125,7 +125,7 @@ class TestMakeupState(unittest.TestCase):
         for st in EXTRA_TYPES:
             self.assertFalse(is_training(st), st)
         self.assertEqual(set(sl.LIBRARY_TYPES) - set(EXTRA_TYPES),
-                         {"strength_a", "strength_b", "strength_c"})
+                         {"strength_a", "strength_b", "strength_c", "strength_full"})
 
 
 class TestExtras(unittest.TestCase):
@@ -139,8 +139,8 @@ class TestExtras(unittest.TestCase):
             self.assertEqual(types[:4], ["recovery_flow", "core", "mobility", "yoga_strength"],
                              loc["key"])
             # QUICK-START: strength only where the room can hold it.
-            want = [t for t in ("strength_a", "strength_b", "strength_c")
-                    if office.can_hold(loc["key"], t)]
+            from knowledge.session_types import STRENGTH_TYPES
+            want = [t for t in STRENGTH_TYPES if office.can_hold(loc["key"], t)]
             self.assertEqual(types[4:], want, loc["key"])
 
     def test_core_is_light_and_says_when(self):

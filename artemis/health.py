@@ -1320,6 +1320,13 @@ _EQUIPMENT_MAP: dict[str, dict] = {
         "equipment": _office.SESSION_EQUIPMENT["strength_c"],
         "first_lift": "DB Romanian deadlift",
     },
+    # FULLBODY-1: the office version (X); a Richfield row names its own room.
+    "strength_full": {
+        "location": "office gym",
+        "equipment": ["DBs", "flat bench", "adjustable bench", "functional trainer",
+                      "upright bike", "mat"],
+        "first_lift": "DB split squat",
+    },
     "cardio_z2": {
         "location": "office gym",
         "equipment": _office.SESSION_EQUIPMENT["cardio_z2"],
@@ -1439,6 +1446,7 @@ def _session_pretty_name(session_type: str) -> str:
         "strength_a":       "Strength A — Push/Legs",
         "strength_b":       "Strength B — Pull/Hinge",
         "strength_c":       "Strength C — Full Body",
+        "strength_full":    "Full Body",
         "cardio_intervals": "Cardio Intervals",
         "cardio_z2":        "Cardio Zone 2",
         "rest_mobility":    "Rest / Mobility",
@@ -2435,6 +2443,8 @@ _SESSION_TYPE_ALIASES = {
     "strength_a": "strength_a", "strength a": "strength_a",
     "strength_b": "strength_b", "strength b": "strength_b",
     "strength_c": "strength_c", "strength c": "strength_c",
+    "strength_full": "strength_full", "full body": "strength_full",
+    "full-body": "strength_full",
     "cardio_intervals": "cardio_intervals", "cardio intervals": "cardio_intervals",
     "intervals": "cardio_intervals", "hiit": "cardio_intervals",
     "cardio_z2": "cardio_z2", "cardio z2": "cardio_z2", "zone 2": "cardio_z2",

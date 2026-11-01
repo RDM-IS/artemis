@@ -33,14 +33,16 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_KEY = "session_library"
 
-from knowledge.session_types import EXTRA_TYPES, REST_TYPES, is_training  # noqa: E402
+from knowledge.session_types import (EXTRA_TYPES, REST_TYPES, STRENGTH_TYPES,  # noqa: E402
+                                     is_training)
 
 #: Extras (Ryan, 2026-09-27): yoga / core / mobility, every day.
 #: QUICK-START (Ryan, 2026-10-20): "give me buttons to decide what I want to do
 #: and when" -- so strength A/B/C are in the library too, wherever the room can
 #: hold them, and gym-display's Strength button picks the next in rotation.
 #: The Extras list on the screen still shows only EXTRA_TYPES.
-LIBRARY_TYPES = EXTRA_TYPES + ("strength_a", "strength_b", "strength_c")
+#: WEEK-TEMPLATE (2026-11-01): strength_full joins; A/B/C stay launchable.
+LIBRARY_TYPES = EXTRA_TYPES + STRENGTH_TYPES
 
 #: Pseudo-locations with no room to train in.
 _NOT_A_ROOM = frozenset({"transit", "outside"})

@@ -153,6 +153,19 @@ def _specs_for(d: date, wk: int, *, placements: dict | None = None,
     # explicit placement and an away day are decisions about THAT day, so both
     # win over the table, as they win over session_for().
     if not (placements and d in placements) and stay is None:
+        from artemis import week_template
+        if week_template.applies(d):
+            # WEEK-TEMPLATE (2026-11-01): the plan names the session, the room
+            # the machine. Supersedes ROW-SCHEDULE's table from TEMPLATE_FROM.
+            # The evening keeps the day's own room and nothing of the morning's
+            # shape (a row_kind on a flow would make build_row reshape it).
+            specs = [week_template.place(base, office._cycle.DEFAULT_LOCATIONS)]
+            if office.cycle_pos(d) in office.EVENING_POS and office.evening_is_possible(d):
+                ev = {**base, "slot": "evening", "session_type": office.EVENING_SESSION}
+                if office.day_type(d) == "travel":
+                    ev["extra"] = "mobility"
+                specs.append(ev)
+            return specs
         from artemis import row_schedule
         morning = row_schedule.place(base, office._cycle.DEFAULT_LOCATIONS)
         if morning is not base:

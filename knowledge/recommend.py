@@ -27,7 +27,7 @@ BUTTONS = ("row", "row_circuit", "ride", "run", "strength", "yoga", "recovery")
 #: The extras that live under "More" (not on a Start button).
 MORE_TYPES = ("core", "mobility")
 
-STRENGTH_TYPES = ("strength_a", "strength_b", "strength_c")
+from knowledge.session_types import STRENGTH_TYPES  # noqa: E402  (one list)
 REST_TYPES = ("rest", "rest_mobility")
 LIFT_GAP = timedelta(hours=48)
 
