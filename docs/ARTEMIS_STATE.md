@@ -248,12 +248,12 @@ Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on
 |---|---|---|---|
 | Warm-up | 8 | 5 min easy on the room's machine + hip/T-spine mobility | same, bike |
 | 1 · fresh, unilateral — 3 rounds, 60 s between | 14 | DB split squat ×8/side · single-arm DB row ×10/side | DB step-up ×8/side · TRX single-arm row ×10/side |
-| 2 · density circuit — 4 rounds, no rest between moves | 26 | DB goblet squat ×12 · DB bench press ×10 · seated cable row ×12 · DB Romanian deadlift ×10 · **3 min upright bike at Z3** | DB front squat ×12 · push-up ×10–15 · band row ×15 · DB RDL ×10 · **3 min bike at Z3** |
+| 2 · density circuit — 4 rounds, no rest between moves | 26 | DB goblet squat ×12 · DB bench press ×10 · chest-supported DB row (incline bench) ×12 · DB Romanian deadlift ×10 · **3 min upright bike at Z3** | DB front squat ×12 · push-up ×10–15 · band row ×15 · DB RDL ×10 · **3 min bike at Z3** |
 | 3 · trunk — 2 rounds | 7 | cable Pallof press ×10/side · dead bug ×10 · side plank 30 s/side | band anti-rotation ×10/side · bird dog ×10 · plank 40 s |
 | Cool-down | 5 | easy machine + stretch | same |
 
 - **Progression order:** add a round to block 2 (4 → 5) → shorten machine rest → raise machine target into Z3/Z4 → only then load. Load steps follow the room (PowerBlocks in 10s at Richfield).
-- **Equipment:** TRX exists only at Richfield; X uses only the office inventory already in `health_office` (dumbbells + flat bench, Pulldown/Seated Row machine, functional trainer, upright bike), still unverified in person (OFFICE-WALK). The builder fails closed on anything a room can't resolve.
+- **Office, confirmed by Ryan 2026-11-01:** hex dumbbells **5–50 in 5s** (`load_config.OFFICE` updated); benches are movable; the **Pulldown/Seated Row combo is broken** — X depends on no machine station, so block 2's pull is a chest-supported DB row, and the single-arm cable row on the functional trainer is the swap when it's free (**10 lb steps**, confirmed); the **upright bike** is there and heart rate comes from the watch (handles optional); mats exist, floor space depends on the crowd — if the floor is full, block 3 runs standing (cable Pallof press, then an incline plank on a bench). TRX exists only at Richfield. Still open on OFFICE-WALK: the machine pin-stack steps, the Smith bar, the plate set. The builder fails closed on anything a room can't resolve.
 - **Open for Ryan:** movement list as drafted; whether block 2's machine interval is 3 min or 2 min; deload rule (proposed: every 6th week, 3 rounds, no Z3).
 
 **ROW-SCHEDULE — every Minneapolis morning is a row — BUILT 2026-10-19 (`feat/row-schedule` + gym-display `feat/row-schedule`). NOT APPLIED: `scripts/apply_row_schedule.py` (dry run by default) is Ryan's to run.** Ryan, 21:54: "let's just focus on rowing every MPLS day, some row only, some floor work."

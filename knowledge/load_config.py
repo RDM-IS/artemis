@@ -25,9 +25,11 @@ _NONE = {"mode": "none"}
 
 #: The office (all Precor). These are today's client-side constants, moved.
 OFFICE: dict[str, dict] = {
-    "dumbbell": {"mode": "numeric", "step": 5, "min": 5, "max": 45},
+    # Hex rack 5-50 in 5s (Ryan, confirmed 2026-11-01).
+    "dumbbell": {"mode": "numeric", "step": 5, "min": 5, "max": 50},
     # TODO(office): confirm each Precor pin-stack increment in person.
     "machine": {"mode": "numeric", "step": 10, "min": 0, "max": 300},
+    # Functional trainer: 10 lb steps (Ryan, confirmed 2026-11-01).
     "cable": {"mode": "numeric", "step": 10, "min": 0, "max": 200},
     # TODO(office): the Icarian Smith may be counterbalanced; until measured
     # the bar counts as 0 and loads are plates only.
