@@ -221,7 +221,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 - **Rows from before 056** have no target: target = what was held, finished — the rule they were written under.
 - **Migrate-first:** apply 056 before the Lambda, because both `/log` inserts name the new columns.
 
-**WEEK-TEMPLATE — one 14-day cycle, sessions by day, machine by room — DECIDED 2026-11-01, NOT BUILT (`feat/week-template`).** Ryan, 09:31–10:12: "we need rest days"; strength on Wednesdays plus a Richfield off day; Wisconsin days stay flexible because where he will be is not known in advance. **Supersedes ROW-SCHEDULE's table** (every MSP morning a row, no rest) from block 2 onward.
+**WEEK-TEMPLATE — one 14-day cycle, sessions by day, machine by room — APPROVED 2026-11-01 10:42, BUILDING (`feat/week-template`), target live Sun 11/08.** Ryan, 09:31–10:12: "we need rest days"; strength on Wednesdays plus a Richfield off day; Wisconsin days stay flexible because where he will be is not known in advance. **Supersedes ROW-SCHEDULE's table** (every MSP morning a row, no rest) from block 2 onward.
 
 | pos | Wk 1 | room | pos | Wk 2 | room |
 |---|---|---|---|---|---|
@@ -240,7 +240,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 - **gym-display:** `RcKind` today mixes format and machine (`circuit | ladder | ride | run`); split into `format` (ladder | circuit) × `machine` (rower | bike | treadmill) so ride + floor and run + floor exist. Same screens, DNF and progression rules; history keyed per machine × format. No migration expected — confirm `row_exercise` naming carries the machine before claiming that.
 - **Build order:** FULLBODY-1 content approved → builder + `can_hold` for `strength_full` (ENUM-EXPAND if it is a new `session_type`: union first in gym-display) → weekday/position table replacing `row_schedule.ROW_BY_POS` for dates ≥ block-2 start → variants on plan rows → gym-display split → reseed block 2 from tomorrow with the md5 + per-row guards.
 
-**FULLBODY-1 — the one full-body strength session — DRAFT 2026-11-01, needs Ryan's approval before the builder.** Decided in the 2026-10-02 redesign (A/B/C collapse into one session); at 2×/week a split would leave each lift 7–10 days stale. Rules from the redesign: multi-joint at moderate load with heart rate held; **skill and unilateral work first, simpler stable movements in the high-HR rounds**; cardio alternates in the same room; progression is **density** (rounds, work:rest, time in zone), not load, with LAST bounded by the room's `load_config`.
+**FULLBODY-1 — the one full-body strength session — APPROVED 2026-11-01 10:42 (Ryan: "confirm all").** Decided in the 2026-10-02 redesign (A/B/C collapse into one session); at 2×/week a split would leave each lift 7–10 days stale. Rules from the redesign: multi-joint at moderate load with heart rate held; **skill and unilateral work first, simpler stable movements in the high-HR rounds**; cardio alternates in the same room; progression is **density** (rounds, work:rest, time in zone), not load, with LAST bounded by the room's `load_config`.
 
 Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on the Richfield day) so the patterns repeat and the joint load spreads:
 
@@ -254,7 +254,14 @@ Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on
 
 - **Progression order:** add a round to block 2 (4 → 5) → shorten machine rest → raise machine target into Z3/Z4 → only then load. Load steps follow the room (PowerBlocks in 10s at Richfield).
 - **Office, confirmed by Ryan 2026-11-01:** hex dumbbells **5–50 in 5s** (`load_config.OFFICE` updated); benches are movable; the **Pulldown/Seated Row combo is broken** — X depends on no machine station, so block 2's pull is a chest-supported DB row, and the single-arm cable row on the functional trainer is the swap when it's free (**10 lb steps**, confirmed); the **upright bike** is there and heart rate comes from the watch (handles optional); mats exist, floor space depends on the crowd — if the floor is full, block 3 runs standing (cable Pallof press, then an incline plank on a bench). TRX exists only at Richfield. Still open on OFFICE-WALK: the machine pin-stack steps, the Smith bar, the plate set. The builder fails closed on anything a room can't resolve.
-- **Open for Ryan:** movement list as drafted; whether block 2's machine interval is 3 min or 2 min; deload rule (proposed: every 6th week, 3 rounds, no Z3).
+- **Decided 2026-11-01 10:42 (Ryan confirmed all):**
+  - Movement list as drafted (X office, Y Richfield); X/Y stay tied to the room, because the equipment decides.
+  - Block-2 machine interval **3 min** — HR needs 60–90 s to reach Z3, and time in zone is the progression.
+  - Start: **session 1 = 3 rounds of block 2 at RPE 6**, 4 rounds from session 2.
+  - **No scheduled deload in block 2** — 11/21–30 (nothing planned) is the deload; the every-6th-week rule (3 rounds, no Z3) starts in block 3.
+  - **New `session_type` `strength_full`** — an ENUM-EXPAND: CHECK constraint, gym-display union first, RECOMMEND, strength-next, EVAL, reports.
+- **Interim, until the template is live:** the seeded block 2 still says "row every MSP morning". Ryan follows the template by hand from Start this week (Sun rest · Mon circuit · Tue ladder · Wed strength at the office · Thu ladder · Fri strength at Richfield · Sat ladder); skipped planned rows may count as misses for the week, accepted. 11/20 stays Strength A (#281) and becomes full-body Y on the reseed. The cycle stays as recorded (wk1 Mon–Thu, wk2 Tue–Fri work).
+- **Deploy:** #282 holds until the build lands (it moves Lambda package identity via `load_config`) — one deploy. The rest of OFFICE-WALK (pin steps, Smith bar, plates) is not blocking; the broken combo is not recorded in code.
 
 **ROW-SCHEDULE — every Minneapolis morning is a row — BUILT 2026-10-19 (`feat/row-schedule` + gym-display `feat/row-schedule`). NOT APPLIED: `scripts/apply_row_schedule.py` (dry run by default) is Ryan's to run.** Ryan, 21:54: "let's just focus on rowing every MPLS day, some row only, some floor work."
 
