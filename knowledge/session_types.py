@@ -44,3 +44,27 @@ def is_training(session_type: str | None) -> bool:
 #: 2026-09-27). Core and standalone mobility join when they have definitions.
 EXTRA_TYPES: tuple[str, ...] = ("recovery_flow", "core", "mobility",
                                 "yoga_strength")
+
+
+# ── Strength types — ONE list (SAME-FACT-MANY-PLACES, 2026-11-01) ────────────
+# The Lambda's rotation, RECOMMEND, the check-in and the session library each
+# carried their own ("strength_a", "strength_b", "strength_c"), so adding
+# FULLBODY-1 would have been four edits with one forgotten. They read these now;
+# tests/test_session_types.py greps for a fresh literal copy.
+
+#: The current program's only lift (WEEK-TEMPLATE / FULLBODY-1, migration 058).
+STRENGTH_CURRENT = "strength_full"
+
+#: The retired A/B/C split. Still real in history, so still a strength type.
+STRENGTH_LEGACY: tuple[str, ...] = ("strength_a", "strength_b", "strength_c")
+
+#: Every strength type a plan row or a logged session can carry.
+STRENGTH_TYPES: tuple[str, ...] = STRENGTH_LEGACY + (STRENGTH_CURRENT,)
+
+#: Short label where a letter used to be shown.
+STRENGTH_LABEL: dict[str, str] = {"strength_a": "A", "strength_b": "B",
+                                  "strength_c": "C", "strength_full": "Full Body"}
+
+
+def is_strength(session_type: str | None) -> bool:
+    return (session_type or "") in STRENGTH_TYPES

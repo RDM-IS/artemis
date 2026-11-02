@@ -190,6 +190,7 @@ _LEGACY_PRETTY = {
     "strength_a": "Strength A — Push/Legs",
     "strength_b": "Strength B — Pull/Hinge",
     "strength_c": "Strength C — Full Body",
+    "strength_full": "Full Body",
     "cardio_intervals": "Cardio Intervals",
     "cardio_z2": "Cardio Zone 2",
     "rest_mobility": "Rest / Mobility",
@@ -2565,7 +2566,10 @@ def get_row_circuit(
 # silently restart the rotation.
 # ---------------------------------------------------------------------------
 
-STRENGTH_ROTATION = ("strength_a", "strength_b", "strength_c")
+#: FULLBODY-1 (2026-11-01): there is one strength session now, so "next" is
+#: always it. The lookup below still reads every strength type, because `after`
+#: (the last lift he logged) is real history whatever it was called.
+from knowledge.session_types import STRENGTH_CURRENT, STRENGTH_TYPES  # noqa: E402
 
 
 @router.get("/strength-next")
@@ -2584,16 +2588,15 @@ def get_strength_next(
             GROUP BY 1
             ORDER BY at DESC
             LIMIT 1
-        """), {"types": list(STRENGTH_ROTATION)}).mappings().first()
+        """), {"types": list(STRENGTH_TYPES)}).mappings().first()
     except SQLAlchemyError:
         logger.exception("strength-next: read failed")
         return {"available": False,
                 "reason": "Couldn't read your last strength session, so there is no next one."}
     if not row:
-        return {"available": True, "session_type": STRENGTH_ROTATION[0], "after": None}
+        return {"available": True, "session_type": STRENGTH_CURRENT, "after": None}
     last = row["session_type"]
-    nxt = STRENGTH_ROTATION[(STRENGTH_ROTATION.index(last) + 1) % len(STRENGTH_ROTATION)]
-    return {"available": True, "session_type": nxt, "after": last,
+    return {"available": True, "session_type": STRENGTH_CURRENT, "after": last,
             "after_at": row["at"].isoformat() if row["at"] else None}
 
 

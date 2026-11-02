@@ -372,10 +372,10 @@ def parse_checkin(text: str) -> CheckIn:
 # Plan helpers
 # ============================================================================
 
-STRENGTH_TYPES = ("strength_a", "strength_b", "strength_c")
+from knowledge.session_types import STRENGTH_TYPES, STRENGTH_LABEL  # noqa: E402
 from knowledge.session_types import REST_TYPES as LIGHT_TYPES  # noqa: E402
 FLOW_TYPE = "recovery_flow"   # YOGA-1: only the day-off rules apply
-_SESSION_LETTER = {"strength_a": "A", "strength_b": "B", "strength_c": "C"}
+_SESSION_LETTER = STRENGTH_LABEL
 
 
 def coerce_blocks(blocks) -> dict:

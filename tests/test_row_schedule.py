@@ -174,10 +174,18 @@ class TestBlock2(unittest.TestCase):
             start = block2.start_date([])
             d = start
             placed_day = start + timedelta(days=1)
+            from artemis import week_template as wt
             for _ in range(14):
                 specs = block2._specs_for(d, 1, placements={placed_day: "strength_a"})
                 morning = specs[0]
-                want = rs.ROW_BY_POS.get(cycle.cycle_pos(d))
+                # WEEK-TEMPLATE (2026-11-01) supersedes the rowing table from
+                # TEMPLATE_FROM; before it, the table still decides.
+                if wt.applies(d):
+                    kind = wt.kind_for(cycle.cycle_pos(d))
+                    want = (kind if kind in (wt.LADDER, wt.CIRCUIT)
+                            and morning.get("location_key") == "msp_home" else None)
+                else:
+                    want = rs.ROW_BY_POS.get(cycle.cycle_pos(d))
                 if d == placed_day:
                     self.assertEqual(morning["session_type"], "strength_a")
                     self.assertNotIn("row_kind", morning)

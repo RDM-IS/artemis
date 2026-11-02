@@ -221,6 +221,52 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 - **Rows from before 056** have no target: target = what was held, finished — the rule they were written under.
 - **Migrate-first:** apply 056 before the Lambda, because both `/log` inserts name the new columns.
 
+**WEEK-TEMPLATE — one 14-day cycle, sessions by day, machine by room — APPROVED 2026-11-01 10:42; BUILT 2026-11-01 (`feat/week-template`, both repos), migration 058 NOT APPLIED, block 2 NOT RESEEDED.** Ryan, 09:31–10:12: "we need rest days"; strength on Wednesdays plus a Richfield off day; Wisconsin days stay flexible because where he will be is not known in advance. **Supersedes ROW-SCHEDULE's table** (every MSP morning a row, no rest) from block 2 onward.
+
+| pos | Wk 1 | room | pos | Wk 2 | room |
+|---|---|---|---|---|---|
+| 0 Sun | rest (optional ladder from Start) | MSP home | 7 Sun | **rest** | WI |
+| 1 Mon | circuit | MSP · work | 8 Mon | **strength** (before the drive) | Richfield |
+| 2 Tue | ladder | MSP · work | 9 Tue | ladder | MSP · work |
+| 3 Wed | **strength** | office | 10 Wed | **strength** | office |
+| 4 Thu | ladder (then drive) | MSP · work | 11 Thu | ladder | MSP · work |
+| 5 Fri | **strength** | Richfield | 12 Fri | circuit | MSP · work |
+| 6 Sat | ladder | Richfield or BD | 13 Sat | ladder | MSP home |
+
+- **The plan names the session; the room names the machine.** ladder / circuit resolve to row (MSP home), ride (Richfield bike), run (Brown Deer treadmill). Strength resolves only where `can_hold` says yes (office, Richfield); anywhere else it falls back to that room's ladder. Each plan row carries `blocks.variants` keyed by `location_key`, so moving between Richfield and Brown Deer swaps the variant shown and **nothing is reseeded** (the redesign's "location declared, not predicted").
+- **Rules the table encodes:** strength 2×/week, ≥48 h apart except the wk2-Wed → wk1-Wed gap (7 days, the cost of tying strength to rooms); **no floor work the day after strength**; never two circuits in a row; every Sunday rest (wk1's an optional ladder — taken is a bonus, skipped is not a miss); ≈145 cardio min/week without it.
+- **A strength day spent where strength can't run** (e.g. Brown Deer) gets the ladder; RECOMMEND's existing "no lift in 48 h + room holds strength" rule highlights strength at the next capable room. No new automation.
+- **Overrides still win** (placements, stays, CAL-OCT and the 2026-11-01 November calendar, #281).
+- **gym-display:** `RcKind` today mixes format and machine (`circuit | ladder | ride | run`); split into `format` (ladder | circuit) × `machine` (rower | bike | treadmill) so ride + floor and run + floor exist. Same screens, DNF and progression rules; history keyed per machine × format. No migration expected — confirm `row_exercise` naming carries the machine before claiming that.
+- **Build order:** FULLBODY-1 content approved → builder + `can_hold` for `strength_full` (ENUM-EXPAND if it is a new `session_type`: union first in gym-display) → weekday/position table replacing `row_schedule.ROW_BY_POS` for dates ≥ block-2 start → variants on plan rows → gym-display split → reseed block 2 from tomorrow with the md5 + per-row guards.
+
+- **As built (2026-11-01):** `artemis/week_template.py` (the table + `place()`), called by `block2._specs_for` from `TEMPLATE_FROM` = 11/02 when no placement or stay applies; earlier dates keep ROW-SCHEDULE's table. **Per-room variants on the row were NOT built**: the planned row carries the predicted room, and a change of room on the day goes through the existing Start buttons (Ride/Run/Strength by room chip) — adequate for now, but a session launched from Start in another room leaves the planned row unlogged. Revisit if that shows up in adherence. **ride + floor / run + floor were NOT built** either: the table has no circuit outside Minneapolis, so a circuit there runs as that room's ladder. In gym-display a planned bike / treadmill Zone 2 row now opens the ride / run ladder.
+- **Strength types are one list:** `knowledge.session_types.STRENGTH_TYPES` (A/B/C + `strength_full`); RECOMMEND, the check-in, the session library, the Lambda and block 1's `LIFT_ORDER` read it, and `tests/test_week_template.py` fails on a fresh literal copy. `/strength-next` returns `strength_full` always (`after` still names the last lift logged).
+- **Deploy order:** apply 058 → deploy the Lambda (`load_config`, `/strength-next`, labels) → deploy gym-display (union + segmented circuits) → on the box `git pull` → `seed_block2.py` dry run (Ryan reviews) → `--commit` → `python3.11 -m artemis.session_library`.
+
+**FULLBODY-1 — the one full-body strength session — APPROVED 2026-11-01 10:42 (Ryan: "confirm all").** Decided in the 2026-10-02 redesign (A/B/C collapse into one session); at 2×/week a split would leave each lift 7–10 days stale. Rules from the redesign: multi-joint at moderate load with heart rate held; **skill and unilateral work first, simpler stable movements in the high-HR rounds**; cardio alternates in the same room; progression is **density** (rounds, work:rest, time in zone), not load, with LAST bounded by the room's `load_config`.
+
+Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on the Richfield day) so the patterns repeat and the joint load spreads:
+
+| Block | Min | X (office) | Y (Richfield) |
+|---|---|---|---|
+| Warm-up | 8 | 5 min easy on the room's machine + hip/T-spine mobility | same, bike |
+| 1 · fresh, unilateral — 3 rounds, 60 s between | 14 | DB split squat ×8/side · single-arm DB row ×10/side | DB step-up ×8/side · TRX single-arm row ×10/side |
+| 2 · density circuit — 4 rounds, no rest between moves | 26 | DB goblet squat ×12 · DB bench press ×10 · chest-supported DB row (incline bench) ×12 · DB Romanian deadlift ×10 · **3 min upright bike at Z3** | DB front squat ×12 · push-up ×10–15 · band row ×15 · DB RDL ×10 · **3 min bike at Z3** |
+| 3 · trunk — 2 rounds | 7 | cable Pallof press ×10/side · dead bug ×10 · side plank 30 s/side | band anti-rotation ×10/side · bird dog ×10 · plank 40 s |
+| Cool-down | 5 | easy machine + stretch | same |
+
+- **Progression order:** add a round to block 2 (4 → 5) → shorten machine rest → raise machine target into Z3/Z4 → only then load. Load steps follow the room (PowerBlocks in 10s at Richfield).
+- **Office, confirmed by Ryan 2026-11-01:** hex dumbbells **5–50 in 5s** (`load_config.OFFICE` updated); benches are movable; the **Pulldown/Seated Row combo is broken** — X depends on no machine station, so block 2's pull is a chest-supported DB row, and the single-arm cable row on the functional trainer is the swap when it's free (**10 lb steps**, confirmed); the **upright bike** is there and heart rate comes from the watch (handles optional); mats exist, floor space depends on the crowd — if the floor is full, block 3 runs standing (cable Pallof press, then an incline plank on a bench). TRX exists only at Richfield. Still open on OFFICE-WALK: the machine pin-stack steps, the Smith bar, the plate set. The builder fails closed on anything a room can't resolve.
+- **Decided 2026-11-01 10:42 (Ryan confirmed all):**
+  - Movement list as drafted (X office, Y Richfield); X/Y stay tied to the room, because the equipment decides.
+  - Block-2 machine interval **3 min** — HR needs 60–90 s to reach Z3, and time in zone is the progression.
+  - Start: **session 1 = 3 rounds of block 2 at RPE 6**, 4 rounds from session 2.
+  - **No scheduled deload in block 2** — 11/21–30 (nothing planned) is the deload; the every-6th-week rule (3 rounds, no Z3) starts in block 3.
+  - **New `session_type` `strength_full`** — an ENUM-EXPAND: CHECK constraint, gym-display union first, RECOMMEND, strength-next, EVAL, reports.
+- **Interim, until the template is live:** the seeded block 2 still says "row every MSP morning". Ryan follows the template by hand from Start this week (Sun rest · Mon circuit · Tue ladder · Wed strength at the office · Thu ladder · Fri strength at Richfield · Sat ladder); skipped planned rows may count as misses for the week, accepted. 11/20 stays Strength A (#281) and becomes full-body Y on the reseed. The cycle stays as recorded (wk1 Mon–Thu, wk2 Tue–Fri work).
+- **Deploy:** #282 holds until the build lands (it moves Lambda package identity via `load_config`) — one deploy. The rest of OFFICE-WALK (pin steps, Smith bar, plates) is not blocking; the broken combo is not recorded in code.
+
 **ROW-SCHEDULE — every Minneapolis morning is a row — BUILT 2026-10-19 (`feat/row-schedule` + gym-display `feat/row-schedule`). NOT APPLIED: `scripts/apply_row_schedule.py` (dry run by default) is Ryan's to run.** Ryan, 21:54: "let's just focus on rowing every MPLS day, some row only, some floor work."
 
 - **The table** (`artemis/row_schedule.py`, by cycle position): wk 1 Sun ladder · Mon circuit · Tue ladder · Wed circuit · Thu ladder; wk 2 Tue ladder · Wed circuit · Thu ladder · Fri circuit · Sat ladder. **Ladders on Tue/Thu both weeks; never two circuits in a row**; 4 circuits and 6 ladders a cycle. Wisconsin mornings (positions 5–8) and every evening are unchanged.
