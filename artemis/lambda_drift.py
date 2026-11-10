@@ -140,7 +140,15 @@ def message(result: dict, *, ref_sha: str = "", modified: str = "") -> str | Non
     return ("⚠️ Lambda drift — the live API is not running this code. "
             + " ".join(lines) + "."
             + head + stamp
-            + " Redeploy: `cd api && AWS_PROFILE=rdmis-admin bash deploy.sh`.")
+            + " " + REDEPLOY)
+
+
+#: The CLAUDE.md-approved deploy command, verbatim. NOT `AWS_PROFILE=rdmis-admin`:
+#: an exported profile with a stale SSO token breaks `ssh rdmis` (the ssh
+#: ProxyCommand takes no --profile), and the preflight then fails closed looking
+#: like a box problem. tests/test_lambda_drift.py pins this against CLAUDE.md.
+REDEPLOY = ("Redeploy from the repo root on the Mac: `PATH=$PWD/venv/bin:$PATH bash api/deploy.sh` "
+            "(do not export AWS_PROFILE).")
 
 
 def download_live(dest: Path, *, client=None) -> tuple[Path, str]:

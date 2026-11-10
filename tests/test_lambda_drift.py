@@ -77,8 +77,19 @@ class TestComparison(unittest.TestCase):
         msg = ld.message(result, ref_sha="a9ab7b8c", modified="2026-09-20T17:55:52.000+0000")
         self.assertIn("api/app/routers/health.py", msg)
         self.assertIn("not running this code", msg)
-        self.assertIn("bash deploy.sh", msg)
+        self.assertIn("PATH=$PWD/venv/bin:$PATH bash api/deploy.sh", msg)
+        self.assertNotIn("AWS_PROFILE=", msg)
         self.assertIn("a9ab7b8", msg)
+
+    def test_the_redeploy_line_is_the_claude_md_command(self):
+        """The message must print the deploy command CLAUDE.md approves, not a
+        stale copy of it (it used to say `AWS_PROFILE=rdmis-admin`)."""
+        from artemis import lambda_drift as ld
+        rules = (ld.REPO / "CLAUDE.md").read_text()
+        self.assertIn("`PATH=$PWD/venv/bin:$PATH bash api/deploy.sh`", rules)
+        self.assertIn("`PATH=$PWD/venv/bin:$PATH bash api/deploy.sh`", ld.REDEPLOY)
+        self.assertIn("Do NOT export `AWS_PROFILE=rdmis-admin`", rules)
+        self.assertNotIn("AWS_PROFILE=rdmis-admin", ld.REDEPLOY)
 
     def test_a_merged_file_that_was_never_deployed(self):
         """#114 and #106 sat merged-but-undeployed for a day. This is that."""
