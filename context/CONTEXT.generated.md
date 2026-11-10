@@ -1,9 +1,9 @@
 # CONTEXT.generated.md — DO NOT HAND-EDIT (run scripts/context_snapshot.sh)
-_Generated: 2026-09-26T20:05:06Z_
+_Generated: 2026-11-10T10:27:07Z_
 
 ## Git
 - Branch: main
-- Head: 4c336a1 feat(cycle): the script owns the whole leave window — 9/29 was the last carve-out (#203)
+- Head: 8d89a8b feat(health): SESSION-OPEN — weekly strength quota; plan rows are suggestions (#283)
 - Origin: https://github.com/RDM-IS/artemis.git
 
 ## Runtime (only meaningful when run ON EC2)
@@ -26,20 +26,25 @@ _Generated: 2026-09-26T20:05:06Z_
 - PB-011: Vault / Second Brain Ingest (v1)
 
 ## Migrations (latest 5)
-- 039_drop_plan_status_debris.sql
-- 040_nutrition_diet1.sql
-- 041_watch_hourly.sql
-- 042_plan_slot.sql
-- 043_session_log_modality.sql
+- 054_health_export.sql
+- 055_session_log_row_circuit.sql
+- 056_session_log_row_dnf.sql
+- 057_session_log_target_bpm.sql
+- 058_strength_full.sql
 
 ## artemis/ modules
 - __init__.py
 - availability.py
+- away.py
 - billing.py
+- block2.py
 - briefs.py
+- bw_circuit.py
 - calendar.py
 - calendar_cache.py
 - cardio_baseline.py
+- cardio_detect.py
+- cognition_outcomes.py
 - commitments.py
 - config.py
 - crm_client.py
@@ -48,9 +53,11 @@ _Generated: 2026-09-26T20:05:06Z_
 - crm_writer.py
 - cycle.py
 - demo_intake.py
+- dietitian_report.py
 - dossier.py
 - drift.py
 - email_index.py
+- full_body.py
 - gmail.py
 - google_drive.py
 - google_sheets.py
@@ -63,15 +70,21 @@ _Generated: 2026-09-26T20:05:06Z_
 - health_patterns.py
 - health_regions.py
 - help_registry.py
+- hr_zones.py
 - inbox.py
 - inbox_cli.py
 - intent.py
 - interaction_logger.py
+- interval_gate.py
 - lambda_drift.py
 - life_ops.py
+- llm_json.py
 - log_redaction.py
 - main.py
+- manual_gap.py
 - mattermost.py
+- meal_log.py
+- meal_nudge.py
 - monitors.py
 - morning_brief.py
 - notion_meal_plan.py
@@ -82,11 +95,16 @@ _Generated: 2026-09-26T20:05:06Z_
 - parser.py
 - playbook_rules.py
 - posting.py
+- prep.py
+- prep_notion.py
+- program_repeat.py
 - prompts.py
 - quiet_hours.py
+- row_schedule.py
 - scheduler.py
 - scheduling.py
 - schema_drift.py
+- session_library.py
 - test_billing.py
 - test_dossier.py
 - test_guardrails.py
@@ -101,6 +119,8 @@ _Generated: 2026-09-26T20:05:06Z_
 - wake.py
 - watch_prefill.py
 - weather.py
+- week_ahead.py
+- week_template.py
 
 ## Database (live RDS)
 
@@ -153,6 +173,7 @@ _Generated: 2026-09-26T20:05:06Z_
 - phase_config
 - plan
 - reflection
+- session_hr_zones
 - session_log
 - training_rules
 - watch_heart_rate
@@ -164,6 +185,19 @@ _Generated: 2026-09-26T20:05:06Z_
 - day
 - entry
 - food
+- health_export
+- prep_config
+- prep_event
+- prep_ingredient
+- prep_recipe
+- prep_recipe_line
+- prep_session
+- prep_stay
+- prep_stay_day
+- prep_store
+- prep_store_item
+- prep_sync
+- recipe_step
 - target
 
 ### schema `public`
@@ -191,6 +225,6 @@ _Generated: 2026-09-26T20:05:06Z_
 - notes
 
 ### health.plan — next 3 days
-- 2026-09-26: recovery_flow
-- 2026-09-26: rest
-- 2026-09-27: recovery_flow
+- 2026-11-10: cardio_z2
+- 2026-11-11: strength_full
+- 2026-11-11: recovery_flow
