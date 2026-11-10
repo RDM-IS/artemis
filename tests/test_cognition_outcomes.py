@@ -11,6 +11,8 @@ from unittest import mock
 from artemis import cognition_outcomes as co
 
 TODAY = date(2027, 3, 10)
+#: A Sunday (a program-week start) whose judged goal week (Mon 3/1-Sun 3/7) has ended.
+REPEAT_SUN = date(2027, 2, 28)
 YESTERDAY = TODAY - timedelta(days=1)
 MADE_AT = datetime(2027, 3, 9, 12, 0, tzinfo=timezone.utc)
 
@@ -162,38 +164,40 @@ class TestMakeupOutcomeRetired(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRepeatOutcome(unittest.TestCase):
-    """SESSION-OPEN: the repeated week is judged by the strength quota."""
+    """SESSION-OPEN: the repeated week is judged by the strength quota. STATUS-3
+    phase 2: the repeated program week (Sun..Sat from REPEAT_SUN) is judged by
+    the Mon..Sun goal week that starts the day after it."""
 
     def _d(self, start):
         return _decision("repeat_week", assumptions={"repeat_start": start.isoformat()})
 
     def _run_with(self, cur, days=None, side_effect=None):
         from knowledge import strength_quota as sq
-        start = TODAY - timedelta(days=8)
+        start = REPEAT_SUN
 
         def fake(day, *, tz, today, execute):
-            self.assertEqual((day, tz, today), (start, "UTC", TODAY))
+            self.assertEqual((day, tz, today), (start + timedelta(days=1), "UTC", TODAY))
             self.assertTrue(callable(execute))           # on the decision's own cursor
             if side_effect:
                 raise side_effect
-            return sq.compute(day, days or [], today=today, counts_from=date(2000, 1, 2))
+            return sq.compute(day, days or [], today=today, counts_from=date(2000, 1, 3))
         with mock.patch("artemis.quiet_hours.get_active_timezone", return_value="UTC"), \
              mock.patch("knowledge.strength_quota.read_pg", side_effect=fake):
             return _run(cur)
 
     def _three(self):
-        # Three days inside the Sun..Sat week that holds the repeat start.
+        # Three days inside the Mon..Sun goal week after the repeat start.
         from knowledge.strength_quota import week_of
-        ws, _ = week_of(TODAY - timedelta(days=8))
+        ws, _ = week_of(REPEAT_SUN + timedelta(days=1))
         return [ws + timedelta(days=i) for i in (1, 3, 5)]
 
     def test_a_clean_repeated_week(self):
-        cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
+        cur = Cur(decisions=[self._d(REPEAT_SUN)])
         self._run_with(cur, days=self._three())
         self.assertEqual(cur.written[0]["outcome"], "week_clean")
 
     def test_the_repeated_week_was_short_again(self):
-        cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
+        cur = Cur(decisions=[self._d(REPEAT_SUN)])
         self._run_with(cur, days=self._three()[:1])
         row = cur.written[0]
         self.assertEqual(row["outcome"], "week_short")
@@ -201,17 +205,17 @@ class TestRepeatOutcome(unittest.TestCase):
         self.assertEqual((md["count"], md["required"]), (1, 3))
 
     def test_a_second_repeat_of_the_same_week_is_the_correction(self):
-        cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))], repeats_again=1)
+        cur = Cur(decisions=[self._d(REPEAT_SUN)], repeats_again=1)
         self._run_with(cur, days=self._three())
         self.assertIn("again", json.loads(cur.written[0]["correction"])["what"])
 
     def test_a_week_still_running_is_not_yet(self):
-        cur = Cur(decisions=[self._d(TODAY - timedelta(days=2))])
+        cur = Cur(decisions=[self._d(TODAY - timedelta(days=3))])   # Sun 3/7: judged 3/8-3/14
         self.assertEqual(_run(cur)["not_yet"], 1)
 
     def test_an_unreadable_week_writes_nothing(self):
         from knowledge import strength_quota as sq
-        cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
+        cur = Cur(decisions=[self._d(REPEAT_SUN)])
         counts = self._run_with(cur, side_effect=sq.QuotaUnreadable("RDS down"))
         self.assertEqual((counts["unreadable"], counts["wrote"]), (1, 0))
         self.assertEqual(cur.written, [])

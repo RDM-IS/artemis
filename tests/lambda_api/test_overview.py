@@ -130,6 +130,10 @@ class FakeSession:
             return _Result([])
         if "acos.system_state" in sql and p.get("k") == "strength_quota_counts_from":
             return _Result([{"value": self.counts_from}] if self.counts_from else [])
+        if "acos.system_state" in sql and p.get("k") == "cycle_anchor":
+            return _Result([])                         # unset: the built-in anchor
+        if "acos.cycle_day_overrides" in sql:          # STATUS-3 phase 2 feasibility
+            return _Result(list(getattr(self, "overrides", [])))
         if "acos.system_state" in sql:
             return _Result([{"value": json.dumps(self.state)}] if self.state else [])
         if "to_regclass" in sql:
@@ -247,13 +251,45 @@ class TestStrengthQuota(Base):
         body = self.overview()
         q = body["strength_quota"]
         self.assertTrue(q["section"]["ok"])
-        self.assertEqual((q["week_start"], q["week_end"]), ("2026-09-13", "2026-09-19"))
+        # STATUS-3 phase 2: goal weeks run Mon..Sun
+        self.assertEqual((q["week_start"], q["week_end"]), ("2026-09-14", "2026-09-20"))
         self.assertEqual(q["required"], 3)
         self.assertEqual(q["status"], "not_counted")       # a week before counts_from
         self.assertEqual(self.session.quota_params["tz"], "America/Chicago")
         g = body["goals"]["strength"]
         self.assertEqual((g["sessions_done"], g["sessions_planned"]), (q["count"], 3))
         self.assertGreaterEqual(q["count"], 1)
+
+    def test_the_grid_carries_the_cycle_and_one_quota_per_week(self):
+        """STATUS-3 phase 2: the grid names each day's type and location, and
+        carries the quota of every goal week it touches -- the current one IS
+        the top-level read."""
+        body = self.overview()
+        g = body["grid"]
+        self.assertTrue(g["cycle_section"]["ok"])
+        self.assertEqual([c["date"] for c in g["cycle"]][0], g["start"])
+        self.assertEqual(len(g["cycle"]), 7)
+        for c in g["cycle"]:
+            self.assertIn(c["day_type"], ("msp_work", "msp_home", "wi", "travel"))
+        starts = [x["week_start"] for x in g["quotas"]]
+        self.assertEqual(starts, sorted(set(starts)))
+        self.assertIn(body["strength_quota"]["week_start"], starts)
+        cur = next(x for x in g["quotas"] if x["week_start"] == body["strength_quota"]["week_start"])
+        self.assertEqual(cur, body["strength_quota"])
+
+    def test_an_unreadable_override_table_fails_the_quota_closed(self):
+        sess = FakeSession()
+        real = sess.execute
+
+        def execute(clause, params=None):
+            if "acos.cycle_day_overrides" in str(clause):
+                raise RuntimeError("relation does not exist")
+            return real(clause, params)
+        sess.execute = execute
+        body = self.overview(sess)
+        self.assertFalse(body["strength_quota"]["section"]["ok"])
+        self.assertFalse(body["grid"]["cycle_section"]["ok"])
+        self.assertEqual(body["grid"]["cycle"], [])
 
     def test_an_unset_counts_from_is_unreadable(self):
         body = self.overview(FakeSession(counts_from=None))

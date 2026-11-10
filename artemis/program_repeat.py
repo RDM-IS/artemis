@@ -1,13 +1,17 @@
 """REPEAT-WEEK — a program week below the strength quota repeats
 (Ryan, 2026-09-27; re-keyed by SESSION-OPEN, 2026-11-09).
 
-    Sunday 08:35  the weekly job looks at the week that just ended. Fewer than
+    Monday 08:35  the weekly job looks at the Mon..Sun GOAL week that just
+                  ended (STATUS-3 phase 2, 2026-11-10). Fewer than
                   3 strength days (knowledge.strength_quota — plan rows are
                   suggestions, so "sessions not done" no longer means anything)
                   → it PROPOSES repeating it and stores the proposal. Nothing
                   moves. Weeks before acos.system_state['strength_quota_counts_from'] never propose.
     `repeat week` Ryan confirms. The repeat is recorded as the Sunday the repeat
-                  week begins (health_office.REPEATS_KEY); every plan row from
+                  week begins (health_office.REPEATS_KEY) -- the Sunday that
+                  closed the judged goal week, so the program week that began
+                  the day before the proposal. Both Sundays are rest days in
+                  the template, so starting the repeat there costs no session; every plan row from
                   that Sunday on is rebuilt with the program week held back one,
                   and the block's END MOVES OUT a week (Ryan: "#1 go").
     `no repeat`   the program carries on as planned.
@@ -41,7 +45,7 @@ PENDING_KEY = "repeat_week_pending"
 # ---------------------------------------------------------------------------
 
 def quota_for(week_start: date) -> dict:
-    """The strength quota for the Sun..Sat week starting `week_start`.
+    """The strength quota for the Mon..Sun goal week starting `week_start`.
     Raises strength_quota.QuotaUnreadable — never 'no strength days'."""
     from artemis.quiet_hours import get_active_timezone, local_today
     from knowledge import strength_quota as sq
@@ -55,10 +59,13 @@ def propose(week_start: date, now: datetime | None = None) -> str | None:
     stay silent as if the week were fine."""
     from artemis import health_office as office
     from artemis.quiet_hours import get_system_value, set_system_value
+    if week_start.weekday() != 0:
+        raise ValueError(f"a goal week starts on a Monday, got {week_start:%a} {week_start}")
     q = quota_for(week_start)
     if not q["repeat_due"]:
         return None
-    repeat_start = week_start + timedelta(days=7)
+    # The program week (Sun..Sat) that starts on the goal week's closing Sunday.
+    repeat_start = week_start + timedelta(days=6)
     if repeat_start in office.repeat_starts():
         return None
     wk = office.week_num_for(week_start)

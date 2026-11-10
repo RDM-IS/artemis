@@ -298,8 +298,11 @@ def read_quota(start: date, today: date) -> dict:
     never as zero strength days (FAIL-CLOSED-RESOLVERS)."""
     from artemis.quiet_hours import get_active_timezone
     from knowledge import strength_quota as sq
+    # STATUS-3 phase 2: goal weeks run Mon..Sun. A program-week Sunday (the
+    # CLI's --week path) is judged by the goal week that starts the day after.
+    day = sq.for_program_week(start) if start.weekday() == 6 else start
     try:
-        return sq.read_pg(start, tz=get_active_timezone(), today=today)
+        return sq.read_pg(day, tz=get_active_timezone(), today=today)
     except sq.QuotaUnreadable as exc:
         return {"unreadable": str(exc)}
 
