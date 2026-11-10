@@ -7,6 +7,8 @@ legal for the code that reads it.
 """
 from __future__ import annotations
 
+import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
+
 import unittest
 from datetime import date, datetime, timedelta, timezone
 
