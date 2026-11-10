@@ -2,6 +2,11 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# Everything below is relative to api/: the build container mounts $PWD and
+# installs ./requirements.txt, and the zips name app/ and ../knowledge/. Run
+# from anywhere else (CLAUDE.md's `bash api/deploy.sh` from the repo root) it
+# installed the BOX's requirements and then failed on `zip app/`. So cd first.
+cd "$REPO/api"
 OVERRIDE_LOG="$HOME/.artemis_lambda_deploy.log"
 
 # COLUMN-GREP preflight — before the build, so a refusal costs nothing.
