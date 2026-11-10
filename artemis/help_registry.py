@@ -77,6 +77,8 @@ COMMANDS: list[Command] = [
     Command("health", "set target …", "Set a nutrition target (confirmed)", "new target 2000 cal, 190 protein, 40 fiber"),
     Command("health", "repeat week / no repeat", "Answer the Sunday repeat-week proposal",
             "repeat week"),
+    Command("health", "rebuild sessions", "Rebuild the Sessions page library now (timers are paused)",
+            "rebuild sessions"),
     Command("health", "build grocery list", "Propose the week's staples from the meal plan", "build grocery list"),
 
     # ── rules ── (handler: rule_command)
