@@ -35,17 +35,22 @@ class TestKnownEmptyIsNotUnknown(unittest.TestCase):
         for v in cfg.values():
             self.assertEqual(v["mode"], "none")
 
-    def test_msp_home_is_still_unknown_and_must_stay_that_way(self):
-        self.assertIsNone(lc.for_location("msp_home"),
-                          "msp_home has no confirmed inventory — absent, not empty")
+    def test_msp_home_is_confirmed_rower_floor_and_mat(self):
+        """Ryan, 2026-11-10: the rower, the floor and a mat — nothing loadable.
+        It used to be absent ("unknown"); it is now KNOWN and empty of load."""
+        cfg = lc.for_location("msp_home")
+        self.assertIsNotNone(cfg)
+        self.assertEqual(set(cfg), {"bodyweight", "cardio"})
         self.assertFalse(lc.has_numeric_load("msp_home"))
+        for cls in ("trx", "bands", "dumbbell", "barbell"):
+            self.assertNotIn(cls, cfg)
 
-    def test_has_numeric_load_alone_cannot_tell_them_apart(self):
-        """Both are False, which is exactly why for_location() is the gate."""
-        self.assertEqual(lc.has_numeric_load("brown_deer"),
-                         lc.has_numeric_load("msp_home"))
+    def test_has_numeric_load_alone_cannot_tell_known_from_unknown(self):
+        """False for a known bodyweight-only room AND for an unknown one —
+        which is exactly why for_location() is the gate."""
+        self.assertEqual(lc.has_numeric_load("brown_deer"), lc.has_numeric_load("nowhere"))
         self.assertIsNotNone(lc.for_location("brown_deer"))
-        self.assertIsNone(lc.for_location("msp_home"))
+        self.assertIsNone(lc.for_location("nowhere"))
 
     def test_no_loadable_class_is_listed(self):
         for cls in ("dumbbell", "barbell", "machine", "cable", "smith"):

@@ -6,7 +6,7 @@ year 2031 -- legal for the code, implausible for him.
 import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD: never a real DB
 import sys
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -290,6 +290,70 @@ class TestRecommendEndpoint(unittest.TestCase):
 
     def test_a_failed_read_highlights_nothing(self):
         self.assertFalse(self._get(_RecSession(fail=True))["available"])
+
+    # SESSION-OPEN 3a: strength_bw is a LIFT for the 48 h clock, never a step in
+    # the rotation (and never a rot.index() crash when it is the latest lift).
+    def test_a_recent_bodyweight_session_counts_as_a_lift(self):
+        class _Capture(_RecSession):
+            def execute(self, stmt, params=None):
+                if "group by 1" in str(stmt).lower():
+                    self.types = list((params or {}).get("types") or [])
+                return super().execute(stmt, params)
+        plan = {"plan_id": 7, "session_type": "cardio_z2", "logged": True,
+                "blocks": {"row_kind": "ladder", "cardio": {"modality": "row"}}}
+        recent = datetime.now(timezone.utc) - timedelta(hours=2)
+        done = [{"t": "strength_b", "at": datetime(2020, 3, 1, 10, tzinfo=timezone.utc)},
+                {"t": "strength_bw", "at": recent}]
+        sess = _Capture(plan, done, self.LIB)
+        body = self._get(sess)
+        self.assertIn("strength_bw", sess.types)
+        self.assertNotEqual(body["primary"], "strength")          # lifted 2 h ago
+        self.assertEqual(body["strength"], None)
+
+    # SESSION-OPEN 3a (Ryan, 2026-11-10): no lift in 48 h and the room can't
+    # hold strength_full -> highlight Bodyweight. Brown Deer and home are the
+    # two real rooms where that happens.
+    def _bw_room(self, key, display):
+        return {"today_location_key": key, "locations": [
+            {"key": key, "display": display, "sessions": [
+                {"session_type": "recovery_flow"}, {"session_type": "core"},
+                {"session_type": "strength_bw"}]}]}
+
+    def _rowed(self):
+        return {"plan_id": 7, "session_type": "cardio_z2", "logged": True,
+                "blocks": {"row_kind": "ladder", "cardio": {"modality": "row"}}}
+
+    def test_brown_deer_with_no_lift_in_48h_highlights_bodyweight(self):
+        done = [{"t": "strength_full", "at": datetime(2020, 3, 1, 10, tzinfo=timezone.utc)}]
+        body = self._get(_RecSession(self._rowed(), done, self._bw_room("brown_deer", "Brown Deer")))
+        self.assertEqual((body["primary"], body["label"]), ("bodyweight", "Bodyweight"))
+        self.assertIsNone(body["strength"])
+        self.assertIn("can't hold the next lift", body["reason"])
+
+    def test_home_with_no_lift_ever_highlights_bodyweight(self):
+        body = self._get(_RecSession(self._rowed(), [], self._bw_room("msp_home", "home")))
+        self.assertEqual(body["primary"], "bodyweight")
+
+    def test_a_lift_in_the_last_48h_suppresses_it(self):
+        recent = datetime.now(timezone.utc) - timedelta(hours=5)
+        done = [{"t": "strength_bw", "at": recent}]
+        body = self._get(_RecSession(self._rowed(), done, self._bw_room("brown_deer", "Brown Deer")))
+        self.assertEqual(body["primary"], "recovery")
+
+    def test_a_room_that_holds_full_body_still_gets_strength_not_bodyweight(self):
+        lib = {"today_location_key": "office", "locations": [{"key": "office", "sessions": [
+            {"session_type": "strength_full"}, {"session_type": "strength_bw"}]}]}
+        done = [{"t": "strength_c", "at": datetime(2020, 3, 1, 10, tzinfo=timezone.utc)}]
+        body = self._get(_RecSession(self._rowed(), done, lib))
+        self.assertEqual((body["primary"], body["strength"]), ("strength", "strength_full"))
+
+    def test_bodyweight_as_the_latest_lift_leaves_the_rotation_alone(self):
+        plan = {"plan_id": 7, "session_type": "cardio_z2", "logged": True,
+                "blocks": {"row_kind": "ladder", "cardio": {"modality": "row"}}}
+        done = [{"t": "strength_b", "at": datetime(2020, 3, 1, 10, tzinfo=timezone.utc)},
+                {"t": "strength_bw", "at": datetime(2020, 3, 5, 10, tzinfo=timezone.utc)}]
+        body = self._get(_RecSession(plan, done, self.LIB))
+        self.assertEqual((body["primary"], body["strength"]), ("strength", "strength_c"))
 
     def test_no_library_is_unavailable_once_strength_is_in_question(self):
         plan = {"plan_id": 7, "session_type": "cardio_z2", "logged": True,

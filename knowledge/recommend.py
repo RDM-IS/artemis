@@ -7,6 +7,9 @@ nothing is scheduled, nothing is written. One rule, evaluated on each read:
     1. today's planned session isn't logged yet -> that session's button
     2. it's done (or has no button), the room can hold strength and
        nothing strength-shaped was logged in the last 48 h -> Strength (next)
+    2b. (SESSION-OPEN 3a, Ryan 2026-11-10) the room can NOT hold the next
+       strength session but lists Bodyweight, and no lift in 48 h
+                                                -> Bodyweight
     3. otherwise                                -> Recovery
 
 Plus the "More" list: highlight every extra in it EXCEPT the one done most
@@ -22,17 +25,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 #: The Start buttons, as gym-display names them.
-BUTTONS = ("row", "row_circuit", "ride", "run", "strength", "yoga", "recovery")
+BUTTONS = ("row", "row_circuit", "ride", "run", "strength", "bodyweight", "yoga", "recovery")
 
 #: The extras that live under "More" (not on a Start button).
 MORE_TYPES = ("core", "mobility")
 
-from knowledge.session_types import STRENGTH_TYPES  # noqa: E402  (one list)
+from knowledge.session_types import LIFT_TYPES, STRENGTH_TYPES  # noqa: E402  (one list each)
 REST_TYPES = ("rest", "rest_mobility")
 LIFT_GAP = timedelta(hours=48)
 
 _LABEL = {"row": "Row", "row_circuit": "Row + floor", "ride": "Ride", "run": "Run",
-          "strength": "Strength", "yoga": "Yoga — Intense", "recovery": "Recovery"}
+          "strength": "Strength", "bodyweight": "Bodyweight", "yoga": "Yoga — Intense",
+          "recovery": "Recovery"}
 _MODALITY_BUTTON = {"row": "row", "bike": "ride", "treadmill": "run"}
 
 
@@ -43,7 +47,7 @@ def button_for(session_type: str | None, blocks: dict | None) -> str | None:
         return "row_circuit"
     if b.get("row_kind") == "ladder":
         return "row"
-    if session_type in STRENGTH_TYPES:
+    if session_type in LIFT_TYPES:
         return "strength"
     if session_type == "recovery_flow":
         return "recovery"
@@ -67,9 +71,11 @@ def _ago(now: datetime, then: datetime | None) -> str:
 def recommend(*, now: datetime, planned_type: str | None, planned_blocks: dict | None,
               planned_logged: bool, room_holds_strength: bool | None,
               next_strength: str | None, last_strength_at: datetime | None,
-              last_more: dict[str, datetime]) -> dict:
+              last_more: dict[str, datetime],
+              room_holds_bodyweight: bool | None = False) -> dict:
     """The highlight. `room_holds_strength` None = the library could not be read;
-    the rule then stops BEFORE step 2 rather than guessing (FAIL-CLOSED)."""
+    the rule then stops BEFORE step 2 rather than guessing (FAIL-CLOSED). The
+    same goes for `room_holds_bodyweight`, read from the same library."""
     planned_btn = button_for(planned_type, planned_blocks)
     primary, reason = None, ""
     if planned_type in REST_TYPES:
@@ -81,12 +87,17 @@ def recommend(*, now: datetime, planned_type: str | None, planned_blocks: dict |
         done = (f"{_LABEL[planned_btn]} done" if planned_btn and planned_logged
                 else "nothing else planned")
         recent_lift = last_strength_at is not None and now - last_strength_at < LIFT_GAP
-        if room_holds_strength is None:
+        if room_holds_strength is None or room_holds_bodyweight is None:
             return {"available": False,
                     "reason": "Couldn't read which sessions this room can hold."}
         if room_holds_strength and next_strength and not recent_lift:
             primary = "strength"
             reason = f"{done} · {_ago(now, last_strength_at)}"
+        elif not room_holds_strength and room_holds_bodyweight and not recent_lift:
+            # SESSION-OPEN 3a: bodyweight is strength; a room that can't hold the
+            # next lift still holds a strength day.
+            primary = "bodyweight"
+            reason = f"{done} · {_ago(now, last_strength_at)} · this room can't hold the next lift"
         else:
             primary = "recovery"
             why = ("lifted in the last 48 h" if recent_lift

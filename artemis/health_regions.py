@@ -105,6 +105,34 @@ _reg("Stability-ball hamstring curl", {"hamstrings"}, {"knee", "low back"})
 _reg("Band face pull", {"shoulder", "back"}, {"neck"})
 _reg("Lying leg raise", {"core"}, {"low back", "hip"})
 
+# ── SESSION-OPEN 3a — strength_bw (approved 2026-11-09). Every name the
+# builder can emit in any room, so the pain ladder can reason about each one.
+# "Push-up" and the two bikes are shared with FULLBODY-1, which never had them.
+_reg("Reverse lunge", {"legs", "quads"}, {"hip", "knee"})
+_reg("Single-leg glute bridge", {"hip"}, {"hamstrings", "low back"})
+_reg("Hand-supported single-leg RDL", {"hamstrings", "hip"}, {"low back", "knee"})
+_reg("Tempo squat (3-1-1)", {"legs", "quads"}, {"knee", "hip"})
+_reg("Push-up", {"chest"}, {"shoulder", "triceps", "arms", "wrist"})
+_reg("TRX row", {"back"}, {"shoulder", "biceps", "arms"})
+_reg("Band row", {"back"}, {"shoulder", "biceps"})
+_reg("Prone Y-T-W", {"shoulder", "back"}, {"neck", "low back"})
+_reg("Good morning", {"hamstrings", "low back"}, {"hip"})
+_reg("Row — Z3", {"legs", "back"}, {"knee", "hip", "low back"})
+_reg("Bike — Z3", {"legs"}, {"knee", "hip"})
+_reg("Upright bike — Z3", {"legs"}, {"knee", "hip"})
+_reg("Recumbent bike — Z3", {"legs"}, {"knee"})
+_reg("Treadmill — Z3", {"legs"}, {"calves", "knee", "hip"})
+_reg("Elliptical — Z3", {"legs"}, {"knee", "hip"})
+_reg("High knees / jacks — Z3", {"legs", "calves"}, {"knee", "hip"})
+
+# ── FULLBODY-1's remaining names (Ryan, 2026-11-10): the pain ladder could not
+# reason about these on a live Full Body row. Each mirrors the exercise it is
+# closest to, as LOCATION-1's substitutes do.
+_reg("Chest-supported DB row", {"back"}, {"shoulder", "biceps", "arms"})        # ≈ 1-arm DB row, no trunk load
+_reg("DB front squat", {"legs", "quads"}, {"shoulder", "low back", "hip", "knee"})  # ≈ DB goblet squat
+_reg("DB step-up", {"legs", "quads"}, {"hip", "knee"})                         # ≈ Reverse lunge
+_reg("TRX single-arm row", {"back"}, {"shoulder", "biceps", "arms", "core"})   # ≈ 1-arm DB row
+
 # ── YOGA-6 (2026-09-28, DRAFT): so the pain ladder can reason about them too ──
 _reg("Chair", {"quads", "legs"}, {"knee", "shoulder"})
 _reg("Plank", {"core", "shoulder"}, {"low back", "wrist"})

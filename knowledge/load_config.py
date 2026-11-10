@@ -89,18 +89,26 @@ BROWN_DEER: dict[str, dict] = {
     "cardio": _NONE,          # the treadmill; see knowledge/cardio.py
 }
 
+#: MSP home — CONFIRMED by Ryan 2026-11-10 (SESSION-OPEN 3a, answering "what is
+#: actually at home"): the rower, floor space and a mat. NOTHING ELSE — no TRX,
+#: no bands, no weights. Like Brown Deer it is PRESENT AND EMPTY OF NUMERIC LOAD,
+#: which is a measured fact, not a gap. The rower is the cardio class here; it
+#: arrived with ROWER-MOVE (knowledge/cardio.py MOVES, 2026-10-04).
+#:
+#: Until this date the entry was deliberately absent ("unknown, not empty" —
+#: nobody had confirmed it), and strength_bw refused to build here because it
+#: could not tell whether there was a strap. With this entry it builds with
+#: prone Y-T-W and the rower.
+MSP_HOME: dict[str, dict] = {
+    "bodyweight": _NONE,
+    "cardio": _NONE,          # the rower; see knowledge/cardio.py
+}
+
 BY_LOCATION: dict[str, dict] = {
     "office": OFFICE,
     "richfield": RICHFIELD,
     "brown_deer": BROWN_DEER,
-    # msp_home has NO recorded inventory, so it gets no config and
-    # for_location() returns None for it — "unknown", not "empty".
-    #
-    # PROGRAM-2 seeds cardio there from 2026-10-04 (the rower), and it was
-    # tempting to call that a confirmed empty. It is not: Ryan confirmed
-    # Richfield's inventory and has never confirmed this one, so "we know there
-    # is nothing to load here" would be a claim nobody has made. A cardio row
-    # carries no loaded exercise, so it costs nothing to leave this unknown.
+    "msp_home": MSP_HOME,
 }
 
 #: Room constraints that are not loads, kept OUT of BY_LOCATION so `classes_at()`

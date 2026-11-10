@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_KEY = "session_library"
 
-from knowledge.session_types import EXTRA_TYPES, STRENGTH_TYPES  # noqa: E402
+from knowledge.session_types import EXTRA_TYPES, STRENGTH_BW, STRENGTH_TYPES  # noqa: E402
 
 #: Extras (Ryan, 2026-09-27): yoga / core / mobility, every day.
 #: QUICK-START (Ryan, 2026-10-20): "give me buttons to decide what I want to do
@@ -41,7 +41,8 @@ from knowledge.session_types import EXTRA_TYPES, STRENGTH_TYPES  # noqa: E402
 #: hold them, and gym-display's Strength button picks the next in rotation.
 #: The Extras list on the screen still shows only EXTRA_TYPES.
 #: WEEK-TEMPLATE (2026-11-01): strength_full joins; A/B/C stay launchable.
-LIBRARY_TYPES = EXTRA_TYPES + STRENGTH_TYPES
+#: SESSION-OPEN 3a (2026-11-09): strength_bw joins — bodyweight is strength.
+LIBRARY_TYPES = EXTRA_TYPES + STRENGTH_TYPES + (STRENGTH_BW,)
 
 #: Pseudo-locations with no room to train in.
 _NOT_A_ROOM = frozenset({"transit", "outside"})
@@ -50,6 +51,13 @@ _NOT_A_ROOM = frozenset({"transit", "outside"})
 def _supported(location_key: str, session_type: str) -> bool:
     from artemis import health_office as office
     from knowledge import cardio as cardio_cfg
+    if session_type == STRENGTH_BW:
+        # SESSION-OPEN 3a: a floor travels, so every real room (the library
+        # already skips transit and outside). Its builder still resolves the row
+        # and cardio from the room's inventory and RAISES where that inventory is
+        # unknown — build() then logs the failure loudly and leaves it out, rather
+        # than this answer hiding it as "not supported".
+        return True
     if session_type.startswith("strength"):
         return office.can_hold(location_key, session_type)
     if session_type == "cardio_z2":
