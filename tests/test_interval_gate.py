@@ -15,7 +15,9 @@ class Cur:
 
     def __init__(self, *, cleared="true", cardio=(), pain=(), raises=(),
                  resolved=None, logged=False, row_exists=True):
-        self.cleared, self.cardio, self.pain = cleared, list(cardio), list(pain)
+        # SESSION-OPEN: `cardio` is the COUNT of real cardio sessions in the
+        # last 14 days — the gate no longer reads planned rows.
+        self.cleared, self.cardio, self.pain = cleared, cardio, list(pain)
         self.raises, self._res, self.written = set(raises), [], []
         self.resolved, self.logged, self.row_exists = resolved, logged, row_exists
         self.marked, self.upserted = [], []
@@ -51,10 +53,11 @@ class Cur:
             self._res = [(41,)] if self.row_exists else []
         elif "INSERT INTO health.plan" in s:
             self.upserted.append(params)
-        elif "health.plan" in s and "session_type IN" in s:   # recent cardio
+        elif "log_type = 'cardio_block'" in s:                # recent cardio
             if "cardio" in self.raises:
                 raise RuntimeError("down")
-            self._res = list(self.cardio)
+            self.cardio_params = params
+            self._res = [(self.cardio if isinstance(self.cardio, int) else 0,)]
         elif "health.daily_state" in s:
             if "pain" in self.raises:
                 raise RuntimeError("down")
@@ -71,8 +74,9 @@ class Cur:
         return self._res
 
 
-def _cardio(n_rows=6, n_logged=6):
-    return [(TODAY - timedelta(days=i + 1), i < n_logged) for i in range(n_rows)]
+def _cardio(n=6):
+    """n real cardio sessions in the last 14 days."""
+    return n
 
 
 def _pain(score, region="knee", days_ago=1):
@@ -99,14 +103,28 @@ class TestEachConditionBlocks(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertIs(r.conditions["cleared"], False)
 
-    def test_too_few_logged_cardio_blocks(self):
-        r = ig.evaluate(Cur(cardio=_cardio(6, 3), pain=_pain(0)), TODAY)
+    def test_too_few_cardio_sessions_blocks(self):
+        r = ig.evaluate(Cur(cardio=_cardio(3), pain=_pain(0)), TODAY)
         self.assertFalse(r.ok)
-        self.assertIn("3 of the last 6", r.reason)
+        self.assertIn("only 3 cardio sessions in the last 14 days", r.reason)
 
-    def test_exactly_four_of_six_passes(self):
-        r = ig.evaluate(Cur(cardio=_cardio(6, 4), pain=_pain(0)), TODAY)
+    def test_exactly_four_passes(self):
+        r = ig.evaluate(Cur(cardio=_cardio(4), pain=_pain(0)), TODAY)
         self.assertTrue(r.ok)
+
+    def test_the_window_is_14_local_days_any_plan_id(self):
+        """SESSION-OPEN (Ryan, 2026-11-09): real cardio in the last 14 local
+        days, planned or ad-hoc — sessions, not rows; inferred never counts."""
+        cur = Cur(cardio=_cardio(4), pain=_pain(0))
+        with mock.patch("artemis.quiet_hours.get_active_timezone", return_value="Pacific/Auckland"):
+            ig.evaluate(cur, TODAY)
+        self.assertEqual(cur.cardio_params,
+                         ("Pacific/Auckland", "Pacific/Auckland", TODAY - timedelta(days=13), TODAY))
+        sql = " ".join(ig._TRAINING_SQL.split())
+        self.assertNotIn("health.plan", sql)                     # any plan_id
+        self.assertIn("IS DISTINCT FROM 'inferred'", sql)
+        self.assertIn("SELECT DISTINCT", sql)                    # sessions, not rows
+        self.assertNotIn("Auckland", sql)
 
     def test_pain_at_the_threshold_blocks(self):
         r = ig.evaluate(Cur(cardio=_cardio(), pain=_pain(3)), TODAY)

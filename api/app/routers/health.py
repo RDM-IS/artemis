@@ -50,7 +50,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from knowledge import cognition
 from knowledge.machine_setup import parse_setup
 
 from ..database import get_db
@@ -331,6 +330,27 @@ class TodaySummary(BaseModel):
     exists: bool = False
 
 
+class Section(BaseModel):
+    """Whether this section could be read at all."""
+    ok: bool = True
+    reason: Optional[str] = None
+
+
+class StrengthQuotaOut(BaseModel):
+    """SESSION-OPEN: strength days this Sun..Sat week, toward 3. One read
+    (knowledge.strength_quota), fail-closed: section.ok=False and no numbers
+    when it could not be read — never a zero."""
+    section: Section = Field(default_factory=Section)
+    week_start: Optional[date] = None
+    week_end: Optional[date] = None
+    strength_days: list[date] = Field(default_factory=list)
+    count: Optional[int] = None
+    required: Optional[int] = None
+    needed: Optional[int] = None
+    days_left: Optional[int] = None
+    status: Optional[str] = None      # met | on_track | tight | short | not_counted
+
+
 class StatusResponse(BaseModel):
     today: date
     window_start: date
@@ -342,6 +362,8 @@ class StatusResponse(BaseModel):
     same_type_history: list[LoggedSession]
     rpe_trend: list[TrendPoint]
     weight_trend: list[TrendPoint]
+    #: SESSION-OPEN. Additive with a default: older clients ignore it.
+    strength_quota: Optional[StrengthQuotaOut] = None
 
 
 def _serialize_log_row(r: dict[str, Any]) -> ExerciseLog:
@@ -569,7 +591,14 @@ def get_status(
         same_type_history=same_type_history,
         rpe_trend=rpe_trend,
         weight_trend=weight_trend,
+        strength_quota=_quota_now(db),
     )
+
+
+def _quota_now(db: Session) -> StrengthQuotaOut:
+    """Today in the ACTIVE timezone, not /status's legacy fixed-Central today."""
+    tz_name = _active_timezone(db)
+    return _strength_quota(db, tz_name, datetime.now(ZoneInfo(tz_name)).date())
 
 
 # ---------------------------------------------------------------------------
@@ -1512,14 +1541,16 @@ def get_sessions(
 #             that has passed
 #   partial   some real logs but not finished (flow: a "partial" summary)
 #   skipped   a past training day Ryan marked `skip <reason>` (MAKEUP-1)
-#   missed    a past training day with no real logs (inferred rows don't count)
+#   not_done  a past suggested session with no real logs (inferred rows don't
+#             count). Neutral: SESSION-OPEN made plan rows suggestions, and
+#             the week is judged by the strength quota, not by this row.
 #   today     today, nothing logged yet
 #   upcoming  a future day
 #
 # Past and current days also return `logged` — per-exercise sets actually done.
 
 PLAN_RANGE_MAX_DAYS = 14
-PLAN_STATUSES = ("done", "partial", "missed", "skipped", "upcoming", "today")
+PLAN_STATUSES = ("done", "partial", "not_done", "skipped", "upcoming", "today")
 HOME_TIMEZONE = "America/Chicago"   # mirrors artemis.config.HOME_TIMEZONE
 
 
@@ -1577,7 +1608,7 @@ def _active_timezone(db: Session) -> str:
 
 
 def _is_rest_day(session_type: Optional[str], blocks: Any) -> bool:
-    """A true rest day (incl. a check-in day off) — never 'missed'. A Recovery
+    """A true rest day (incl. a check-in day off) — never "not_done". A Recovery
     Flow is a session, even on a rest_mobility row."""
     b = blocks if isinstance(blocks, dict) else {}
     if b.get("type") == "recovery_flow" or session_type == "recovery_flow":
@@ -1612,7 +1643,7 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
     planned = _planned_set_count(blocks)
     if logged:
         # Every slot accounted for — logged or explicitly skipped. Sessions of
-        # nothing but skips fall past this to missed / skipped / today, as if
+        # nothing but skips fall past this to not_done / skipped / today, as if
         # the session had never been opened.
         return "done" if planned and len(work) >= planned else "partial"
     if summaries:            # only flow "partial" summaries
@@ -1624,9 +1655,10 @@ def derive_day_status(plan: dict[str, Any], logs: list[dict[str, Any]], today: d
     if _is_rest_day(plan.get("session_type"), blocks) and not plan.get("is_skipped"):
         return "done"
     if plan.get("is_skipped"):
-        # MAKEUP-1: Ryan said so out loud; a skip is not a missed session.
+        # MAKEUP-1: Ryan said so out loud.
         return "skipped"
-    return "missed"
+    # SESSION-OPEN: a suggestion not taken. Never "missed".
+    return "not_done"
 
 
 def summarize_logs(logs: list[dict[str, Any]]) -> list[LoggedExercise]:
@@ -1871,7 +1903,7 @@ class PatternOut(BaseModel):
 
 class FlagOut(BaseModel):
     date: date
-    kind: str                       # "rpe" | "pain" | "missed" | "partial"
+    kind: str                       # "rpe" | "pain" | "partial" (SESSION-OPEN: no "missed")
     text: str
 
 
@@ -1887,12 +1919,6 @@ class WeightSummary(BaseModel):
 # matters: "0 cardio minutes this week" is an ANSWER -- he did not train -- and
 # "I could not read your cardio" is not. A section that showed 0 for both would
 # quietly turn a database problem into a training judgement.
-
-
-class Section(BaseModel):
-    """Whether this section could be read at all."""
-    ok: bool = True
-    reason: Optional[str] = None
 
 
 class WeightGoal(BaseModel):
@@ -1929,6 +1955,23 @@ class CardioGoal(BaseModel):
     interval_gate: Optional[str] = None          # "intervals" | "z2_variant" | "unresolved"
     interval_gate_reason: Optional[str] = None
     interval_gate_date: Optional[date] = None
+
+
+def _strength_quota(db: Session, tz_name: str, today: date) -> StrengthQuotaOut:
+    from knowledge import strength_quota as sq
+    try:
+        q = sq.read_sa(db, today, tz=tz_name, today=today)
+    except sq.QuotaUnreadable as exc:
+        logger.warning("SESSION-OPEN: %s", exc)
+        try:
+            db.rollback()             # a failed statement aborts the transaction
+        except Exception:             # noqa: BLE001
+            pass
+        return StrengthQuotaOut(section=Section(ok=False, reason="couldn't read strength days"))
+    return StrengthQuotaOut(
+        week_start=q["week_start"], week_end=q["week_end"], strength_days=q["strength_days"],
+        count=q["count"], required=q["required"], needed=q["needed"],
+        days_left=q["days_left"], status=q["status"])
 
 
 class StrengthGoal(BaseModel):
@@ -2016,6 +2059,8 @@ class OverviewResponse(BaseModel):
     cardio_detail: CardioDetail = Field(default_factory=CardioDetail)
     nutrition_7d: NutritionDetail = Field(default_factory=NutritionDetail)
     sleep_recovery: SleepRecovery = Field(default_factory=SleepRecovery)
+    #: SESSION-OPEN. The same read the strength goal below uses.
+    strength_quota: Optional[StrengthQuotaOut] = None
 
 
 def _md(d: date) -> str:
@@ -2216,9 +2261,9 @@ def build_flags(days: list["PlanDay"], logs_by_plan: dict[int, list[dict[str, An
             continue
         name = day.display_name or day.session_type
         logs = _real(logs_by_plan.get(day.plan_id, []))
-        if day.status == "missed":
-            flags.append(FlagOut(date=day.plan_date, kind="missed", text=f"Missed: {name} ({_md(day.plan_date)})"))
-        elif day.status == "partial" and day.plan_date < today:
+        # SESSION-OPEN: no "missed" flag — a suggestion not taken is not a fact
+        # worth flagging; the week's strength quota is.
+        if day.status == "partial" and day.plan_date < today:
             p = progress_for(day, logs)
             unit = "sets" if p.unit == "sets" else "min"
             flags.append(FlagOut(date=day.plan_date, kind="partial",
@@ -2251,7 +2296,7 @@ def build_flags(days: list["PlanDay"], logs_by_plan: dict[int, list[dict[str, An
                     seen.add(key)
                     flags.append(FlagOut(date=day.plan_date, kind="pain",
                                          text=f"Pain note{where} ({_md(day.plan_date)}): “{notes}”"))
-    order = {"missed": 0, "partial": 1, "rpe": 2, "pain": 3}
+    order = {"partial": 1, "rpe": 2, "pain": 3}
     flags.sort(key=lambda f: (-f.date.toordinal(), order.get(f.kind, 9), f.text))
     return flags
 
@@ -2680,130 +2725,25 @@ def get_recommend(
 
 
 # ---------------------------------------------------------------------------
-# /makeup — MAKEUP-2 (Ryan, 2026-09-27): the one session not done this program
-# week is made up on today's rest day. The missed row becomes rest ("made up
-# on <date>"); today's rest row becomes the session, as the box's seeder built
-# it for today's location. The offer comes from the library the box wrote —
-# never from the client — and every condition is re-checked here, in one
-# transaction, before anything changes. Each row keeps what it was
-# (`makeup_original`, not `original`: the check-in's undo owns that key).
+# /makeup — RETIRED by SESSION-OPEN (Ryan, 2026-11-09). Plan rows are
+# suggestions now and the week is judged by the strength quota, so there is
+# nothing to make up. The route stays so an old gym-display build gets a clear
+# answer instead of a 404 it would read as an outage.
 # ---------------------------------------------------------------------------
 
-class MakeupIn(BaseModel):
-    missed_plan_id: int
-    rest_plan_id: int
-
-
-def _conflict(reason: str) -> HTTPException:
-    return HTTPException(status_code=status.HTTP_409_CONFLICT,
-                         detail={"error": "makeup_not_possible", "reason": reason})
+MAKEUP_RETIRED = {
+    "error": "retired",
+    "message": ("Makeups are retired (SESSION-OPEN, 2026-11-09): plan days are suggestions, "
+                "and the week counts strength days toward 3. Start any session from "
+                "the Sessions tab."),
+}
 
 
 @router.post("/makeup")
 def post_makeup(
-    body: MakeupIn,
-    db: Session = Depends(get_db),
     _api_key: str = Depends(verify_health_api_key),
 ) -> dict[str, Any]:
-    from knowledge.session_types import REST_TYPES, is_training
-
-    row = db.execute(text("SELECT value FROM acos.system_state WHERE key = :k"),
-                     {"k": SESSION_LIBRARY_KEY}).mappings().first()
-    try:
-        lib = json.loads(row["value"]) if row and row.get("value") else None
-    except (TypeError, ValueError):
-        lib = None
-    today = datetime.now(ZoneInfo(_active_timezone(db))).date()
-    if not lib or lib.get("generated_on") != today.isoformat():
-        raise _conflict("the session library isn't current for today — rebuild it on the box")
-    mk = lib.get("makeup") or {}
-    offer = mk.get("offer")
-    if (not offer or offer.get("missed_plan_id") != body.missed_plan_id
-            or offer.get("rest_plan_id") != body.rest_plan_id or not offer.get("entry")):
-        raise _conflict("that makeup isn't on offer today")
-
-    def plan_row(pid: int):
-        return db.execute(text("""
-            SELECT plan_id, plan_date, slot, session_type, blocks, is_skipped,
-                   EXISTS (SELECT 1 FROM health.session_log sl WHERE sl.plan_id = health.plan.plan_id
-                           AND sl.logged_via <> 'inferred') AS logged
-            FROM health.plan WHERE plan_id = :pid AND slot = 'morning'
-        """), {"pid": pid}).mappings().first()
-
-    rest, missed = plan_row(body.rest_plan_id), plan_row(body.missed_plan_id)
-    if not rest or rest["plan_date"] != today or rest["session_type"] not in REST_TYPES or rest["logged"]:
-        raise _conflict("today's morning is no longer an unlogged rest day")
-    week_start = date.fromisoformat(mk["week_start"])
-    if (not missed or not (week_start <= missed["plan_date"] < today)
-            or not is_training(missed["session_type"]) or missed["logged"]):
-        raise _conflict("that session is no longer a not-done session from this week")
-    not_done = db.execute(text("""
-        SELECT plan_id, session_type FROM health.plan
-        WHERE slot = 'morning' AND plan_date >= :ws AND plan_date < :today
-          AND NOT EXISTS (SELECT 1 FROM health.session_log sl WHERE sl.plan_id = health.plan.plan_id
-                          AND sl.logged_via <> 'inferred')
-    """), {"ws": week_start, "today": today}).mappings().all()
-    not_done = [r for r in not_done if is_training(r["session_type"])]
-    if len(not_done) != 1:
-        raise _conflict(f"{len(not_done)} sessions are not done this week — the week repeats instead")
-
-    entry = offer["entry"]
-    old_rest_blocks = rest["blocks"] if isinstance(rest["blocks"], dict) else json.loads(rest["blocks"] or "{}")
-    old_missed_blocks = (missed["blocks"] if isinstance(missed["blocks"], dict)
-                         else json.loads(missed["blocks"] or "{}"))
-    new_blocks = dict(entry["blocks"])
-    new_blocks["makeup_of"] = {"plan_id": missed["plan_id"], "plan_date": missed["plan_date"].isoformat()}
-    new_blocks["makeup_original"] = {"session_type": rest["session_type"], "blocks": old_rest_blocks}
-    rest_blocks = {"type": "rest", "display_name": f"Rest — made up on {today:%a %-m/%-d}",
-                   "equipment": [], "made_up_on": today.isoformat(),
-                   "makeup_original": {"session_type": missed["session_type"],
-                                       "blocks": old_missed_blocks,
-                                       "is_skipped": bool(missed["is_skipped"])}}
-    try:
-        db.execute(text("""
-            UPDATE health.plan SET session_type = :t, blocks = CAST(:b AS jsonb),
-                   target_rpe = :rpe, target_hr_zone = :zone, est_duration_min = :est
-            WHERE plan_id = :pid
-        """), {"t": entry["session_type"], "b": json.dumps(new_blocks, default=str),
-               "rpe": entry.get("target_rpe"), "zone": entry.get("target_hr_zone"),
-               "est": entry.get("est_duration_min"), "pid": rest["plan_id"]})
-        db.execute(text("""
-            UPDATE health.plan SET session_type = 'rest', blocks = CAST(:b AS jsonb),
-                   is_skipped = FALSE, target_rpe = NULL, target_hr_zone = NULL, est_duration_min = 0
-            WHERE plan_id = :pid
-        """), {"b": json.dumps(rest_blocks, default=str), "pid": missed["plan_id"]})
-        # COGNITION-1 site 2: the swap is a decision, so it records what it
-        # rested on. `can_hold` is NOT evaluated here -- the box evaluates it
-        # when it builds the library, and an offer only exists when it passed
-        # (session_library._supported). Recording it as a check this route made
-        # would be a small lie about where the constraint was enforced.
-        cognition.log_decision_sa(
-            db, agent="gym_display", action="makeup_swap", domain="health",
-            outcome="executed", manual_gap=False,
-            metadata={"missed_plan_id": missed["plan_id"],
-                      "missed_date": missed["plan_date"].isoformat(),
-                      "rest_plan_id": rest["plan_id"], "on": today.isoformat(),
-                      "session_type": entry["session_type"]},
-            assumptions={
-                "rule": "one session not done this week is made up on an unlogged rest day",
-                "missed": {"plan_id": missed["plan_id"],
-                           "plan_date": missed["plan_date"].isoformat(),
-                           "session_type": missed["session_type"],
-                           "was_skipped": bool(missed["is_skipped"])},
-                "rest_day": {"plan_id": rest["plan_id"], "plan_date": rest["plan_date"].isoformat(),
-                             "session_type_before": rest["session_type"]},
-                "week_start": week_start.isoformat(),
-                "week_not_done_count": len(not_done),
-                "location_key": offer.get("location_key"),
-                "can_hold": {"result": True, "evaluated_by": "session_library on the box",
-                             "library_generated_on": lib.get("generated_on")},
-            })
-        db.commit()
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail={"error": "makeup_failed", "message": str(e)})
-    return {"ok": True, "plan_id": rest["plan_id"], "session_type": entry["session_type"],
-            "made_up": missed["plan_date"].isoformat()}
+    raise HTTPException(status_code=status.HTTP_410_GONE, detail=MAKEUP_RETIRED)
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -3254,15 +3194,19 @@ def _nutrition(db: Session, today: date) -> tuple[NutritionGoal, NutritionDetail
     return goal, NutritionDetail(days=day_rows)
 
 
-def _strength_goal(db: Session, today: date, program: Optional[ProgramInfo],
+def _strength_goal(quota: StrengthQuotaOut,
                    progress: list[StrengthProgressRow]) -> StrengthGoal:
-    """Strength reads nothing of its own -- it reuses the program counts and the
+    """Strength reads nothing of its own -- it reuses the strength quota and the
     strength_progress rows the response already computes, so there is no second
-    read here to disagree with anything."""
+    read here to disagree with anything. SESSION-OPEN: "sessions" are strength
+    DAYS this week toward the quota, not planned rows done (ONE-READ-ONE-STATUS:
+    the tile and `strength_quota` are the same read and share its status)."""
+    if not quota.section.ok:
+        return StrengthGoal(section=quota.section)
     try:
         return StrengthGoal(
-            sessions_done=program.sessions_done if program else None,
-            sessions_planned=program.sessions_planned if program else None,
+            sessions_done=quota.count,
+            sessions_planned=quota.required,
             lifts_progressed_14d=sum(1 for r in progress if r.trend == "up"))
     except Exception:                                           # noqa: BLE001
         logger.warning("STATUS-2: could not read strength progress", exc_info=True)
@@ -3416,6 +3360,7 @@ def get_overview(
     # STATUS-2: one read per domain, so the tile and the section below it cannot
     # disagree about the same data.
     _cardio_pair = _cardio(db, today, program.week_start if program else today)
+    _quota = _strength_quota(db, tz_name, today)
     _nutrition_pair = _nutrition(db, today)
     return OverviewResponse(
         date=today,
@@ -3432,7 +3377,7 @@ def get_overview(
         goals=Goals(
             weight=_weight_goal(db, today, prog["anchor"] if prog else None),
             cardio=_cardio_pair[0],
-            strength=_strength_goal(db, today, program, strength_progress(names, set_rows)),
+            strength=_strength_goal(_quota, strength_progress(names, set_rows)),
             nutrition=_nutrition_pair[0],
         ),
         cardio_detail=_cardio_pair[1],
@@ -3440,4 +3385,5 @@ def get_overview(
         sleep_recovery=_sleep_recovery(db, today),
         weight_summary=weight_summary(weight),
         previous_program_end=previous_end,
+        strength_quota=_quota,
     )

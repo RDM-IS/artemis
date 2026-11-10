@@ -241,46 +241,80 @@ class TestFixFlow(unittest.TestCase):
 # ============================================================================
 
 class TestNagLogic(unittest.TestCase):
-    def test_skip_when_rest_day(self):
-        with patch("knowledge.db.execute_one") as mock_one:
-            mock_one.return_value = {
-                "plan_id": 1, "session_type": "rest_mobility",
-                "target_rpe": None, "is_skipped": False,
-            }
-            self.assertIsNone(health.run_nag_check())
+    """SESSION-OPEN (2026-11-09): the nag is the strength quota's, once a week,
+    when the strength days still needed reach the days left. Synthetic dates
+    (PUBLIC-FIXTURES): the Sun 2031-03-02 .. Sat 2031-03-08 week."""
 
-    def test_skip_when_already_logged(self):
-        from knowledge import db as kdb
+    MON, WED, THU, FRI, SAT = (date(2031, 3, 3), date(2031, 3, 5), date(2031, 3, 6),
+                               date(2031, 3, 7), date(2031, 3, 8))
 
-        plan_row = {"plan_id": 5, "session_type": "strength_a", "target_rpe": 6.5, "is_skipped": False}
+    def _run(self, days, today, sent=None):
+        from knowledge import strength_quota as sq
+        q = sq.compute(today, days, today=today, counts_from=date(2000, 1, 2))
+        with patch("artemis.quiet_hours.get_active_timezone", return_value="UTC"), \
+             patch("artemis.quiet_hours.get_system_value", return_value=sent), \
+             patch("knowledge.strength_quota.read_pg", return_value=q) as rd:
+            out = health.strength_nag(today)
+        rd.assert_called_once_with(today, tz="UTC", today=today)
+        return out
 
-        with patch.object(kdb, "execute_one", return_value=plan_row), \
-             patch.object(kdb, "execute_query", return_value=[{"log_id": 1}]):
-            self.assertIsNone(health.run_nag_check())
+    def test_no_nag_while_on_track(self):
+        self.assertIsNone(self._run([self.MON], today=self.WED))
 
-    def test_nag_when_no_log(self):
-        from knowledge import db as kdb
+    def test_no_nag_when_met(self):
+        self.assertIsNone(self._run([self.MON, self.WED, self.THU], today=self.FRI))
 
-        plan_row = {"plan_id": 5, "session_type": "strength_a", "target_rpe": 6.5, "is_skipped": False}
+    def test_nag_when_needed_reaches_days_left(self):
+        out = self._run([self.MON], today=self.FRI)          # needs 2, Fri+Sat left
+        self.assertIsNotNone(out)
+        msg, week = out
+        self.assertEqual(week, "2031-03-02")
+        self.assertIn("1 of 3", msg)
+        self.assertIn("2 more needed, 2 days left (today, Sat)", msg)
 
-        with patch.object(kdb, "execute_one", return_value=plan_row), \
-             patch.object(kdb, "execute_query", return_value=[]):
-            msg = health.run_nag_check()
-        self.assertIsNotNone(msg)
-        self.assertIn("Strength A", msg)
-        self.assertIn("debrief", msg.lower())
+    def test_once_per_week(self):
+        self.assertIsNone(self._run([self.MON], today=self.FRI, sent="2031-03-02"))
+        # a marker from an earlier week does not silence this one
+        self.assertIsNotNone(self._run([self.MON], today=self.FRI, sent="2031-02-23"))
 
-    def test_skip_when_skipped_explicit(self):
-        with patch("knowledge.db.execute_one") as mock_one:
-            mock_one.return_value = {
-                "plan_id": 5, "session_type": "strength_a",
-                "target_rpe": 6.5, "is_skipped": True,
-            }
-            self.assertIsNone(health.run_nag_check())
+    def test_short_says_so(self):
+        msg, _ = self._run([], today=self.SAT)
+        self.assertIn("can't reach 3", msg)
 
-    def test_no_plan_no_nag(self):
-        with patch("knowledge.db.execute_one", return_value=None):
-            self.assertIsNone(health.run_nag_check())
+    def test_a_week_before_the_quota_counts_never_nags(self):
+        from datetime import date as d
+        from knowledge import strength_quota as sq
+        q = sq.compute(d(2031, 3, 8), [], today=d(2031, 3, 8),
+                       counts_from=d(2031, 3, 9))                 # the week before it counts
+        self.assertEqual(q["status"], "not_counted")
+        self.assertFalse(q["nag_due"])
+
+    def test_unreadable_raises_rather_than_staying_quiet(self):
+        from knowledge import strength_quota as sq
+        with patch("artemis.quiet_hours.get_active_timezone", return_value="UTC"), \
+             patch("knowledge.strength_quota.read_pg", side_effect=sq.QuotaUnreadable("down")):
+            with self.assertRaises(sq.QuotaUnreadable):
+                health.strength_nag(self.FRI)
+
+    def test_the_marker_is_written_after_the_post(self):
+        from artemis.scheduler import ArtemisScheduler
+        order = []
+        sched = ArtemisScheduler.__new__(ArtemisScheduler)
+        sched._is_quiet = lambda: False
+        sched._post = lambda *a, **k: order.append("post")
+        with patch("artemis.health.strength_nag", return_value=("msg", "2031-03-02")), \
+             patch("artemis.health.mark_strength_nag",
+                   side_effect=lambda w: order.append(("mark", w))):
+            sched.job_health_nag()
+        self.assertEqual(order, ["post", ("mark", "2031-03-02")])
+
+    def test_quiet_hours_respected(self):
+        from artemis.scheduler import ArtemisScheduler
+        sched = ArtemisScheduler.__new__(ArtemisScheduler)
+        sched._is_quiet = lambda: True
+        with patch("artemis.health.strength_nag") as nag:
+            sched.job_health_nag()
+        nag.assert_not_called()
 
     # ── EXERCISE-CLASS: the row's class beats the name ────────────────────
     def test_the_rows_class_wins_over_the_name_rules(self):
@@ -308,14 +342,6 @@ class TestNagLogic(unittest.TestCase):
                                          load_config=load_config.OFFICE), 40.0)
 
     # ── EVENING-1: `rest` is a rest, exactly like rest_mobility ────────────
-    def test_skip_when_rest_morning(self):
-        """A planned rest gets a REAL row typed `rest` (migration 042). If the
-        nag didn't know the type, a rest morning would be nagged every day."""
-        with patch("knowledge.db.execute_one") as mock_one:
-            mock_one.return_value = {"plan_id": 1, "session_type": "rest",
-                                     "target_rpe": None, "is_skipped": False}
-            self.assertIsNone(health.run_nag_check())
-
     def test_rest_and_rest_mobility_are_both_no_followup(self):
         from knowledge.session_types import NO_FOLLOWUP_TYPES, REST_TYPES, is_rest
         self.assertIn("rest", REST_TYPES)
@@ -325,31 +351,13 @@ class TestNagLogic(unittest.TestCase):
         self.assertTrue(is_rest("rest"))
         self.assertFalse(is_rest("strength_a"))
 
-    def test_the_inferred_backstop_skips_a_rest_morning(self):
-        """The 21:50 backstop writes an inferred 'missed' summary. A rest
-        morning must never get one — it would read as a missed session for
-        ever after."""
-        from knowledge import db as kdb
-        for st in ("rest", "rest_mobility"):
-            with self.subTest(session_type=st):
-                plan_row = {"plan_id": 7, "session_type": st, "target_rpe": None,
-                            "is_skipped": False}
-                with patch.object(kdb, "execute_one", return_value=plan_row), \
-                     patch.object(kdb, "execute_query", return_value=[]), \
-                     patch.object(kdb, "execute_write") as write:
-                    self.assertFalse(health.insert_inferred_summary())
-                    write.assert_not_called()
-
-    def test_the_inferred_backstop_still_fires_on_a_training_day(self):
-        from knowledge import db as kdb
-        plan_row = {"plan_id": 7, "session_type": "strength_a", "target_rpe": 6.0,
-                    "is_skipped": False}
-        # two reads: the plan, then "is there already a log?"
-        with patch.object(kdb, "execute_one", side_effect=[plan_row, None]), \
-             patch.object(kdb, "execute_query", return_value=[]), \
-             patch.object(kdb, "execute_write") as write:
-            self.assertTrue(health.insert_inferred_summary())
-            write.assert_called_once()
+    def test_the_inferred_backstop_is_retired(self):
+        """SESSION-OPEN: nothing writes an inferred summary any more, and no job
+        is registered for it. Its historical rows stay and stay filtered."""
+        from artemis import scheduler
+        self.assertFalse(hasattr(health, "insert_inferred_summary"))
+        src = Path(scheduler.__file__).read_text()
+        self.assertNotIn("inferred_summary", src)
 
 
 # ============================================================================

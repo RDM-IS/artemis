@@ -145,24 +145,21 @@ def resolve_checkin(cur, row: dict, today: date) -> Resolution | None:
 
 
 # ---------------------------------------------------------------------------
-# Site 2 — the makeup swap
+# Site 2 — the makeup swap: RETIRED with MAKEUP-2 (SESSION-OPEN, 2026-11-09).
+# The rule that judged a makeup ("did he log the swapped-in session?") is gone.
+# An open makeup_swap decision is CLOSED as `retired` — not judged — so it never
+# sits in pending for ever. One-time and idempotent by construction: the
+# runner skips any decision that already has an outcome row, and no new
+# makeup_swap decision can be written (POST /makeup answers 410). 0 such rows
+# existed on 2026-11-09; the old Lambda can still write one until deploy.
 # ---------------------------------------------------------------------------
 
-def resolve_makeup(cur, row: dict, today: date) -> Resolution | None:
+def resolve_makeup_retired(cur, row: dict, today: date) -> Resolution:
     m = row["metadata"] or {}
-    rest_plan_id, on = m.get("rest_plan_id"), _as_date(m.get("on"))
-    if rest_plan_id is None or on is None:
-        raise OutcomeUnreadable("the decision carries no rest_plan_id/on")
-    if on >= today:
-        return None
-
-    logged = _logged(cur, rest_plan_id)
-    # Ryan's spec: "if he skips it, that is the correction."
-    correction = (None if logged else
-                  {"what": "skipped — the swapped-in session was never logged on the rest day"})
-    return Resolution("logged" if logged else "not_logged",
-                      {"rest_plan_id": rest_plan_id, "on": on.isoformat(), "logged": logged},
-                      correction)
+    return Resolution("retired", {"reason": "MAKEUP-2 retired by SESSION-OPEN (2026-11-09); "
+                                            "the makeup was not judged",
+                                  "rest_plan_id": m.get("rest_plan_id"), "on": m.get("on")},
+                      None)
 
 
 # ---------------------------------------------------------------------------
@@ -178,11 +175,22 @@ def resolve_repeat(cur, row: dict, today: date) -> Resolution | None:
     if week_end >= today:
         return None                       # the repeated week hasn't finished
 
-    from artemis import program_repeat
+    # SESSION-OPEN (Ryan, 2026-11-09): the repeated week is judged by the
+    # strength quota — on the decision's own cursor, so it reads what this
+    # transaction sees. Unreadable raises; it never resolves as "clean".
+    from artemis.quiet_hours import get_active_timezone
+    from knowledge import strength_quota as sq
+
+    def _execute(sql, params):
+        cur.execute(sql, params)
+        return cur.fetchall()
     try:
-        not_done = program_repeat.not_done_in(repeat_start)
-    except Exception as exc:              # noqa: BLE001
+        q = sq.read_pg(repeat_start, tz=get_active_timezone(), today=today, execute=_execute)
+    except sq.QuotaUnreadable as exc:
         raise OutcomeUnreadable(f"could not read the repeated week: {exc}") from exc
+    # Judged on the count, not `status`: a repeat begun before the quota's counts-from week is
+    # still owed an honest answer about whether the repeated week reached 3.
+    clean = q["count"] >= q["required"]
 
     # Ryan's spec: a second repeat of the same week is the strongest correction
     # signal there is.
@@ -192,11 +200,10 @@ def resolve_repeat(cur, row: dict, today: date) -> Resolution | None:
     repeated_again = (_scalar(cur) or 0) > 0
 
     correction = ({"what": "the same week was repeated again"} if repeated_again else None)
-    return Resolution("week_clean" if not not_done else "week_not_done",
+    return Resolution("week_clean" if clean else "week_short",
                       {"repeat_start": repeat_start.isoformat(),
-                       "not_done_count": len(not_done),
-                       "not_done": [f"{m.get('plan_date')} {m.get('display_name')}"
-                                    for m in not_done],
+                       "strength_days": q["strength_days"], "count": q["count"],
+                       "required": q["required"],
                        "repeated_again": repeated_again},
                       correction)
 
@@ -231,7 +238,7 @@ def resolve_prefill(cur, row: dict, today: date) -> Resolution | None:
 RESOLVERS = {
     "checkin_adjust": resolve_checkin,
     "checkin_adjust_suppressed": resolve_checkin,
-    "makeup_swap": resolve_makeup,
+    "makeup_swap": resolve_makeup_retired,
     "repeat_week": resolve_repeat,
     "nutrition_prefill": resolve_prefill,
 }

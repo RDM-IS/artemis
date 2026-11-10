@@ -296,6 +296,14 @@ class _QueryAwareSession:
 
     def execute(self, stmt, *_args, **_kwargs):
         sql = str(stmt).lower()
+        if "acos.system_state" in sql and _args and (_args[0] or {}).get("k") == "strength_quota_counts_from":
+            cf = self._f.get("counts_from", "2000-01-02")
+            return _MockMultiResult([{"value": cf}] if cf else [])
+        if "as day_type" in sql:                     # SESSION-OPEN strength quota
+            if self._f.get("quota_raises"):
+                raise RuntimeError("UndefinedColumn")
+            self.quota_params = _args[0] if _args else None
+            return _MockMultiResult(self._f.get("quota", []))
         if "phase_config" in sql:
             rows = self._f.get("phase_config", [])
         elif "from health.plan" in sql and "between" in sql:
@@ -354,6 +362,42 @@ def _build_status_client(fixtures: dict):
     app.dependency_overrides[get_db] = _override_db
     health_router._HEALTH_API_KEY = VALID_KEY
     return TestClient(app), app
+
+
+class TestStatusQuota(unittest.TestCase):
+    """SESSION-OPEN: /status carries the week's strength quota, in the ACTIVE
+    timezone, fail-closed."""
+
+    def tearDown(self):
+        from api.app.routers import health as health_router
+        if getattr(self, "app", None) is not None:
+            self.app.dependency_overrides.clear()
+        health_router._HEALTH_API_KEY = None
+
+    def test_status_carries_the_quota(self):
+        from knowledge.strength_quota import week_of
+        today = _endpoint_today()
+        ws, we = week_of(today)
+        client, self.app = _build_status_client({"quota": [{"day": ws}]})
+        body = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY}).json()
+        q = body["strength_quota"]
+        self.assertTrue(q["section"]["ok"])
+        self.assertEqual((q["week_start"], q["week_end"]), (ws.isoformat(), we.isoformat()))
+        self.assertEqual((q["count"], q["required"]), (1, 3))
+        self.assertEqual(q["strength_days"], [ws.isoformat()])
+
+    def test_an_unset_counts_from_is_unreadable(self):
+        client, self.app = _build_status_client({"counts_from": None, "quota": []})
+        q = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY}).json()["strength_quota"]
+        self.assertFalse(q["section"]["ok"])
+
+    def test_unreadable_says_so_and_status_still_renders(self):
+        client, self.app = _build_status_client({"quota_raises": True})
+        r = client.get("/api/health/status", headers={"X-API-Key": VALID_KEY})
+        self.assertEqual(r.status_code, 200)
+        q = r.json()["strength_quota"]
+        self.assertFalse(q["section"]["ok"])
+        self.assertIsNone(q["count"])
 
 
 class TestStatusEndpoint(unittest.TestCase):

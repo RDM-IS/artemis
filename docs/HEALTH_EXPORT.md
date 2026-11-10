@@ -71,7 +71,7 @@ An item:
    ```
 2. **Confirm the Lambda's role can read it.** If its policy lists secrets by name rather than by `rdmis/dev/*`, the new ARN has to be added — an IAM change, so Ryan's. Without it every export route returns 500 on first use while the rest of the API is unaffected.
 3. **Migrate first:** apply `054_health_export.sql` and confirm `nutrition.health_export` exists before deploying the Lambda. It is additive; nothing existing reads it.
-4. **Deploy the Lambda** (`PATH=/opt/homebrew/bin:$PATH bash deploy.sh`). No box change: nothing in `artemis/` is touched.
+4. **Deploy the Lambda** (`PATH=$PWD/venv/bin:$PATH bash api/deploy.sh`, from the repo root). No box change: nothing in `artemis/` is touched.
 5. **Verify, still switched off:** `POST /claim` with the key → `{"status": "disabled", …}`; with the display key → 401.
 
 ## Activation (Ryan's, and it forces the two decisions)

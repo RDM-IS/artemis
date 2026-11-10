@@ -68,3 +68,49 @@ STRENGTH_LABEL: dict[str, str] = {"strength_a": "A", "strength_b": "B",
 
 def is_strength(session_type: str | None) -> bool:
     return (session_type or "") in STRENGTH_TYPES
+
+
+# ── Strength DAYS — the weekly quota (SESSION-OPEN, 2026-11-09) ──────────────
+# A strength day is a lift or a circuit with floor work. Checked against the
+# live tables on 2026-11-09 (MATCHES-NOTHING):
+#   * a PLANNED circuit is never its own session_type. ROW-SCHEDULE writes it as
+#     `cardio_z2` with `blocks.row_kind = 'circuit'` (12 live rows, 10/21-12/11),
+#     so a list of session_type values alone matches zero planned circuits. The
+#     quota reader maps that row_kind onto CIRCUIT_TYPES before it compares.
+#   * an AD-HOC circuit (Start button) logs `adhoc_session_type = 'row_circuit'`
+#     (knowledge.row_circuit.KINDS["circuit"]). Zero live rows today.
+#   * ride + floor / run + floor were never built (WEEK-TEMPLATE, "as built"):
+#     `ride_ladder` / `run_ladder` have no floor work and are NOT strength days.
+#     A name for a floor ride or run would match nothing anyone writes, so none
+#     is listed; tests/test_strength_quota.py fails when a floor kind is added
+#     to row_circuit.KINDS without being added here.
+#   * `yoga_strength` is excluded on purpose (an extra, not a strength day).
+
+#: Circuit formats that count as a strength day — every row_circuit kind with
+#: floor work, by its ad-hoc slug.
+CIRCUIT_TYPES: tuple[str, ...] = ("row_circuit",)
+
+#: The `blocks.row_kind` that makes a planned cardio_z2 row a circuit, and the
+#: circuit type it counts as.
+PLANNED_CIRCUIT_ROW_KIND = "circuit"
+PLANNED_CIRCUIT_TYPE = "row_circuit"
+
+#: AWAY's no-gym substitute (BW-CIRCUIT): a planned row typed
+#: `bodyweight_circuit` on a work or vacation day without a gym. Counts toward
+#: the quota (Ryan, 2026-11-09). A hotel-gym day is already a strength type.
+AWAY_STRENGTH_TYPES: tuple[str, ...] = ("bodyweight_circuit",)
+
+#: Everything that makes a day a strength day. ONE list — readers import it.
+STRENGTH_DAY_TYPES: tuple[str, ...] = STRENGTH_TYPES + CIRCUIT_TYPES + AWAY_STRENGTH_TYPES
+
+
+def day_type(session_type: str | None, row_kind: str | None = None) -> str | None:
+    """What a logged session counts as for the quota: a planned circuit row is a
+    circuit, whatever its session_type says."""
+    if row_kind == PLANNED_CIRCUIT_ROW_KIND:
+        return PLANNED_CIRCUIT_TYPE
+    return session_type
+
+
+def is_strength_day_type(session_type: str | None, row_kind: str | None = None) -> bool:
+    return day_type(session_type, row_kind) in STRENGTH_DAY_TYPES

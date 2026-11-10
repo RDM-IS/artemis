@@ -547,15 +547,14 @@ class TestNudgeAndFollowups(unittest.TestCase):
         post.assert_not_called()
 
     def test_no_debrief_nag_and_no_inferred_miss_on_flow_days(self):
+        # SESSION-OPEN: the per-day nag and the inferred backstop are retired,
+        # and a flow is never a strength day, so it can neither satisfy nor
+        # trigger the quota nag.
         from artemis import health
-        plan = {"plan_id": 104, "session_type": "recovery_flow", "target_rpe": 2.0,
-                "is_skipped": False}
-        with patch("knowledge.db.execute_one", return_value=plan), \
-             patch("knowledge.db.execute_query", return_value=[]) as q, \
-             patch("knowledge.db.execute_write") as w:
-            self.assertIsNone(health.run_nag_check())
-            self.assertFalse(health.insert_inferred_summary())
-        w.assert_not_called()
+        from knowledge.session_types import is_strength_day_type
+        self.assertFalse(hasattr(health, "run_nag_check"))
+        self.assertFalse(hasattr(health, "insert_inferred_summary"))
+        self.assertFalse(is_strength_day_type("recovery_flow"))
 
 
 class TestWakePost(unittest.TestCase):

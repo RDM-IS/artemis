@@ -10,8 +10,7 @@ D = date(2026, 10, 6)          # a date inside the program window
 
 
 def _build(**patches):
-    with mock.patch.object(sl, "_load_week_rows", return_value=[]), \
-         mock.patch.object(cycle, "override_for", return_value=None), \
+    with mock.patch.object(cycle, "override_for", return_value=None), \
          mock.patch.object(cycle, "locations", return_value=cycle.DEFAULT_LOCATIONS), \
          mock.patch.object(cycle, "anchor", return_value=cycle.DEFAULT_ANCHOR):
         return sl.build(D)
@@ -78,45 +77,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestMakeupState(unittest.TestCase):
-    """MAKEUP-2 (Ryan, 2026-09-27): one not-done session is made up on a rest
-    day; more than one means the week repeats."""
-    from datetime import date as _d
-    WS = _d(2027, 3, 7)                       # a synthetic Sunday
-    TODAY = _d(2027, 3, 11)
+class TestMakeupRetired(unittest.TestCase):
+    """SESSION-OPEN (Ryan, 2026-11-09): MAKEUP-2 is retired. The library keeps
+    the `makeup` keys an older gym-display build reads, and never offers."""
 
-    def _row(self, pid, day, st, logged=False, skipped=False):
-        from datetime import timedelta
-        return {"plan_id": pid, "plan_date": self.WS + timedelta(days=day), "session_type": st,
-                "display_name": st, "is_skipped": skipped, "logged": logged}
-
-    def test_one_missed_on_a_rest_day_is_offered(self):
-        rows = [self._row(1, 1, "strength_a", logged=True), self._row(2, 2, "strength_b"),
-                self._row(3, 3, "cardio_z2", logged=True), self._row(4, 4, "rest")]
-        mk = sl.makeup_state(rows, self.TODAY, self.WS)
-        self.assertEqual(mk["offer"]["missed_plan_id"], 2)
-        self.assertEqual(mk["offer"]["rest_plan_id"], 4)
-        self.assertFalse(mk["repeat"])
-
-    def test_a_skip_counts_as_not_done(self):
-        rows = [self._row(2, 2, "strength_b", skipped=True), self._row(4, 4, "rest")]
-        self.assertEqual(sl.makeup_state(rows, self.TODAY, self.WS)["not_done"][0]["skipped"], True)
-
-    def test_two_missed_means_repeat_and_no_offer(self):
-        rows = [self._row(1, 1, "strength_a"), self._row(2, 2, "strength_b"), self._row(4, 4, "rest")]
-        mk = sl.makeup_state(rows, self.TODAY, self.WS)
-        self.assertTrue(mk["repeat"])
+    def test_the_offer_is_always_null(self):
+        mk = _build()["makeup"]
         self.assertIsNone(mk["offer"])
+        self.assertFalse(mk["repeat"])
+        self.assertEqual(mk["not_done"], [])
+        self.assertTrue(mk["retired"])
 
-    def test_no_offer_on_a_training_day_or_a_logged_rest_day(self):
-        rows = [self._row(2, 2, "strength_b"), self._row(4, 4, "strength_c")]
-        self.assertIsNone(sl.makeup_state(rows, self.TODAY, self.WS)["offer"])
-        rows = [self._row(2, 2, "strength_b"), self._row(4, 4, "rest", logged=True)]
-        self.assertIsNone(sl.makeup_state(rows, self.TODAY, self.WS)["offer"])
-
-    def test_flows_and_rest_are_never_missed(self):
-        rows = [self._row(1, 1, "recovery_flow"), self._row(2, 2, "rest"), self._row(4, 4, "rest")]
-        self.assertEqual(sl.makeup_state(rows, self.TODAY, self.WS)["not_done"], [])
+    def test_the_library_reads_no_plan_rows_for_it(self):
+        self.assertFalse(hasattr(sl, "makeup_state"))
+        self.assertFalse(hasattr(sl, "_load_week_rows"))
 
     def test_extras_only_in_the_general_list(self):
         # QUICK-START (2026-10-20): strength A/B/C joined the library for the

@@ -168,7 +168,7 @@ class TestTheSkippedExerciseCase(unittest.TestCase):
     def test_a_session_of_nothing_but_skips_is_missed(self):
         """Every slot skipped, nothing logged: the session did not happen."""
         self.assertEqual(status(circuit(rounds=2, n=6), sets(12, skipped=12),
-                                day=date(2026, 10, 15), today=TODAY), "missed")
+                                day=date(2026, 10, 15), today=TODAY), "not_done")
 
     def test_a_skipped_walk_is_not_a_walk_that_happened(self):
         """The case that caught the first attempt: one cardio_block, skipped.
@@ -176,7 +176,7 @@ class TestTheSkippedExerciseCase(unittest.TestCase):
         marked complete by the act of skipping it."""
         self.assertEqual(status({"type": "steady"},
                                 sets(1, skipped=1, log_type="cardio_block"),
-                                day=date(2026, 10, 15), today=TODAY), "missed")
+                                day=date(2026, 10, 15), today=TODAY), "not_done")
 
     def test_a_walk_actually_logged_is_done(self):
         self.assertEqual(status({"type": "steady"},

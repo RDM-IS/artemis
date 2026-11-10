@@ -131,9 +131,8 @@ class _Office:
 class TestRepeatAssumptions(unittest.TestCase):
     PROPOSAL = {"week_start": "2027-02-21", "repeat_start": "2027-02-28", "week_num": 3,
                 "proposed_at": "2027-02-28T14:35:00+00:00",
-                "not_done": [{"plan_date": "2027-02-23", "display_name": "Test Strength A"},
-                             {"plan_date": "2027-02-25", "display_name": "Test Mobility",
-                              "skipped": True}]}
+                # SESSION-OPEN: the proposal carries the strength quota.
+                "strength_days": ["2027-02-23", "2027-02-25"], "count": 2, "required": 3}
 
     def _build(self, pending_value=PROPOSAL, raises=False):
         from artemis import program_repeat as pr
@@ -144,12 +143,19 @@ class TestRepeatAssumptions(unittest.TestCase):
             return pr._assumptions(date(2027, 2, 28), [], [date(2027, 2, 28)], plan,
                                    ["k1", "k2", "k3"], "md5-before", _Office())
 
-    def test_it_records_which_sessions_were_not_done(self):
+    def test_it_records_which_strength_days_counted(self):
         a = self._build()
-        self.assertEqual(a["trigger"]["not_done_count"], 2)
+        self.assertEqual((a["trigger"]["count"], a["trigger"]["required"]), (2, 3))
         self.assertEqual(a["trigger"]["source"], "proposal")
-        self.assertIn("2027-02-23 Test Strength A", a["trigger"]["not_done"])
-        self.assertIn("(skipped)", a["trigger"]["not_done"][1])
+        self.assertEqual(a["trigger"]["strength_days"], ["2027-02-23", "2027-02-25"])
+        self.assertIn("strength days", a["rule"])
+
+    def test_a_pre_session_open_proposal_is_unknown_not_zero(self):
+        old = {"week_start": "2027-02-21", "repeat_start": "2027-02-28", "week_num": 3,
+               "not_done": [{"plan_date": "2027-02-23", "display_name": "Test Strength A"}]}
+        a = self._build(pending_value=old)
+        self.assertIsNone(a["trigger"]["count"])
+        self.assertIsNone(a["trigger"]["strength_days"])
 
     def test_it_carries_the_hash_and_the_block_move(self):
         a = self._build()
@@ -159,16 +165,16 @@ class TestRepeatAssumptions(unittest.TestCase):
         self.assertNotEqual(a["program_end_before"], a["program_end_after"])
 
     def test_an_unreadable_proposal_is_unknown_not_empty(self):
-        """Absence and silence are different answers. An empty not_done list
-        would claim the rule fired on nothing at all."""
+        """Absence and silence are different answers. An empty strength_days
+        list would claim the rule fired on a week with none."""
         a = self._build(raises=True)
-        self.assertIsNone(a["trigger"]["not_done"])
-        self.assertIsNone(a["trigger"]["not_done_count"])
+        self.assertIsNone(a["trigger"]["strength_days"])
+        self.assertIsNone(a["trigger"]["count"])
         self.assertIn("unreadable", a["trigger"]["source"])
 
     def test_no_live_proposal_says_so(self):
         a = self._build(pending_value=None)
-        self.assertIsNone(a["trigger"]["not_done"])
+        self.assertIsNone(a["trigger"]["strength_days"])
         self.assertIn("absent", a["trigger"]["source"])
 
     def test_the_whole_payload_is_jsonb_serialisable(self):
@@ -177,7 +183,7 @@ class TestRepeatAssumptions(unittest.TestCase):
 
 
 class TestRepeatWritesTheDecision(unittest.TestCase):
-    def test_apply_writes_assumptions_with_the_not_done_list(self):
+    def test_apply_writes_assumptions_with_the_quota(self):
         from tests import test_program_repeat as tpr
         t = tpr.TestApply("test_a_repeat_rebuilds_from_the_repeat_week_and_extends_the_block")
         with mock.patch("artemis.program_repeat.pending",
@@ -188,7 +194,7 @@ class TestRepeatWritesTheDecision(unittest.TestCase):
         row = rows[0]
         self.assertIs(row["manual_gap"], False)
         a = json.loads(row["assumptions"])
-        self.assertEqual(a["trigger"]["not_done_count"], 2)
+        self.assertEqual(a["trigger"]["count"], 2)
         self.assertIn("rule", a)
         # metadata still carries what the write DID; assumptions is not a copy.
         self.assertIn("md5_untouched", json.loads(row["metadata"]))

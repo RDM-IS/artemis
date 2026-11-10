@@ -226,11 +226,11 @@ class TestStatus(Base):
         d = self.days(plans, logs)
         self.assertEqual({k: v["status"] for k, v in d.items()}, {
             "2026-09-16": "done", "2026-09-17": "done", "2026-09-18": "partial",
-            "2026-09-19": "done", "2026-09-20": "missed", "2026-09-21": "today",
+            "2026-09-19": "done", "2026-09-20": "not_done", "2026-09-21": "today",
             "2026-09-22": "upcoming",
         })
         for k, v in d.items():
-            self.assertIn(v["status"], ("done", "partial", "missed", "upcoming", "today"))
+            self.assertIn(v["status"], ("done", "partial", "not_done", "skipped", "upcoming", "today"))
         self.assertEqual(d["2026-09-17"]["location"], "office gym")
         self.assertEqual(d["2026-09-20"]["location"], "outside")
         self.assertEqual(d["2026-09-20"]["logged"], [], "inferred rows are never shown as logged")
@@ -258,7 +258,7 @@ class TestStatus(Base):
         self.assertEqual(d["2026-09-18"]["status"], "done",
                          "Ryan trained (Ex1, Ex2) and decided about Ex0 — skipped slots count")
         # 9/17-style flow on a rest_mobility row: a missed flow is missed, not a rest day.
-        self.assertEqual(d["2026-09-19"]["status"], "missed")
+        self.assertEqual(d["2026-09-19"]["status"], "not_done")
         self.assertEqual(d["2026-09-17"]["summary_notes"], "recovery_flow: partial 14 of 30 min")
 
     def test_a_debrief_summary_completes_a_day(self):
@@ -269,7 +269,7 @@ class TestStatus(Base):
         d = self.days([plan(1, W), plan(3, W + timedelta(2), status="completed")],
                       [log(1, "session_summary", None, rpe_actual=7, notes="felt good")])
         self.assertEqual(d["2026-09-16"]["status"], "done")     # from its summary
-        self.assertEqual(d["2026-09-18"]["status"], "missed")   # no logs, status ignored
+        self.assertEqual(d["2026-09-18"]["status"], "not_done")   # no logs, status ignored
 
     def test_a_skipped_past_day_is_skipped_not_missed(self):
         """MAKEUP-1: a deliberate skip is a different fact from a missed day."""
@@ -291,16 +291,16 @@ class TestStatus(Base):
         self.assertEqual(t["display_name"], "Day off")
         self.assertEqual(t["status"], "today")
         self.assertTrue(d["2026-09-18"]["adjusted"])
-        self.assertEqual(d["2026-09-18"]["status"], "missed")
+        self.assertEqual(d["2026-09-18"]["status"], "not_done")
 
     def test_pure_status_function(self):
         from api.app.routers.health import derive_day_status
         p = plan(1, TODAY - timedelta(1), "walk", {"type": "steady"})
-        self.assertEqual(derive_day_status(p, [], TODAY), "missed")
+        self.assertEqual(derive_day_status(p, [], TODAY), "not_done")
         self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk")], TODAY), "done")   # 1 of 1
         # A walk is one cardio_block. Skipping it is not doing it, and there
         # is no other real set in the session to make the skip count.
-        self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk", is_skipped=True)], TODAY), "missed")
+        self.assertEqual(derive_day_status(p, [log(1, "cardio_block", "Walk", is_skipped=True)], TODAY), "not_done")
         self.assertEqual(derive_day_status(p, [log(1, "session_summary", None)], TODAY), "done")
         self.assertEqual(derive_day_status(plan(2, TODAY, "rest_mobility", {"type": "mobility"}), [], TODAY), "today")
 

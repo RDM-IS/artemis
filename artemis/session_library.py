@@ -6,10 +6,10 @@ Spec: docs/ARTEMIS_STATE.md, SESSION-LIB. The rules this module keeps:
   `health_office.build_row(...)` for the session type, the location and the
   current program week — nothing is a stored template, so Phase 2 Week 3 comes
   out right with nothing to update.
-* **Extras every day; training only as a makeup** (Ryan, 2026-09-27). The
-  general list is low-impact extras (EXTRA_TYPES: yoga now, core and mobility
-  once defined), rest days included. Strength and cardio appear only as the
-  makeup of the ONE session not done this program week, on a rest day.
+* **Extras every day** (Ryan, 2026-09-27). The general list is low-impact
+  extras (EXTRA_TYPES), rest days included. The MAKEUP-2 offer that used to sit
+  beside it is RETIRED (SESSION-OPEN, 2026-11-09): `makeup` keeps its keys so
+  older gym-display builds render nothing, and `offer` is always null.
 * **Absent, not greyed.** A session a location can't support isn't listed
   there: strength needs an approved substitution table (`can_hold`), cardio
   needs a machine (`knowledge.cardio.resolve`). Recovery Flow needs a mat, which
@@ -33,8 +33,7 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_KEY = "session_library"
 
-from knowledge.session_types import (EXTRA_TYPES, REST_TYPES, STRENGTH_TYPES,  # noqa: E402
-                                     is_training)
+from knowledge.session_types import EXTRA_TYPES, STRENGTH_TYPES  # noqa: E402
 
 #: Extras (Ryan, 2026-09-27): yoga / core / mobility, every day.
 #: QUICK-START (Ryan, 2026-10-20): "give me buttons to decide what I want to do
@@ -89,56 +88,14 @@ def entry_for(session_type: str, location_key: str, today: date) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MAKEUP-2 (Ryan, 2026-09-27): one session not done in a program week can be
-# made up on a later rest day of that week — the missed day becomes rest, the
-# rest day becomes the session. More than one not done: nothing is offered,
-# the missed stay missed, and the week repeats (proposed, then confirmed).
-# "Not done" = a morning training row before today with no real log, whether
-# it was skipped deliberately or simply missed.
+# MAKEUP-2 — RETIRED by SESSION-OPEN (Ryan, 2026-11-09). Plan rows are
+# suggestions; the week is judged by knowledge.strength_quota. The shape stays
+# (gym-display's LibraryScreen reads `makeup.offer` and `makeup.repeat`) so an
+# older build shows nothing rather than breaking.
 # ---------------------------------------------------------------------------
 
-def program_week_start(d: date) -> date | None:
-    from artemis import health_office as office
-    if d < office.WEEK2_START:
-        return None
-    return office.WEEK2_START + timedelta(days=7 * ((d - office.WEEK2_START).days // 7))
-
-
-def makeup_state(rows: list[dict], today: date, week_start: date | None) -> dict:
-    """Pure. `rows`: the program week's MORNING rows up to and including today,
-    each {plan_id, plan_date, session_type, display_name, is_skipped, logged}
-    where `logged` means a real (non-inferred) log exists."""
-    out: dict = {"week_start": week_start.isoformat() if week_start else None,
-                 "not_done": [], "offer": None, "repeat": False}
-    if week_start is None:
-        return out
-    for r in rows:
-        if r["plan_date"] < today and is_training(r["session_type"]) and not r["logged"]:
-            out["not_done"].append({"plan_id": r["plan_id"], "plan_date": r["plan_date"].isoformat(),
-                                    "session_type": r["session_type"],
-                                    "display_name": r.get("display_name") or r["session_type"],
-                                    "skipped": bool(r.get("is_skipped"))})
-    out["repeat"] = len(out["not_done"]) > 1
-    today_row = next((r for r in rows if r["plan_date"] == today), None)
-    if (len(out["not_done"]) == 1 and today_row is not None
-            and today_row["session_type"] in REST_TYPES and not today_row["logged"]):
-        m = out["not_done"][0]
-        out["offer"] = {"missed_plan_id": m["plan_id"], "missed_date": m["plan_date"],
-                        "rest_plan_id": today_row["plan_id"], "session_type": m["session_type"],
-                        "display_name": m["display_name"]}
-    return out
-
-
-def _load_week_rows(today: date, week_start: date) -> list[dict]:
-    from knowledge.db import execute_query
-    rows = execute_query(
-        "SELECT p.plan_id, p.plan_date, p.session_type, p.is_skipped, "
-        "p.blocks->>'display_name' AS display_name, "
-        "EXISTS (SELECT 1 FROM health.session_log sl WHERE sl.plan_id = p.plan_id "
-        "        AND sl.logged_via <> 'inferred') AS logged "
-        "FROM health.plan p WHERE p.slot = 'morning' AND p.plan_date BETWEEN %s AND %s "
-        "ORDER BY p.plan_date", (week_start, today))
-    return [dict(r) for r in rows]
+MAKEUP_RETIRED: dict = {"week_start": None, "not_done": [], "offer": None,
+                        "repeat": False, "retired": True}
 
 
 def build(today: date) -> dict:
@@ -152,19 +109,7 @@ def build(today: date) -> dict:
                  "week_num": office.week_num_for(today),
                  "today_location_key": today_key,
                  "locations": []}
-    ws = program_week_start(today)
-    mk = makeup_state(_load_week_rows(today, ws) if ws else [], today, ws)
-    offer = mk["offer"]
-    if offer:
-        # Built where he is TODAY, by the seeder — and only if this place can hold it.
-        if _supported(today_key, offer["session_type"]):
-            offer["location_key"] = today_key
-            offer["entry"] = entry_for(offer["session_type"], today_key, today)
-        else:
-            mk["offer"] = None
-            mk["offer_blocked"] = (f"{offer['display_name']} can't be run at "
-                                   f"{(locs.get(today_key) or {}).get('display', today_key)}")
-    out["makeup"] = mk
+    out["makeup"] = dict(MAKEUP_RETIRED)
     for key, meta in locs.items():
         if key in _NOT_A_ROOM or (meta or {}).get("transit"):
             continue
@@ -195,13 +140,6 @@ def main() -> int:
     for loc in lib["locations"]:
         names = ", ".join(s["display_name"] for s in loc["sessions"]) or "nothing"
         print(f"{loc['display']:>12}: {names}")
-    mk = lib.get("makeup") or {}
-    nd = ", ".join(f"{m['plan_date']} {m['display_name']}" for m in mk.get("not_done", [])) or "none"
-    print(f"not done this week: {nd}")
-    if mk.get("offer"):
-        print(f"makeup on offer: {mk['offer']['display_name']} from {mk['offer']['missed_date']}")
-    elif mk.get("repeat"):
-        print("more than one not done — the week repeats (proposed, then confirmed)")
     print(f"week {lib['week_num']}, today at {lib['today_location_key']}, "
           f"written to acos.system_state[{SYSTEM_KEY!r}]")
     return 0

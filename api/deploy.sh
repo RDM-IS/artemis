@@ -2,6 +2,11 @@
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# Everything below is relative to api/: the build container mounts $PWD and
+# installs ./requirements.txt, and the zips name app/ and ../knowledge/. Run
+# from anywhere else (CLAUDE.md's `bash api/deploy.sh` from the repo root) it
+# installed the BOX's requirements and then failed on `zip app/`. So cd first.
+cd "$REPO/api"
 OVERRIDE_LOG="$HOME/.artemis_lambda_deploy.log"
 
 # COLUMN-GREP preflight — before the build, so a refusal costs nothing.
@@ -13,7 +18,15 @@ OVERRIDE_LOG="$HOME/.artemis_lambda_deploy.log"
 #
 # Override: bash deploy.sh --force "why this deploy cannot wait". The reason is
 # required, printed, and appended to $OVERRIDE_LOG with the sha being deployed.
-python3 "$REPO/scripts/lambda_preflight.py" "$@"
+#
+# The preflight imports the project, so it needs the project's interpreter: the
+# repo venv (python3.11, matches the box) when it exists, else python3 on PATH.
+# A bare python3 resolved to Homebrew's newest (3.15 by 2026-11-09), which has
+# none of the packages, and the preflight then failed before checking anything.
+PY="$REPO/venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+echo "[deploy] preflight interpreter: $PY ($("$PY" --version 2>&1))"
+"$PY" "$REPO/scripts/lambda_preflight.py" "$@"
 
 if [ "$1" = "--force" ]; then
   printf '%s  %s  FORCED: %s\n' \

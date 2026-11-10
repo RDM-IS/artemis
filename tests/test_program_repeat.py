@@ -76,35 +76,58 @@ class TestPlanRewrite(unittest.TestCase):
 
 
 class TestProposal(unittest.TestCase):
-    ND = [{"plan_id": 1, "plan_date": "2027-03-08", "session_type": "strength_a",
-           "display_name": "Test A", "skipped": False},
-          {"plan_id": 2, "plan_date": "2027-03-10", "session_type": "cardio_z2",
-           "display_name": "Test Z2", "skipped": True}]
+    """SESSION-OPEN: a finished, counted week below 3 strength days proposes.
+    Synthetic 2031 week (PUBLIC-FIXTURES)."""
+    WS = date(2031, 3, 2)
+    AFTER = date(2031, 3, 9)
 
-    def _run(self, nd, repeats=()):
+    def _quota(self, days, today=None, counts_from=None):
+        from knowledge import strength_quota as sq
+        return sq.compute(self.WS, days, today=today or self.AFTER,
+                          counts_from=counts_from or date(2000, 1, 2))
+
+    def _run(self, q, repeats=()):
         store = {}
-        with mock.patch.object(pr, "not_done_in", return_value=nd), \
+        with mock.patch.object(pr, "quota_for", return_value=q) as qf, \
              mock.patch.object(office, "repeat_starts", return_value=list(repeats)), \
+             mock.patch.object(office, "week_num_for", return_value=5), \
+             mock.patch.object(office, "program_end", return_value=date(2031, 4, 30)), \
              mock.patch("artemis.quiet_hours.get_system_value", side_effect=lambda k: store.get(k)), \
              mock.patch("artemis.quiet_hours.set_system_value",
                         side_effect=lambda k, v: store.__setitem__(k, v)):
-            return pr.propose(office.WEEK2_START + timedelta(days=7)), store
+            out = pr.propose(self.WS)
+        qf.assert_called_once_with(self.WS)
+        return out, store
 
-    def test_two_not_done_proposes_and_stores(self):
-        msg, store = self._run(self.ND)
+    def test_below_three_proposes_and_stores(self):
+        msg, store = self._run(self._quota([date(2031, 3, 3), date(2031, 3, 5)]))
+        self.assertIn("2 of 3 strength days", msg)
+        self.assertIn("Mon 3/3, Wed 3/5", msg)
         self.assertIn("repeat week", msg)
         self.assertIn("no repeat", msg)
-        self.assertIn("(skipped)", msg)
         p = json.loads(store[pr.PENDING_KEY])
-        self.assertEqual(p["repeat_start"], (office.WEEK2_START + timedelta(days=14)).isoformat())
+        self.assertEqual(p["repeat_start"], "2031-03-09")
+        self.assertEqual((p["count"], p["required"]), (2, 3))
 
-    def test_one_or_none_proposes_nothing(self):
-        self.assertEqual(self._run(self.ND[:1])[0], None)
-        self.assertEqual(self._run([])[0], None)
+    def test_three_proposes_nothing(self):
+        q = self._quota([date(2031, 3, 3), date(2031, 3, 5), date(2031, 3, 7)])
+        self.assertEqual(self._run(q)[0], None)
+
+    def test_an_unfinished_week_proposes_nothing(self):
+        self.assertEqual(self._run(self._quota([], today=date(2031, 3, 6)))[0], None)
+
+    def test_a_week_before_the_quota_counts_proposes_nothing(self):
+        self.assertEqual(self._run(self._quota([], counts_from=date(2031, 3, 9)))[0], None)
 
     def test_an_already_repeated_week_is_not_proposed_again(self):
-        msg, _ = self._run(self.ND, repeats=[office.WEEK2_START + timedelta(days=14)])
+        msg, _ = self._run(self._quota([]), repeats=[date(2031, 3, 9)])
         self.assertIsNone(msg)
+
+    def test_an_unreadable_quota_raises(self):
+        from knowledge import strength_quota as sq
+        with mock.patch.object(pr, "quota_for", side_effect=sq.QuotaUnreadable("down")):
+            with self.assertRaises(sq.QuotaUnreadable):
+                pr.propose(self.WS)
 
 
 class TestRouting(unittest.TestCase):

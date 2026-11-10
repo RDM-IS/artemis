@@ -115,8 +115,11 @@ DAILY = {
 
 class FakeSession:
     def __init__(self, plans=PLANS, logs=LOGS, daily=DAILY, program_state=None,
-                 patterns=None, reflections=None):
+                 patterns=None, reflections=None, quota_raises=False,
+                 counts_from="2026-11-08"):
         self.plans, self.logs, self.daily = plans, logs, daily
+        self.quota_raises, self.quota_params, self.rolled_back = quota_raises, None, False
+        self.counts_from = counts_from
         self.state, self.patterns, self.reflections = program_state, patterns, reflections
 
     def execute(self, clause, params=None):
@@ -124,6 +127,8 @@ class FakeSession:
         p = params or {}
         if "acos.timezone_overrides" in sql:
             return _Result([])
+        if "acos.system_state" in sql and p.get("k") == "strength_quota_counts_from":
+            return _Result([{"value": self.counts_from}] if self.counts_from else [])
         if "acos.system_state" in sql:
             return _Result([{"value": json.dumps(self.state)}] if self.state else [])
         if "to_regclass" in sql:
@@ -158,6 +163,21 @@ class FakeSession:
         if "FROM health.plan WHERE plan_date BETWEEN" in sql:
             return _Result(sorted([x for x in self.plans if p["s"] <= x["plan_date"] <= p["e"]],
                                   key=lambda x: x["plan_date"]))
+        if "AS day_type" in sql:                       # SESSION-OPEN strength quota
+            if self.quota_raises:
+                raise RuntimeError("UndefinedColumn")
+            self.quota_params = p
+            by_id = {x["plan_id"]: x for x in self.plans}
+            days = set()
+            for l in self.logs:
+                pr = by_id.get(l["plan_id"])
+                if pr is None or l["logged_via"] == "inferred" or l["is_skipped"]:
+                    continue
+                kind = (pr.get("blocks") or {}).get("row_kind")
+                t = p["row_kind_type"] if kind == p["row_kind"] else pr["session_type"]
+                if t in p["types"] and p["week_start"] <= pr["plan_date"] <= p["week_end"]:
+                    days.add(pr["plan_date"])
+            return _Result([{"day": d} for d in sorted(days)])
         if "FROM health.session_log sl JOIN health.plan p" in sql:
             dates = {x["plan_id"]: x["plan_date"] for x in self.plans}
             return _Result([{"exercise": l["exercise"], "plan_date": dates[l["plan_id"]],
@@ -178,6 +198,9 @@ class FakeSession:
             return _Result([{"state_date": d, "resting_hr": None, **r} for d, r in sorted(self.daily.items())
                             if p["s"] <= d <= p["t"]])
         raise AssertionError(f"unexpected SQL: {sql[:90]}")
+
+    def rollback(self):
+        self.rolled_back = True
 
 
 class Base(unittest.TestCase):
@@ -212,6 +235,37 @@ class Base(unittest.TestCase):
         r = client.get("/api/health/overview", headers={"X-API-Key": VALID_KEY})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
+
+
+class TestStrengthQuota(Base):
+    """SESSION-OPEN: one read; the strength goal tile is the same read."""
+
+    def test_overview_carries_the_quota_and_the_goal_reads_it(self):
+        body = self.overview()
+        q = body["strength_quota"]
+        self.assertTrue(q["section"]["ok"])
+        self.assertEqual((q["week_start"], q["week_end"]), ("2026-09-13", "2026-09-19"))
+        self.assertEqual(q["required"], 3)
+        self.assertEqual(q["status"], "not_counted")       # a week before counts_from
+        self.assertEqual(self.session.quota_params["tz"], "America/Chicago")
+        g = body["goals"]["strength"]
+        self.assertEqual((g["sessions_done"], g["sessions_planned"]), (q["count"], 3))
+        self.assertGreaterEqual(q["count"], 1)
+
+    def test_an_unset_counts_from_is_unreadable(self):
+        body = self.overview(FakeSession(counts_from=None))
+        self.assertFalse(body["strength_quota"]["section"]["ok"])
+        self.assertFalse(body["goals"]["strength"]["section"]["ok"])
+
+    def test_unreadable_is_one_status_for_both(self):
+        body = self.overview(FakeSession(quota_raises=True))
+        self.assertFalse(body["strength_quota"]["section"]["ok"])
+        self.assertIsNone(body["strength_quota"]["count"])
+        self.assertFalse(body["goals"]["strength"]["section"]["ok"])
+        self.assertIsNone(body["goals"]["strength"]["sessions_done"])
+        self.assertTrue(self.session.rolled_back)
+        # the rest of the page still renders
+        self.assertIn("program", body)
 
 
 class TestProgram(Base):
@@ -413,14 +467,14 @@ class TestPatternsFlagsWeight(Base):
         ])
         self.assertEqual([f["kind"] for f in flags], ["pain", "partial", "rpe"])
 
-    def test_missed_and_keyword_pain_flags(self):
+    def test_no_missed_flags_and_keyword_pain_flags(self):
         plans = PLANS + [plan(17, date(2026, 9, 15), "strength_b", circuit("Old", B), phase=3, week=15)]
         logs = LOGS + [log(10, "DB bench press", 30, 8, notes="left shoulder hurt a bit")]
         now = datetime(2026, 9, 23, 17, 0, tzinfo=timezone.utc)   # week 2; 9/18–9/22 now past
         body = self.overview(FakeSession(plans=plans, logs=logs), now=now)
         texts = [f["text"] for f in body["flags"]]
-        self.assertIn("Missed: Walk (9/20)", texts)
-        self.assertIn("Missed: Office Strength C (9/21)", texts)
+        # SESSION-OPEN: a suggestion not taken is never flagged.
+        self.assertFalse([t for t in texts if t.startswith("Missed")])
         self.assertIn("Partial: Office Strength B (9/18) — 1 of 4 sets", texts)
         self.assertIn("Pain note on DB bench press (9/16): “left shoulder hurt a bit”", texts)
         self.assertNotIn("Missed: Rest / Mobility (9/19)", texts)

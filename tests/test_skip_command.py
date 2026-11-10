@@ -101,19 +101,20 @@ class TestReportsDistinguishSkipped(unittest.TestCase):
         r = ev.evaluate(self.plans("sick"), [], [], start=TODAY, end=TODAY + timedelta(days=6),
                         today=TODAY + timedelta(days=1), anchor=TODAY)
         self.assertEqual(r["sessions"][0]["status"], "skipped")
-        self.assertEqual(r["missed"], [])
+        self.assertEqual(r["not_done"], [])
         self.assertEqual(r["counts"]["due"], 0)
         self.assertEqual(r["skipped"], [{"date": TODAY.isoformat(),
                                          "label": "Office Strength A", "reason": "sick"}])
         line = next(l for l in ev.render_lines(r) if l.startswith("Skipped:"))
         self.assertIn("Office Strength A — sick", line)
-        self.assertIn("Missed: none", ev.render_lines(r))
+        # SESSION-OPEN: no "Missed:" line at all — the quota line replaces it.
+        self.assertFalse(any(l.startswith("Missed") for l in ev.render_lines(r)))
 
-    def test_the_same_day_unskipped_is_still_missed(self):
+    def test_the_same_day_unskipped_is_not_done_never_missed(self):
         r = ev.evaluate(self.plans(), [], [], start=TODAY, end=TODAY + timedelta(days=6),
                         today=TODAY + timedelta(days=1), anchor=TODAY)
-        self.assertEqual(r["sessions"][0]["status"], "missed")
-        self.assertEqual(len(r["missed"]), 1)
+        self.assertEqual(r["sessions"][0]["status"], "not_done")
+        self.assertEqual(len(r["not_done"]), 1)
         self.assertEqual(r["counts"]["due"], 1)
         self.assertEqual(r["skipped"], [])
 
@@ -131,14 +132,17 @@ class TestReportsDistinguishSkipped(unittest.TestCase):
         self.assertNotRegex(line.lower(), r"\b(should|try|excuse|again|only|poor|good)\b")
 
 
-class TestNagAndBackstopRespectIt(unittest.TestCase):
-    """Both already gate on is_skipped — this pins that they still do."""
+class TestNagAndBackstopRetired(unittest.TestCase):
+    """SESSION-OPEN (2026-11-09): the per-day debrief nag and the inferred
+    backstop are gone — a skip no longer needs to quiet them. The quota nag
+    reads logs, never plan rows, so a skipped row cannot trigger it."""
 
-    def test_the_nag_and_the_backstop_check_is_skipped(self):
+    def test_the_per_day_nag_and_the_backstop_are_gone(self):
         src = (Path(__file__).resolve().parent.parent / "artemis" / "health.py").read_text()
         for fn in ("def run_nag_check", "def insert_inferred_summary"):
-            body = src[src.index(fn):src.index(fn) + 1600]
-            self.assertIn("is_skipped", body, fn)
+            self.assertNotIn(fn, src)
+        body = src[src.index("def strength_nag"):src.index("def mark_strength_nag")]
+        self.assertNotIn("health.plan", body)
 
 
 if __name__ == "__main__":

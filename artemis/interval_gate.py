@@ -8,9 +8,10 @@ a given day are medical, structural and physical in that order. So a
      says vigorous exercise is fine. **Artemis never sets this**, under any
      circumstances — it is the Brad Spaits rule applied to his body rather than
      his mailbox. `intervals not cleared` revokes it.
-  b. **He is actually training.** ≥ 4 of the last 6 PLANNED cardio sessions carry
-     a real log. Intervals on top of a fortnight of missed sessions is how people
-     get hurt.
+  b. **He is actually training.** ≥ 4 real cardio sessions in the last 14 local
+     days, planned or ad-hoc (SESSION-OPEN, Ryan 2026-11-09 — plan rows are
+     suggestions, so "of the planned ones" no longer means anything). Intervals
+     on top of a fortnight without cardio is how people get hurt.
   c. **Nothing hurts.** No check-in pain ≥ 3 in the last 7 days.
 
 FAIL-CLOSED, and that is the whole design: any condition that is false, and any
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 CLEARED_KEY = "intervals_cleared"
 
 #: (b) and (c), as numbers rather than magic literals in the SQL below.
-RECENT_CARDIO = 6
+RECENT_CARDIO_DAYS = 14
 RECENT_CARDIO_MIN_LOGGED = 4
 PAIN_WINDOW_DAYS = 7
 PAIN_THRESHOLD = 3
@@ -64,25 +65,41 @@ def _cleared(cur) -> bool | None:
     return str(value).strip().lower() in ("1", "true", "yes", "cleared")
 
 
-def _training(cur, today: date) -> tuple[bool | None, dict]:
-    """≥ RECENT_CARDIO_MIN_LOGGED of the last RECENT_CARDIO planned cardio rows
-    carry a real log. `inferred` rows are the nightly backstop, not him training."""
+#: One real cardio SESSION per row: a planned session is its plan_id, an
+#: ad-hoc one its local day. Counting log ROWS would let one six-round ladder
+#: (six cardio_block rows) satisfy the gate on its own.
+_TRAINING_SQL = """
+SELECT count(*) FROM (
+    SELECT DISTINCT COALESCE('plan:' || sl.plan_id::text,
+                             'adhoc:' || ((COALESCE(sl.started_at, sl.logged_at)
+                                           AT TIME ZONE %s)::date)::text) AS session
+    FROM health.session_log sl
+    WHERE sl.log_type = 'cardio_block'
+      AND sl.logged_via IS DISTINCT FROM 'inferred'
+      AND NOT COALESCE(sl.is_skipped, false)
+      AND (COALESCE(sl.started_at, sl.logged_at) AT TIME ZONE %s)::date
+          BETWEEN %s AND %s
+) s
+"""
+
+
+def _training(cur, today: date, tz: str | None = None) -> tuple[bool | None, dict]:
+    """≥ RECENT_CARDIO_MIN_LOGGED real cardio sessions in the last
+    RECENT_CARDIO_DAYS local days (today included), any plan_id. `inferred`
+    rows are the retired nightly backstop, not him training."""
+    since = today - timedelta(days=RECENT_CARDIO_DAYS - 1)
     try:
-        cur.execute(
-            "SELECT p.plan_date, EXISTS (SELECT 1 FROM health.session_log sl "
-            "  WHERE sl.plan_id = p.plan_id AND sl.logged_via <> 'inferred') "
-            "FROM health.plan p "
-            "WHERE p.session_type IN ('cardio_z2', 'cardio_intervals') "
-            "  AND p.plan_date < %s "
-            "ORDER BY p.plan_date DESC LIMIT %s", (today, RECENT_CARDIO))
-        rows = cur.fetchall()
+        if tz is None:
+            from artemis.quiet_hours import get_active_timezone
+            tz = get_active_timezone()
+        cur.execute(_TRAINING_SQL, (tz, tz, since, today))
+        row = cur.fetchone()
+        logged = int(row[0] if not isinstance(row, dict) else list(row.values())[0])
     except Exception:                                           # noqa: BLE001
         logger.warning("interval gate: could not read recent cardio", exc_info=True)
         return None, {}
-    logged = sum(1 for r in rows for v in [r[1] if not isinstance(r, dict)
-                                           else list(r.values())[1]] if v)
     return logged >= RECENT_CARDIO_MIN_LOGGED, {
-        "recent_cardio_rows": len(rows), "recent_cardio_logged": logged,
+        "recent_cardio_days": RECENT_CARDIO_DAYS, "recent_cardio_logged": logged,
         "recent_cardio_needed": RECENT_CARDIO_MIN_LOGGED}
 
 
@@ -130,8 +147,8 @@ def evaluate(cur, today: date) -> GateResult:
     if training is None:
         failed.append("I couldn't read your recent cardio")
     elif not training:
-        failed.append(f"only {t_detail.get('recent_cardio_logged', 0)} of the last "
-                      f"{t_detail.get('recent_cardio_rows', 0)} cardio sessions are logged")
+        failed.append(f"only {t_detail.get('recent_cardio_logged', 0)} cardio sessions in the "
+                      f"last {RECENT_CARDIO_DAYS} days (needs {RECENT_CARDIO_MIN_LOGGED})")
     if no_pain is None:
         failed.append("I couldn't read your recent check-ins")
     elif not no_pain:
