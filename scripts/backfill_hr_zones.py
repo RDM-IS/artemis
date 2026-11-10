@@ -22,7 +22,7 @@ def main() -> int:
     ap.add_argument("--commit", action="store_true")
     args = ap.parse_args()
 
-    from artemis import hr_zones
+    from knowledge import hr_zones
     from knowledge import cognition
     from knowledge.db import get_connection
 

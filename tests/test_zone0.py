@@ -8,7 +8,7 @@ import os as _os; _os.environ["ARTEMIS_TEST_NO_DB"] = "1"  # TEST-DB-GUARD
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from artemis import hr_zones
+from knowledge import hr_zones
 from knowledge import zones
 
 T0 = datetime(2099, 1, 1, 7, 0, tzinfo=timezone.utc)
@@ -162,9 +162,10 @@ class TestBoundaryAndOutsideSamples(unittest.TestCase):
 
 class TestTheWindow(unittest.TestCase):
     class Cur:
+        description = ()
         def __init__(self, rows): self.rows, self._res = rows, []
         def execute(self, sql, params=None):
-            self._res = self.rows
+            self._res = [] if "watch_workout" in sql else self.rows
         def fetchall(self): return self._res
 
     def test_a_cardio_block_duration_wins(self):
@@ -253,6 +254,7 @@ class TestTheWindowFindsRealDurations(unittest.TestCase):
     whose duration was sitting right there."""
 
     class Cur:
+        description = ()
         def __init__(self, rows): self.rows, self._res = rows, []
         def execute(self, sql, params=None): self._res = self.rows
         def fetchall(self): return self._res
@@ -276,12 +278,17 @@ class TestTheWindowFindsRealDurations(unittest.TestCase):
         start, stop, _ = hr_zones.window_for(cur, 1)
         self.assertEqual(int((stop - start).total_seconds()), 1980)
 
-    def test_a_cardio_block_still_wins_over_a_summary(self):
+    def test_a_summary_now_wins_over_a_cardio_block(self):
+        """Reversed 2026-11-10 (ZONE-WINDOW). Preferring the cardio_block was
+        right when a session was ONE block; since the row ladders a block is one
+        240 s round, POSTed at Finish, so the block rule scored the four minutes
+        after the last round. The summary covers the session."""
         end = T0 + timedelta(minutes=30)
-        cur = self.Cur([self._row("session_summary", 9999, end),
-                        self._row("cardio_block", 1800, end)])
-        _s, _e, src = hr_zones.window_for(cur, 1)
-        self.assertIn("cardio_block", src)
+        cur = self.Cur([self._row("session_summary", 1800, end),
+                        self._row("cardio_block", 240, end)])
+        start, stop, src = hr_zones.window_for(cur, 1)
+        self.assertIn("session_summary", src)
+        self.assertEqual(int((stop - start).total_seconds()), 1800)
 
     def test_a_null_duration_does_not_become_a_window(self):
         cur = self.Cur([self._row("session_summary", None, T0)])

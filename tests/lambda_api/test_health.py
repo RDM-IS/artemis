@@ -520,6 +520,7 @@ class _LogCaptureSession:
         #: samples the endpoint is allowed to see.
         self.zone_writes: list = []
         self.hr_samples: list = []
+        self.watch_workouts: list = []
         self.committed = False
         self.rolled_back = False
         self._fixtures = fixtures or {}
@@ -554,6 +555,12 @@ class _LogCaptureSession:
             return _Empty()
         if sql.startswith("select") and "watch_heart_rate" in sql:
             return _Rows(self.hr_samples)
+        # ZONE-WINDOW: the window is read from ALL of the session's rows (what
+        # this fake has inserted) and from the watch workouts near them.
+        if sql.startswith("select log_type, duration_sec, logged_at, started_at, ended_at"):
+            return _Rows([r for r in self.inserted if r["plan_id"] == params["p"]])
+        if sql.startswith("select") and "from health.watch_workout" in sql:
+            return _Rows(self.watch_workouts)
         if sql.startswith("insert"):
             assert params is not None
             self._log_counter += 1
@@ -575,6 +582,8 @@ class _LogCaptureSession:
                 "logged_at": datetime(2026, 6, 8, 18, 30, 0),
                 "logged_via": params["logged_via"],
                 "adhoc_session_type": params.get("adhoc_session_type"),
+                "started_at": params.get("started_at"),
+                "ended_at": params.get("ended_at"),
             }
             self.inserted.append(row)
             return _MockExecuteResult(row)
@@ -809,6 +818,49 @@ class TestLogEndpoint(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertIsNone(resp.json()["hr_zones"])
         self.assertEqual([r["log_type"] for r in sess.inserted], ["cardio_block"])
+
+    # ── ZONE-WINDOW (2026-11-10): the session's span, not the last round ──
+    def _ladder_post(self, workouts=(), samples=()):
+        """A row ladder as gym-display posts it at Finish: every 240 s round in
+        one POST, each with its own started_at/ended_at, plus the summary. All
+        timestamps synthetic (2026-06-08), never a real session's."""
+        from datetime import timedelta as _td, timezone as _tz
+        client, self.app, sess = _build_log_client()
+        t0 = datetime(2026, 6, 8, 17, 0, 0, tzinfo=_tz.utc)
+        sess.watch_workouts = list(workouts)
+        sess.hr_samples = list(samples)
+        rounds = [{"duration_sec": 240,
+                   "started_at": (t0 + _td(minutes=5 * i)).isoformat(),
+                   "ended_at": (t0 + _td(minutes=5 * i, seconds=240)).isoformat()}
+                  for i in range(6)]
+        resp = client.post(
+            "/api/health/log", headers={"X-API-Key": VALID_KEY},
+            json={"plan_id": 9001, "exercise": "Row ladder", "log_type": "cardio_block",
+                  "modality": "row", "device": "water", "sets": rounds})
+        return resp, sess, t0
+
+    def test_a_ladder_scores_its_whole_span_not_one_round(self):
+        from datetime import timedelta as _td
+        resp, sess, t0 = self._ladder_post()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        w = sess.zone_writes[0]
+        self.assertEqual(w["wsrc"], "logged started_at..ended_at")
+        self.assertEqual((w["ws"], w["we"]), (t0, t0 + _td(minutes=25, seconds=240)))
+
+    def test_an_overlapping_watch_workout_wins(self):
+        from datetime import timedelta as _td
+        from datetime import timezone as _tz
+        t0 = datetime(2026, 6, 8, 17, 0, 0, tzinfo=_tz.utc)
+        ws, we = t0 - _td(minutes=1), t0 + _td(minutes=35)
+        dense = [{"measured_at": ws + _td(seconds=30 * i), "bpm": 112} for i in range(72)]
+        resp, sess, _ = self._ladder_post(
+            workouts=[{"kind": "Rowing", "started_at": ws, "ended_at": we,
+                       "duration_sec": 2160}], samples=dense)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        w = sess.zone_writes[0]
+        self.assertEqual((w["ws"], w["we"]), (ws, we))
+        self.assertTrue(w["wsrc"].startswith("watch workout"))
+        self.assertEqual(resp.json()["hr_zones"]["status"], "ok")
 
     # ── ADHOC-LOG ──────────────────────────────────────────────────────────
     def _adhoc(self, fixtures=None, **extra):
