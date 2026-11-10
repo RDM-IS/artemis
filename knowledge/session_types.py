@@ -61,9 +61,22 @@ STRENGTH_LEGACY: tuple[str, ...] = ("strength_a", "strength_b", "strength_c")
 #: Every strength type a plan row or a logged session can carry.
 STRENGTH_TYPES: tuple[str, ...] = STRENGTH_LEGACY + (STRENGTH_CURRENT,)
 
+#: SESSION-OPEN 3a (approved 2026-11-09): the bodyweight full-body session.
+#: Deliberately NOT in STRENGTH_TYPES — that tuple is the lift ROTATION
+#: (RECOMMEND's "next strength", /strength-next's history, the check-in's
+#: lettered labels), and "bodyweight" is a room's answer, not a step in it. It
+#: IS a lift for "did he lift in the last 48 h" (LIFT_TYPES) and a strength day
+#: for the weekly quota (STRENGTH_DAY_TYPES).
+STRENGTH_BW = "strength_bw"
+
+#: Everything that is a lift, for "when did he last lift": the rotation plus
+#: bodyweight. RECOMMEND's 48 h rule reads this, never STRENGTH_TYPES.
+LIFT_TYPES: tuple[str, ...] = STRENGTH_TYPES + (STRENGTH_BW,)
+
 #: Short label where a letter used to be shown.
 STRENGTH_LABEL: dict[str, str] = {"strength_a": "A", "strength_b": "B",
-                                  "strength_c": "C", "strength_full": "Full Body"}
+                                  "strength_c": "C", "strength_full": "Full Body",
+                                  STRENGTH_BW: "Bodyweight"}
 
 
 def is_strength(session_type: str | None) -> bool:
@@ -101,7 +114,8 @@ PLANNED_CIRCUIT_TYPE = "row_circuit"
 AWAY_STRENGTH_TYPES: tuple[str, ...] = ("bodyweight_circuit",)
 
 #: Everything that makes a day a strength day. ONE list — readers import it.
-STRENGTH_DAY_TYPES: tuple[str, ...] = STRENGTH_TYPES + CIRCUIT_TYPES + AWAY_STRENGTH_TYPES
+STRENGTH_DAY_TYPES: tuple[str, ...] = (STRENGTH_TYPES + (STRENGTH_BW,) + CIRCUIT_TYPES
+                                       + AWAY_STRENGTH_TYPES)
 
 
 def day_type(session_type: str | None, row_kind: str | None = None) -> str | None:

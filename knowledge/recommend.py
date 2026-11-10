@@ -27,7 +27,7 @@ BUTTONS = ("row", "row_circuit", "ride", "run", "strength", "yoga", "recovery")
 #: The extras that live under "More" (not on a Start button).
 MORE_TYPES = ("core", "mobility")
 
-from knowledge.session_types import STRENGTH_TYPES  # noqa: E402  (one list)
+from knowledge.session_types import LIFT_TYPES, STRENGTH_TYPES  # noqa: E402  (one list each)
 REST_TYPES = ("rest", "rest_mobility")
 LIFT_GAP = timedelta(hours=48)
 
@@ -43,7 +43,7 @@ def button_for(session_type: str | None, blocks: dict | None) -> str | None:
         return "row_circuit"
     if b.get("row_kind") == "ladder":
         return "row"
-    if session_type in STRENGTH_TYPES:
+    if session_type in LIFT_TYPES:
         return "strength"
     if session_type == "recovery_flow":
         return "recovery"

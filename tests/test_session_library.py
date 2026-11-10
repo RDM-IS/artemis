@@ -98,8 +98,9 @@ class TestMakeupRetired(unittest.TestCase):
         from knowledge.session_types import EXTRA_TYPES, is_training
         for st in EXTRA_TYPES:
             self.assertFalse(is_training(st), st)
+        # SESSION-OPEN 3a: strength_bw joins (bodyweight is strength).
         self.assertEqual(set(sl.LIBRARY_TYPES) - set(EXTRA_TYPES),
-                         {"strength_a", "strength_b", "strength_c", "strength_full"})
+                         {"strength_a", "strength_b", "strength_c", "strength_full", "strength_bw"})
 
 
 class TestExtras(unittest.TestCase):
@@ -113,8 +114,8 @@ class TestExtras(unittest.TestCase):
             self.assertEqual(types[:4], ["recovery_flow", "core", "mobility", "yoga_strength"],
                              loc["key"])
             # QUICK-START: strength only where the room can hold it.
-            from knowledge.session_types import STRENGTH_TYPES
-            want = [t for t in STRENGTH_TYPES if office.can_hold(loc["key"], t)]
+            from knowledge.session_types import STRENGTH_BW, STRENGTH_TYPES
+            want = [t for t in STRENGTH_TYPES + (STRENGTH_BW,) if office.can_hold(loc["key"], t)]
             self.assertEqual(types[4:], want, loc["key"])
 
     def test_core_is_light_and_says_when(self):

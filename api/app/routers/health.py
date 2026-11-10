@@ -190,6 +190,7 @@ _LEGACY_PRETTY = {
     "strength_b": "Strength B — Pull/Hinge",
     "strength_c": "Strength C — Full Body",
     "strength_full": "Full Body",
+    "strength_bw": "Bodyweight",
     "cardio_intervals": "Cardio Intervals",
     "cardio_z2": "Cardio Zone 2",
     "rest_mobility": "Rest / Mobility",
@@ -2677,7 +2678,7 @@ def get_recommend(
             WHERE sl.logged_via <> 'inferred' AND NOT sl.is_skipped
               AND COALESCE(p.session_type, sl.adhoc_session_type) = ANY(:types)
             GROUP BY 1
-        """), {"types": list(rec.STRENGTH_TYPES) + list(rec.MORE_TYPES)}).mappings().all()
+        """), {"types": list(rec.LIFT_TYPES) + list(rec.MORE_TYPES)}).mappings().all()
         lib_row = db.execute(text("SELECT value FROM acos.system_state WHERE key = :k"),
                              {"k": SESSION_LIBRARY_KEY}).mappings().first()
     except SQLAlchemyError:
@@ -2685,11 +2686,14 @@ def get_recommend(
         return {"available": False, "reason": "Couldn't read today's plan or history."}
 
     last = {r["t"]: r["at"] for r in done if r["at"] is not None}
-    strength_times = [v for k, v in last.items() if k in rec.STRENGTH_TYPES]
+    # SESSION-OPEN 3a: the 48 h clock counts EVERY lift, bodyweight included
+    # (LIFT_TYPES); the rotation that picks "next" walks only STRENGTH_TYPES, so
+    # a bodyweight session is never the next lift and never breaks rot.index().
+    strength_times = [v for k, v in last.items() if k in rec.LIFT_TYPES]
     last_strength = max(strength_times) if strength_times else None
-    next_strength = None
-    if last_strength is not None:
-        latest = max((k for k in last if k in rec.STRENGTH_TYPES), key=lambda k: last[k])
+    rotation_last = [k for k in last if k in rec.STRENGTH_TYPES]
+    if rotation_last:
+        latest = max(rotation_last, key=lambda k: last[k])
         rot = rec.STRENGTH_TYPES
         next_strength = rot[(rot.index(latest) + 1) % len(rot)]
     else:

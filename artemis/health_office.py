@@ -242,6 +242,23 @@ EQUIPMENT_CLASS: dict[str, str] = {
     "Push-up": "bodyweight",
     "Upright bike — Z3": "cardio",
     "Bike — Z3": "cardio",
+    # SESSION-OPEN step 3a — strength_bw (approved 2026-11-09). All no-load
+    # classes: the screens show no load fields, and lighter_load() returns
+    # nothing rather than inventing a number. "Push-up", "Reverse lunge", the
+    # trunk moves and the two bikes above are shared and already classed.
+    "Single-leg glute bridge": "bodyweight",
+    "Hand-supported single-leg RDL": "bodyweight",
+    "Tempo squat (3-1-1)": "bodyweight",
+    "Good morning": "bodyweight",
+    "Prone Y-T-W": "bodyweight",
+    "Band row": "bands",
+    "Row — Z3": "cardio",
+    "Recumbent bike — Z3": "cardio",
+    "Treadmill — Z3": "cardio",
+    "Elliptical — Z3": "cardio",
+    # No machine in the room: the interval is done on the floor, so it is
+    # bodyweight work, not a cardio machine.
+    "High knees / jacks — Z3": "bodyweight",
 }
 
 
@@ -540,6 +557,17 @@ def can_hold(location_key: str, session_type: str) -> bool:
         # table; the rooms it was written for are the ones that hold it.
         from artemis import full_body
         return location_key in full_body.ROOMS
+    if session_type == "strength_bw":
+        # SESSION-OPEN 3a: needs only a floor, but its row and cardio choices
+        # read the room's inventory. A room whose inventory can't be read holds
+        # nothing (the builder would raise) — "unknown", never assumed empty.
+        from artemis import strength_bw
+        try:
+            strength_bw.resolve_row(location_key)
+            strength_bw.resolve_cardio(location_key, None)
+        except strength_bw.InventoryUnreadable:
+            return False
+        return True
     if location_key == "office":
         return True
     return bool(subs_for(location_key, session_type))
@@ -570,6 +598,7 @@ _DISPLAY = {
     "strength_b": "Strength B",
     "strength_c": "Strength C",
     "strength_full": "Full Body",
+    "strength_bw": "Bodyweight",
     "cardio_z2": "Zone 2",
     # Without a modality this is the honest generic; with one it becomes
     # "Row intervals" etc. via display_name_for().
@@ -1613,6 +1642,11 @@ def _extra(session_type: str, location: str):
     return blocks, rpe, None, max(5, round(rounds * work / 60))
 
 
+#: The A/B/C split, built by _strength(). Named, not `startswith("strength")`,
+#: so a new strength type cannot fall into the A/B/C builder by its prefix.
+STRENGTH_LEGACY_BUILT = frozenset(LIFT_ORDER)      # knowledge.session_types.STRENGTH_LEGACY
+
+
 def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
                  location: str | None = None, location_key: str = "office",
                  on=None, gate: dict | None = None):
@@ -1632,7 +1666,12 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
         # FULLBODY-1: its own per-room versions; raises where it can't run.
         from artemis import full_body
         return full_body.build(location_key, location or LOCATION, on=on)
-    if session_type.startswith("strength"):
+    if session_type == "strength_bw":
+        # SESSION-OPEN 3a. BEFORE the startswith("strength") branch below, which
+        # would otherwise build it as Strength A/B/C — the quiet wrong session.
+        from artemis import strength_bw
+        return strength_bw.build(location_key, location or LOCATION, on=on)
+    if session_type in STRENGTH_LEGACY_BUILT:
         return _strength(session_type, week_num, wk0=wk0,
                          location=location or LOCATION, location_key=location_key)
     if session_type == "cardio_z2":
@@ -1642,7 +1681,12 @@ def _build_inner(session_type: str, week_num: int, *, wk0: bool = False,
                           on=on, gate=gate)
     if session_type == "rest":
         return _rest_day()
-    return _rest(week_num)
+    if session_type == "rest_mobility":
+        return _rest(week_num)
+    # NO FALLTHROUGH (SESSION-OPEN 3a, 2026-11-09). This used to `return
+    # _rest(week_num)` for anything unrecognised, so a new session_type with no
+    # builder rendered as a plausible Rest / Mobility day (SESSION-LABELS).
+    raise ValueError(f"no builder for session_type {session_type!r} — add a dispatch branch")
 
 
 def _apply_prep(blocks: dict, location_key: str, location: str,
@@ -1960,7 +2004,8 @@ def format_estimate(minutes) -> str:
     return f"~{m} min" if m > TARGET_MIN else f"{m} min"
 
 
-LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "strength_full", "cardio_intervals",
+LEGAL_SESSION_TYPES = {"strength_a", "strength_b", "strength_c", "strength_full", "strength_bw",
+                       "cardio_intervals",
                        "cardio_z2", "rest", "rest_mobility", "recovery_flow"}
 
 

@@ -1413,6 +1413,7 @@ def _session_pretty_name(session_type: str) -> str:
         "strength_b":       "Strength B — Pull/Hinge",
         "strength_c":       "Strength C — Full Body",
         "strength_full":    "Full Body",
+        "strength_bw":      "Bodyweight",
         "cardio_intervals": "Cardio Intervals",
         "cardio_z2":        "Cardio Zone 2",
         "rest_mobility":    "Rest / Mobility",
@@ -2412,6 +2413,10 @@ _SESSION_TYPE_ALIASES = {
     "strength_c": "strength_c", "strength c": "strength_c",
     "strength_full": "strength_full", "full body": "strength_full",
     "full-body": "strength_full",
+    # Substring match, first wins: the circuit BEFORE the bare word, or a
+    # question about the bodyweight circuit would resolve to strength_bw.
+    "bodyweight_circuit": "bodyweight_circuit", "bodyweight circuit": "bodyweight_circuit",
+    "strength_bw": "strength_bw", "bodyweight": "strength_bw",
     "cardio_intervals": "cardio_intervals", "cardio intervals": "cardio_intervals",
     "intervals": "cardio_intervals", "hiit": "cardio_intervals",
     "cardio_z2": "cardio_z2", "cardio z2": "cardio_z2", "zone 2": "cardio_z2",
