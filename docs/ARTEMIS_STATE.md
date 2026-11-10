@@ -224,7 +224,7 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 **SESSION-OPEN — any session, any room; the week is a quota, not a calendar — DECIDED AND APPROVED 2026-11-09 (Ryan, 20:06 and 20:16). Build steps 1, 2 and 4 BUILT 2026-11-09 (artemis #283, gym-display #67, both draft); steps 3, 5 (beyond the status union) and 6 NOT BUILT; NOT DEPLOYED.** Supersedes WEEK-TEMPLATE's day-by-day contract, MAKEUP-2, and SESSION-LIB's "same type completes the row" rule. Source: Ryan's spec (`session-open-spec.md`, 2026-11-09), reconciled with what was built. The reconciliations are marked **As built**.
 
 *Decisions (Ryan, 2026-11-09 20:06 and 20:16):*
-1. **A pain day off warns, it does not hide.** Banner: "Day off from the check-in — gentle mobility suggested." Every session stays launchable. **Not built** (step 5).
+1. **A pain day off warns, it does not hide.** Banner: "Day off from the check-in — gentle mobility suggested." Every session stays launchable. **BUILT 2026-11-10 (step 5a, gym-display `feat/session-counter`):** QuickStart and the full More list show on a day off under the banner, and the rest-day screen still opens Sessions; RECOMMEND may still highlight Mobility.
 2. **The only weekly requirement is 3+ strength days per program week (Sun–Sat).** Strength = weights, a **row + floor** circuit (push / core), or bodyweight. Everything else — which day, which room, cardio, rest — is free.
 3. **Bodyweight is strength.** No equipment is required for a strength day, so strength exists in every room.
 4. **Yoga — Intense (`yoga_strength`) does not count** as a strength day.
@@ -261,7 +261,8 @@ Progression order, as FULLBODY-1: add a round → shorten rest → raise the mac
 - **Cardio:** Row · Ride · Run, each **Ladder** or **+ floor** (six buttons, every room). This builds WEEK-TEMPLATE's deferred `format × machine` split.
 - **Strength:** Full-body (the room's version: X office / Y Richfield / bodyweight elsewhere) · Bodyweight · Row + floor. A/B/C behind "older".
 - **Yoga & extras:** Intense · Recovery · Core · Mobility.
-- **Week counter at the top:** "Strength 1 of 3 · 4 days left". Strength-day buttons tagged "counts".
+- **Week counter at the top:** "Strength 1 of 3 · 4 days left". Strength-day buttons tagged "counts". **BUILT 2026-11-10 (step 5a).** **As built:** one read (`strength_quota` on `/status`, re-read on entering Sessions), one status driving the colour — `met` green and "Strength 3 of 3 — done", `on_track`/`not_counted` neutral, `tight` amber, `short` red; unreadable reads "Couldn't read this week's strength count", never 0. The "counts" list is `strength_quota.strength_day_types`, served by the Lambda from `STRENGTH_DAY_TYPES` even when the quota is unreadable — gym-display holds no copy, and a test fails if one appears.
+- **Rebuilding without timers (step 5a, BUILT 2026-11-10):** `rebuild sessions` (qualified words, CONFIRM-ARB) runs `session_library.write()` and replies with each room's session count; acos startup rebuilds once on a daemon thread, fail-soft. No timer is added. The stale notice reads 'Built for <date> — send "rebuild sessions" to Artemis.'
 - The location chip lists every room; RECOMMEND highlights only.
 
 *C. The week — the quota replaces the calendar* (**BUILT**):

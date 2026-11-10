@@ -5190,6 +5190,57 @@ def _handle_dietitian_report(post: dict, question: str) -> bool:
     return True
 
 
+# SESSION-OPEN 5a: `rebuild sessions` — the session library on demand, because
+# timers are paused and nothing rebuilds it nightly. A qualified phrase, never a
+# bare control word, so CONFIRM-ARB neither claims it nor is disturbed by it.
+_REBUILD_SESSIONS_RE = re.compile(r"^\s*rebuild\s+(?:the\s+)?sessions?(?:\s+library)?\s*[.!]*\s*$", re.I)
+
+
+def render_library_summary(lib: dict) -> str:
+    """The reply to `rebuild sessions`: the date, then each room and its count."""
+    lines = [f"Sessions rebuilt for {lib['generated_on']} (week {lib.get('week_num')}):"]
+    for loc in lib.get("locations") or []:
+        n = len(loc.get("sessions") or [])
+        lines.append(f"- {loc.get('display') or loc.get('key')}: {n} session{'s' if n != 1 else ''}")
+    if not lib.get("locations"):
+        lines.append("- no rooms — the cycle listed none")
+    return "\n".join(lines)
+
+
+def _handle_rebuild_sessions(post: dict, question: str) -> bool:
+    """`rebuild sessions` — run session_library.write() now and say what it built."""
+    if not _REBUILD_SESSIONS_RE.match(question or ""):
+        return False
+    from artemis import session_library
+    channel_id = post.get("channel_id", "")
+    root_id = post.get("root_id") or post["id"]
+    try:
+        reply = render_library_summary(session_library.write())
+    except Exception:
+        logger.exception("rebuild sessions: session_library.write() failed")
+        # A failed rebuild must not read like a successful one: the page still
+        # serves the previous build, and says what date that was.
+        reply = ("I couldn't rebuild the sessions — the page still shows the last "
+                 "build. The traceback is in the log.")
+    if _mm:
+        _mm.post_message(channel_id, reply, root_id=root_id)
+    return True
+
+
+def _startup_rebuild_library() -> None:
+    """SESSION-OPEN 5a: rebuild the session library once at startup, because
+    timers are paused (TIMED_JOBS_ENABLED unset) and nothing else rebuilds it.
+    FAIL-SOFT: a failure is logged and startup carries on — the page then shows
+    its stale notice, which names `rebuild sessions` as the fix."""
+    try:
+        from artemis import session_library
+        lib = session_library.write()
+        logger.info("startup: session library rebuilt for %s (%d rooms)",
+                    lib.get("generated_on"), len(lib.get("locations") or []))
+    except Exception:
+        logger.exception("startup: session library rebuild failed — continuing")
+
+
 _REPEAT_RE = re.compile(r"^\s*(repeat(?:\s+the)?\s+week|yes\s+repeat)\s*[.!]*\s*$", re.I)
 _NO_REPEAT_RE = re.compile(r"^\s*(no\s+repeat|don'?t\s+repeat(?:\s+the\s+week)?)\s*[.!]*\s*$", re.I)
 
@@ -5372,6 +5423,8 @@ def _handle_mention(post: dict, thread: list[dict]):
         # WEEK-AHEAD `week ahead` — read-only, deterministic, ahead of the LLM so
         # a lookahead is never answered by a guess.
         ("week_ahead", _handle_week_ahead),
+        # SESSION-OPEN 5a `rebuild sessions` — deterministic, ahead of the LLM.
+        ("rebuild_sessions", _handle_rebuild_sessions),
         # PROGRAM-2 `intervals cleared` — human-gated, deterministic.
         ("intervals_cleared", _handle_intervals_cleared),
         ("cardio_detect", _handle_cardio_detect),
@@ -5972,6 +6025,11 @@ def main():
         _sched.run_catchup()
     except Exception:
         logger.exception("Startup catch-up failed — continuing normally")
+
+    # SESSION-OPEN 5a: rebuild the session library once, on its own thread so a
+    # slow or hung database read can never hold startup. Fail-soft by design.
+    Thread(target=_startup_rebuild_library, name="startup-session-library",
+                     daemon=True).start()
 
     # Post startup message
     _post_startup_message(_mm, _gmail, _calendar, _sched)

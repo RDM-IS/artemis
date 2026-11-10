@@ -51,6 +51,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from knowledge.machine_setup import parse_setup
+from knowledge.session_types import STRENGTH_DAY_TYPES
 
 from ..database import get_db
 
@@ -350,6 +351,11 @@ class StrengthQuotaOut(BaseModel):
     needed: Optional[int] = None
     days_left: Optional[int] = None
     status: Optional[str] = None      # met | on_track | tight | short | not_counted
+    #: SESSION-OPEN 5a: the session types whose day counts toward the quota
+    #: (knowledge.session_types.STRENGTH_DAY_TYPES), served so gym-display tags
+    #: its "counts" buttons without a copy of the list (SAME-FACT-MANY-PLACES).
+    #: Sent even when the quota is unreadable: it is a constant, not a read.
+    strength_day_types: list[str] = Field(default_factory=lambda: list(STRENGTH_DAY_TYPES))
 
 
 class StatusResponse(BaseModel):
