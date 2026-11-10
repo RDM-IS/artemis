@@ -5,9 +5,10 @@ Status page could only ever say "minutes logged only". But WATCH-1 has been
 recording heart rate continuously since 2026-09-19, and those samples cover the
 sessions whether or not the session itself recorded a number. This reads them.
 
-Deliberately NOT waiting for watch *workouts*: WATCH-1's workout matching is
-still at zero, and a feature that needs a second feature to start working is a
-feature that does not work.
+Still deliberately NOT waiting for workout MATCHING (watch_workout.plan_id):
+a feature that needs a second feature to start working does not work. Since
+2026-11-10 the window does use a watch workout's own start/stop, found by TIME
+OVERLAP with the logged span (knowledge.zone_window), which needs no plan_id.
 
 THE WINDOW IS THE HARD PART, and it is where this fails closed. A zone
 breakdown is only as honest as the window it was computed over, so the window
@@ -18,9 +19,9 @@ duration, which is a prediction, not an observation.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
-from knowledge import zones
+from knowledge import zone_window, zones
+from knowledge.watch_prefill import _dicts
 
 logger = logging.getLogger(__name__)
 
@@ -29,55 +30,28 @@ CARDIO_TYPES = ("cardio_z2", "cardio_intervals")
 
 
 def window_for(cur, plan_id: int) -> tuple:
-    """(start, end, source) for one session's logs, or (None, None, reason).
+    """(start, end, source) for one session, or (None, None, reason).
 
-    Two ways, in order of trustworthiness:
-
-    1. ANY log row carrying a real `duration_sec` -- its `logged_at` is when the
-       block finished, so the window is [logged_at - duration, logged_at]. This
-       was originally restricted to `log_type = 'cardio_block'`, which matched
-       NOTHING: the durations that exist in this database are on
-       `session_summary` rows (1770 s and 1980 s on plans 106 and 107). A window
-       rule that only recognises a log type nobody writes finds no windows.
-    2. Otherwise the span of the session's own log rows, first to last.
-
-    A single log row with no duration gives a zero-length span, which is
-    `bad_window`, not a guess: one row says when something happened, not for how
-    long. The plan's INTENDED duration is deliberately not a fallback -- it is a
-    prediction, and a zone breakdown computed over a window he did not actually
-    train is a fabricated number wearing a real one's clothes.
+    The rule lives in knowledge.zone_window (shared with the Lambda): a watch
+    workout overlapping the logged span first, then the iPad's own
+    started_at..ended_at, then the legacy duration anchors. This only reads.
+    A failed read RAISES -- it must never look like "no workout"
+    (FAIL-CLOSED-RESOLVERS).
     """
     cur.execute(
-        "SELECT log_type, duration_sec, logged_at FROM health.session_log "
+        "SELECT log_type, duration_sec, logged_at, started_at, ended_at "
+        "FROM health.session_log "
         "WHERE plan_id = %s AND logged_via <> 'inferred' ORDER BY logged_at",
         (plan_id,))
-    rows = cur.fetchall()
-    if not rows:
-        return None, None, "no logs"
-
-    def _get(r, key, idx):
-        return r[key] if isinstance(r, dict) else r[idx]
-
-    # Prefer a cardio_block if one exists, then any row with a duration. The
-    # longest wins: a 45 s row beside a 1980 s row on the same session is a
-    # per-exercise entry, not the session.
-    with_duration = [r for r in rows if _get(r, "duration_sec", 1)]
-    blocks = [r for r in with_duration if _get(r, "log_type", 0) == "cardio_block"]
-    best = None
-    if blocks:
-        best, why = max(blocks, key=lambda r: int(_get(r, "duration_sec", 1))), "cardio_block duration"
-    elif with_duration:
-        best = max(with_duration, key=lambda r: int(_get(r, "duration_sec", 1)))
-        why = f"{_get(best, 'log_type', 0)} duration"
-    if best is not None:
-        end = _get(best, "logged_at", 2)
-        return end - timedelta(seconds=int(_get(best, "duration_sec", 1))), end, why
-
-    first = _get(rows[0], "logged_at", 2)
-    last = _get(rows[-1], "logged_at", 2)
-    if first == last:
-        return None, None, "one log row — no span"
-    return first, last, "first..last logged_at"
+    logs = _dicts(cur)
+    start, end, _ = zone_window.logged_span(logs)
+    if start is None:
+        return zone_window.session_window(logs, [])
+    cur.execute(
+        "SELECT kind, started_at, ended_at, duration_sec FROM health.watch_workout "
+        "WHERE started_at < %s AND started_at > %s ORDER BY started_at",
+        (end + zone_window.WORKOUT_READ_PAD, start - zone_window.WORKOUT_READ_PAD))
+    return zone_window.session_window(logs, _dicts(cur))
 
 
 def samples_between(cur, start, end) -> list:
@@ -158,3 +132,57 @@ def describe(row: dict) -> str:
     parts = [f"{name} {z[name]} min" for name in ("Z1", "Z2", "Z3", "Z4", "Z5")
              if z.get(name)]
     return " · ".join(parts) if parts else "below Z1 throughout"
+
+
+#: How many local days back the ingest recompute reaches. The watch syncs a
+#: session within hours; a push that carries OLDER days (a re-export) must not
+#: quietly backfill history -- scripts/backfill_hr_zones.py is the explicit path.
+RECOMPUTE_DAYS = 3
+
+
+def recompute_recent(cur, days, today) -> dict:
+    """Recompute the zone breakdown of finished sessions on `days`, limited to
+    the last RECOMPUTE_DAYS local days ending `today`.
+
+    WHY (2026-11-10): the Finish POST computes the breakdown before the watch
+    has synced, so it stores `no_samples` and, until this, nothing ever looked
+    again. The watch ingest calls this after it stores heart rate.
+
+    Only sessions that a Finish could have scored (a cardio_block or
+    session_summary with a duration, same trigger as the POST) and whose row is
+    not already final -- 'ok' over a watch-workout window -- are recomputed.
+    Writes only health.session_hr_zones. The caller owns the transaction; a
+    read failure RAISES, so the caller's savepoint rolls it back rather than
+    storing a breakdown built on a read that did not happen.
+    """
+    from datetime import timedelta as _td
+    floor = today - _td(days=RECOMPUTE_DAYS - 1)
+    days = sorted({d for d in days if floor <= d <= today})
+    if not days:
+        return {"days": [], "recomputed": []}
+    cur.execute(
+        "SELECT DISTINCT p.plan_id FROM health.plan p "
+        "JOIN health.session_log sl ON sl.plan_id = p.plan_id "
+        "WHERE p.plan_date = ANY(%s) AND sl.logged_via <> 'inferred' "
+        "  AND sl.log_type = ANY(%s) AND sl.duration_sec IS NOT NULL "
+        "ORDER BY p.plan_id",
+        (days, list(zone_window.FINISHERS)))
+    plan_ids = [r["plan_id"] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
+    if not plan_ids:
+        return {"days": [d.isoformat() for d in days], "recomputed": []}
+    # A separate read, not a join: one statement naming health.plan beside a
+    # `status` column trips the deploy's column-drop preflight (039).
+    cur.execute(
+        "SELECT plan_id FROM health.session_hr_zones "
+        "WHERE plan_id = ANY(%s) AND status = 'ok' AND window_source LIKE %s",
+        (plan_ids, zone_window.WATCH_SOURCE + "%"))
+    final = {r["plan_id"] if isinstance(r, dict) else r[0] for r in cur.fetchall()}
+    plan_ids = [p for p in plan_ids if p not in final]
+    out = []
+    for plan_id in plan_ids:
+        row = compute_for_plan(cur, plan_id)
+        store(cur, row)
+        out.append({"plan_id": plan_id, "status": row["status"],
+                    "window_source": row["window_source"],
+                    "sample_count": row.get("sample_count", 0)})
+    return {"days": [d.isoformat() for d in days], "recomputed": out}

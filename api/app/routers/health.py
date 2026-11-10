@@ -699,16 +699,35 @@ def _store_zone_minutes(db: Session, plan_id: Optional[int],
     """
     if not plan_id:
         return None
-    FINISHERS = ("cardio_block", "session_summary")
+    from knowledge import zone_window as _zw
     durations = [r for r in inserted_rows
-                 if r.get("log_type") in FINISHERS and r.get("duration_sec")]
+                 if r.get("log_type") in _zw.FINISHERS and r.get("duration_sec")]
     if not durations:
         return None
     from knowledge import zones as _zones
     try:
-        best = max(durations, key=lambda r: int(r["duration_sec"]))
-        end = best["logged_at"]
-        start = end - timedelta(seconds=int(best["duration_sec"]))
+        # ZONE-WINDOW (2026-11-10): the window is the SESSION's, from every one
+        # of its rows -- a circuit's rounds arrive over several POSTs -- plus any
+        # watch workout overlapping it. It used to be this POST's longest
+        # finisher anchored on logged_at, which for a row ladder is one 240 s
+        # round ending at Finish: four minutes after the work, not the work.
+        # At Finish the watch has usually not synced yet, so this often stores
+        # no_samples; the next watch ingest recomputes it
+        # (knowledge.hr_zones.recompute_recent).
+        logs = db.execute(text(
+            "SELECT log_type, duration_sec, logged_at, started_at, ended_at "
+            "FROM health.session_log WHERE plan_id = :p AND logged_via <> 'inferred' "
+            "ORDER BY logged_at"), {"p": plan_id}).mappings().all()
+        span_start, span_end, _ = _zw.logged_span([dict(r) for r in logs])
+        if span_start is None:
+            return None
+        workouts = db.execute(text(
+            "SELECT kind, started_at, ended_at, duration_sec FROM health.watch_workout "
+            "WHERE started_at < :b AND started_at > :a ORDER BY started_at"),
+            {"a": span_start - _zw.WORKOUT_READ_PAD,
+             "b": span_end + _zw.WORKOUT_READ_PAD}).mappings().all()
+        start, end, wsrc = _zw.session_window([dict(r) for r in logs],
+                                              [dict(r) for r in workouts])
         samples = [(r["measured_at"], r["bpm"]) for r in db.execute(text(
             "SELECT measured_at, bpm FROM health.watch_heart_rate "
             "WHERE measured_at BETWEEN :a AND :b AND bpm IS NOT NULL "
@@ -730,7 +749,7 @@ def _store_zone_minutes(db: Session, plan_id: Optional[int],
             "  hr_max_used = EXCLUDED.hr_max_used, zones_source = EXCLUDED.zones_source, "
             "  computed_at = now()"),
             {"plan_id": plan_id, "ws": start, "we": end,
-             "wsrc": f"{best['log_type']} duration", "status": out["status"],
+             "wsrc": wsrc, "status": out["status"],
              "n": out.get("sample_count", 0), "c": out.get("counted_sec", 0),
              "u": out.get("unaccounted_sec", 0),
              "z1": z.get("Z1"), "z2": z.get("Z2"), "z3": z.get("Z3"),
@@ -2998,6 +3017,28 @@ def post_ingest(
         except Exception as exc:                       # noqa: BLE001
             workout_match = {"error": f"{type(exc).__name__}: {exc}"}
 
+    # ZONE-WINDOW (2026-11-10): recompute the zone breakdown of sessions this
+    # push carried heart rate for. The Finish POST scores a session before the
+    # watch has synced, so it stores no_samples; this is the second look that
+    # never existed. Recent days only -- an old re-export does not backfill.
+    # Same savepoint rule as the match: a failure never costs the ingest.
+    zone_recompute: dict = {}
+    if hr_rows or workout_rows:
+        try:
+            from knowledge.hr_zones import recompute_recent
+            raw_cur = db.connection().connection.cursor()
+            raw_cur.execute("SAVEPOINT zone_recompute")
+            try:
+                zone_recompute = recompute_recent(
+                    raw_cur, {r["local_date"] for r in hr_rows + workout_rows},
+                    datetime.now(tz).date())
+                raw_cur.execute("RELEASE SAVEPOINT zone_recompute")
+            except Exception as exc:                   # noqa: BLE001
+                raw_cur.execute("ROLLBACK TO SAVEPOINT zone_recompute")
+                zone_recompute = {"error": f"{type(exc).__name__}: {exc}"}
+        except Exception as exc:                       # noqa: BLE001
+            zone_recompute = {"error": f"{type(exc).__name__}: {exc}"}
+
     # WATCH-1: re-run the pre-fill for TODAY on every ingest, so a value that
     # syncs after the 04:30 wake (resting HR usually does) still lands. Only
     # empty or `watch` fields are filled; a manual value is never touched. A
@@ -3031,6 +3072,7 @@ def post_ingest(
                                             "workouts": len(workout_rows) - ins_w},
                              "replaced_sleep_nights": replaced_nights,
                              "workout_match": workout_match,
+                             "zone_recompute": zone_recompute,
                              "hourly": hourly,
                              "prefill": prefill},
                             default=str)})
