@@ -67,7 +67,12 @@ class TestBuiltRows(unittest.TestCase):
         seen = 0
         while d <= end:
             r = self.mornings[d]
-            want = rs.ROW_BY_POS.get(cycle.cycle_pos(d))
+            # SUNDAY-TRAVEL (2026-11-10): pos 5 and 8 now anchor at MSP home,
+            # so the table's Wisconsin-position fallback plans them.
+            pos = cycle.cycle_pos(d)
+            want = rs.ROW_BY_POS.get(pos) or (
+                rs.OVERRIDE_BY_POS.get(pos)
+                if cycle.anchor_location(d, use_overrides=False) in rs.MSP_LOCATIONS else None)
             self.assertEqual(r["blocks"].get("row_kind"), want, d)
             if want:
                 seen += 1
@@ -98,7 +103,7 @@ class TestBuiltRows(unittest.TestCase):
             if d < REAL_FROM:
                 continue
             pos = cycle.cycle_pos(d)
-            if r["slot"] == "evening" or pos not in rs.ROW_BY_POS:
+            if r["slot"] == "evening" or not r["blocks"].get("row_kind"):
                 self.assertEqual(r["session_type"], base[(d, r["slot"])]["session_type"],
                                  f"{d} {r['slot']}")
 

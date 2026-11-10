@@ -75,9 +75,11 @@ class TestPhaseBoundaries(PhaseCase):
 
     def test_eu_dst_transition_day_differs_from_us(self):
         # 2026-10-25 (a Sunday): the EU falls back a week before the US — the
-        # windows are local wall-clock in each zone (weekend 07:30 / 08:30).
-        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 7, 30)), quiet_hours.PHASE_WAKE)
-        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 8, 30)), quiet_hours.PHASE_OPEN)
+        # windows are local wall-clock in each zone. Since SUNDAY-TRAVEL that
+        # Sunday is the travel day: a Brown Deer wake (07:30) and work hours,
+        # so it is quiet until the wake and open from it.
+        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 7, 29)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(PARIS, at(PARIS, 2026, 10, 25, 7, 30)), quiet_hours.PHASE_OPEN)
         # Same instant in Chicago that morning is still the middle of the night.
         instant = at(PARIS, 2026, 10, 25, 8, 30).astimezone(ZoneInfo(CHICAGO))
         self.assertEqual(self.phase_at(CHICAGO, instant), quiet_hours.PHASE_QUIET)
@@ -107,7 +109,7 @@ class TestWeekendSchedule(PhaseCase):
             ((22, 29), quiet_hours.PHASE_OPEN),
             ((22, 30), quiet_hours.PHASE_QUIET),
         ]
-        for day in (26, 27):  # Sat 9/26, Sun 9/27
+        for day in (26,):  # Sat 9/26 (Sun 9/27 is the travel Sunday since 2026-11-10)
             for (hh, mm), expected in cases:
                 with self.subTest(day=day, time=f"{hh:02d}:{mm:02d}"):
                     self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, day, hh, mm)), expected)
@@ -124,16 +126,20 @@ class TestWeekendSchedule(PhaseCase):
         self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 10, 2, 16, 59)), quiet_hours.PHASE_OPEN)
         self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 10, 2, 17, 0)), quiet_hours.PHASE_QUIET)
 
-    def test_sunday_night_quiet_to_the_travel_monday_richfield_wake(self):
-        """Mon 9/28 is the travel day and a RICHFIELD morning: wake 06:00, not
-        the office 04:30. This is the gap SCHEDULE-2 left open."""
+    def test_the_travel_sunday_keeps_work_hours(self):
+        """SUNDAY-TRAVEL (2026-11-10): Sun 9/27 is the drive back. Travel keeps
+        work hours, so it goes quiet at 17:00 -- he is home from 16:00."""
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 27, 16, 59)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 27, 17, 0)), quiet_hours.PHASE_QUIET)
+
+    def test_sunday_night_quiet_to_the_home_monday_0430_wake(self):
+        """Mon 9/28 is the home Monday: wake 04:30 (DAY_WAKE), off-work hours."""
         self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 27, 23, 0)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 30)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 5, 59)), quiet_hours.PHASE_QUIET)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 6, 0)), quiet_hours.PHASE_WAKE)
-        # …and it is still a work day: open 06:30, quiet 17:00
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 6, 30)), quiet_hours.PHASE_OPEN)
-        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 17, 0)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 29)), quiet_hours.PHASE_QUIET)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 4, 30)), quiet_hours.PHASE_WAKE)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 8, 30)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 17, 0)), quiet_hours.PHASE_OPEN)
+        self.assertEqual(self.phase_at(CHICAGO, at(CHICAGO, 2026, 9, 28, 22, 30)), quiet_hours.PHASE_QUIET)
 
     def test_next_wake_and_next_open(self):
         tz = ZoneInfo(CHICAGO)
@@ -141,9 +147,9 @@ class TestWeekendSchedule(PhaseCase):
         self.assertEqual(quiet_hours.next_wake(fri_eve), at(CHICAGO, 2026, 9, 26, 7, 30))
         self.assertEqual(quiet_hours.next_open(fri_eve), at(CHICAGO, 2026, 9, 26, 8, 30))
         sun_eve = at(CHICAGO, 2026, 9, 27, 23, 0).astimezone(tz)
-        # the travel Monday wakes at Richfield's 06:00, and works from 06:30
-        self.assertEqual(quiet_hours.next_wake(sun_eve), at(CHICAGO, 2026, 9, 28, 6, 0))
-        self.assertEqual(quiet_hours.next_open(sun_eve), at(CHICAGO, 2026, 9, 28, 6, 30))
+        # the home Monday wakes at 04:30 and opens at the off-work 08:30
+        self.assertEqual(quiet_hours.next_wake(sun_eve), at(CHICAGO, 2026, 9, 28, 4, 30))
+        self.assertEqual(quiet_hours.next_open(sun_eve), at(CHICAGO, 2026, 9, 28, 8, 30))
 
     def test_friday_goodnight_holds_until_saturday_wake(self):
         set_at = at(CHICAGO, 2026, 9, 25, 21, 0).astimezone(timezone.utc)

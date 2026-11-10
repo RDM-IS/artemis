@@ -16,11 +16,11 @@ Two axes, deliberately independent:
   * day_type — work status: msp_work | msp_home | wi | travel
   * location — where he is: office | richfield | brown_deer | msp_home | outside
 
-`wi` is NOT split per place: the wi Sunday is at Brown Deer until 17:00 and at
-Richfield after, so location resolves per (date, time of day).
+`wi` is NOT split per place: the wi Friday starts at MSP home and ends at
+Brown Deer, so location resolves per (date, time of day).
 
-Wake follows the LOCATION (Ryan, 2026-09-19: the travel Monday is a Richfield
-morning, so keying wake off the day type would need a special case). Business
+Wake follows the LOCATION (Ryan, 2026-09-19), with a per-position exception
+table (DAY_WAKE) for the 04:30 mornings at MSP home (2026-11-10). Business
 open and quiet-hours start follow the DAY TYPE, since they are about working,
 not about geography.
 """
@@ -42,10 +42,13 @@ ANCHOR_KEY = "cycle_anchor"
 LOCATIONS_KEY = "cycle_locations"
 SEGMENTS_KEY = "cycle_day_segments"
 
-# Position 0..13 from the anchor: 8 msp_work, 2 msp_home, 3 wi, 1 travel.
+# Position 0..13 from the anchor: 8 msp_work, 3 msp_home, 2 wi, 1 travel.
+# SUNDAY-TRAVEL (Ryan, 2026-11-10): the drive back to MSP is the wk-2 SUNDAY
+# (pos 7) -- "Monday doesn't leave enough time to prepare for work Tuesday" --
+# and the wk-2 Monday (pos 8) is a day at home: off work, a training day.
 DAY_TYPES: tuple[str, ...] = (
-    "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "wi", "wi",      # wk 1
-    "wi", "travel", "msp_work", "msp_work", "msp_work", "msp_work", "msp_home",  # wk 2
+    "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "wi", "wi",          # wk 1
+    "travel", "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "msp_home",  # wk 2
 )
 
 # ── Where he is, in two layers ───────────────────────────────────────────────
@@ -62,30 +65,38 @@ DAY_TYPES: tuple[str, ...] = (
 # WAKE READS THE ANCHOR, NEVER THE 00:00 SEGMENT. An msp_work day starts at
 # msp_home, so a wake keyed off the segment would return 07:30 instead of 04:30
 # and move every weekday.
-FRIDAY_MOVE = time(16, 0)
-SUNDAY_MOVE = time(17, 0)
 DAY_LOCATIONS: dict[int, str] = {
     0: "msp_home", 1: "office", 2: "office", 3: "office", 4: "office",
-    5: "richfield",
+    # wk-1 Friday: the DEFAULT is a train week -- he wakes at MSP home, trains
+    # there, and takes the Amtrak after ~08:00. A car week (drove Thursday
+    # night) is an override or a placement that moves the day to Richfield.
+    5: "msp_home",
     6: "brown_deer",
-    7: "brown_deer",         # the wi Sunday moves to Richfield at 17:00
-    8: "richfield",          # travel: the morning is a Richfield morning
+    7: "brown_deer",         # travel Sunday: wakes at Brown Deer, leaves 11:00
+    8: "msp_home",           # wk-2 Monday: home all day
     9: "office", 10: "office", 11: "office", 12: "office", 13: "msp_home",
 }
+
+# Wake is per LOCATION, with these per-POSITION exceptions (Ryan, 2026-11-10):
+# the train Friday and the home Monday are 04:30 mornings at MSP home, where
+# the location's own wake is 07:30. Applied only when no override moves the
+# day -- an override names a place, and the place's wake then rules.
+DAY_WAKE: dict[int, str] = {5: "04:30", 8: "04:30"}
 
 # Office hours ~06:00-16:30 with a 30 min commute either side (Ryan's times).
 _WORK_DAY = (("msp_home", None), ("office", "05:00"), ("msp_home", "17:00"))
 DAY_SEGMENTS: dict[int, tuple] = {
     0: (("msp_home", None),),
     1: _WORK_DAY, 2: _WORK_DAY, 3: _WORK_DAY,
-    # wk 1 Thursday: an office day that ends with the 5 h drive to the farm.
-    4: (("msp_home", None), ("office", "05:00"), ("transit", "16:30"),
-        ("richfield", "21:30")),
-    5: (("richfield", None), ("brown_deer", "16:00")),
+    # wk 1 Thursday: an ordinary office day by default (a train week). A car
+    # week's Thursday-night drive is told to us, not assumed.
+    4: _WORK_DAY,
+    # wk 1 Friday: train at home, Amtrak after ~08:00, at Brown Deer by 16:00.
+    5: (("msp_home", None), ("transit", "08:00"), ("brown_deer", "16:00")),
     6: (("brown_deer", None),),
-    7: (("brown_deer", None), ("richfield", "17:00")),
-    # travel Monday: leaves the farm at 11:00, ~5 h to MSP.
-    8: (("richfield", None), ("transit", "11:00"), ("msp_home", "16:00")),
+    # travel Sunday: leaves Brown Deer 11:00, ~5 h, home 16:00. No session.
+    7: (("brown_deer", None), ("transit", "11:00"), ("msp_home", "16:00")),
+    8: (("msp_home", None),),
     9: _WORK_DAY, 10: _WORK_DAY, 11: _WORK_DAY, 12: _WORK_DAY,
     13: (("msp_home", None),),
 }
@@ -300,7 +311,14 @@ def location_at(d: date, t: time | None = None, *, override: dict | None = None,
 def wake_on(d: date, **kw) -> time:
     """Wake follows the day's ANCHOR location — never the 00:00 segment, which
     on an msp_work day is msp_home and would move every weekday to 07:30."""
-    loc = anchor_location(d, **kw)
+    ov = kw.pop("override", None)
+    if ov is None and kw.get("use_overrides", True):
+        ov = override_for(d)
+    kw.pop("use_overrides", None)
+    moved = bool(ov and ov.get("location") and known_location(ov["location"]))
+    if not moved and cycle_pos(d) in DAY_WAKE:
+        return _parse_hhmm(DAY_WAKE[cycle_pos(d)])
+    loc = anchor_location(d, override=ov or {}, use_overrides=False)
     cfg = locations().get(loc) or DEFAULT_LOCATIONS["office"]
     return _parse_hhmm(cfg.get("wake") or DEFAULT_LOCATIONS["office"]["wake"])
 

@@ -24,12 +24,15 @@ from artemis import quiet_hours as qh  # noqa: E402
 CT = ZoneInfo("America/Chicago")
 ANCHOR = date(2026, 9, 20)
 
-# The three days Ryan named, plus the travel Monday.
-RICHFIELD_FRI = date(2026, 9, 25)
-OFFICE_TUE = date(2026, 9, 22)
-MSP_HOME_SAT = date(2026, 10, 3)
-TRAVEL_MON = date(2026, 9, 28)
-WI_SUNDAY = date(2026, 9, 27)
+# Named days. SUNDAY-TRAVEL (2026-11-10) moved the drive to the wk-2 Sunday
+# and made the wk-2 Monday a home day; the wk-1 Friday wakes at MSP home.
+TRAIN_FRI = date(2026, 9, 25)       # pos 5
+OFFICE_TUE = date(2026, 9, 22)      # pos 2
+MSP_HOME_SAT = date(2026, 10, 3)    # pos 13
+HOME_MON = date(2026, 9, 28)        # pos 8
+TRAVEL_SUN = date(2026, 9, 27)      # pos 7
+# the old names, kept for the tests that only need "some day of each kind"
+RICHFIELD_FRI, TRAVEL_MON, WI_SUNDAY = TRAIN_FRI, HOME_MON, TRAVEL_SUN
 
 
 def no_overrides():
@@ -49,8 +52,8 @@ class TestDerivation(unittest.TestCase):
         with no_overrides():
             got = [cycle.day_type(ANCHOR + timedelta(days=i)) for i in range(14)]
         self.assertEqual(got.count("msp_work"), 8)
-        self.assertEqual(got.count("msp_home"), 2)
-        self.assertEqual(got.count("wi"), 3)
+        self.assertEqual(got.count("msp_home"), 3)
+        self.assertEqual(got.count("wi"), 2)
         self.assertEqual(got.count("travel"), 1)
 
     def test_position_never_drifts_across_dst(self):
@@ -104,30 +107,42 @@ class TestDerivation(unittest.TestCase):
         self.assertEqual((b["location"], b["evening_location"]), ("office", "msp_home"))
         self.assertEqual(b["wake"], time(4, 30))
 
-    def test_the_thursday_drive_to_the_farm(self):
-        """wk 1 Thursday: office day, leaves 16:30, ~5 h, at Richfield 21:30."""
+    def test_the_wk1_thursday_is_an_ordinary_office_day(self):
+        """SUNDAY-TRAVEL: the default week is a train week, so Thursday has no
+        drive -- a car week is told to us (override or placement)."""
         thu = date(2026, 9, 24)
         with no_overrides():
             self.assertEqual(cycle.day_type(thu), "msp_work")
-            for t, want in ((time(5, 0), "office"), (time(16, 29), "office"),
-                            (time(16, 30), "transit"), (time(21, 29), "transit"),
-                            (time(21, 30), "richfield"), (time(23, 0), "richfield")):
-                with self.subTest(t=t):
-                    self.assertEqual(cycle.location_at(thu, t), want)
+            self.assertEqual(cycle.DAY_SEGMENTS[cycle.cycle_pos(thu)], cycle.DAY_SEGMENTS[2])
+            self.assertEqual(cycle.location_at(thu, time(18, 0)), "msp_home")
             self.assertEqual(cycle.wake_on(thu), time(4, 30))
-            # quiet starts 17:00 on a work day — he is on the road then
-            self.assertEqual(cycle.boundaries(thu)["evening_location"], "transit")
 
-    def test_the_travel_monday_drive_to_msp(self):
-        """Leaves Richfield 11:00, ~5 h, home 16:00. Wake is still 06:00."""
+    def test_the_travel_sunday_drive_to_msp(self):
+        """Leaves Brown Deer 11:00, ~5 h, home 16:00. Wakes at Brown Deer."""
         with no_overrides():
-            for t, want in ((time(6, 0), "richfield"), (time(10, 59), "richfield"),
+            self.assertEqual(cycle.day_type(TRAVEL_SUN), "travel")
+            for t, want in ((time(7, 30), "brown_deer"), (time(10, 59), "brown_deer"),
                             (time(11, 0), "transit"), (time(15, 59), "transit"),
                             (time(16, 0), "msp_home"), (time(20, 0), "msp_home")):
                 with self.subTest(t=t):
-                    self.assertEqual(cycle.location_at(TRAVEL_MON, t), want)
-            self.assertEqual(cycle.wake_on(TRAVEL_MON), time(6, 0))
-            self.assertEqual(cycle.anchor_location(TRAVEL_MON), "richfield")
+                    self.assertEqual(cycle.location_at(TRAVEL_SUN, t), want)
+            self.assertEqual(cycle.wake_on(TRAVEL_SUN), time(7, 30))
+            self.assertEqual(cycle.anchor_location(TRAVEL_SUN), "brown_deer")
+            # travel keeps work hours: quiet at 17:00, he is home by then
+            self.assertEqual(cycle.boundaries(TRAVEL_SUN)["evening_location"], "msp_home")
+
+    def test_the_home_monday_wakes_at_0430(self):
+        """Ryan, 2026-11-10: home all day, off work, wake 04:30 -- overriding
+        the 07:30 MSP-home wake for this position only."""
+        with no_overrides():
+            self.assertEqual(cycle.day_type(HOME_MON), "msp_home")
+            self.assertEqual(cycle.location_at(HOME_MON, time(12, 0)), "msp_home")
+            self.assertEqual(cycle.wake_on(HOME_MON), time(4, 30))
+            self.assertEqual((cycle.open_on(HOME_MON), cycle.quiet_on(HOME_MON)),
+                             (time(8, 30), time(22, 30)))
+            # the other MSP-home days keep the location's 07:30
+            self.assertEqual(cycle.wake_on(MSP_HOME_SAT), time(7, 30))
+            self.assertEqual(cycle.wake_on(ANCHOR), time(7, 30))
 
     def test_segments_come_from_system_state_when_set(self):
         import json
@@ -152,48 +167,58 @@ class TestDerivation(unittest.TestCase):
                     self.assertEqual(cycle.segments(), cycle.DAY_SEGMENTS)
                     self.assertEqual(cycle.location_at(OFFICE_TUE, time(12, 0)), "office")
 
-    def test_the_wi_friday_moves_at_1600(self):
-        """Ryan, 2026-09-22: the farm day ends at Brown Deer. Wake is unchanged
-        (the morning is still Richfield, 06:00)."""
+    def test_the_train_friday(self):
+        """Ryan, 2026-11-10: trains at MSP home from 04:30, Amtrak after ~08:00,
+        at Brown Deer by 16:00. Still a wi day (off work)."""
         with no_overrides():
-            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(6, 0)), "richfield")
-            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(15, 59)), "richfield")
-            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(16, 0)), "brown_deer")
-            self.assertEqual(cycle.location_at(RICHFIELD_FRI, time(21, 0)), "brown_deer")
-            self.assertEqual(cycle.wake_on(RICHFIELD_FRI), time(6, 0))
-            b = cycle.boundaries(RICHFIELD_FRI)
-        self.assertEqual((b["location"], b["evening_location"]), ("richfield", "brown_deer"))
+            self.assertEqual(cycle.day_type(TRAIN_FRI), "wi")
+            for t, want in ((time(4, 30), "msp_home"), (time(7, 59), "msp_home"),
+                            (time(8, 0), "transit"), (time(15, 59), "transit"),
+                            (time(16, 0), "brown_deer"), (time(21, 0), "brown_deer")):
+                with self.subTest(t=t):
+                    self.assertEqual(cycle.location_at(TRAIN_FRI, t), want)
+            self.assertEqual(cycle.wake_on(TRAIN_FRI), time(4, 30))
+            b = cycle.boundaries(TRAIN_FRI)
+        self.assertEqual((b["location"], b["evening_location"]), ("msp_home", "brown_deer"))
 
-    def test_the_wi_sunday_moves_at_1700(self):
-        with no_overrides():
-            self.assertEqual(cycle.location_at(WI_SUNDAY, time(9, 0)), "brown_deer")
-            self.assertEqual(cycle.location_at(WI_SUNDAY, time(16, 59)), "brown_deer")
-            self.assertEqual(cycle.location_at(WI_SUNDAY, time(17, 0)), "richfield")
-            self.assertEqual(cycle.location_at(WI_SUNDAY, time(21, 0)), "richfield")
-            # the morning location drives the wake. Quiet follows the DAY TYPE,
-            # so the move changes neither wake nor quiet — only where he is.
-            b = cycle.boundaries(WI_SUNDAY)
-        self.assertEqual((b["location"], b["evening_location"]), ("brown_deer", "richfield"))
-        self.assertEqual((b["wake"], b["quiet"]), (time(7, 30), time(22, 30)))
+    def test_a_car_week_friday_is_an_override_and_takes_the_places_wake(self):
+        """A location override names a place, so the place's wake rules and
+        DAY_WAKE does not apply."""
+        ov = {"override_id": 9, "day_type": None, "location": "richfield"}
+        with patch.object(cycle, "override_for", side_effect=lambda d: ov if d == TRAIN_FRI else None):
+            self.assertEqual(cycle.location_at(TRAIN_FRI, time(18, 0)), "richfield")
+            self.assertEqual(cycle.wake_on(TRAIN_FRI), time(6, 0))
+            self.assertEqual(cycle.boundaries(TRAIN_FRI)["wake"], time(6, 0))
+            self.assertEqual(qh.wake_time_on(TRAIN_FRI), time(6, 0))
+
+    def test_a_day_type_only_override_keeps_the_position_wake(self):
+        ov = {"override_id": 10, "day_type": "msp_home", "location": None}
+        with patch.object(cycle, "override_for", side_effect=lambda d: ov if d == HOME_MON else None):
+            self.assertEqual(cycle.wake_on(HOME_MON), time(4, 30))
+
 
     def test_wake_follows_location_not_day_type(self):
         with no_overrides():
-            # the travel Monday is a Richfield morning — no special case needed
-            self.assertEqual(cycle.day_type(TRAVEL_MON), "travel")
-            self.assertEqual(cycle.location_at(TRAVEL_MON), "richfield")
-            self.assertEqual(cycle.wake_on(TRAVEL_MON), time(6, 0))
-            self.assertEqual(cycle.wake_on(RICHFIELD_FRI), time(6, 0))
             self.assertEqual(cycle.wake_on(OFFICE_TUE), time(4, 30))
             self.assertEqual(cycle.wake_on(MSP_HOME_SAT), time(7, 30))
+            self.assertEqual(cycle.wake_on(date(2026, 9, 26)), time(7, 30))  # Brown Deer Sat
+            # only the DAY_WAKE positions differ from their location's wake
+            for n in range(cycle.CYCLE_LEN):
+                d = ANCHOR + timedelta(days=n)
+                loc_wake = cycle._parse_hhmm(cycle.DEFAULT_LOCATIONS[cycle.anchor_location(d)]["wake"])
+                want = cycle._parse_hhmm(cycle.DAY_WAKE[n]) if n in cycle.DAY_WAKE else loc_wake
+                with self.subTest(pos=n):
+                    self.assertEqual(cycle.wake_on(d), want)
+        self.assertEqual(set(cycle.DAY_WAKE), {5, 8})
 
     def test_business_hours_follow_day_type(self):
         with no_overrides():
             self.assertEqual((cycle.open_on(OFFICE_TUE), cycle.quiet_on(OFFICE_TUE)),
                              (time(6, 30), time(17, 0)))
-            self.assertEqual((cycle.open_on(RICHFIELD_FRI), cycle.quiet_on(RICHFIELD_FRI)),
+            self.assertEqual((cycle.open_on(TRAIN_FRI), cycle.quiet_on(TRAIN_FRI)),
                              (time(8, 30), time(22, 30)))
             # travel is a work day whose morning is displaced, not a weekend
-            self.assertEqual((cycle.open_on(TRAVEL_MON), cycle.quiet_on(TRAVEL_MON)),
+            self.assertEqual((cycle.open_on(TRAVEL_SUN), cycle.quiet_on(TRAVEL_SUN)),
                              (time(6, 30), time(17, 0)))
 
 
@@ -288,9 +313,10 @@ class TestOneSourceOfTruth(unittest.TestCase):
                 self.assertEqual(qh.quiet_start_on(d), cycle.quiet_on(d), d)
 
     def test_next_wake_agrees_with_the_cycle_on_the_named_days(self):
-        """Richfield Friday 06:00, office Tuesday 04:30, MSP-home Saturday 07:30."""
-        cases = [(RICHFIELD_FRI, time(6, 0)), (OFFICE_TUE, time(4, 30)),
-                 (MSP_HOME_SAT, time(7, 30))]
+        """Train Friday and home Monday 04:30, office Tuesday 04:30, MSP-home
+        Saturday 07:30, travel Sunday (Brown Deer) 07:30."""
+        cases = [(TRAIN_FRI, time(4, 30)), (HOME_MON, time(4, 30)), (OFFICE_TUE, time(4, 30)),
+                 (MSP_HOME_SAT, time(7, 30)), (TRAVEL_SUN, time(7, 30))]
         with no_overrides():
             for d, expected in cases:
                 midnight = datetime.combine(d, time(0, 1), tzinfo=CT)

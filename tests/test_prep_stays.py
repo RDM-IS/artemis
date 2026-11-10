@@ -75,11 +75,12 @@ class TestFindStays(unittest.TestCase):
         from artemis import cycle
         letters = {"msp_work": "w", "msp_home": "h", "wi": "i", "travel": "t"}
         spec = "".join(letters[t] for t in cycle.DAY_TYPES)
-        self.assertEqual(spec, "hwwwwiiitwwwwh")
+        self.assertEqual(spec, "hwwwwiithwwwwh")
         stays = prep.find_stays(types(spec))
         self.assertEqual(len(stays), 2)
-        # The second stay opens on the travel day and runs to the msp_home Sunday.
-        self.assertEqual(stays[1][0], date(2031, 3, 9))
+        # SUNDAY-TRAVEL: the second stay opens on the travel SUNDAY (arrives
+        # 16:00) and runs through the home Monday to the msp_home Sunday.
+        self.assertEqual(stays[1][0], date(2031, 3, 8))
 
 
 if __name__ == "__main__":
