@@ -218,7 +218,8 @@ class ReadTest(unittest.TestCase):
         q = sq.read_sa(db, WED, tz="UTC", today=WED)
         self.assertEqual(q["strength_days"], [TUE.isoformat()])
         self.assertEqual(db.k, {"k": sq.COUNTS_FROM_KEY})
-        self.assertEqual(re.sub(r":(\w+)", r"%(\1)s", db.sql), sq.SQL_PG)
+        # binds only: `::date` is a cast, not a parameter
+        self.assertEqual(re.sub(r"(?<!:):([a-z_]\w*)", r"%(\1)s", db.sql), sq.SQL_PG)
 
     @unittest.skipUnless(HAVE_SA, "sqlalchemy not installed")
     def test_sa_fail_closed(self):

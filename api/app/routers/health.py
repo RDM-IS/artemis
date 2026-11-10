@@ -330,6 +330,27 @@ class TodaySummary(BaseModel):
     exists: bool = False
 
 
+class Section(BaseModel):
+    """Whether this section could be read at all."""
+    ok: bool = True
+    reason: Optional[str] = None
+
+
+class StrengthQuotaOut(BaseModel):
+    """SESSION-OPEN: strength days this Sun..Sat week, toward 3. One read
+    (knowledge.strength_quota), fail-closed: section.ok=False and no numbers
+    when it could not be read — never a zero."""
+    section: Section = Field(default_factory=Section)
+    week_start: Optional[date] = None
+    week_end: Optional[date] = None
+    strength_days: list[date] = Field(default_factory=list)
+    count: Optional[int] = None
+    required: Optional[int] = None
+    needed: Optional[int] = None
+    days_left: Optional[int] = None
+    status: Optional[str] = None      # met | on_track | tight | short | not_counted
+
+
 class StatusResponse(BaseModel):
     today: date
     window_start: date
@@ -342,7 +363,7 @@ class StatusResponse(BaseModel):
     rpe_trend: list[TrendPoint]
     weight_trend: list[TrendPoint]
     #: SESSION-OPEN. Additive with a default: older clients ignore it.
-    strength_quota: Optional["StrengthQuotaOut"] = None
+    strength_quota: Optional[StrengthQuotaOut] = None
 
 
 def _serialize_log_row(r: dict[str, Any]) -> ExerciseLog:
@@ -574,7 +595,7 @@ def get_status(
     )
 
 
-def _quota_now(db: Session) -> "StrengthQuotaOut":
+def _quota_now(db: Session) -> StrengthQuotaOut:
     """Today in the ACTIVE timezone, not /status's legacy fixed-Central today."""
     tz_name = _active_timezone(db)
     return _strength_quota(db, tz_name, datetime.now(ZoneInfo(tz_name)).date())
@@ -1900,12 +1921,6 @@ class WeightSummary(BaseModel):
 # quietly turn a database problem into a training judgement.
 
 
-class Section(BaseModel):
-    """Whether this section could be read at all."""
-    ok: bool = True
-    reason: Optional[str] = None
-
-
 class WeightGoal(BaseModel):
     section: Section = Field(default_factory=Section)
     avg_7d: Optional[float] = None
@@ -1942,21 +1957,6 @@ class CardioGoal(BaseModel):
     interval_gate_date: Optional[date] = None
 
 
-class StrengthQuotaOut(BaseModel):
-    """SESSION-OPEN: strength days this Sun..Sat week, toward 3. One read
-    (knowledge.strength_quota), fail-closed: section.ok=False and no numbers
-    when it could not be read — never a zero."""
-    section: Section = Field(default_factory=Section)
-    week_start: Optional[date] = None
-    week_end: Optional[date] = None
-    strength_days: list[date] = Field(default_factory=list)
-    count: Optional[int] = None
-    required: Optional[int] = None
-    needed: Optional[int] = None
-    days_left: Optional[int] = None
-    status: Optional[str] = None      # met | on_track | tight | short | not_counted
-
-
 def _strength_quota(db: Session, tz_name: str, today: date) -> StrengthQuotaOut:
     from knowledge import strength_quota as sq
     try:
@@ -1972,9 +1972,6 @@ def _strength_quota(db: Session, tz_name: str, today: date) -> StrengthQuotaOut:
         week_start=q["week_start"], week_end=q["week_end"], strength_days=q["strength_days"],
         count=q["count"], required=q["required"], needed=q["needed"],
         days_left=q["days_left"], status=q["status"])
-
-
-StatusResponse.model_rebuild()
 
 
 class StrengthGoal(BaseModel):
