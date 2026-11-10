@@ -116,8 +116,9 @@ DAILY = {
 class FakeSession:
     def __init__(self, plans=PLANS, logs=LOGS, daily=DAILY, program_state=None,
                  patterns=None, reflections=None, quota_raises=False,
-                 counts_from="2026-11-08"):
+                 counts_from="2026-11-08", burn=()):
         self.plans, self.logs, self.daily = plans, logs, daily
+        self.burn = list(burn)
         self.quota_raises, self.quota_params, self.rolled_back = quota_raises, None, False
         self.counts_from = counts_from
         self.state, self.patterns, self.reflections = program_state, patterns, reflections
@@ -188,6 +189,8 @@ class FakeSession:
                             and p["s"] <= dates[l["plan_id"]] <= p["t"]])
         if "FROM health.session_log" in sql:
             return _Result([l for l in self.logs if l["plan_id"] in p["pids"]])
+        if "FROM health.watch_workout" in sql:                 # STATUS-3 grid burn
+            return _Result([b for b in self.burn if p["a"] <= b["local_date"] <= p["b"]])
         if "FROM health.daily_state WHERE state_date = :d" in sql:
             r = self.daily.get(p["d"])
             return _Result([{"state_date": p["d"], "resting_hr": None, **r}] if r else [])
@@ -540,7 +543,7 @@ class TestOneReadOneStatus(unittest.TestCase):
 
     def test_a_failed_nutrition_read_degrades_the_tile_AND_the_detail(self):
         from api.app.routers.health import _nutrition
-        goal, detail = _nutrition(self.Boom("health.nutrition_log"), date(2026, 9, 28))
+        goal, detail = _nutrition(self.Boom("nutrition.day_totals"), date(2026, 9, 28))
         self.assertFalse(goal.section.ok)
         self.assertFalse(detail.section.ok)
         self.assertEqual(goal.section.reason, detail.section.reason)

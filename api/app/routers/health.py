@@ -1934,6 +1934,9 @@ class WeightGoal(BaseModel):
     change_since_start: Optional[float] = None
     lb_per_week: Optional[float] = None
     days_7d: int = 0                  # how many of the 7 carry a weigh-in
+    #: STATUS-3: the 7-day rolling mean of the weigh-ins, one point per day for
+    #: 30 days. A day with no weigh-in in its window is absent, never zero.
+    trend_7d: list[TrendPoint] = Field(default_factory=list)
 
 
 class CardioGoal(BaseModel):
@@ -1955,6 +1958,18 @@ class CardioGoal(BaseModel):
     #: should not imply it covered the week.
     zone_sessions: int = 0
     zone_sessions_total: int = 0
+    #: STATUS-3. The trend tile measures TOTAL cardio minutes against the planned
+    #: minutes. Zone minutes were the intended measure, but no session has had a
+    #: usable zone breakdown since 9/29 (2026-11-10: every recent
+    #: session_hr_zones row is `no_samples` although the Watch recorded 300-770
+    #: samples inside each workout), so the tile says minutes, not zones.
+    #: Both windows are the last 7 local days, today included.
+    minutes_7d: Optional[int] = None
+    planned_minutes_7d: Optional[int] = None
+    #: Rolling 7-day TOTAL of logged cardio minutes, one point per day for 30
+    #: days. A day without a session is a real zero, so it is a total, and its
+    #: last point equals `minutes_7d`.
+    trend_7d: list[TrendPoint] = Field(default_factory=list)
     #: From the next cardio_intervals ROW, which is where the wake job writes the
     #: gate's answer. The Lambda deliberately does not evaluate the gate: that
     #: would be a second evaluation against a different read at a different
@@ -2000,6 +2015,28 @@ class NutritionGoal(BaseModel):
     target_protein_g: Optional[int] = None
     target_fiber_g: Optional[int] = None
     target_set_by: Optional[str] = None
+    #: STATUS-3 (Ryan 2026-11-10): calories against the PLAN, labelled "plan" and
+    #: never presented as a dietitian target. Read from the active
+    #: nutrition.target row, which holds Ryan's own provisional numbers
+    #: (set_by 'ryan'). Nothing here writes either target table. Null when no
+    #: row is active.
+    avg_kcal_7d: Optional[float] = None
+    plan_kcal: Optional[int] = None
+    plan_set_by: Optional[str] = None
+    plan_provisional: Optional[bool] = None
+    #: Rolling 7-day mean kcal over LOGGED days (an unlogged day is unknown, not
+    #: zero), one point per day for 30 days.
+    trend_7d: list[TrendPoint] = Field(default_factory=list)
+
+
+class StrengthVolume(BaseModel):
+    """STATUS-3: total volume (load x reps, lb) of real, unskipped strength sets.
+    Its own read and its own status. Bodyweight sets carry no load, so they add
+    nothing here; they still count toward the quota."""
+    section: Section = Field(default_factory=Section)
+    total_7d: Optional[float] = None
+    #: Rolling 7-day TOTAL, one point per day for 30 days; last point == total_7d.
+    trend_7d: list[TrendPoint] = Field(default_factory=list)
 
 
 class Goals(BaseModel):
@@ -2007,6 +2044,7 @@ class Goals(BaseModel):
     cardio: CardioGoal = Field(default_factory=CardioGoal)
     strength: StrengthGoal = Field(default_factory=StrengthGoal)
     nutrition: NutritionGoal = Field(default_factory=NutritionGoal)
+    strength_volume: StrengthVolume = Field(default_factory=StrengthVolume)
 
 
 class CardioWeek(BaseModel):
@@ -2046,6 +2084,28 @@ class SleepRecovery(BaseModel):
     days: list[SleepDay] = Field(default_factory=list)
 
 
+class BurnOut(BaseModel):
+    """Watch workout calories for one date and slot. The slot comes from the
+    local start hour (before noon = morning): Watch workouts are not matched to
+    plan rows (0 of 9 in the 30 days to 2026-11-10), so the date and the hour
+    are all there is to go on."""
+    date: date
+    slot: str
+    kcal: float
+    workouts: int
+
+
+class GridOut(BaseModel):
+    """STATUS-3: the 7-day grid -- yesterday, today and the next five days. Plan
+    rows (both slots, the shared status derivation) and the Watch's burn, under
+    one status."""
+    section: Section = Field(default_factory=Section)
+    start: Optional[date] = None
+    end: Optional[date] = None
+    days: list[PlanDay] = Field(default_factory=list)
+    burn: list[BurnOut] = Field(default_factory=list)
+
+
 class OverviewResponse(BaseModel):
     date: date
     timezone: str
@@ -2068,6 +2128,8 @@ class OverviewResponse(BaseModel):
     sleep_recovery: SleepRecovery = Field(default_factory=SleepRecovery)
     #: SESSION-OPEN. The same read the strength goal below uses.
     strength_quota: Optional[StrengthQuotaOut] = None
+    #: STATUS-3. Additive and defaulted, like every key since STATUS-2.
+    grid: GridOut = Field(default_factory=GridOut)
 
 
 def _md(d: date) -> str:
@@ -3020,6 +3082,38 @@ def _fail(model, exc: Exception, what: str):
     return model(section=Section(ok=False, reason=f"couldn't read {what}"))
 
 
+#: STATUS-3 trend tiles: a 7-day rolling window, one point per day for 30 days.
+TREND_DAYS = 30
+TREND_WINDOW = 7
+#: How far back a trend read must reach so the first point has a full window.
+TREND_READ_DAYS = TREND_DAYS + TREND_WINDOW - 1
+
+
+def rolling_7d(daily: dict[date, float], end: date, *, mode: str,
+               days: int = TREND_DAYS) -> list[TrendPoint]:
+    """Pure. One point per day for `days` days ending `end`, each over the
+    TREND_WINDOW days ending that day.
+
+    mode "mean"   the mean of the days that HAVE a value -- weigh-ins, logged
+                  nutrition days. A day without one is unknown, not zero, and a
+                  point whose whole window is empty is left out.
+    mode "total"  the sum over the window -- cardio minutes, lifted volume. A day
+                  without a session is a real zero, so every day has a point.
+    """
+    if mode not in ("mean", "total"):
+        raise ValueError(f"unknown mode {mode!r}")
+    out: list[TrendPoint] = []
+    for i in range(days):
+        d = end - timedelta(days=days - 1 - i)
+        window = [daily[k] for k in (d - timedelta(days=j) for j in range(TREND_WINDOW))
+                  if k in daily]
+        if mode == "total":
+            out.append(TrendPoint(date=d, value=round(sum(window), 1)))
+        elif window:
+            out.append(TrendPoint(date=d, value=round(sum(window) / len(window), 1)))
+    return out
+
+
 def _weight_goal(db: Session, today: date, anchor: Optional[date]) -> WeightGoal:
     try:
         rows = db.execute(text(
@@ -3041,8 +3135,12 @@ def _weight_goal(db: Session, today: date, anchor: Optional[date]) -> WeightGoal
             change = round(avg7 - float(first["weight_lbs"]), 1)
             weeks = max((today - first["state_date"]).days, 1) / 7.0
             rate = round(change / weeks, 2)
+    # STATUS-3: the sparkline is the same read as the tile's number. The last
+    # point is the mean of the last 7 days' weigh-ins, i.e. avg_7d.
+    trend = rolling_7d({r["state_date"]: float(r["weight_lbs"]) for r in rows},
+                       today, mode="mean")
     return WeightGoal(avg_7d=avg7, change_since_start=change,
-                      lb_per_week=rate, days_7d=len(recent))
+                      lb_per_week=rate, days_7d=len(recent), trend_7d=trend)
 
 
 def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, CardioDetail]:
@@ -3075,6 +3173,13 @@ def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, Car
             "SELECT state_date, resting_hr FROM health.daily_state "
             "WHERE resting_hr IS NOT NULL AND state_date BETWEEN :a AND :b "
             "ORDER BY state_date"), {"a": since, "b": today}).mappings().all()
+        # STATUS-3: the planned side of "minutes vs planned", same session types
+        # and slot as the logged side above, same 7 local days as minutes_7d.
+        planned = db.execute(text(
+            "SELECT COALESCE(SUM(est_duration_min), 0) AS m FROM health.plan "
+            "WHERE slot = 'morning' AND session_type IN ('cardio_z2', 'cardio_intervals') "
+            "  AND plan_date BETWEEN :a AND :b"),
+            {"a": today - timedelta(days=TREND_WINDOW - 1), "b": today}).mappings().first()
     except Exception as exc:                                    # noqa: BLE001
         logger.warning("STATUS-2: could not read cardio", exc_info=True)
         down = Section(ok=False, reason="couldn't read cardio")
@@ -3142,11 +3247,18 @@ def _cardio(db: Session, today: date, week_start: date) -> tuple[CardioGoal, Car
         acc["secs"] += r["duration_sec"] or 0
         acc["plans"].add(r["plan_id"])
 
+    daily_min: dict[date, float] = {}
+    for r in rows:
+        daily_min[r["plan_date"]] = daily_min.get(r["plan_date"], 0.0) + (r["duration_sec"] or 0) / 60.0
+    trend = rolling_7d(daily_min, today, mode="total")
     goal = CardioGoal(minutes_this_week=minutes, z2_minutes=z2, z4_minutes=z4,
                       has_zone_data=zone_source is not None, zone_source=zone_source,
                       zone_sessions=zone_n, zone_sessions_total=len(week_plan_ids),
                       interval_gate=gate, interval_gate_reason=gate_reason,
-                      interval_gate_date=gate_date)
+                      interval_gate_date=gate_date,
+                      minutes_7d=int(round(trend[-1].value)) if trend else 0,
+                      planned_minutes_7d=int((planned or {}).get("m") or 0),
+                      trend_7d=trend)
     detail = CardioDetail(
         weeks=[CardioWeek(week_start=wk, minutes=int(round(a["secs"] / 60.0)),
                           sessions=len(a["plans"]))
@@ -3164,16 +3276,24 @@ def _nutrition(db: Session, today: date) -> tuple[NutritionGoal, NutritionDetail
     """
     since = today - timedelta(days=6)
     try:
-        rows = db.execute(text(
-            "SELECT logged_date, SUM(kcal) k, SUM(protein_g) p, SUM(fiber_g) f, COUNT(*) n "
-            "FROM health.nutrition_log WHERE logged_date BETWEEN :a AND :b "
-            "GROUP BY logged_date ORDER BY logged_date"),
-            {"a": since, "b": today}).mappings().all()
+        # STATUS-3: the live store. This read health.nutrition_log, which has
+        # never held a row (0 rows, checked on RDS 2026-11-10): NUTRITION-2 logs
+        # to nutrition.entry, and nutrition.day_totals() is the ONE definition of
+        # a day's total that the box's meal log replies use too. A day with no
+        # entries is not a logged day, so it is dropped here, not zeroed.
+        all_rows = db.execute(text(
+            "SELECT d::date AS logged_date, t.kcal AS k, t.protein_g AS p, "
+            "       t.fiber_g AS f, t.n_entries AS n "
+            "FROM generate_series(CAST(:a AS date), CAST(:b AS date), interval '1 day') AS d "
+            "CROSS JOIN LATERAL nutrition.day_totals(d::date) AS t "
+            "WHERE t.n_entries > 0 ORDER BY 1"),
+            {"a": today - timedelta(days=TREND_READ_DAYS - 1), "b": today}).mappings().all()
     except Exception:                                           # noqa: BLE001
         logger.warning("STATUS-2: could not read nutrition", exc_info=True)
         down = Section(ok=False, reason="couldn't read nutrition")
         return NutritionGoal(section=down), NutritionDetail(section=down)
 
+    rows = [r for r in all_rows if r["logged_date"] >= since]
     days = len(rows)
     avg_p = round(sum(float(r["p"] or 0) for r in rows) / days, 1) if days else None
     avg_f = round(sum(float(r["f"] or 0) for r in rows) / days, 1) if days else None
@@ -3202,9 +3322,80 @@ def _nutrition(db: Session, today: date) -> tuple[NutritionGoal, NutritionDetail
             fiber_g=float(r["f"]) if r and r["f"] is not None else None,
             items=int(r["n"]) if r else 0))
 
+    plan_kcal = plan_by = plan_prov = None
+    try:
+        # STATUS-3: "calories vs plan". Ryan's own provisional row, read only and
+        # labelled as the plan -- the dietitian table above stays the only
+        # source of a "target".
+        pt = db.execute(text(
+            "SELECT kcal, set_by, provisional FROM nutrition.target "
+            "WHERE effective_from <= :t AND (effective_to IS NULL OR effective_to >= :t) "
+            "ORDER BY effective_from DESC LIMIT 1"), {"t": today}).mappings().first()
+        if pt and pt["kcal"] is not None:
+            plan_kcal, plan_by, plan_prov = int(pt["kcal"]), pt["set_by"], bool(pt["provisional"])
+    except Exception:                                           # noqa: BLE001
+        logger.warning("STATUS-3: could not read the nutrition plan", exc_info=True)
+
+    avg_k = round(sum(float(r["k"] or 0) for r in rows) / days, 0) if days else None
+    trend = rolling_7d({r["logged_date"]: float(r["k"] or 0) for r in all_rows},
+                       today, mode="mean")
     goal = NutritionGoal(days_logged=days, avg_protein_g=avg_p, avg_fiber_g=avg_f,
-                         target_protein_g=tp, target_fiber_g=tf, target_set_by=set_by)
+                         target_protein_g=tp, target_fiber_g=tf, target_set_by=set_by,
+                         avg_kcal_7d=avg_k, plan_kcal=plan_kcal, plan_set_by=plan_by,
+                         plan_provisional=plan_prov, trend_7d=trend)
     return goal, NutritionDetail(days=day_rows)
+
+
+def _strength_volume(db: Session, today: date, tz_name: str) -> StrengthVolume:
+    """STATUS-3: lifted volume per local day, rolled into 7-day totals.
+
+    A log's DATE is its plan row's date when it has one, else the local date it
+    started or was logged -- the strength quota's rule, so an ad-hoc session
+    lands on the same day in both. Inferred and skipped sets never count."""
+    try:
+        rows = db.execute(text(
+            "SELECT x.d, SUM(x.v) AS v FROM ("
+            "  SELECT COALESCE(p.plan_date, "
+            "           (COALESCE(sl.started_at, sl.logged_at) AT TIME ZONE :tz)::date) AS d, "
+            "         sl.weight_lbs * sl.reps_done AS v "
+            "  FROM health.session_log sl LEFT JOIN health.plan p ON p.plan_id = sl.plan_id "
+            "  WHERE sl.log_type = 'strength_set' AND sl.logged_via IS DISTINCT FROM 'inferred' "
+            "    AND NOT COALESCE(sl.is_skipped, FALSE) "
+            "    AND sl.weight_lbs IS NOT NULL AND sl.reps_done IS NOT NULL"
+            ") x WHERE x.d BETWEEN :a AND :b GROUP BY x.d ORDER BY x.d"),
+            {"tz": tz_name, "a": today - timedelta(days=TREND_READ_DAYS - 1),
+             "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        return _fail(StrengthVolume, exc, "strength volume")
+    trend = rolling_7d({r["d"]: float(r["v"] or 0) for r in rows}, today, mode="total")
+    return StrengthVolume(total_7d=trend[-1].value if trend else 0.0, trend_7d=trend)
+
+
+#: STATUS-3 grid: yesterday, today, the next five.
+GRID_BACK, GRID_AHEAD = 1, 5
+
+
+def _grid(db: Session, today: date, tz_name: str) -> GridOut:
+    start, end = today - timedelta(days=GRID_BACK), today + timedelta(days=GRID_AHEAD)
+    try:
+        days, _logs = _plan_days(db, start, end, today)
+        burn_rows = db.execute(text(
+            "SELECT local_date, "
+            "       CASE WHEN EXTRACT(HOUR FROM started_at AT TIME ZONE :tz) < 12 "
+            "            THEN 'morning' ELSE 'evening' END AS slot, "
+            "       SUM(kcal) AS kcal, COUNT(*) AS n "
+            "FROM health.watch_workout "
+            "WHERE local_date BETWEEN :a AND :b AND kcal IS NOT NULL "
+            "GROUP BY 1, 2 ORDER BY 1, 2"),
+            {"tz": tz_name, "a": start, "b": today}).mappings().all()
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning("STATUS-3: could not read the grid", exc_info=True)
+        return GridOut(section=Section(ok=False, reason="couldn't read the plan"),
+                       start=start, end=end)
+    return GridOut(start=start, end=end, days=days,
+                   burn=[BurnOut(date=r["local_date"], slot=r["slot"],
+                                 kcal=round(float(r["kcal"]), 0), workouts=int(r["n"]))
+                         for r in burn_rows])
 
 
 def _strength_goal(quota: StrengthQuotaOut,
@@ -3392,7 +3583,9 @@ def get_overview(
             cardio=_cardio_pair[0],
             strength=_strength_goal(_quota, strength_progress(names, set_rows)),
             nutrition=_nutrition_pair[0],
+            strength_volume=_strength_volume(db, today, tz_name),
         ),
+        grid=_grid(db, today, tz_name),
         cardio_detail=_cardio_pair[1],
         nutrition_7d=_nutrition_pair[1],
         sleep_recovery=_sleep_recovery(db, today),
