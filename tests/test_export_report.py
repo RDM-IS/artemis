@@ -81,11 +81,12 @@ class TestWeekly(unittest.TestCase):
         uses, per week; unreadable says so. Synthetic 2031 week."""
         from knowledge import strength_quota as sq
         data = week(date(2026, 9, 20))
-        data.quotas = [sq.compute(date(2031, 3, 2), [date(2031, 3, 4)], today=date(2031, 3, 9),
-                                  counts_from=date(2000, 1, 2)),
+        # STATUS-3 phase 2: goal weeks run Mon..Sun (2031-03-03 is a Monday)
+        data.quotas = [sq.compute(date(2031, 3, 3), [date(2031, 3, 4)], today=date(2031, 3, 10),
+                                  counts_from=date(2000, 1, 3)),
                        {"unreadable": "down"}]
         out = er.md(er.build_weekly(data, GEN))
-        self.assertIn("- Week of Mar 2: Strength days: 1 of 3 (Tue 3/4) — short", out)
+        self.assertIn("- Week of Mar 3: Strength days: 1 of 3 (Tue 3/4) — short", out)
         self.assertIn("- Strength days: couldn't read them", out)
 
     def test_week_over_week_change_groups_the_renamed_exercise(self):

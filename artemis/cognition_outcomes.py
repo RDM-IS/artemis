@@ -171,9 +171,16 @@ def resolve_repeat(cur, row: dict, today: date) -> Resolution | None:
     repeat_start = _as_date(a.get("repeat_start"))
     if repeat_start is None:
         raise OutcomeUnreadable("the decision carries no repeat_start")
-    week_end = repeat_start + timedelta(days=6)
+    # STATUS-3 phase 2: the repeated PROGRAM week (Sun..Sat from repeat_start)
+    # is judged by the Mon..Sun GOAL week that starts the day after it.
+    from knowledge import strength_quota as _sq
+    try:
+        goal_monday = _sq.for_program_week(repeat_start)
+    except ValueError as exc:
+        raise OutcomeUnreadable(f"repeat_start is not a program-week Sunday: {exc}") from exc
+    week_end = goal_monday + timedelta(days=6)
     if week_end >= today:
-        return None                       # the repeated week hasn't finished
+        return None                       # the judged goal week hasn't finished
 
     # SESSION-OPEN (Ryan, 2026-11-09): the repeated week is judged by the
     # strength quota — on the decision's own cursor, so it reads what this
@@ -185,7 +192,7 @@ def resolve_repeat(cur, row: dict, today: date) -> Resolution | None:
         cur.execute(sql, params)
         return cur.fetchall()
     try:
-        q = sq.read_pg(repeat_start, tz=get_active_timezone(), today=today, execute=_execute)
+        q = sq.read_pg(goal_monday, tz=get_active_timezone(), today=today, execute=_execute)
     except sq.QuotaUnreadable as exc:
         raise OutcomeUnreadable(f"could not read the repeated week: {exc}") from exc
     # Judged on the count, not `status`: a repeat begun before the quota's counts-from week is

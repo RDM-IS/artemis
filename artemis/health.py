@@ -1201,9 +1201,10 @@ def handle_fix_intent(message: str) -> str | None:
 # Strength-quota nag — SESSION-OPEN (Ryan, 2026-11-09)
 # ============================================================================
 # Replaces the per-day debrief nag: plan rows are suggestions, so an unlogged
-# row is not something to chase. The nag fires ONCE per Sun..Sat week, the
-# first time the strength days still needed reach the days left
-# (strength_quota's `nag_due`). Quiet hours are the caller's (job_health_nag).
+# row is not something to chase. The nag fires ONCE per Mon..Sun goal week, on
+# the day that is the real LAST CHANCE for the first remaining strength day --
+# the remaining days placed as late as feasible, travel and away days excluded
+# (strength_quota's `nag_due`, STATUS-3 phase 2). Quiet hours are the caller's (job_health_nag).
 #
 # The 21:50 inferred-summary backstop is RETIRED with it: it wrote a
 # placeholder "assumed at baseline" summary for every unlogged planned row,
@@ -1237,16 +1238,14 @@ def mark_strength_nag(week_start: str) -> None:
 def format_strength_nag(q: dict, today: date) -> str:
     """Pure."""
     done = ", ".join(f"{date.fromisoformat(d):%a}" for d in q["strength_days"]) or "none yet"
-    end = date.fromisoformat(q["week_end"])
-    first = today + timedelta(days=1) if today.isoformat() in q["strength_days"] else today
-    left = [first + timedelta(days=i) for i in range((end - first).days + 1)]
-    names = ", ".join("today" if d == today else f"{d:%a}" for d in left)
+    names = ", ".join("today" if d == today.isoformat() else f"{date.fromisoformat(d):%a}"
+                      for d in q["placements"])
     head = (f"💪 Strength days this week: {q['count']} of {q['required']} ({done}). "
-            f"{q['needed']} more needed, {q['days_left']} day{'s' if q['days_left'] != 1 else ''} "
-            f"left ({names}).")
+            f"{q['needed']} more needed — the latest days that still work: {names}. "
+            f"Today is the last chance for the first one.")
     if q["status"] == "short":
-        return head + " The week can't reach 3 now — it comes up for a repeat on Sunday."
-    return head + " Every one of them needs a lift or a circuit."
+        return head + " Even then the week can't reach 3 — it comes up for a repeat on Monday."
+    return head + " No two strength days in a row; travel days don't count."
 
 
 # ============================================================================

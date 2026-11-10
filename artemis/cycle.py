@@ -32,24 +32,17 @@ import logging
 from datetime import date, datetime, time, timedelta
 
 from artemis import config
+# The 14-day PATTERN lives in knowledge/ so the Lambda reads the same table
+# (STATUS-3 phase 2: feasibility needs travel days). Re-exported here.
+from knowledge.cycle_days import (ANCHOR_KEY, CYCLE_LEN, DAY_LOCATIONS,  # noqa: F401
+                                  DAY_TYPES, DEFAULT_ANCHOR)
 
 logger = logging.getLogger(__name__)
 
-CYCLE_LEN = 14
-DEFAULT_ANCHOR = date(2026, 9, 20)          # Sun — week 1, day 1 (confirmed)
 
-ANCHOR_KEY = "cycle_anchor"
 LOCATIONS_KEY = "cycle_locations"
 SEGMENTS_KEY = "cycle_day_segments"
 
-# Position 0..13 from the anchor: 8 msp_work, 3 msp_home, 2 wi, 1 travel.
-# SUNDAY-TRAVEL (Ryan, 2026-11-10): the drive back to MSP is the wk-2 SUNDAY
-# (pos 7) -- "Monday doesn't leave enough time to prepare for work Tuesday" --
-# and the wk-2 Monday (pos 8) is a day at home: off work, a training day.
-DAY_TYPES: tuple[str, ...] = (
-    "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "wi", "wi",          # wk 1
-    "travel", "msp_home", "msp_work", "msp_work", "msp_work", "msp_work", "msp_home",  # wk 2
-)
 
 # ── Where he is, in two layers ───────────────────────────────────────────────
 #
@@ -65,17 +58,6 @@ DAY_TYPES: tuple[str, ...] = (
 # WAKE READS THE ANCHOR, NEVER THE 00:00 SEGMENT. An msp_work day starts at
 # msp_home, so a wake keyed off the segment would return 07:30 instead of 04:30
 # and move every weekday.
-DAY_LOCATIONS: dict[int, str] = {
-    0: "msp_home", 1: "office", 2: "office", 3: "office", 4: "office",
-    # wk-1 Friday: the DEFAULT is a train week -- he wakes at MSP home, trains
-    # there, and takes the Amtrak after ~08:00. A car week (drove Thursday
-    # night) is an override or a placement that moves the day to Richfield.
-    5: "msp_home",
-    6: "brown_deer",
-    7: "brown_deer",         # travel Sunday: wakes at Brown Deer, leaves 11:00
-    8: "msp_home",           # wk-2 Monday: home all day
-    9: "office", 10: "office", 11: "office", 12: "office", 13: "msp_home",
-}
 
 # Wake is per LOCATION, with these per-POSITION exceptions (Ryan, 2026-11-10):
 # the train Friday and the home Monday are 04:30 mornings at MSP home, where

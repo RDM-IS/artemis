@@ -78,13 +78,13 @@ class TestPlanRewrite(unittest.TestCase):
 class TestProposal(unittest.TestCase):
     """SESSION-OPEN: a finished, counted week below 3 strength days proposes.
     Synthetic 2031 week (PUBLIC-FIXTURES)."""
-    WS = date(2031, 3, 2)
-    AFTER = date(2031, 3, 9)
+    WS = date(2031, 3, 3)          # a Monday: goal weeks run Mon..Sun
+    AFTER = date(2031, 3, 10)
 
     def _quota(self, days, today=None, counts_from=None):
         from knowledge import strength_quota as sq
         return sq.compute(self.WS, days, today=today or self.AFTER,
-                          counts_from=counts_from or date(2000, 1, 2))
+                          counts_from=counts_from or date(2000, 1, 3))
 
     def _run(self, q, repeats=()):
         store = {}
@@ -117,11 +117,15 @@ class TestProposal(unittest.TestCase):
         self.assertEqual(self._run(self._quota([], today=date(2031, 3, 6)))[0], None)
 
     def test_a_week_before_the_quota_counts_proposes_nothing(self):
-        self.assertEqual(self._run(self._quota([], counts_from=date(2031, 3, 9)))[0], None)
+        self.assertEqual(self._run(self._quota([], counts_from=date(2031, 3, 10)))[0], None)
 
     def test_an_already_repeated_week_is_not_proposed_again(self):
         msg, _ = self._run(self._quota([]), repeats=[date(2031, 3, 9)])
         self.assertIsNone(msg)
+
+    def test_a_sunday_is_refused(self):
+        with self.assertRaises(ValueError):
+            pr.propose(date(2031, 3, 2))
 
     def test_an_unreadable_quota_raises(self):
         from knowledge import strength_quota as sq

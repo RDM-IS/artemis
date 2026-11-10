@@ -330,7 +330,9 @@ class ArtemisScheduler:
             # location (Ryan, 2026-09-19): the weekly health review, then the
             # EVAL-1 post for the week that just ended.
             CronSpec("health_review", "job_health_review", 8, 30, "sun", tier="health"),
-            CronSpec("weekly_eval", "job_weekly_eval", 8, 35, "sun", tier="health"),
+            # STATUS-3 phase 2: goal weeks run Mon..Sun, so the eval and the
+            # repeat proposal run MONDAY, after the goal week closes.
+            CronSpec("weekly_eval", "job_weekly_eval", 8, 35, "mon", tier="health"),
         ]
         if t is not None:
             specs += [
@@ -2282,11 +2284,12 @@ class ArtemisScheduler:
             logger.exception("Week-ahead flags failed")
 
     def job_weekly_eval(self):
-        """Sun 08:35 local — the EVAL-1 post for the week that just ENDED.
+        """Mon 08:35 local — the EVAL-1 post for the GOAL week that just ENDED.
 
-        SCHEDULE-2 moved program weeks to Sun..Sat, so Sunday 08:35 sits just
-        after a week closes: the post covers that complete Sun..Sat week, not
-        a partial. (Before, weeks ran Wed..Tue and Sunday was mid-week.)
+        STATUS-3 phase 2 (Ryan, 2026-11-10): goal weeks run Mon..Sun, so the
+        post covers the complete Mon..Sun week that closed yesterday, and the
+        strength quota it reports is that same week. (Program weeks still run
+        Sun..Sat; the eval labels the week by the program week its Monday is in.)
 
         Read-only and data only: counts, effort vs cap, load change, missed
         sessions, adjustments. No recommendations. Open phase only."""
@@ -2295,8 +2298,9 @@ class ArtemisScheduler:
             return
         from artemis import health_eval
         today = _local_today()
-        # The week that ended yesterday (Sat), reported complete.
-        start, end = health_eval.week_of(today - timedelta(days=1))
+        # The goal week that ended yesterday (Sun), reported complete.
+        from knowledge import strength_quota as _sq
+        start, end = _sq.week_of(today - timedelta(days=1))
         try:
             result = health_eval.load(start, end, today=today)
             lines = health_eval.render_lines(result)

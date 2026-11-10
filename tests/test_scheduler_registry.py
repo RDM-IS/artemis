@@ -273,14 +273,16 @@ class TestRegistryShape(unittest.TestCase):
         by_id = {s.id: s for s in self.s.cron_specs()}
         self.assertEqual((by_id["health_review"].hour, by_id["health_review"].minute), (8, 30))
         self.assertEqual((by_id["weekly_eval"].hour, by_id["weekly_eval"].minute), (8, 35))
+        self.assertEqual(by_id["health_review"].day_of_week, "sun")
+        # STATUS-3 phase 2: the eval judges the Mon..Sun goal week, so it runs Monday
+        self.assertEqual(by_id["weekly_eval"].day_of_week, "mon")
         for job in ("health_review", "weekly_eval"):
-            self.assertEqual(by_id[job].day_of_week, "sun")
             self.assertNotIn(job, self.s.LOCATION_JOBS)
 
-    def test_weekly_eval_posts_sunday_after_the_review(self):
+    def test_weekly_eval_posts_monday_after_the_goal_week(self):
         spec = {s.id: s for s in self.s.cron_specs()}["weekly_eval"]
         self.assertEqual((spec.hour, spec.minute, spec.day_of_week, spec.tier),
-                         (8, 35, "sun", "health"))
+                         (8, 35, "mon", "health"))
         self.assertTrue(callable(getattr(self.s, spec.func_name)))
 
     def test_sunday_health_review_runs_after_the_weekend_open(self):
@@ -503,30 +505,34 @@ class TestPhaseGating(unittest.TestCase):
 
 
 class TestWeeklyEvalJob(unittest.TestCase):
-    """EVAL-1 Sunday post: Wed–Sat span, open phase only, never a DB write."""
+    """EVAL-1 Monday post: the Mon..Sun goal week, open phase only, never a DB write."""
 
     def _run(self, is_open=True):
         from artemis import health_eval
+        from artemis import program_repeat
         from artemis import scheduler as sched
         s = make_scheduler()
-        sun = date(2026, 9, 20)
-        result = health_eval.evaluate([], [], [], start=date(2026, 9, 16), end=date(2026, 9, 19),
-                                      today=sun)
-        with patch.object(sched, "_local_today", return_value=sun), \
+        mon = date(2026, 11, 16)
+        result = health_eval.evaluate([], [], [], start=date(2026, 11, 9), end=date(2026, 11, 15),
+                                      today=mon)
+        with patch.object(sched, "_local_today", return_value=mon), \
+             patch.object(program_repeat, "propose", return_value=None) as self.propose, \
              patch.object(s, "_is_open", return_value=is_open), \
              patch.object(health_eval, "load", return_value=result) as load:
             s.job_weekly_eval()
         return s, load
 
-    def test_posts_the_week_that_just_ended(self):
-        """SCHEDULE-2 moved program weeks to Sun..Sat, so the Sunday 08:35 post
-        covers the COMPLETE week that ended yesterday, not a partial."""
+    def test_posts_the_goal_week_that_just_ended(self):
+        """STATUS-3 phase 2: the Monday 08:35 post covers the COMPLETE Mon..Sun
+        goal week that ended yesterday, and the repeat proposal judges the
+        same week (passed its Monday)."""
         s, load = self._run()
         load.assert_called_once()
         start, end = load.call_args[0][0], load.call_args[0][1]
-        self.assertEqual((start, end), (date(2026, 9, 16), date(2026, 9, 19)))
+        self.assertEqual((start, end), (date(2026, 11, 9), date(2026, 11, 15)))
+        self.propose.assert_called_once_with(date(2026, 11, 9))
         text = s.mm.post_message.call_args[0][1]
-        self.assertIn("Week 1 (Wed 9/16 – Sat 9/19)", text)
+        self.assertIn("Mon 11/9 – Sun 11/15", text)
         self.assertNotIn("partial", text)
 
     def test_nothing_outside_the_open_phase(self):

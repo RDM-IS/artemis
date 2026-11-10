@@ -242,15 +242,24 @@ class TestFixFlow(unittest.TestCase):
 
 class TestNagLogic(unittest.TestCase):
     """SESSION-OPEN (2026-11-09): the nag is the strength quota's, once a week,
-    when the strength days still needed reach the days left. Synthetic dates
-    (PUBLIC-FIXTURES): the Sun 2031-03-02 .. Sat 2031-03-08 week."""
+    on the day that is the real last chance (STATUS-3 phase 2: Mon..Sun goal
+    weeks, remaining days placed as late as feasible). Synthetic dates
+    (PUBLIC-FIXTURES): the Mon 2031-03-03 .. Sun 2031-03-09 week, every day free."""
 
-    MON, WED, THU, FRI, SAT = (date(2031, 3, 3), date(2031, 3, 5), date(2031, 3, 6),
-                               date(2031, 3, 7), date(2031, 3, 8))
+    MON, WED, THU, FRI, SAT, SUN = (date(2031, 3, 3), date(2031, 3, 5), date(2031, 3, 6),
+                                    date(2031, 3, 7), date(2031, 3, 8), date(2031, 3, 9))
+
+    @staticmethod
+    def _free():
+        from knowledge import cycle_days
+        out = cycle_days.resolve_days(date(2031, 3, 3), date(2031, 3, 9), [])
+        for info in out.values():
+            info.update(day_type="msp_home", away=False)
+        return out
 
     def _run(self, days, today, sent=None):
         from knowledge import strength_quota as sq
-        q = sq.compute(today, days, today=today, counts_from=date(2000, 1, 2))
+        q = sq.compute(today, days, today=today, counts_from=date(2000, 1, 3), days=self._free())
         with patch("artemis.quiet_hours.get_active_timezone", return_value="UTC"), \
              patch("artemis.quiet_hours.get_system_value", return_value=sent), \
              patch("knowledge.strength_quota.read_pg", return_value=q) as rd:
@@ -264,28 +273,30 @@ class TestNagLogic(unittest.TestCase):
     def test_no_nag_when_met(self):
         self.assertIsNone(self._run([self.MON, self.WED, self.THU], today=self.FRI))
 
-    def test_nag_when_needed_reaches_days_left(self):
-        out = self._run([self.MON], today=self.FRI)          # needs 2, Fri+Sat left
+    def test_nag_on_the_last_chance_day(self):
+        self.assertIsNone(self._run([self.MON], today=self.THU))   # last chance is Fri
+        out = self._run([self.MON], today=self.FRI)          # needs 2: Fri and Sun
         self.assertIsNotNone(out)
         msg, week = out
-        self.assertEqual(week, "2031-03-02")
+        self.assertEqual(week, "2031-03-03")
         self.assertIn("1 of 3", msg)
-        self.assertIn("2 more needed, 2 days left (today, Sat)", msg)
+        self.assertIn("2 more needed — the latest days that still work: today, Sun", msg)
 
     def test_once_per_week(self):
-        self.assertIsNone(self._run([self.MON], today=self.FRI, sent="2031-03-02"))
+        self.assertIsNone(self._run([self.MON], today=self.FRI, sent="2031-03-03"))
         # a marker from an earlier week does not silence this one
-        self.assertIsNotNone(self._run([self.MON], today=self.FRI, sent="2031-02-23"))
+        self.assertIsNotNone(self._run([self.MON], today=self.FRI, sent="2031-02-24"))
 
     def test_short_says_so(self):
-        msg, _ = self._run([], today=self.SAT)
+        self.assertIsNone(self._run([], today=self.SAT))       # the one placeable day is Sun
+        msg, _ = self._run([], today=self.SUN)
         self.assertIn("can't reach 3", msg)
 
     def test_a_week_before_the_quota_counts_never_nags(self):
         from datetime import date as d
         from knowledge import strength_quota as sq
         q = sq.compute(d(2031, 3, 8), [], today=d(2031, 3, 8),
-                       counts_from=d(2031, 3, 9))                 # the week before it counts
+                       counts_from=d(2031, 3, 10))                # the week before it counts
         self.assertEqual(q["status"], "not_counted")
         self.assertFalse(q["nag_due"])
 

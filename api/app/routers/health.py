@@ -339,7 +339,8 @@ class Section(BaseModel):
 
 
 class StrengthQuotaOut(BaseModel):
-    """SESSION-OPEN: strength days this Sun..Sat week, toward 3. One read
+    """SESSION-OPEN: strength days this Mon..Sun goal week (STATUS-3 phase 2),
+    toward 3, with the remaining days placed as late as feasible. One read
     (knowledge.strength_quota), fail-closed: section.ok=False and no numbers
     when it could not be read — never a zero."""
     section: Section = Field(default_factory=Section)
@@ -351,6 +352,17 @@ class StrengthQuotaOut(BaseModel):
     needed: Optional[int] = None
     days_left: Optional[int] = None
     status: Optional[str] = None      # met | on_track | tight | short | not_counted
+    #: STATUS-3 phase 2 -- feasibility. Additive with defaults.
+    counted: Optional[bool] = None
+    away: Optional[bool] = None
+    capacity: Optional[int] = None
+    #: The remaining strength days placed as LATE as feasible (no two in a row,
+    #: no travel or away day). The first is the real last chance.
+    placements: list[date] = Field(default_factory=list)
+    last_chance: Optional[date] = None
+    #: {iso date: "red" | "orange"} -- red on the last chance, orange the day before.
+    urgency: dict[str, str] = Field(default_factory=dict)
+    blocked_days: list[date] = Field(default_factory=list)
     #: SESSION-OPEN 5a: the session types whose day counts toward the quota
     #: (knowledge.session_types.STRENGTH_DAY_TYPES), served so gym-display tags
     #: its "counts" buttons without a copy of the list (SAME-FACT-MANY-PLACES).
@@ -1979,10 +1991,12 @@ class CardioGoal(BaseModel):
     interval_gate_date: Optional[date] = None
 
 
-def _strength_quota(db: Session, tz_name: str, today: date) -> StrengthQuotaOut:
+def _strength_quota(db: Session, tz_name: str, today: date,
+                    day: Optional[date] = None) -> StrengthQuotaOut:
+    """The goal week containing `day` (default: today), judged as of `today`."""
     from knowledge import strength_quota as sq
     try:
-        q = sq.read_sa(db, today, tz=tz_name, today=today)
+        q = sq.read_sa(db, day or today, tz=tz_name, today=today)
     except sq.QuotaUnreadable as exc:
         logger.warning("SESSION-OPEN: %s", exc)
         try:
@@ -1993,7 +2007,10 @@ def _strength_quota(db: Session, tz_name: str, today: date) -> StrengthQuotaOut:
     return StrengthQuotaOut(
         week_start=q["week_start"], week_end=q["week_end"], strength_days=q["strength_days"],
         count=q["count"], required=q["required"], needed=q["needed"],
-        days_left=q["days_left"], status=q["status"])
+        days_left=q["days_left"], status=q["status"], counted=q["counted"],
+        away=q["away"], capacity=q["capacity"], placements=q["placements"],
+        last_chance=q["last_chance"], urgency=q["urgency"],
+        blocked_days=q["blocked_days"])
 
 
 class StrengthGoal(BaseModel):
@@ -2104,6 +2121,24 @@ class GridOut(BaseModel):
     end: Optional[date] = None
     days: list[PlanDay] = Field(default_factory=list)
     burn: list[BurnOut] = Field(default_factory=list)
+    #: STATUS-3 phase 2: where each grid date is and what kind of day it is
+    #: (knowledge.cycle_days -- the same pattern and overrides the box reads),
+    #: so the Recommended row can name the room. Empty when unreadable.
+    cycle: list["GridDayOut"] = Field(default_factory=list)
+    cycle_section: Section = Field(default_factory=Section)
+    #: The strength quota for every goal week the grid touches, in date order.
+    #: The week holding today IS the response's `strength_quota` (same read).
+    quotas: list[StrengthQuotaOut] = Field(default_factory=list)
+
+
+class GridDayOut(BaseModel):
+    date: date
+    day_type: str
+    location: str
+    away: bool = False
+
+
+GridOut.model_rebuild()
 
 
 class OverviewResponse(BaseModel):
@@ -3375,7 +3410,36 @@ def _strength_volume(db: Session, today: date, tz_name: str) -> StrengthVolume:
 GRID_BACK, GRID_AHEAD = 1, 5
 
 
-def _grid(db: Session, today: date, tz_name: str) -> GridOut:
+def _grid_cycle(db: Session, start: date, end: date) -> tuple[list[GridDayOut], Section]:
+    from knowledge import cycle_days
+    try:
+        got = cycle_days.read_sa(db, start, end)
+    except cycle_days.CycleUnreadable as exc:
+        logger.warning("STATUS-3: %s", exc)
+        try:
+            db.rollback()
+        except Exception:                                       # noqa: BLE001
+            pass
+        return [], Section(ok=False, reason="couldn't read the cycle")
+    return [GridDayOut(date=d, day_type=i["day_type"], location=i["location"], away=i["away"])
+            for d, i in sorted(got.items())], Section()
+
+
+def _grid_quotas(db: Session, tz_name: str, today: date, start: date, end: date,
+                 current: StrengthQuotaOut) -> list[StrengthQuotaOut]:
+    """One quota per goal week the grid touches. The current week is `current`
+    -- the response's own read, never a second one (ONE-READ-ONE-STATUS)."""
+    from knowledge import strength_quota as sq
+    out, ws = [], sq.week_of(start)[0]
+    this_week = sq.week_of(today)[0]
+    while ws <= end:
+        out.append(current if ws == this_week else _strength_quota(db, tz_name, today, day=ws))
+        ws += timedelta(days=7)
+    return out
+
+
+def _grid(db: Session, today: date, tz_name: str,
+          quota: Optional[StrengthQuotaOut] = None) -> GridOut:
     start, end = today - timedelta(days=GRID_BACK), today + timedelta(days=GRID_AHEAD)
     try:
         days, _logs = _plan_days(db, start, end, today)
@@ -3392,10 +3456,14 @@ def _grid(db: Session, today: date, tz_name: str) -> GridOut:
         logger.warning("STATUS-3: could not read the grid", exc_info=True)
         return GridOut(section=Section(ok=False, reason="couldn't read the plan"),
                        start=start, end=end)
+    cycle, cycle_section = _grid_cycle(db, start, end)
+    quotas = _grid_quotas(db, tz_name, today, start, end,
+                          quota or _strength_quota(db, tz_name, today))
     return GridOut(start=start, end=end, days=days,
                    burn=[BurnOut(date=r["local_date"], slot=r["slot"],
                                  kcal=round(float(r["kcal"]), 0), workouts=int(r["n"]))
-                         for r in burn_rows])
+                         for r in burn_rows],
+                   cycle=cycle, cycle_section=cycle_section, quotas=quotas)
 
 
 def _strength_goal(quota: StrengthQuotaOut,
@@ -3585,7 +3653,7 @@ def get_overview(
             nutrition=_nutrition_pair[0],
             strength_volume=_strength_volume(db, today, tz_name),
         ),
-        grid=_grid(db, today, tz_name),
+        grid=_grid(db, today, tz_name, _quota),
         cardio_detail=_cardio_pair[1],
         nutrition_7d=_nutrition_pair[1],
         sleep_recovery=_sleep_recovery(db, today),
