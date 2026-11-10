@@ -315,7 +315,6 @@ class ArtemisScheduler:
             CronSpec("health_nag", "job_health_nag", 16, 30, tier="health"),
             CronSpec("vault_coverage", "job_vault_coverage", 16, 30, "mon-fri"),
             # 21:50 — silent DB backstop; writes only, posts nothing.
-            CronSpec("health_inferred_summary", "job_health_inferred_summary", 21, 50),
             # 21:55 — silent pain-pattern recompute (PAIN-1); writes only.
             CronSpec("pain_pattern_recompute", "job_pain_pattern_recompute", 21, 55),
             # 22:00 — CYCLE-1: re-point the location jobs at tomorrow. Quiet
@@ -1949,36 +1948,25 @@ class ArtemisScheduler:
             logger.exception("PB-007 billing intake job failed")
 
     def job_health_nag(self):
-        """Health: 16:30 local — prompt for a workout debrief if one is missing.
+        """Health: 16:30 local — SESSION-OPEN's strength-quota nag.
 
-        Suppression is by PLAN, not day-of-week: run_nag_check() already skips
-        rest_mobility / walk / skipped days and days that already have a log.
+        Fires at most once per Sun..Sat week, the first day the strength days
+        still needed reach the days left. Quiet hours respected. An unreadable
+        quota is logged, never guessed at. (The per-day debrief nag and the
+        21:50 inferred-summary backstop are retired.)
         """
         if self._is_quiet():
             return
         try:
-            from artemis.health import run_nag_check
-            msg = run_nag_check()
-            if msg:
+            from artemis.health import mark_strength_nag, strength_nag
+            due = strength_nag()
+            if due:
+                msg, week_start = due
                 self._post(config.CHANNEL_OPS, msg, tier="health")
-                logger.info("Posted health debrief nag")
+                mark_strength_nag(week_start)
+                logger.info("Posted strength-quota nag for week %s", week_start)
         except Exception:
             logger.exception("Health nag job failed")
-
-    def job_health_inferred_summary(self):
-        """Health: at 21:50 CT, insert a placeholder summary for today if no
-        debrief was logged. Marked logged_via='inferred' so the autoregulator
-        knows it's not real data.
-
-        Fires every day regardless of nag suppression — data-quality backstop.
-        """
-        try:
-            from artemis.health import insert_inferred_summary
-            inserted = insert_inferred_summary()
-            if inserted:
-                logger.info("Inserted inferred session_summary for today")
-        except Exception:
-            logger.exception("Health inferred-summary job failed")
 
     # ── T4: Proactive prompts (PB-009) ────────────────────────────────────
 

@@ -72,7 +72,7 @@ class TestWeek(unittest.TestCase):
 
     def test_full_week(self):
         r = ev.evaluate(plans(), full_week_logs(), [], start=WED, end=TUE, today=TUE + timedelta(days=1))
-        self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6, "missed": 0, "upcoming": 0})
+        self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6, "not_done": 0, "upcoming": 0})
         self.assertFalse(r["week"]["partial"])
         self.assertEqual(r["week"]["program_week"], 1)
         # rest day is neither done nor missed
@@ -98,12 +98,12 @@ class TestWeek(unittest.TestCase):
                         today=TUE + timedelta(days=1))
         # the morning numbers are untouched by the evenings
         self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6,
-                                       "missed": 0, "upcoming": 0})
+                                       "not_done": 0, "upcoming": 0})
         self.assertEqual(r["evening"], {"planned": 3, "done": 1, "due": 3,
-                                        "missed": 2, "upcoming": 0})
+                                        "not_done": 2, "upcoming": 0})
         # and they are never folded into one line
         line = ev.render_lines(r)[0]
-        self.assertIn("6 of 6 sessions due done", line)
+        self.assertIn("6 of 6 suggested sessions done", line)
         self.assertIn("Evenings: 1 of 3 due done", "\n".join(ev.render_lines(r)))
 
     def test_no_evening_line_when_there_are_none(self):
@@ -121,7 +121,7 @@ class TestWeek(unittest.TestCase):
                         today=TUE + timedelta(days=1))
         self.assertEqual(r["counts"]["planned"], 6)
         self.assertEqual([s["status"] for s in r["sessions"]][1], "rest")
-        self.assertEqual(r["missed"], [])
+        self.assertEqual(r["not_done"], [])
 
     def test_a_walk_row_is_not_a_session(self):
         """WALK-RETIRE (Ryan, 2026-09-22): walking is daily life, not a
@@ -133,27 +133,44 @@ class TestWeek(unittest.TestCase):
         r = ev.evaluate(rows + [walk], full_week_logs() + [summary(999, WED + timedelta(days=1))],
                         [], start=WED, end=TUE, today=TUE + timedelta(days=1))
         self.assertEqual(r["counts"], {"planned": 6, "done": 6, "due": 6,
-                                       "missed": 0, "upcoming": 0})
+                                       "not_done": 0, "upcoming": 0})
         self.assertNotIn("walk", [x["session_type"] for x in r["sessions"]])
-        self.assertEqual(r["missed"], [])
+        self.assertEqual(r["not_done"], [])
 
     def test_partial_week_counts_only_what_is_due(self):
         logs = full_week_logs()[:4]                    # A and B logged
         r = ev.evaluate(plans(), logs, [], start=WED, end=TUE, today=date(2026, 9, 19))
         self.assertTrue(r["week"]["partial"])
         self.assertEqual(r["week"]["through"], "2026-09-19")
-        self.assertEqual(r["counts"], {"planned": 6, "done": 2, "due": 2, "missed": 0, "upcoming": 4})
+        self.assertEqual(r["counts"], {"planned": 6, "done": 2, "due": 2, "not_done": 0, "upcoming": 4})
         self.assertEqual([x["status"] for x in r["sessions"][2:5]], ["done", "today", "upcoming"])
         self.assertIn("partial", ev.render_lines(r)[0])
 
-    def test_missed_session(self):
+    def test_a_suggestion_not_taken_is_not_done(self):
         mon = date(2026, 9, 21)
         logs = [l for l in full_week_logs() if l["plan_id"] != 102 and l["plan_date"] <= mon]
         r = ev.evaluate(plans(), logs, [], start=WED, end=TUE, today=mon)
-        self.assertEqual(r["missed"], [{"date": "2026-09-18", "label": "strength_b"}])
-        # A, flow, walk, C (today, logged) done; B missed; Tue still to come
+        self.assertEqual(r["not_done"], [{"date": "2026-09-18", "label": "strength_b"}])
+        # A, flow, walk, C (today, logged) done; B not done; Tue still to come
         self.assertEqual((r["counts"]["done"], r["counts"]["due"], r["counts"]["upcoming"]), (4, 5, 1))
-        self.assertIn("Missed: Fri 9/18 strength_b", ev.render_lines(r))
+        # SESSION-OPEN: never a "Missed:" line.
+        self.assertFalse(any("Missed" in l for l in ev.render_lines(r)))
+
+    def test_the_quota_line_replaces_missed(self):
+        """SESSION-OPEN: the week is judged by the strength quota (synthetic
+        2031 week; PUBLIC-FIXTURES)."""
+        from knowledge import strength_quota as sq
+        q = sq.compute(date(2031, 3, 8), [date(2031, 3, 3), date(2031, 3, 5)],
+                       today=date(2031, 3, 9), counts_from=date(2000, 1, 2))
+        r = ev.evaluate([], [], [], start=date(2031, 3, 2), end=date(2031, 3, 8),
+                        today=date(2031, 3, 9), quota=q)
+        lines = ev.render_lines(r)
+        self.assertEqual(lines[1], "Strength days: 2 of 3 (Mon 3/3, Wed 3/5) — short")
+
+    def test_an_unreadable_quota_says_so_never_zero(self):
+        r = ev.evaluate([], [], [], start=WED, end=TUE, today=TUE,
+                        quota={"unreadable": "connection refused"})
+        self.assertIn("Strength days: couldn't read them", ev.render_lines(r))
 
     def test_adjustments_applied(self):
         adj = {2: {"rules_fired": ["pain_mobility", "lighten_sore"], "reason": "Pain hip 3/5 …"}}
@@ -165,11 +182,11 @@ class TestWeek(unittest.TestCase):
 
     def test_empty_week(self):
         r = ev.evaluate([], [], [], start=WED, end=TUE, today=TUE)
-        self.assertEqual(r["counts"], {"planned": 0, "done": 0, "due": 0, "missed": 0, "upcoming": 0})
+        self.assertEqual(r["counts"], {"planned": 0, "done": 0, "due": 0, "not_done": 0, "upcoming": 0})
         self.assertIsNone(r["rpe"])
         self.assertEqual(r["loads"], [])
         lines = ev.render_lines(r)
-        self.assertIn("Missed: none", lines)
+        self.assertFalse(any(l.startswith("Missed") for l in lines))
         self.assertIn("Effort: no session RPE logged", lines)
 
     def test_renamed_exercise_is_not_a_new_exercise(self):

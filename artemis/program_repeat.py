@@ -1,14 +1,16 @@
-"""REPEAT-WEEK — a program week with more than one session not done repeats
-(Ryan, 2026-09-27; MAKEUP-2 is the one-session case).
+"""REPEAT-WEEK — a program week below the strength quota repeats
+(Ryan, 2026-09-27; re-keyed by SESSION-OPEN, 2026-11-09).
 
-    Sunday 08:35  the weekly job looks at the week that just ended. More than
-                  one training session not done (missed or skipped) → it
-                  PROPOSES repeating it and stores the proposal. Nothing moves.
+    Sunday 08:35  the weekly job looks at the week that just ended. Fewer than
+                  3 strength days (knowledge.strength_quota — plan rows are
+                  suggestions, so "sessions not done" no longer means anything)
+                  → it PROPOSES repeating it and stores the proposal. Nothing
+                  moves. Weeks before acos.system_state['strength_quota_counts_from'] never propose.
     `repeat week` Ryan confirms. The repeat is recorded as the Sunday the repeat
                   week begins (health_office.REPEATS_KEY); every plan row from
                   that Sunday on is rebuilt with the program week held back one,
                   and the block's END MOVES OUT a week (Ryan: "#1 go").
-    `no repeat`   the missed stay missed and the program carries on.
+    `no repeat`   the program carries on as planned.
 
 Why propose-then-confirm when Ryan's rule is unconditional: applying it
 rewrites every future plan row, and CLAUDE.md gates any write to the system of
@@ -38,36 +40,38 @@ PENDING_KEY = "repeat_week_pending"
 # Proposal
 # ---------------------------------------------------------------------------
 
-def not_done_in(week_start: date) -> list[dict]:
-    """Training sessions not done in the program week starting `week_start`."""
-    from artemis import session_library as sl
-    week_end = week_start + timedelta(days=6)
-    rows = sl._load_week_rows(week_end, week_start)
-    return sl.makeup_state(rows, week_end + timedelta(days=1), week_start)["not_done"]
+def quota_for(week_start: date) -> dict:
+    """The strength quota for the Sun..Sat week starting `week_start`.
+    Raises strength_quota.QuotaUnreadable — never 'no strength days'."""
+    from artemis.quiet_hours import get_active_timezone, local_today
+    from knowledge import strength_quota as sq
+    return sq.read_pg(week_start, tz=get_active_timezone(), today=local_today())
 
 
 def propose(week_start: date, now: datetime | None = None) -> str | None:
-    """Store a proposal when the week had more than one not done; return the
-    message to post, or None when there's nothing to propose."""
+    """Store a proposal when the finished week was below the quota; return the
+    message to post, or None when there's nothing to propose. An unreadable
+    quota raises (the caller logs it) — it does not propose and it does not
+    stay silent as if the week were fine."""
     from artemis import health_office as office
     from artemis.quiet_hours import get_system_value, set_system_value
-    nd = not_done_in(week_start)
-    if len(nd) <= 1:
+    q = quota_for(week_start)
+    if not q["repeat_due"]:
         return None
     repeat_start = week_start + timedelta(days=7)
     if repeat_start in office.repeat_starts():
         return None
     wk = office.week_num_for(week_start)
     pending = {"week_start": week_start.isoformat(), "repeat_start": repeat_start.isoformat(),
-               "week_num": wk, "not_done": nd,
+               "week_num": wk, "strength_days": q["strength_days"], "count": q["count"],
+               "required": q["required"],
                "proposed_at": (now or datetime.now(timezone.utc)).isoformat()}
     if get_system_value(PENDING_KEY) == json.dumps(pending, sort_keys=True):
         return None
     set_system_value(PENDING_KEY, json.dumps(pending, sort_keys=True))
-    items = ", ".join(f"{date.fromisoformat(m['plan_date']):%a} {m['display_name']}"
-                      + (" (skipped)" if m.get("skipped") else "") for m in nd)
+    days = ", ".join(f"{date.fromisoformat(d):%a %-m/%-d}" for d in q["strength_days"]) or "none"
     new_end = office.program_end() + timedelta(days=7)
-    return (f"🔁 **Week {wk} had {len(nd)} sessions not done** — {items}.\n"
+    return (f"🔁 **Week {wk} had {q['count']} of {q['required']} strength days** ({days}).\n"
             f"Your rule: the week repeats. Reply `repeat week` to run week {wk} again from "
             f"{repeat_start:%a %-m/%-d} (the block then ends {new_end:%a %-m/%-d}), "
             f"or `no repeat` to carry on as planned.")
@@ -96,8 +100,7 @@ def decline() -> str:
     set_system_value(PENDING_KEY, "")
     if not p:
         return "Nothing to repeat right now."
-    return (f"Not repeating week {p['week_num']} — the missed sessions stay missed and the "
-            f"program carries on.")
+    return f"Not repeating week {p['week_num']} — the program carries on as planned."
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +134,14 @@ def _assumptions(repeat_start: date, reps: list, new_reps: list, plan: dict,
 
     Deliberately NOT a copy of `metadata`: metadata records what the write did,
     assumptions records what it took to be true beforehand. The one that matters
-    is `not_done` — the rule fires on "more than one session not done", and
-    nothing in the audit row has ever said WHICH sessions those were, so a repeat
-    that turns out to have been wrong cannot currently be argued with.
+    is the quota — the rule fires on "fewer than 3 strength days", and the
+    audit row must say WHICH days counted, so a repeat that turns out to have
+    been wrong can be argued with.
 
     The proposal is read for that, and an unreadable proposal is recorded as
     UNKNOWN rather than as an empty list. Absence and silence are different
-    answers (FAIL-CLOSED-RESOLVERS); an empty `not_done` would claim the rule
-    fired on nothing. This never raises: a decision record must not be able to
+    answers (FAIL-CLOSED-RESOLVERS); an empty `strength_days` would claim the
+    rule fired on a week with none. This never raises: a decision record must not be able to
     break the decision it describes.
     """
     try:
@@ -146,22 +149,22 @@ def _assumptions(repeat_start: date, reps: list, new_reps: list, plan: dict,
     except Exception as exc:                                        # noqa: BLE001
         logger.warning("repeat assumptions: proposal unreadable — %s", exc)
         p = None
-        trigger = {"not_done": None, "not_done_count": None,
+        trigger = {"strength_days": None, "count": None, "required": None,
                    "source": "unreadable: the proposal could not be read"}
     else:
         if p is None:
-            trigger = {"not_done": None, "not_done_count": None,
+            trigger = {"strength_days": None, "count": None, "required": None,
                        "source": "absent: applied with no live proposal"}
         else:
-            nd = p.get("not_done") or []
-            trigger = {"not_done": [f"{m.get('plan_date')} {m.get('display_name')}"
-                                    + (" (skipped)" if m.get("skipped") else "") for m in nd],
-                       "not_done_count": len(nd),
+            # A proposal written before SESSION-OPEN carries `not_done`, not
+            # the quota; recorded as unknown rather than as zero days.
+            trigger = {"strength_days": p.get("strength_days"), "count": p.get("count"),
+                       "required": p.get("required"),
                        "source": "proposal",
                        "proposed_at": p.get("proposed_at"),
                        "proposal_week_num": p.get("week_num")}
     return {
-        "rule": "a program week with more than one session not done repeats",
+        "rule": "a program week with fewer than 3 strength days repeats (SESSION-OPEN)",
         "trigger": trigger,
         "week_num": office.week_num_for(repeat_start, new_reps),
         "repeat_start": repeat_start.isoformat(),

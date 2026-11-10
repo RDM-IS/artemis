@@ -133,26 +133,28 @@ class TestCheckinOutcome(unittest.TestCase):
 # Site 2
 # ---------------------------------------------------------------------------
 
-class TestMakeupOutcome(unittest.TestCase):
+class TestMakeupOutcomeRetired(unittest.TestCase):
+    """SESSION-OPEN (2026-11-09): MAKEUP-2 is retired. An open makeup_swap
+    decision is closed as `retired` — not judged by the old rule — once, so
+    cognition never counts it as pending."""
     D = _decision("makeup_swap", assumptions={"rule": "x"},
-                  metadata={"rest_plan_id": 22, "on": YESTERDAY.isoformat()})
+                  metadata={"rest_plan_id": 22, "on": TODAY.isoformat()})
 
-    def test_logged(self):
-        cur = Cur(decisions=[self.D], logs=1)
-        _run(cur)
-        self.assertEqual(cur.written[0]["outcome"], "logged")
-        self.assertIsNone(cur.written[0]["correction"])
+    def test_an_open_makeup_is_closed_as_retired_even_unlogged_or_future(self):
+        cur = Cur(decisions=[self.D], logs=0)
+        counts = _run(cur)
+        self.assertEqual(counts["wrote"], 1)
+        row = cur.written[0]
+        self.assertEqual(row["outcome"], "retired")
+        self.assertEqual(row["action"], "makeup_swap.outcome")
+        self.assertIsNone(row["correction"])               # not judged, so no correction
+        self.assertIn("retired", json.loads(row["metadata"])["reason"])
 
-    def test_skipping_it_is_the_correction(self):
+    def test_idempotent(self):
         cur = Cur(decisions=[self.D], logs=0)
         _run(cur)
-        self.assertEqual(cur.written[0]["outcome"], "not_logged")
-        self.assertIn("skipped", json.loads(cur.written[0]["correction"])["what"])
-
-    def test_the_rest_day_has_not_passed_yet(self):
-        d = _decision("makeup_swap", assumptions={},
-                      metadata={"rest_plan_id": 22, "on": TODAY.isoformat()})
-        self.assertEqual(_run(Cur(decisions=[d]))["not_yet"], 1)
+        again = _run(cur)                                  # the outcome now exists
+        self.assertEqual((again["wrote"], len(cur.written)), (0, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -160,28 +162,47 @@ class TestMakeupOutcome(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRepeatOutcome(unittest.TestCase):
+    """SESSION-OPEN: the repeated week is judged by the strength quota."""
+
     def _d(self, start):
         return _decision("repeat_week", assumptions={"repeat_start": start.isoformat()})
 
+    def _run_with(self, cur, days=None, side_effect=None):
+        from knowledge import strength_quota as sq
+        start = TODAY - timedelta(days=8)
+
+        def fake(day, *, tz, today, execute):
+            self.assertEqual((day, tz, today), (start, "UTC", TODAY))
+            self.assertTrue(callable(execute))           # on the decision's own cursor
+            if side_effect:
+                raise side_effect
+            return sq.compute(day, days or [], today=today, counts_from=date(2000, 1, 2))
+        with mock.patch("artemis.quiet_hours.get_active_timezone", return_value="UTC"), \
+             mock.patch("knowledge.strength_quota.read_pg", side_effect=fake):
+            return _run(cur)
+
+    def _three(self):
+        # Three days inside the Sun..Sat week that holds the repeat start.
+        from knowledge.strength_quota import week_of
+        ws, _ = week_of(TODAY - timedelta(days=8))
+        return [ws + timedelta(days=i) for i in (1, 3, 5)]
+
     def test_a_clean_repeated_week(self):
         cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
-        with mock.patch("artemis.program_repeat.not_done_in", return_value=[]):
-            _run(cur)
+        self._run_with(cur, days=self._three())
         self.assertEqual(cur.written[0]["outcome"], "week_clean")
 
-    def test_the_repeated_week_also_had_sessions_not_done(self):
+    def test_the_repeated_week_was_short_again(self):
         cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
-        nd = [{"plan_date": "2027-03-03", "display_name": "Test A"}]
-        with mock.patch("artemis.program_repeat.not_done_in", return_value=nd):
-            _run(cur)
+        self._run_with(cur, days=self._three()[:1])
         row = cur.written[0]
-        self.assertEqual(row["outcome"], "week_not_done")
-        self.assertEqual(json.loads(row["metadata"])["not_done_count"], 1)
+        self.assertEqual(row["outcome"], "week_short")
+        md = json.loads(row["metadata"])
+        self.assertEqual((md["count"], md["required"]), (1, 3))
 
     def test_a_second_repeat_of_the_same_week_is_the_correction(self):
         cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))], repeats_again=1)
-        with mock.patch("artemis.program_repeat.not_done_in", return_value=[]):
-            _run(cur)
+        self._run_with(cur, days=self._three())
         self.assertIn("again", json.loads(cur.written[0]["correction"])["what"])
 
     def test_a_week_still_running_is_not_yet(self):
@@ -189,10 +210,9 @@ class TestRepeatOutcome(unittest.TestCase):
         self.assertEqual(_run(cur)["not_yet"], 1)
 
     def test_an_unreadable_week_writes_nothing(self):
+        from knowledge import strength_quota as sq
         cur = Cur(decisions=[self._d(TODAY - timedelta(days=8))])
-        with mock.patch("artemis.program_repeat.not_done_in",
-                        side_effect=RuntimeError("RDS down")):
-            counts = _run(cur)
+        counts = self._run_with(cur, side_effect=sq.QuotaUnreadable("RDS down"))
         self.assertEqual((counts["unreadable"], counts["wrote"]), (1, 0))
         self.assertEqual(cur.written, [])
 

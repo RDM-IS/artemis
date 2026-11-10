@@ -1198,89 +1198,55 @@ def handle_fix_intent(message: str) -> str | None:
 
 
 # ============================================================================
-# Nag job — runs at 23:00 CT
+# Strength-quota nag — SESSION-OPEN (Ryan, 2026-11-09)
 # ============================================================================
+# Replaces the per-day debrief nag: plan rows are suggestions, so an unlogged
+# row is not something to chase. The nag fires ONCE per Sun..Sat week, the
+# first time the strength days still needed reach the days left
+# (strength_quota's `nag_due`). Quiet hours are the caller's (job_health_nag).
+#
+# The 21:50 inferred-summary backstop is RETIRED with it: it wrote a
+# placeholder "assumed at baseline" summary for every unlogged planned row,
+# which only ever polluted readers that did not filter it out — nothing
+# depended on it (grepped 2026-11-09). Its 86 historical rows stay; every
+# reader that filters `logged_via <> 'inferred'` keeps doing so.
 
-# No debrief nag and no inferred "missed" summary on these days. A Recovery
-# Flow logs itself from gym-display (YOGA-1); a missed one is never a miss.
-from knowledge.session_types import NO_FOLLOWUP_TYPES as _NO_FOLLOWUP_SESSIONS  # noqa: E402
+STRENGTH_NAG_KEY = "strength_quota_nag_week"
 
 
-def run_nag_check() -> Optional[str]:
-    """Check whether today's session has a debrief logged.
-
-    If the day was a rest/skipped/walk/mobility, no nag.
-    If a debrief is already logged, no nag.
-    Otherwise: returns the nag message (caller posts to Mattermost).
-    """
-    from knowledge.db import execute_one, execute_query
-
-    today = datetime.now(_local_tz()).date()
-
-    plan = execute_one(
-        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan "
-        "WHERE plan_date = %s AND slot = 'morning'",
-        (today,),
-    )
-
-    if not plan:
-        # No plan for today — nothing to nag about.
+def strength_nag(today: date | None = None) -> tuple[str, str] | None:
+    """(message, week_start) when the quota nag is due and not yet sent this
+    week, else None. An unreadable quota RAISES (the job logs it): it neither
+    nags on a guess nor stays quiet as if the week were on track."""
+    from artemis.quiet_hours import get_active_timezone, get_system_value
+    from knowledge import strength_quota as sq
+    tz = get_active_timezone()
+    today = today or datetime.now(ZoneInfo(tz)).date()
+    q = sq.read_pg(today, tz=tz, today=today)
+    if not q["nag_due"] or get_system_value(STRENGTH_NAG_KEY) == q["week_start"]:
         return None
-
-    if plan["is_skipped"] or plan["session_type"] in _NO_FOLLOWUP_SESSIONS:
-        return None
-
-    # Check for any session_log rows tied to this plan_id
-    logs = execute_query(
-        "SELECT log_id FROM health.session_log WHERE plan_id = %s LIMIT 1",
-        (plan["plan_id"],),
-    )
-
-    if logs:
-        return None
-
-    # No debrief logged — nag in trainer voice.
-    pretty = plan["session_type"].replace("_", " ").title()
-    return f"No debrief logged for today's {pretty}. How did it go?"
+    return format_strength_nag(q, today), q["week_start"]
 
 
-def insert_inferred_summary() -> bool:
-    """Insert a placeholder session_summary row for TODAY if still missing.
+def mark_strength_nag(week_start: str) -> None:
+    """Called AFTER the post went out, so a failed post nags again tomorrow."""
+    from artemis.quiet_hours import set_system_value
+    set_system_value(STRENGTH_NAG_KEY, week_start)
 
-    Called at 21:50 CT (50 min after the 21:00 nag, just before quiet hours
-    start at 22:00) and operates on the current calendar day. The
-    autoregulator/trends will know it's inferred via logged_via='inferred'.
 
-    Returns True if a row was inserted, False if a real debrief already exists.
-    """
-    from knowledge.db import execute_one, execute_write
-
-    today = datetime.now(_local_tz()).date()
-
-    plan = execute_one(
-        "SELECT plan_id, session_type, target_rpe, is_skipped FROM health.plan "
-        "WHERE plan_date = %s AND slot = 'morning'",
-        (today,),
-    )
-
-    if not plan or plan["is_skipped"] or plan["session_type"] in _NO_FOLLOWUP_SESSIONS:
-        return False
-
-    existing = execute_one(
-        "SELECT log_id FROM health.session_log WHERE plan_id = %s LIMIT 1",
-        (plan["plan_id"],),
-    )
-    if existing:
-        return False
-
-    execute_write(
-        """INSERT INTO health.session_log
-           (plan_id, log_type, exercise, rpe_actual, notes, logged_via)
-           VALUES (%s, 'session_summary', 'inferred',
-                   %s, 'no debrief — assumed at baseline', 'inferred')""",
-        (plan["plan_id"], plan["target_rpe"]),
-    )
-    return True
+def format_strength_nag(q: dict, today: date) -> str:
+    """Pure."""
+    done = ", ".join(f"{date.fromisoformat(d):%a}" for d in q["strength_days"]) or "none yet"
+    end = date.fromisoformat(q["week_end"])
+    first = today + timedelta(days=1) if today.isoformat() in q["strength_days"] else today
+    left = [first + timedelta(days=i) for i in range((end - first).days + 1)]
+    names = ", ".join("today" if d == today else f"{d:%a}" for d in left)
+    head = (f"💪 Strength days this week: {q['count']} of {q['required']} ({done}). "
+            f"{q['needed']} more needed, {q['days_left']} day{'s' if q['days_left'] != 1 else ''} "
+            f"left ({names}).")
+    if q["status"] == "short":
+        return head + " The week can't reach 3 now — it comes up for a repeat on Sunday."
+    return head + " Every one of them needs a lift or a circuit."
 
 
 # ============================================================================
@@ -2316,8 +2282,9 @@ def handle_workout_session(message: str) -> str | None:
 #
 # Rest is a PLAN property in the canonical schema, so an ad-hoc "skip today"
 # marks today's health.plan row is_skipped (CT date) rather than inserting a
-# workout row. This also keeps the 21:00 nag quiet (run_nag_check skips
-# is_skipped plans). Phrases mirror the legacy life_ops handler verbatim.
+# workout row. (The per-day debrief nag it used to quiet is retired —
+# SESSION-OPEN's quota nag reads logs, not plan rows.) Phrases mirror the
+# legacy life_ops handler verbatim.
 # ----------------------------------------------------------------------------
 
 _REST_DAY_PHRASES = ("rest day", "taking today off", "day off")

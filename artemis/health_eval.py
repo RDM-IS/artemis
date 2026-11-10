@@ -8,12 +8,15 @@ evaluator RAMP-RETIRE called for (health_ramp.py is not reused).
              in the ACTIVE timezone (quiet_hours.local_today()).
   Inputs     the week's health.plan rows, and health.session_log rows (the week
              plus the 7 days before it, for load change), logged_via <> 'inferred'.
-  Output     one dict (evaluate()): sessions done vs planned, missed sessions,
+  Output     one dict (evaluate()): the week's strength quota (SESSION-OPEN),
+             suggested sessions done vs planned, those not done,
              average session RPE vs the plan's cap (target_rpe), per-exercise
              top-set load change vs the prior week, adjustments applied.
 
 Training days are every plan row except rest_mobility; rest days are neither
-done nor missed. A day before the program anchor is pre-program and ignored.
+done nor not done. SESSION-OPEN (2026-11-09): plan rows are SUGGESTIONS, so a
+row not taken is `not_done` — never "missed" — and the week is judged by
+knowledge.strength_quota (strength days toward 3), read once in load(). A day before the program anchor is pre-program and ignored.
 
 Consumers: the weekly report (scripts/export_report.py) and the Sunday post
 (scheduler.job_weekly_eval — the week to date, labelled partial).
@@ -110,11 +113,13 @@ def _top_weights(logs) -> dict[str, float | None]:
 
 
 def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
-             anchor: date = office.WEEK1_START, checkins=None) -> dict:
+             anchor: date = office.WEEK1_START, checkins=None, quota=None) -> dict:
     """Pure. `plans`: health.plan rows for start..end; `logs`: real session_log
     rows for start..end (with plan_date, plan_id); `prior_logs`: the same for
     the 7 days before `start`; `checkins`: health.daily_state rows for
-    start..end (WATCH-1 — sleep and resting HR, data only)."""
+    start..end (WATCH-1 — sleep and resting HR, data only); `quota`: the
+    strength_quota dict for the week, {"unreadable": reason} when it could not
+    be read, or None when the caller did not ask."""
     by_plan: dict[int, list] = {}
     for l in logs:
         by_plan.setdefault(l["plan_id"], []).append(l)
@@ -125,7 +130,7 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
     evening_plans = [p for p in plans if (p.get("slot") or "morning") == "evening"]
     plans = [p for p in plans if (p.get("slot") or "morning") == "morning"]
 
-    sessions, missed, skipped, adjustments = [], [], [], []
+    sessions, not_done, skipped, adjustments = [], [], [], []
     done = due = upcoming = 0
     rpe_pairs = []
     for p in sorted(plans, key=lambda r: r["plan_date"]):
@@ -161,7 +166,7 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
             elif d == today:
                 status = "today"
             else:
-                status = "missed"
+                status = "not_done"
         sets = [l for l in by_plan.get(p["plan_id"], []) if l["log_type"] == "strength_set"]
         summ = [_num(l.get("rpe_actual")) for l in by_plan.get(p["plan_id"], [])
                 if l["log_type"] == "session_summary" and l.get("rpe_actual") is not None]
@@ -176,9 +181,9 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
             due += 1
             if rpe is not None and cap is not None:
                 rpe_pairs.append((rpe, cap, d.isoformat(), label))
-        elif status == "missed":
+        elif status == "not_done":
             due += 1
-            missed.append({"date": d.isoformat(), "label": label})
+            not_done.append({"date": d.isoformat(), "label": label})
         elif status in ("upcoming", "today"):
             upcoming += 1
 
@@ -226,12 +231,13 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
         "week": {"start": start.isoformat(), "end": end.isoformat(), "program_week": program_week,
                  "through": min(today, end).isoformat(), "partial": end > today},
         "counts": {"planned": sum(1 for s in sessions if s["status"] != "rest"),
-                   "done": done, "due": due, "missed": len(missed), "upcoming": upcoming},
+                   "done": done, "due": due, "not_done": len(not_done), "upcoming": upcoming},
         "evening": _evening_counts(evening_plans, by_plan, today),
         "sessions": sessions,
         "recovery": recovery,
-        "missed": missed,
+        "not_done": not_done,
         "skipped": skipped,
+        "quota": quota,
         "rpe": rpe,
         "loads": loads,
         "adjustments": adjustments,
@@ -240,8 +246,8 @@ def evaluate(plans, logs, prior_logs, *, start: date, end: date, today: date,
 
 def _evening_counts(plans, by_plan, today: date) -> dict:
     """EVENING-1: the evening slot's own denominator. Same rules as the
-    morning — a skip is not a miss, today is not yet late — reported apart."""
-    done = due = upcoming = missed = 0
+    morning — a skip is not "not done", today is not yet late — reported apart."""
+    done = due = upcoming = not_done = 0
     for p in plans:
         if p.get("is_skipped"):
             continue
@@ -253,10 +259,10 @@ def _evening_counts(plans, by_plan, today: date) -> dict:
         elif p["plan_date"] == today:
             pass                      # tonight hasn't happened yet
         else:
-            missed += 1
+            not_done += 1
             due += 1
     return {"planned": sum(1 for p in plans if not p.get("is_skipped")),
-            "done": done, "due": due, "missed": missed, "upcoming": upcoming}
+            "done": done, "due": due, "not_done": not_done, "upcoming": upcoming}
 
 
 # ── Loading (read-only) ─────────────────────────────────────────────────────
@@ -284,7 +290,33 @@ def load(start: date, end: date, today: date | None = None) -> dict:
         "WHERE state_date BETWEEN %s AND %s ORDER BY state_date", (start, end))
     return evaluate([dict(r) for r in plans], [dict(r) for r in logs], [dict(r) for r in prior],
                     start=start, end=end, today=today,
-                    checkins=[dict(r) for r in checkins])
+                    checkins=[dict(r) for r in checkins], quota=read_quota(start, today))
+
+
+def read_quota(start: date, today: date) -> dict:
+    """The week's strength quota, or {"unreadable": reason} — rendered as such,
+    never as zero strength days (FAIL-CLOSED-RESOLVERS)."""
+    from artemis.quiet_hours import get_active_timezone
+    from knowledge import strength_quota as sq
+    try:
+        return sq.read_pg(start, tz=get_active_timezone(), today=today)
+    except sq.QuotaUnreadable as exc:
+        return {"unreadable": str(exc)}
+
+
+_QUOTA_WORDS = {"met": "met", "on_track": "on track", "tight": "every day left must count",
+                "short": "short", "not_counted": "before the quota counted"}
+
+
+def quota_line(q: dict | None) -> str | None:
+    """One line, shared by the Sunday post and the weekly report."""
+    if q is None:
+        return None
+    if "unreadable" in q:
+        return "Strength days: couldn't read them"
+    days = ", ".join(_d(d) for d in q["strength_days"]) or "none"
+    return (f"Strength days: {q['count']} of {q['required']} ({days}) — "
+            f"{_QUOTA_WORDS.get(q['status'], q['status'])}")
 
 
 # ── Rendering (data only — no advice) ───────────────────────────────────────
@@ -309,7 +341,7 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
         w["through"] if w["partial"] and w["through"] >= w["start"] else w["end"])
     span = f"{_d(w['start'])} – {_d(last)}"
     lines = [f"{head} ({span}{', partial' if w['partial'] else ''}): "
-             f"{c['done']} of {c['due']} sessions due done"
+             f"{c['done']} of {c['due']} suggested sessions done"
              + (f" · {c['upcoming']} still to come" if c["upcoming"] else "")
              + f" · {c['planned']} planned"]
     # EVENING-1: its own line, never folded into the morning's numbers.
@@ -333,8 +365,11 @@ def render_lines(ev: dict, through: date | None = None) -> list[str]:
         lines.append("Skipped: " + ", ".join(
             f"{_d(s['date'])} {s['label']}" + (f" — {s['reason']}" if s["reason"] else "")
             for s in ev["skipped"]))
-    lines.append("Missed: " + (", ".join(f"{_d(m['date'])} {m['label']}" for m in ev["missed"])
-                               if ev["missed"] else "none"))
+    # SESSION-OPEN: the quota line replaces "Missed: …" — a suggestion not
+    # taken is not a fact about the week; the strength days are.
+    ql = quota_line(ev.get("quota"))
+    if ql:
+        lines.insert(1, ql)
     r = ev["rpe"]
     if r:
         over = "; ".join(f"{_d(o['date'])} {_n(o['rpe'])} vs {_n(o['cap'])}" for o in r["over_cap"])

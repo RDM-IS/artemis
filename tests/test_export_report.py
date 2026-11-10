@@ -50,7 +50,7 @@ def week(today, logs=(), prior=(), checkins=None):
 class TestWeekly(unittest.TestCase):
     def test_empty_week_prints_every_section_and_not_yet_tracked(self):
         out = er.md(er.build_weekly(week(WED - timedelta(days=1)), GEN))
-        for h in ("Adherence", "Sessions", "Weight progress", "Check-in trends", "Body weight",
+        for h in ("Strength days", "Suggested sessions", "Sessions", "Weight progress", "Check-in trends", "Body weight",
                   "Pain and soreness", "Open pain patterns", "Adjustments applied",
                   "Weekly evaluation (EVAL-1)", "Watch data", "Nutrition"):
             self.assertIn(f"## {h}", out)
@@ -72,9 +72,21 @@ class TestWeekly(unittest.TestCase):
         self.assertIn("| Wed 9/16 | strength_a (office gym) | done | 2 |", out)
         self.assertIn("20 min", out)
 
-    def test_a_past_day_with_no_logs_is_missed(self):
+    def test_a_past_day_with_no_logs_is_not_done_never_missed(self):
         data = week(date(2026, 9, 20))
-        self.assertEqual(er.day_status(data, data.plans[2]), "missed")
+        self.assertEqual(er.day_status(data, data.plans[2]), "not done")
+
+    def test_the_report_uses_the_quota(self):
+        """SESSION-OPEN (Ryan, 2026-11-09 Q5): the same line the Sunday post
+        uses, per week; unreadable says so. Synthetic 2031 week."""
+        from knowledge import strength_quota as sq
+        data = week(date(2026, 9, 20))
+        data.quotas = [sq.compute(date(2031, 3, 2), [date(2031, 3, 4)], today=date(2031, 3, 9),
+                                  counts_from=date(2000, 1, 2)),
+                       {"unreadable": "down"}]
+        out = er.md(er.build_weekly(data, GEN))
+        self.assertIn("- Week of Mar 2: Strength days: 1 of 3 (Tue 3/4) — short", out)
+        self.assertIn("- Strength days: couldn't read them", out)
 
     def test_week_over_week_change_groups_the_renamed_exercise(self):
         prior_day = WED - timedelta(days=5)
@@ -140,7 +152,8 @@ class TestDailyAndMonthly(unittest.TestCase):
         self.assertEqual(er.day_status(data, old[0]), "pre-program")
         self.assertEqual(er.adherence(data)[0:2], (1, 1))      # 9/18 not logged yet
         out = er.md(er.build_monthly(data, GEN))
-        self.assertIn("**1** done · 0 missed", out)
+        self.assertIn("**1** done · 0 not done", out)
+        self.assertIn("## Strength days by week", out)
         self.assertIn("6 day(s) before the program start (9/16) not counted", out)
         self.assertIn("week 1 of 7 (started 9/16", out)
 

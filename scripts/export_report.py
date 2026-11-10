@@ -66,6 +66,10 @@ class Data:
     prior_logs: list[dict] = field(default_factory=list)  # the 7 days before start
     patterns: list[dict] = field(default_factory=list)    # open pain patterns
     program: dict | None = None                           # acos.system_state health_program
+    #: SESSION-OPEN: one strength_quota dict per Sun..Sat week overlapping the
+    #: period, oldest first; an entry is {"unreadable": reason} when that week
+    #: could not be read (rendered as such, never as zero strength days).
+    quotas: list[dict] = field(default_factory=list)
 
     @property
     def anchor(self) -> date:
@@ -119,6 +123,12 @@ def load(start: date, end: date) -> Data:
                          ("health_program",))
     if rows and rows[0]["value"]:
         d.program = json.loads(rows[0]["value"])
+    from artemis import health_eval
+    from knowledge import strength_quota as sq
+    wk = sq.week_of(start)[0]
+    while wk <= end:
+        d.quotas.append(health_eval.read_quota(wk, d.today))
+        wk += timedelta(days=7)
     return d
 
 
@@ -161,14 +171,15 @@ def day_status(data: Data, plan: dict) -> str:
         return "rest"
     if is_done(data, plan):
         return "done"
-    # MAKEUP-1: a deliberate skip is not a missed session.
+    # MAKEUP-1: a deliberate skip.
     if plan.get("is_skipped"):
         return "skipped"
     if plan["plan_date"] > data.today:
         return "upcoming"
     if plan["plan_date"] == data.today:
         return "not logged yet"
-    return "missed"
+    # SESSION-OPEN: plan rows are suggestions — never "missed".
+    return "not done"
 
 
 def label(plan: dict) -> str:
@@ -189,11 +200,23 @@ def adherence(data: Data) -> tuple[int, int, int]:
         if st == "done":
             done += 1
             due += 1
-        elif st == "missed":
+        elif st == "not done":
             due += 1
         else:
             upcoming += 1
     return done, due, upcoming
+
+
+def quota_lines(data: Data) -> list[str]:
+    """One line per week: the SAME line the Sunday post uses."""
+    from artemis import health_eval
+    out = []
+    for q in data.quotas:
+        line = health_eval.quota_line(q)
+        if "week_start" in q:
+            line = f"Week of {date.fromisoformat(q['week_start']):%b %-d}: " + line
+        out.append(line)
+    return out
 
 
 def logged_span_min(logs: list[dict]) -> int | None:
@@ -492,8 +515,10 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
         blocks.append(("p", f"Program week {', '.join(map(str, wk))}"
                             + (f" of {data.program['weeks_total']}" if data.program else "")))
     done, due, upcoming = adherence(data)
-    blocks += [("h2", "Adherence"),
-               ("p", f"**{done} of {due}** training sessions due so far completed"
+    # SESSION-OPEN (Ryan, 2026-11-09): the week is judged by the strength quota.
+    blocks += [("h2", "Strength days"), ("ul", quota_lines(data) or ["not read"])]
+    blocks += [("h2", "Suggested sessions"),
+               ("p", f"**{done} of {due}** suggested sessions so far done"
                      + (f" · {upcoming} still upcoming" if upcoming else "")
                      + f" · {sum(1 for p in data.plans if day_status(data, p) == 'rest')} rest day(s)"
                      + _pre_program_note(data))]
@@ -560,7 +585,8 @@ def build_weekly(data: Data, generated: datetime | None = None) -> list:
     blocks += [("h2", "Adjustments applied"), ("ul", adjustments(data) or ["none"])]
     from artemis import health_eval
     ev = health_eval.evaluate(data.plans, data.logs, data.prior_logs, start=data.start,
-                              end=data.end, today=data.today, anchor=data.anchor)
+                              end=data.end, today=data.today, anchor=data.anchor,
+                              quota=data.quotas[0] if data.quotas else None)
     blocks += [("h2", "Weekly evaluation (EVAL-1)"), ("ul", health_eval.render_lines(ev))]
     blocks += [("h2", "Watch data"), ("p", NOT_TRACKED)]
     blocks += [("h2", "Nutrition"), ("p", NOT_TRACKED)]
@@ -571,8 +597,9 @@ def build_monthly(data: Data, generated: datetime | None = None) -> list:
     blocks = _header(data, f"Monthly training report — {data.start:%B %Y}", generated)
     done, due, upcoming = adherence(data)
     planned = done + (due - done) + upcoming
-    blocks += [("h2", "Sessions"),
-               ("p", f"**{done}** done · {due - done} missed · {upcoming} still upcoming · "
+    blocks += [("h2", "Strength days by week"), ("ul", quota_lines(data) or ["not read"])]
+    blocks += [("h2", "Suggested sessions"),
+               ("p", f"**{done}** done · {due - done} not done · {upcoming} still upcoming · "
                      f"{planned} planned in the month" + _pre_program_note(data))]
 
     lifts = []
