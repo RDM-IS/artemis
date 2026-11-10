@@ -2615,7 +2615,7 @@ def get_row_circuit(
 #: FULLBODY-1 (2026-11-01): there is one strength session now, so "next" is
 #: always it. The lookup below still reads every strength type, because `after`
 #: (the last lift he logged) is real history whatever it was called.
-from knowledge.session_types import STRENGTH_CURRENT, STRENGTH_TYPES  # noqa: E402
+from knowledge.session_types import STRENGTH_BW, STRENGTH_CURRENT, STRENGTH_TYPES  # noqa: E402
 
 
 @router.get("/strength-next")
@@ -2699,17 +2699,19 @@ def get_recommend(
     else:
         next_strength = rec.STRENGTH_TYPES[0]
 
-    room_holds = None
+    room_holds = room_holds_bw = None
     try:
         lib = json.loads(lib_row["value"]) if lib_row and lib_row.get("value") else None
         if lib:
             key = lib.get("today_location_key")
             loc = next((l for l in lib.get("locations", []) if l.get("key") == key), None)
             if loc is not None:
-                room_holds = any(s.get("session_type") == next_strength
-                                 for s in loc.get("sessions", []))
+                types_here = {s.get("session_type") for s in loc.get("sessions", [])}
+                room_holds = next_strength in types_here
+                # SESSION-OPEN 3a: one read of the same library row.
+                room_holds_bw = STRENGTH_BW in types_here
     except (TypeError, ValueError):
-        room_holds = None
+        room_holds = room_holds_bw = None
 
     blocks = plan["blocks"] if plan else None
     if isinstance(blocks, str):
@@ -2722,7 +2724,8 @@ def get_recommend(
         planned_blocks=blocks, planned_logged=bool(plan and plan["logged"]),
         room_holds_strength=room_holds, next_strength=next_strength,
         last_strength_at=last_strength.astimezone(tz) if last_strength else None,
-        last_more={k: v for k, v in last.items() if k in rec.MORE_TYPES})
+        last_more={k: v for k, v in last.items() if k in rec.MORE_TYPES},
+        room_holds_bodyweight=room_holds_bw)
     if out.get("available"):
         out["plan_id"] = plan["plan_id"] if plan else None
     return out

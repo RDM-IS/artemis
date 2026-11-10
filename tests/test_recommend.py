@@ -66,3 +66,32 @@ class TestMore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBodyweight(unittest.TestCase):
+    """SESSION-OPEN 3a (Ryan, 2026-11-10): no lift in 48 h and the room can't
+    hold the next strength session -> Bodyweight, where the room lists it."""
+
+    def test_highlighted_when_the_room_cant_hold_the_next_lift(self):
+        out = r(planned_logged=True, room_holds_strength=False, room_holds_bodyweight=True)
+        self.assertEqual((out["primary"], out["label"], out["strength"]), ("bodyweight", "Bodyweight", None))
+
+    def test_not_after_a_lift_in_the_last_48h(self):
+        out = r(planned_logged=True, room_holds_strength=False, room_holds_bodyweight=True,
+                last_strength_at=NOW - timedelta(hours=20))
+        self.assertEqual(out["primary"], "recovery")
+
+    def test_strength_still_wins_where_the_room_holds_it(self):
+        out = r(planned_logged=True, room_holds_strength=True, room_holds_bodyweight=True)
+        self.assertEqual(out["primary"], "strength")
+
+    def test_a_room_without_it_falls_to_recovery(self):
+        out = r(planned_logged=True, room_holds_strength=False, room_holds_bodyweight=False)
+        self.assertEqual(out["primary"], "recovery")
+
+    def test_unreadable_is_unavailable_never_a_guess(self):
+        self.assertFalse(r(planned_logged=True, room_holds_strength=False,
+                           room_holds_bodyweight=None)["available"])
+
+    def test_it_is_a_button(self):
+        self.assertIn("bodyweight", rec.BUTTONS)

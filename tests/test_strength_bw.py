@@ -62,6 +62,14 @@ class ContentTest(unittest.TestCase):
                 self.assertNotIn("target_load_lbs", e)
 
 
+class FullBodyRegionsTest(unittest.TestCase):
+    def test_every_full_body_name_has_regions(self):
+        """FULLBODY-1 shipped seven names the pain ladder couldn't see; this
+        keeps the next one from shipping the same way."""
+        from artemis import full_body
+        self.assertEqual(sorted(n for n in full_body.all_names() if n not in hr.EXERCISE_REGIONS), [])
+
+
 class PerRoomTest(unittest.TestCase):
     def test_richfield_rows_on_the_trx_and_rides_the_bike(self):
         b = _build("richfield")[0]
@@ -102,10 +110,19 @@ class PerRoomTest(unittest.TestCase):
 
 class FailClosedTest(unittest.TestCase):
     def test_an_unrecorded_equipment_inventory_raises_never_y_t_w(self):
-        # msp_home: load_config records it as UNKNOWN, not empty.
-        self.assertIsNone(load_config.for_location("msp_home"))
-        with self.assertRaises(sb.InventoryUnreadable):
-            _build("msp_home")
+        # A room load_config records as UNKNOWN (absent), not empty.
+        with mock.patch.dict(cardio.INVENTORY, {"synthetic_unknown": ()}):
+            self.assertIsNone(load_config.for_location("synthetic_unknown"))
+            with self.assertRaises(sb.InventoryUnreadable):
+                _build("synthetic_unknown")
+
+    def test_home_is_y_t_w_and_the_rower(self):
+        """msp_home confirmed 2026-11-10: rower, floor, mat — no strap, no bands."""
+        b = _build("msp_home")[0]
+        self.assertIn("Prone Y-T-W", _seg(b, 1))
+        self.assertIn("Row — Z3", _seg(b, 1))
+        self.assertIn("water rower", b["warmup"])
+        self.assertEqual(b["equipment"], ["mat", "water rower"])
 
     def test_a_room_missing_from_the_cardio_inventory_raises(self):
         with mock.patch.dict(load_config.BY_LOCATION, {"synthetic_x": {"bodyweight": {"mode": "none"}}}):
@@ -119,7 +136,7 @@ class FailClosedTest(unittest.TestCase):
 
     def test_can_hold_follows_the_builder(self):
         for key, want in (("office", True), ("richfield", True), ("brown_deer", True),
-                          ("msp_home", False), ("transit", False)):
+                          ("msp_home", True), ("transit", False)):
             self.assertEqual(office.can_hold(key, "strength_bw"), want, key)
 
 
@@ -180,16 +197,22 @@ class LibraryTest(unittest.TestCase):
              mock.patch.object(cycle, "anchor", return_value=cycle.DEFAULT_ANCHOR):
             return sl.build(date(2026, 11, 12))
 
-    def test_every_real_room_with_an_inventory_lists_it_and_home_fails_loudly(self):
-        with self.assertLogs("artemis.session_library", level="ERROR") as logs:
-            lib = self._lib()
+    def test_every_real_room_lists_it(self):
+        lib = self._lib()
         by = {l["key"]: [s["session_type"] for s in l["sessions"]] for l in lib["locations"]}
-        for key in ("office", "richfield", "brown_deer"):
+        self.assertEqual(sorted(by), ["brown_deer", "msp_home", "office", "richfield"])
+        for key in by:
             self.assertIn("strength_bw", by[key], key)
-        self.assertNotIn("strength_bw", by["msp_home"])
-        self.assertTrue(any("strength_bw at msp_home failed to build" in m for m in logs.output))
-        self.assertNotIn("transit", by)
-        self.assertNotIn("outside", by)
+
+    def test_a_room_whose_inventory_cant_be_read_fails_loudly_not_silently(self):
+        from artemis import session_library as sl
+        with mock.patch.dict(load_config.BY_LOCATION, clear=False) as bl:
+            bl.pop("brown_deer")
+            with self.assertLogs("artemis.session_library", level="ERROR") as logs:
+                lib = self._lib()
+        by = {l["key"]: [s["session_type"] for s in l["sessions"]] for l in lib["locations"]}
+        self.assertNotIn("strength_bw", by["brown_deer"])
+        self.assertTrue(any("strength_bw at brown_deer failed to build" in m for m in logs.output))
 
     def test_the_library_entry_is_the_builder_output(self):
         from artemis import session_library as sl

@@ -103,9 +103,9 @@ def resolve_row(location_key: str) -> tuple:
     return ROW_FALLBACK
 
 
-def resolve_cardio(location_key: str, on: date | None) -> tuple[str, str]:
-    """(block-2 cardio name, warm-up machine words) for this room on this date.
-    Raises when the room is not in the cardio inventory at all."""
+def resolve_cardio(location_key: str, on: date | None) -> tuple[str, str, str | None]:
+    """(block-2 cardio name, warm-up words, machine label or None) for this room
+    on this date. Raises when the room is not in the cardio inventory at all."""
     from knowledge import cardio
     if location_key not in cardio.INVENTORY:
         raise InventoryUnreadable(
@@ -113,11 +113,12 @@ def resolve_cardio(location_key: str, on: date | None) -> tuple[str, str]:
             "(knowledge/cardio.py) — can't tell machine from no machine")
     got = cardio.resolve(location_key, on)
     if not got.get("modality"):
-        return NO_MACHINE_CARDIO, "marching / jacks"
+        return NO_MACHINE_CARDIO, "marching / jacks", None
     device = got.get("device")
     if device not in CARDIO_BY_DEVICE:
         raise InventoryUnreadable(f"strength_bw: no block-2 name for device {device!r}")
-    return CARDIO_BY_DEVICE[device], f"easy on the {cardio.label_for(device)}"
+    label = cardio.label_for(device)
+    return CARDIO_BY_DEVICE[device], f"easy on the {label}", label
 
 
 def _exercise(name, seg, fmt, target, per_side, note, rounds, class_for) -> dict:
@@ -150,7 +151,7 @@ def build(location_key: str, location: str, *, on: date | None = None, class_for
         from artemis.health_office import class_for as _cf
         class_for = _cf
     row = resolve_row(location_key)
-    cardio_name, warm_machine = resolve_cardio(location_key, on)
+    cardio_name, warm_machine, machine = resolve_cardio(location_key, on)
     interval = (cardio_name, 1, "duration", INTERVAL_SEC, False, "Z3 — heart rate from the watch")
     table = BLOCK1 + (SQUAT, PUSH, row, GOOD_MORNING, interval) + BLOCK3
     segments = [dict(s) for s in SEGMENTS]
@@ -160,8 +161,8 @@ def build(location_key: str, location: str, *, on: date | None = None, class_for
         equipment.append("TRX")
     elif row[0] == "Band row":
         equipment.append("bands")
-    if cardio_name != NO_MACHINE_CARDIO:
-        equipment.append(cardio_name.split(" — ")[0].lower())
+    if machine:
+        equipment.append(machine)
     blocks = {
         "type": "circuit",
         "display_name": DISPLAY_NAME,

@@ -125,6 +125,14 @@ _reg("Treadmill — Z3", {"legs"}, {"calves", "knee", "hip"})
 _reg("Elliptical — Z3", {"legs"}, {"knee", "hip"})
 _reg("High knees / jacks — Z3", {"legs", "calves"}, {"knee", "hip"})
 
+# ── FULLBODY-1's remaining names (Ryan, 2026-11-10): the pain ladder could not
+# reason about these on a live Full Body row. Each mirrors the exercise it is
+# closest to, as LOCATION-1's substitutes do.
+_reg("Chest-supported DB row", {"back"}, {"shoulder", "biceps", "arms"})        # ≈ 1-arm DB row, no trunk load
+_reg("DB front squat", {"legs", "quads"}, {"shoulder", "low back", "hip", "knee"})  # ≈ DB goblet squat
+_reg("DB step-up", {"legs", "quads"}, {"hip", "knee"})                         # ≈ Reverse lunge
+_reg("TRX single-arm row", {"back"}, {"shoulder", "biceps", "arms", "core"})   # ≈ 1-arm DB row
+
 # ── YOGA-6 (2026-09-28, DRAFT): so the pain ladder can reason about them too ──
 _reg("Chair", {"quads", "legs"}, {"knee", "shoulder"})
 _reg("Plank", {"core", "shoulder"}, {"low back", "wrist"})
