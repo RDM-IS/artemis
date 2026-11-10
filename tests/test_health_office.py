@@ -161,9 +161,18 @@ class TestSchedule(unittest.TestCase):
         for r in _EVENINGS:
             self.assertTrue(office.evening_is_possible(r["plan_date"]), r["plan_date"])
         drives = [d for d in _BY_DATE if not office.evening_is_possible(d)]
-        self.assertTrue(drives)
         for d in drives:
             self.assertNotIn(d, _EVENING_BY_DATE)
+        # SUNDAY-TRAVEL (2026-11-10): both drives now end by 16:00, so no
+        # default day is on the road at EVENING_AT. The rule still holds for a
+        # day that IS -- proved on a patched segment table.
+        from unittest.mock import patch as _patch
+        thu = date(2026, 9, 24)
+        segs = {**office._cycle.DAY_SEGMENTS,
+                4: (("msp_home", None), ("transit", "16:30"), ("richfield", "21:30"))}
+        with _patch.object(office._cycle, "segments", return_value=segs), \
+             _patch.object(office._cycle, "override_for", return_value=None):
+            self.assertFalse(office.evening_is_possible(thu))
 
     def test_an_evening_is_where_he_is_in_the_evening(self):
         """Not the office gym — a work-day evening is at home, on a mat."""

@@ -240,10 +240,11 @@ class TestRegistryShape(unittest.TestCase):
         from datetime import datetime
         from artemis import cycle
         cases = {
-            date(2026, 9, 25): (6, 0),      # wi, Richfield
+            date(2026, 9, 25): (4, 30),     # wi, the train Friday at MSP home (DAY_WAKE)
             date(2026, 9, 22): (4, 30),     # msp_work, office
             date(2026, 10, 3): (7, 30),     # msp_home
-            date(2026, 9, 28): (6, 0),      # travel, a Richfield morning
+            date(2026, 9, 28): (4, 30),     # the home Monday (DAY_WAKE)
+            date(2026, 9, 27): (7, 30),     # travel Sunday, a Brown Deer morning
         }
         with patch.object(cycle, "override_for", return_value=None):
             for d, hm in cases.items():
