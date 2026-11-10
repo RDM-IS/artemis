@@ -221,7 +221,87 @@ Nothing mid-migration. HEALTH-1 is closed (verified 2026-09-19). **The build ord
 - **Rows from before 056** have no target: target = what was held, finished — the rule they were written under.
 - **Migrate-first:** apply 056 before the Lambda, because both `/log` inserts name the new columns.
 
-**WEEK-TEMPLATE — one 14-day cycle, sessions by day, machine by room — APPROVED 2026-11-01 10:42; BUILT 2026-11-01 (`feat/week-template`, both repos), migration 058 NOT APPLIED, block 2 NOT RESEEDED.** Ryan, 09:31–10:12: "we need rest days"; strength on Wednesdays plus a Richfield off day; Wisconsin days stay flexible because where he will be is not known in advance. **Supersedes ROW-SCHEDULE's table** (every MSP morning a row, no rest) from block 2 onward.
+**SESSION-OPEN — any session, any room; the week is a quota, not a calendar — DECIDED AND APPROVED 2026-11-09 (Ryan, 20:06 and 20:16). Build steps 1, 2 and 4 BUILT 2026-11-09 (artemis #283, gym-display #67, both draft); steps 3, 5 (beyond the status union) and 6 NOT BUILT; NOT DEPLOYED.** Supersedes WEEK-TEMPLATE's day-by-day contract, MAKEUP-2, and SESSION-LIB's "same type completes the row" rule. Source: Ryan's spec (`session-open-spec.md`, 2026-11-09), reconciled with what was built. The reconciliations are marked **As built**.
+
+*Decisions (Ryan, 2026-11-09 20:06 and 20:16):*
+1. **A pain day off warns, it does not hide.** Banner: "Day off from the check-in — gentle mobility suggested." Every session stays launchable. **Not built** (step 5).
+2. **The only weekly requirement is 3+ strength days per program week (Sun–Sat).** Strength = weights, a **row + floor** circuit (push / core), or bodyweight. Everything else — which day, which room, cardio, rest — is free.
+3. **Bodyweight is strength.** No equipment is required for a strength day, so strength exists in every room.
+4. **Yoga — Intense (`yoga_strength`) does not count** as a strength day.
+5. **A DNF strength session counts** — the day was trained.
+6. **`strength_bw` content approved** as drafted below.
+
+*Definitions:*
+- **Strength day** = a local calendar day (active timezone) with ≥1 logged session of a type in `STRENGTH_DAY_TYPES`, DNF included. Real logs only (`logged_via <> 'inferred'`). A session with every set skipped does not count. One list in `knowledge/session_types.py`; `tests/test_strength_quota.py` fails on a literal copy (SAME-FACT-MANY-PLACES).
+- A log's date is its plan row's date when it has one, otherwise the local date it was logged (`started_at`, else `logged_at`).
+- `STRENGTH_DAY_TYPES` = `STRENGTH_TYPES` (A/B/C, `strength_full`) + `strength_bw` (new) + every **circuit**, including AWAY's `bodyweight_circuit`. **As built:** `STRENGTH_TYPES + ("row_circuit",) + ("bodyweight_circuit",)`. **`strength_bw` is NOT in the list yet**, because no row or log can carry it until step 3's migration — a name nobody writes matches nothing (MATCHES-NOTHING). Step 3 adds it in the same change as the type.
+- **Circuits have no `session_type` of their own (checked live 2026-11-09):** a planned circuit is a `cardio_z2` row with `blocks.row_kind='circuit'` (12 rows, 10/21–12/11); an ad-hoc one logs as `row_circuit` (0 rows so far). The reader maps `row_kind='circuit'` to `row_circuit` before matching. Ride/run + floor don't exist yet; adding a floor kind to `knowledge.row_circuit.KINDS` without adding it to the list fails a test.
+- Not strength: ladders, `cardio_z2` without a circuit, `recovery_flow`, `core` (easy), `mobility`, `yoga_strength`.
+- `days_left` excludes today if today is already a strength day.
+
+*A. The library — every type, every room* (**NOT BUILT**, step 3):
+- `session_library.build` lists every type at every real room (transit/outside still excluded). `_supported()` is deleted; nothing is absent.
+- Each entry carries `fit: "full" | "adapted"` and a `note` (e.g. "no bench: floor press"). The builder still **fails closed** on a movement it can't resolve: the entry stays, labelled "needs X", never silently swapped.
+- `strength_bw` is a new `session_type` (**ENUM-EXPAND**: gym-display union first, then the migration). Bodyweight full-body; runs anywhere with floor; TRX/bands are optional upgrades where the room has them.
+
+*`strength_bw` — APPROVED 2026-11-09.* FULLBODY-1 rules: unilateral/skill first, stable movements in the high-HR rounds, progression is density.
+
+| Block | Min | Movements |
+|---|---|---|
+| Warm-up | 8 | 5 min easy on the room's machine (or marching/jacks) + hip/T-spine mobility |
+| 1 · fresh, unilateral — 3 rounds, 60 s between | 14 | reverse lunge ×8/side · single-leg glute bridge ×10/side · hand-supported single-leg RDL ×8/side |
+| 2 · density — 4 rounds, no rest between moves | 26 | squat (tempo 3-1-1) ×15 · push-up (incline if needed) ×10–15 · TRX/band row ×15 *or* prone Y-T-W ×8 each · good-morning ×15 · **3 min machine at Z3** |
+| 3 · trunk — 2 rounds | 7 | dead bug ×10 · side plank 30 s/side · bird dog ×10 |
+| Cool-down | 5 | easy machine + stretch |
+
+Progression order, as FULLBODY-1: add a round → shorten rest → raise the machine target → harder variation (incline → floor → decline push-up; split squat → rear-foot elevated).
+
+*B. The Sessions page* (**NOT BUILT**, step 5):
+- One grid, no "More" split.
+- **Cardio:** Row · Ride · Run, each **Ladder** or **+ floor** (six buttons, every room). This builds WEEK-TEMPLATE's deferred `format × machine` split.
+- **Strength:** Full-body (the room's version: X office / Y Richfield / bodyweight elsewhere) · Bodyweight · Row + floor. A/B/C behind "older".
+- **Yoga & extras:** Intense · Recovery · Core · Mobility.
+- **Week counter at the top:** "Strength 1 of 3 · 4 days left". Strength-day buttons tagged "counts".
+- The location chip lists every room; RECOMMEND highlights only.
+
+*C. The week — the quota replaces the calendar* (**BUILT**):
+- **Plan rows stay as suggestions.** A row is never "missed".
+- **Adherence = strength days ≥ 3 per Sun–Sat week**, from `knowledge/strength_quota.py`: one statement for box and Lambda (psycopg2 and SQLAlchemy forms generated from one template), fail-closed `QuotaUnreadable`, status `met / on_track / tight / short`, plus `nag_due` and `repeat_due`.
+- **Counts only weeks from the deploy week on.** **As built:** the first counted Sunday is read from `acos.system_state['strength_quota_counts_from']`, fail-closed — absent, unparseable or not a Sunday raises `QuotaUnreadable`, so an unset key cannot quietly count every week back to the start of history. Earlier weeks report `not_counted` and never nag or propose. It is **set at deploy** by `scripts/set_strength_quota_counts_from.py`: a dry run by default; refuses to move an existing value without `--force`; re-reads and verifies.
+- **Nag:** once per week when `needed ≥ days_left`, outside quiet hours. **As built:** the 16:30 `job_health_nag` slot; the sent marker is `acos.system_state['strength_quota_nag_week']`, written only after the post succeeds.
+- Ad-hoc logging (nullable `plan_id`, ADHOC-LOG) is the normal path.
+
+*Coverage — every adherence reader's home (2026-11-09; answers by Claude, confirmed or set by Ryan):*
+
+| Reader | Home |
+|---|---|
+| `/plan` `derive_day_status` | A past unlogged suggestion is **`not_done`** (neutral grey, never red). ENUM-EXPAND: gym-display's `PlanDayStatus` union first, adding the already-returned `skipped` in the same change. **As built:** `missed` stays in the union as an alias, rendered like `not_done`, for a Lambda older than SESSION-OPEN (Ryan: right). |
+| `/overview` ProgramInfo + "Missed" flags | The quota is in the response; "missed" flags are dropped. **As built:** ProgramInfo's planned-row counts are unchanged, as neutral counts. |
+| `/status` | The quota is added (`strength_quota`, active timezone). |
+| `_strength_goal` | Reads the quota: `sessions_done` = strength days, `sessions_planned` = 3. One read, one status: a failure hides both the tile and `strength_quota`. |
+| EVAL-1 Sunday post | The quota line replaces "Missed: …"; a row not taken is `not_done`. |
+| Debrief nag | `nag_due`, once per week, with a sent marker in `acos.system_state`. The per-day debrief nag is gone. |
+| Reseed guards | Unchanged (they protect logged rows, not adherence). |
+| MAKEUP-2 offer + `POST /makeup` | Retired: the library keeps its `makeup` keys with `offer` always null (`retired: true`); the endpoint answers **410** `{"error": "retired"}` and touches nothing. |
+| `cognition_outcomes` makeup resolver | Retired with MAKEUP-2; past outcomes stay readable. **As built (Ryan, 2026-11-09):** an OPEN `makeup_swap` decision is closed with outcome `retired` — not judged — so cognition never counts it as pending. One-time and idempotent by construction (the runner skips any decision with an outcome). 0 such rows existed on 2026-11-09; the pre-SESSION-OPEN Lambda can still write one until deploy. |
+| REPEAT-WEEK propose + its outcome resolver | Re-keyed on the quota (a finished week < 3). **Counts only weeks from the deploy week on** — live data shows every week since 10/04 short (0–2) — and no backfilled proposals. **As built:** the resolver writes `week_clean` / `week_short`, judged on the count, so a repeat begun before the counts-from week still gets an honest answer. |
+| Inferred backstop `insert_inferred_summary` | **Retired** — a suggestion can't be missed. **Grepped 2026-11-09: nothing depends on it** (there is no autoregulator; LAST and the pain ladder filter it out). The readers that did not filter it (`/status` RPE trend, most-recent session, day strip) were polluted by it rather than relying on it. The 21:50 job is unregistered; the existing 86 inferred rows stay. |
+| `interval_gate` (b) | Re-keyed on logs, not plans: ≥4 real cardio logs in the last 14 local days, any `plan_id`. **As built (Ryan confirmed):** counted as distinct **sessions** (a planned session by `plan_id`, an ad-hoc one by local day), not rows — one six-round ladder writes six rows. |
+| `scripts/export_report.py` adherence | The quota, per week — the same line as the Sunday post. |
+
+*Warnings, not rules:*
+- Strength on consecutive days is allowed; RECOMMEND prefers a gap and says why.
+- Cardio has no target. ~145 min/week is shown, not scored.
+
+*Build order:*
+1. ✅ `STRENGTH_DAY_TYPES` + test.
+2. ✅ Quota reader.
+3. ⬜ `strength_bw` + gym-display union + migration (ENUM-EXPAND) → builder; `fit` / `note`; delete `_supported()`; add `strength_bw` to `STRENGTH_DAY_TYPES` in the same change.
+4. ✅ Convert the readers per the coverage table (artemis #283); this entry.
+5. ◐ gym-display: `not_done` + `skipped` in the union is built (#67; TYPE-GATE: build + 764 tests pass). The grid, format × machine circuits, the counter and the day-off banner are not built.
+6. ⬜ Deploy, migrate-first. **WEEK-TEMPLATE's deploy goes first:** 058 is still unapplied on the box at `a3e804a`. Then gym-display #67 (before the Lambda, or older Pages builds label `not_done` days "Upcoming") → merge #283 → box `git pull` → `scripts/set_strength_quota_counts_from.py` (dry run, then `--commit`, naming the deploy week's Sunday) → restart `acos` (confirm `health_inferred_summary` is gone from the registry) → `python3.11 -m artemis.session_library` → Lambda `api/deploy.sh` → verify that `strength_quota.section.ok` is true on `/status` and `/overview`, that `POST /makeup` returns 410, and that `/plan` shows `not_done`. Then verify every room × type on the box (after step 3).
+
+**WEEK-TEMPLATE — one 14-day cycle, sessions by day, machine by room — APPROVED 2026-11-01 10:42; BUILT 2026-11-01 (`feat/week-template`, both repos), migration 058 NOT APPLIED, block 2 NOT RESEEDED.** **Its day-by-day contract is SUPERSEDED by SESSION-OPEN (2026-11-09)**: the table's rows are suggestions, and the week is judged by strength days toward 3. Ryan, 09:31–10:12: "we need rest days"; strength on Wednesdays plus a Richfield off day; Wisconsin days stay flexible because where he will be is not known in advance. **Supersedes ROW-SCHEDULE's table** (every MSP morning a row, no rest) from block 2 onward.
 
 | pos | Wk 1 | room | pos | Wk 2 | room |
 |---|---|---|---|---|---|
@@ -691,7 +771,7 @@ Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on
 
 **SESSION-LIB — start any session on demand. BUILT, NOT DEPLOYED (2026-09-27; artemis `feat/session-lib`, gym-display `feat/session-lib`).**
 - **Built:** `artemis/session_library.py` runs `health_office.build_row` for each type a real location can hold (strength: an approved table via `can_hold`; cardio: a machine via `knowledge.cardio.resolve`; Recovery Flow everywhere but on the road) at today's program week, into `acos.system_state['session_library']` — nightly at 00:20 (silent) and on demand (`python3.11 -m artemis.session_library`). `GET /api/health/library` serves it fail-closed (not built → `available: false` with the fix; built for another day → `stale`). gym-display: a **Sessions** tab (`/library`) and **Start a session** on the rest screen; the location chip defaults to today's and a tap overrides it for that launch only; absent, not greyed. A launch runs through the ordinary Setup/Workout/Done/Flow screens and logs ad-hoc (ADHOC-LOG). "Mobility 20 min or full rest" is retired.
-- **REDEFINED by Ryan, 2026-09-27 — planned work + extras; makeups only on rest days (MAKEUP-2).**
+- **REDEFINED by Ryan, 2026-09-27 — planned work + extras; makeups only on rest days (MAKEUP-2).** **MAKEUP-2 is RETIRED and REPEAT-WEEK is re-keyed on the strength quota by SESSION-OPEN (2026-11-09)** — the rules below are history.
   - **Every day, rest days included: planned work + extras.** Extras are low-impact only — yoga, core, mobility (`knowledge.session_types.EXTRA_TYPES`; the Recovery Flow today, core and mobility once they have definitions). They never complete planned work or count toward adherence. **Core stays light and after the day's lift, never before it** (bracing for squats and hinges); on a pain day off only gentle mobility applies.
   - **Strength and cardio never appear in the general list.** They appear only as a makeup:
   - **One session not done in a program week (Sun–Sat)** — missed or deliberately skipped, both count — is offered on a later **rest day of that week**: *the missed day becomes rest ("made up on <date>"), the rest day becomes the session*, built by the seeder for today's location, and the week carries on. `POST /api/health/makeup` does the swap in one transaction, from the offer the box wrote (never the client's), re-checking every condition; each row keeps what it was under `makeup_original` (not `original`, which the check-in's undo owns). Supersedes MAKEUP-1's "move nothing" for this case.
@@ -712,6 +792,7 @@ Draft, 60 min, two rotating expressions (**X** on the office Wednesday, **Y** on
 - **Location resolves from `cycle.py`** and is shown as a chip at the top, with a **one-tap override that applies to that launch only** and never mutates the cycle.
 - **Sessions the current location cannot support are ABSENT, not greyed** — Bike and Row simply do not appear at the office.
 - **Nothing is stored statically.** The launcher calls the **same builder that seeds plan rows** (type + location + current progression point), so Phase 2 Week 3 comes out right with no template to update.
+- **SUPERSEDED in part by SESSION-OPEN (2026-11-09):** a plan row is a suggestion, and ad-hoc sessions count toward the weekly strength quota whether or not they complete a row.
 - **Logging rule, one rule for every type:** ad-hoc sets are **real** — they feed LAST and the effort trend. They do **not** complete a plan row or count toward scheduled adherence, **unless** today has an uncompleted row of that same type **in either slot**, in which case they complete it.
 - **Open:** (a) whether ad-hoc sessions feed the pain ladder and the day-off rules; (b) **Core has no definition in any form today** and needs one before it can be generated. **Yoga A/B do not exist** — a registry-driven list shows Recovery now and the others when YOGA-6 lands.
 - **Also retires "Mobility 20 min or full rest" on the rest screen:** it either offers something tappable or says nothing.
