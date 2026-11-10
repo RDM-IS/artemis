@@ -212,7 +212,10 @@ def compute(day: date, strength_days, today: date, *, counts_from: date,
     if counted and needed and last_chance is not None:
         urgency[last_chance.isoformat()] = "red"
         before = last_chance - timedelta(days=1)
-        if before >= first and before in open_days:
+        # Orange only where a strength day could actually go: open, and not
+        # next to a day already done (the red day itself is the alternative).
+        if (before >= first and before in open_days
+                and (before - timedelta(days=1)) not in done):
             urgency[before.isoformat()] = "orange"
     return {"week_start": ws.isoformat(), "week_end": we.isoformat(),
             "strength_days": [d.isoformat() for d in done], "count": len(done),

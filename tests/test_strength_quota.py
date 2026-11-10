@@ -138,6 +138,11 @@ class ComputeTest(unittest.TestCase):
         self.assertEqual((r["capacity"], r["status"]), (4, "on_track"))   # M, W, F, SU
         self.assertEqual(r["urgency"], {W.isoformat(): "red", TU.isoformat(): "orange"})
 
+    def test_no_orange_next_to_a_day_already_done(self):
+        r = q(SA, [F], SA)                                 # Sat is next to Fri's lift
+        self.assertEqual(r["placements"], [SU.isoformat()])
+        self.assertEqual(r["urgency"], {SU.isoformat(): "red"})
+
     def test_travel_and_away_days_are_never_placed(self):
         r = q(M, [], M, free(SU="travel"))
         self.assertNotIn(SU.isoformat(), r["placements"])
